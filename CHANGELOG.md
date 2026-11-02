@@ -2,6 +2,11 @@
 
 ## v0.14.0
 
+- pub_media `--mp4` honours the edit list: encoder priming (AAC, Opus pre-skip) is not sent and an empty edit delays the track; an unsupported edit list is ignored with a WARNING.
+- pub_media `--loop` runs every track of a clip on one period, the clip's presented duration, so audio and video no longer drift apart on each pass.
+- pub_media `--timestamp-mapping`: a group that opens off schedule, as at a loop seam after a short last GOP, takes a new group ID instead of the previous one.
+- pub_media `--timestamp-mapping`: mp4 audio whose times stay on a regular frame grid to within the container's rounding (e.g. 21/22 ms at a 1 ms timescale) is mapped on its frame grid in the sample rate's timescale, without a per-object OBJECT_TIMESTAMP.
+- pub_media `--timestamp-mapping`: the audio Object Multiplier is the frame duration also at one frame per group, for `--mp4`, `--ts` and the tone.
 - pub_media sends PUBLISH_NAMESPACE_DONE when the duration ends, as it does on SIGINT/SIGTERM.
 - pub_media `-t 0` publishes until stopped; a negative `-t` is refused.
 - pub_media `--catalog-audio-bitrate BPS` sets the audio track's catalog bitrate beside video's `--catalog-bitrate`.

@@ -63,7 +63,8 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Optional
+from fractions import Fraction
+from typing import NamedTuple, Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.delivery import DatagramTooLarge
@@ -837,19 +838,88 @@ def _media_clock(timescales, align: bool):
     return time.monotonic() + (wall0 - now) / 1e6, wall0
 
 
-def _sample_cadence(source):
-    """(sample duration, samples per group) of an mp4 track with one
-    sample duration and evenly spaced sync samples, else None."""
-    stts = [d for c, d in source._stts if c]
-    if len(set(stts[:-1] if len(stts) > 1 else stts)) != 1:
-        return None
-    if source._sync is None:
-        return stts[0], 1
-    sync = sorted(source._sync)
-    gaps = {b - a for a, b in zip(sync, sync[1:])}
-    if sync[0] != 1 or len(gaps) > 1:
-        return None
-    return stts[0], (gaps.pop() if gaps else len(source._sizes))
+class _SampleHead(NamedTuple):
+    key_frame: bool
+    duration: int
+
+
+class _Cadence(NamedTuple):
+    """A track mapped on a fixed cadence: ticks per sample in `timescale`,
+    and samples per group."""
+    timescale: int
+    frame: int
+    per_group: int
+
+
+def _sample_cadence(samples, timescale: int, samplerate: Optional[int] = None):
+    """(cadence, samples) of one pass [(sample, start s)]: on the track's
+    timescale when every sample lasts the same and sync samples are evenly
+    spaced. Audio (`samplerate` given) whose starts all lie within half a
+    frame of a regular grid, each step within one container tick plus one
+    sample of the frame, is retimed onto it, in samplerate ticks.
+    Else (None, samples)."""
+    if not samples:
+        return None, samples
+    keys = [i for i, (s, _) in enumerate(samples) if s.key_frame]
+    gaps = {b - a for a, b in zip(keys, keys[1:])}
+    if keys[:1] != [0] or len(gaps) > 1:
+        return None, samples
+    per_group = gaps.pop() if gaps else len(samples)
+    starts = [t * timescale for _, t in samples]
+    steps = {b - a for a, b in zip(starts, starts[1:])}
+    if len(steps) <= 1:
+        frame = steps.pop() if steps else Fraction(samples[0][0].duration)
+        if frame > 0 and frame.denominator == 1:
+            return _Cadence(timescale, int(frame), per_group), samples
+    if samplerate and len(samples) > 1:
+        sr = [t * samplerate for _, t in samples]
+        spf = round((sr[-1] - sr[0]) / (len(sr) - 1))
+        slack = Fraction(samplerate, timescale) + 1
+        if spf > 0 and all(
+                abs(b - a - spf) <= slack for a, b in zip(sr, sr[1:])) and all(
+                2 * abs(x - sr[0] - n * spf) < spf for n, x in enumerate(sr)):
+            t0 = samples[0][1]
+            return _Cadence(samplerate, spf, per_group), [
+                (s, t0 + Fraction(n * spf, samplerate))
+                for n, (s, _) in enumerate(samples)]
+    return None, samples
+
+
+class _Mp4Pass:
+    """One pass of an mp4 track as sent: `times`, each sample's start in s
+    from the pass start, its `cadence` (None: no fixed one) and the clip's
+    loop `period` (s). With `cut`, samples starting at or after the
+    period are left out."""
+
+    def __init__(self, source, period: Fraction, cut: bool = False,
+                 samplerate: Optional[int] = None):
+        self._source = source
+        # Sample metadata only: payloads are read again on each pass.
+        heads = [(_SampleHead(s.key_frame, s.duration), t)
+                 for s, t in source.presented() if not cut or t < period]
+        self.cadence, heads = _sample_cadence(heads, source.timescale,
+                                              samplerate)
+        self.times = [t for _, t in heads]
+        self.period = period
+        self.timescale = (self.cadence.timescale if self.cadence
+                          else source.timescale)
+
+    def samples(self):
+        """(sample, start) of one pass."""
+        return zip((s for s, _ in self._source.presented()), self.times)
+
+
+def _mp4_passes(reader, audio, loop: bool):
+    """(video, audio) _Mp4Pass of an mp4, None where absent, looping on
+    one period: the video track's presented duration, else audio's."""
+    video = reader.video
+    lead = video or reader.audio
+    if lead is None:
+        return None, None
+    period = lead.presented_duration
+    return (_Mp4Pass(video, period, loop) if video else None,
+            _Mp4Pass(audio, period, loop, audio.samplerate)
+            if audio else None)
 
 
 def _sample_us(source) -> int:
@@ -867,17 +937,17 @@ def _audio_per_group(args, frame_us: float) -> int:
     return 1
 
 
-def _frindell_for(source, wall0: int, per_group=None):
-    """MediaTimestamps for an mp4 track: mapped on a fixed cadence in the
-    track's own timescale, else explicit. `per_group` overrides the
-    samples per group the sync samples give."""
-    cadence = _sample_cadence(source)
+def _frindell_for(mp4: _Mp4Pass, wall0: int, per_group=None):
+    """MediaTimestamps for an mp4 track: mapped on its cadence from its
+    first sample, else explicit. `per_group` overrides the samples per
+    group the sync samples give."""
+    cadence = mp4.cadence
     if cadence is None:
         return MediaTimestamps(wall0)
-    dur, sync_group = cadence
-    per_group = per_group or sync_group
-    om = dur if per_group > 1 else 0
-    return MediaTimestamps(wall0, source.timescale, dur * per_group, om)
+    per_group = per_group or cadence.per_group
+    return MediaTimestamps(wall0 + round(mp4.times[0] * 1_000_000),
+                           cadence.timescale, cadence.frame * per_group,
+                           cadence.frame)
 
 
 def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str, wall0: int,
@@ -1077,38 +1147,38 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
     await track.finish()
 
 
-async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
-                          group_frames=None, gap_us=33_333,
+async def _feed_mp4_track(track, mp4: _Mp4Pass, args,
+                          stats: _TrackStats, *, group_frames=None,
                           wrap=None, clock=None):
-    """Feed an mp4 track's samples, paced to their media timestamps and
-    stamped with their scheduled wall-clock capture time; --loop
-    restarts the file at later timestamps. Groups open on sync samples,
-    or with `group_frames` (audio) every that many samples.
+    """Feed an mp4 track's pass, paced to its media timestamps and stamped
+    with their scheduled wall-clock capture time; with --loop pass k
+    starts at k periods. Groups open on sync samples, or with
+    `group_frames` (audio) every that many samples.
     wrap(sample, ts_us, end_us) transforms the payload (CMAF chunking)
     given its paced span, end_us None when unknown; a group's first
     chunk is led by a prft with --timestamp-mapping. `clock` is the
     (monotonic, wall µs) start shared with the other feeders."""
     start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
     prft = wrap is not None and getattr(args, 'timestamp_mapping', False)
-    base_us = 0
+    times = mp4.times
+    loop = args.loop and mp4.period > 0
     n = 0
+    k = 0
     while True:
-        last = 0
-        samples = source.samples()
-        s = next(samples, None)
-        while s is not None:
-            nxt = next(samples, None)
-            ts = base_us + s.timestamp_us
-            if ts > args.duration * 1_000_000:
+        base = k * mp4.period if loop else 0
+        for i, (s, t) in enumerate(mp4.samples()):
+            if base + t > args.duration:
                 break
+            ts = round((base + t) * 1_000_000)
             await _pace(start, ts, not args.no_pace)
             if wrap is None:
                 payload = s.payload
             else:
                 # A pass's last sample runs to the next pass's start.
-                end = (base_us + nxt.timestamp_us if nxt is not None
-                       else ts + gap_us if args.loop else None)
-                payload = wrap(s, ts, end)
+                nxt = (base + times[i + 1] if i + 1 < len(times)
+                       else base + mp4.period if loop else None)
+                payload = wrap(s, ts, None if nxt is None
+                               else round(nxt * 1_000_000))
             if group_frames is not None:
                 key = n % group_frames == 0
                 n += 1
@@ -1117,10 +1187,8 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
             if prft and key:
                 payload = _with_prft(payload, wall0 + ts)
             await _send(track, stats, payload, key, timestamp=wall0 + ts)
-            last = ts
-            s = nxt
-        base_us = last + gap_us
-        if not args.loop or base_us > args.duration * 1_000_000:
+        k += 1
+        if not loop or k * mp4.period > args.duration:
             break
     await track.finish()
 
@@ -1394,9 +1462,10 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                                      config_property=cfg_at, **kwargs)
         # One start for every paced feeder; with --timestamp-mapping its
         # wall clock anchors each track's TIMESTAMP_MAPPING.
+        v_mp4, a_mp4 = (_mp4_passes(reader, mp4_audio, args.loop)
+                        if reader else (None, None))
         timescales = [_SAMPLERATE] + [
-            s.timescale for s in (video if reader else None, mp4_audio)
-            if s is not None]
+            p.timescale for p in (v_mp4, a_mp4) if p is not None]
         clock = _media_clock(timescales, args.timestamp_mapping)
         wall0 = clock[1]
 
@@ -1453,17 +1522,16 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 loc01_compat=args.loc01_compat,
                 codec_string=_cs(mp4_audio.codec_string
                                  if mp4_audio is not None else 'pcm-s16')),
-                (_frindell_for(mp4_audio, wall0, a_per)
-                 if mp4_audio is not None
+                (_frindell_for(a_mp4, wall0, a_per)
+                 if a_mp4 is not None
                  else MediaTimestamps(wall0, _SAMPLERATE, spf * a_per,
-                                      spf if a_per > 1 else 0))))
+                                      spf))))
             stats['audio'] = _TrackStats()
             if mp4_audio is not None:
                 a_ck = chunkers.get('audio')
                 feeders.append(_feed_mp4_track(
-                    audio_track, mp4_audio, args, stats['audio'],
+                    audio_track, a_mp4, args, stats['audio'],
                     group_frames=a_per,
-                    gap_us=_sample_us(mp4_audio),
                     wrap=_cmaf_wrap(a_ck, video=False) if a_ck else None,
                     clock=clock))
             else:
@@ -1491,9 +1559,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat,
                     codec_string=_cs(v_codec), annexb=annexb),
-                    _frindell_for(video, wall0))),
-                video, args, stats['video'],
-                gap_us=int(1e6 / (video.fps or 30)),
+                    _frindell_for(v_mp4, wall0))),
+                v_mp4, args, stats['video'],
                 wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
                 clock=clock))
         start = dict(announce_namespace=(args.pub_ns or args.pub_both),

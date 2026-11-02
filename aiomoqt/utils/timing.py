@@ -348,6 +348,7 @@ class MediaTimestamps:
         self.group_multiplier = group_multiplier
         self.object_multiplier = object_multiplier
         self.base = wall0_us * self.timescale // 1_000_000
+        self._group = -1
 
     def track_properties(self, vi64: bool) -> Dict[int, Any]:
         props: Dict[int, Any] = {TIMESCALE: self.timescale}
@@ -362,11 +363,14 @@ class MediaTimestamps:
         return (2 * d + 1_000_000) // 2_000_000
 
     def group_for(self, capture_us: int) -> Optional[int]:
-        """The scheduled group of a group-opening object."""
+        """The scheduled group of a group-opening object, above every
+        group returned before: an off-schedule group never reuses an ID."""
         if not self.mapped or not self.group_multiplier:
             return None
         g = self.group_multiplier
-        return max(0, (2 * self._ticks(capture_us) + g) // (2 * g))
+        self._group = max(self._group + 1,
+                          (2 * self._ticks(capture_us) + g) // (2 * g))
+        return self._group
 
     def object_properties(self, group_id: int, object_id: int,
                           capture_us: int) -> Dict[int, Any]:

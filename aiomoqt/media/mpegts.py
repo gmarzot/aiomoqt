@@ -126,9 +126,8 @@ class TsCadence:
                          per_group: int) -> MediaTimestamps:
         """Mapped timing for audio frames of `frame_samples`, `per_group`
         to a group, the first opening at `wall0_us`."""
-        om = frame_samples if per_group > 1 else 0
         return MediaTimestamps(wall0_us, samplerate,
-                               per_group * frame_samples, om)
+                               per_group * frame_samples, frame_samples)
 
 
 class TsRates:
