@@ -122,6 +122,9 @@ class _Open:
     def __init__(self):
         self.writes = []
 
+    def set_stream_priority(self, _sid, _band):
+        return True
+
     async def open_uni_stream(self):
         return 3
 

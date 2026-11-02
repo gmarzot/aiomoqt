@@ -1,4 +1,4 @@
-"""Ersatz-relay namespace discovery (§9.4).
+"""aiomoqt-relay namespace discovery (§9.4).
 
 d18 splits discovery in two: SUBSCRIBE_NAMESPACE reports the NAMESPACEs
 under a prefix, then SUBSCRIBE_TRACKS asks one of them for its tracks.
@@ -281,7 +281,7 @@ async def test_d14_forwards_publish_namespace_and_its_withdrawal(
     seen: asyncio.Queue = asyncio.Queue()
 
     async def _announce(session, msg):
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         await seen.put(("ANNOUNCE", tuple(msg.namespace)))
 
     async def _done(session, msg):

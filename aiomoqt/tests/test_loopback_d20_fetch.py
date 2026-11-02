@@ -95,11 +95,10 @@ async def _loopback(port, draft, use_quic, prefill=3, history=None,
             assert pub.negotiated_draft == draft
             tracks = {}
             for name, size in _SIZES.items():
-                kw = {} if history is None else dict(
-                    fetch_history_bytes=history)
-                track = PublishedTrack(pub, namespace=_NS, trackname=name,
-                                       object_size=size, group_size=_GROUP,
-                                       rate=200, **kw)
+                track = PublishedTrack(
+                    pub, namespace=_NS, trackname=name, object_size=size,
+                    group_size=_GROUP, rate=200,
+                    fetch_history_bytes=1 << 20 if history is None else history)
                 if prefill:
                     track.prefill(prefill)
                 track.attach()

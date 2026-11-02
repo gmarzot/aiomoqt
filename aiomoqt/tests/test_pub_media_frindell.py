@@ -1,12 +1,14 @@
 """pub_media --timestamp-mapping: draft-frindell-moq-timestamp Track
 Properties and corrections beside LOC TIMESTAMP, a prft on each CMAF and
-LOCMAF group start, end to end through the interop relay into sub_media
+LOCMAF group start, end to end through aiomoqt-relay into sub_media
 --analyze over raw QUIC and WebTransport, audio and video on one
 session."""
 import asyncio
 import csv
 import struct
 import sys
+import time
+from fractions import Fraction
 from types import SimpleNamespace as NS
 
 import pytest
@@ -65,28 +67,41 @@ def test_explicit_media_track_stamps_every_object():
     assert m.group_for(W) is None
 
 
+def _src(stts, sync, timescale=15360):
+    """A fake mp4 track: (count, duration) runs; `sync` 1-based sync
+    sample numbers, None for all."""
+    durs = [d for c, d in stts for _ in range(c)]
+    starts = [sum(durs[:i]) for i in range(len(durs))]
+    samples = [(NS(key_frame=sync is None or i + 1 in sync, duration=d,
+                   payload=b'x'), Fraction(t, timescale))
+               for i, (t, d) in enumerate(zip(starts, durs))]
+    return NS(presented=lambda: iter(samples), timescale=timescale)
+
+
+def _cadence(stts, sync):
+    c = pub_media._Mp4Pass(_src(stts, sync), Fraction(0)).cadence
+    return c and (c.frame, c.per_group)
+
+
 def test_cadence_needs_one_duration_and_even_keyframes():
-    def src(stts, sync, n=90):
-        return NS(_stts=stts, _sync=sync, _sizes=[1] * n, timescale=15360)
-    assert pub_media._sample_cadence(src([(90, 512)], {1, 31, 61})) == (
-        512, 30)
-    assert pub_media._sample_cadence(src([(90, 512)], None)) == (512, 1)
-    assert pub_media._sample_cadence(src([(90, 512)], {1, 31, 50})) is None
-    assert pub_media._sample_cadence(
-        src([(40, 512), (40, 500), (10, 512)], {1, 31, 61})) is None
-    explicit = pub_media._frindell_for(src([(90, 512)], {1, 40, 60}), W)
+    assert _cadence([(90, 512)], {1, 31, 61}) == (512, 30)
+    assert _cadence([(90, 512)], None) == (512, 1)
+    assert _cadence([(90, 512)], {1, 31, 50}) is None
+    assert _cadence([(40, 512), (40, 500), (10, 512)], {1, 31, 61}) is None
+    explicit = pub_media._frindell_for(
+        pub_media._Mp4Pass(_src([(90, 512)], {1, 40, 60}), Fraction(0)))
     assert not explicit.mapped
-    audio = pub_media._frindell_for(
-        NS(_stts=[(100, 1024)], _sync=None, _sizes=[1] * 100,
-           timescale=48000), W, per_group=47)
+    audio = pub_media._frindell_for(pub_media._Mp4Pass(
+        _src([(100, 1024)], None, 48000), Fraction(0)), per_group=47)
     assert (audio.group_multiplier, audio.object_multiplier) == (
         47 * 1024, 1024)
 
 
-def test_media_clock_lands_on_whole_ticks():
-    _, wall0 = pub_media._media_clock([15360, 48000, 44100], True)
-    for t in (15360, 48000, 44100):
-        assert wall0 * t % 1_000_000 == 0
+def test_media_clock_starts_on_the_next_group_boundary():
+    before = int(time.time() * 1_000_000)
+    _, wall0 = pub_media._media_clock((90000, 3003 * 60))
+    assert wall0 * 90000 % (3003 * 60 * 1_000_000) == 0
+    assert before <= wall0 < before + 2_002_000 + 1_000
 
 
 def test_locmaf_carries_prft_as_a_genbox():
@@ -170,7 +185,8 @@ async def test_analyze_reports_frindell_latency(clip, tmp_path,  # noqa: F811
         assert r['ts_source'] == 'frindell', r
         assert r['ts_malformed'] == '0', r
         assert int(r['objects']) > 0, r
-        assert 0 <= float(r['lat_p50_ms']) < 1000, r
+        # pub_media sends a frame due within 1 ms at once.
+        assert -1 < float(r['lat_p50_ms']) < 1000, r
 
 
 @requires_certs
@@ -205,17 +221,28 @@ async def test_chunked_groups_open_with_a_prft(clip, tmp_path,  # noqa: F811
 def test_clip_on_its_cadence_needs_no_corrections(clip):  # noqa: F811
     from aiomoqt.media.sources import Mp4Reader
     reader = Mp4Reader(clip)
-    _, wall0 = pub_media._media_clock(
-        [reader.video.timescale, reader.audio.timescale], True)
-    for source, all_key in ((reader.video, False), (reader.audio, True)):
-        m = pub_media._frindell_for(source, wall0)
+    passes = pub_media._mp4_passes(reader, reader.audio, False)
+    timings = [pub_media._frindell_for(p) for p in passes]
+    _, wall0 = pub_media._media_clock(pub_media._grid(*timings))
+    for mp4, m, all_key in zip(passes, timings, (False, True)):
         assert m.mapped
+        off = (pub_media._audio_delay(wall0, mp4.times[0], m)
+               if all_key else 0)
         group = obj = None
-        for s in source.samples():
-            capture = wall0 + s.timestamp_us
+        for s, t in mp4.samples():
+            capture = wall0 + (off + t) * 1_000_000
             if all_key or s.key_frame:
                 group, obj = m.group_for(capture), 0
             else:
                 obj += 1
             assert m.object_properties(group, obj, capture) == {}, (
-                source, group, obj)
+                mp4, group, obj)
+
+
+def test_audio_object_multiplier_is_the_frame_at_one_frame_per_group():
+    from aiomoqt.media.mpegts import TsCadence
+    mp4 = pub_media._frindell_for(pub_media._Mp4Pass(
+        _src([(100, 1024)], None, 48000), Fraction(0)))
+    assert (mp4.group_multiplier, mp4.object_multiplier) == (1024, 1024)
+    ts = TsCadence.audio_timestamps(48000, 1024, 1)
+    assert (ts.group_multiplier, ts.object_multiplier) == (1024, 1024)

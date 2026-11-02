@@ -8,10 +8,10 @@ It follows the standard `asyncio` transport/protocol pattern via subclasses of `
 
 | | Supported |
 |---|---|
-| Drafts | draft-14, draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16, 14)` |
+| Drafts | draft-14 (deprecated; removed in 0.15.0), draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16, 14)` |
 | Transports | raw QUIC (ALPN `moq-00` / `moqt-NN`), H3/WebTransport (WT-Protocol) |
 | Roles | publisher, subscriber, server (origin), single-port dual-transport server |
-| Data delivery | SubgroupHeader streams (TX + RX); OBJECT_DATAGRAM (TX + RX over raw QUIC, RX over WT) |
+| Data delivery | SubgroupHeader streams (TX + RX); OBJECT_DATAGRAM (TX + RX over raw QUIC and WT) |
 | Control | full message set with sync/async response handling; `MOQTRequestError` is draft-independent |
 | Fetch / join | FETCH, JOINING_SUBSCRIBE (relative and absolute) over both transports |
 | Media | MSF catalogs; LOC packaging (draft-ietf-moq-loc); CMSF/CMAF packaging (draft-ietf-moq-cmsf) |
@@ -148,7 +148,7 @@ await session.publish_namespace(namespace='ns', wait_response=True)
 
 A full track name (namespace + name) serves one track per session.
 
-`StreamMapping` selects the data-plane shape: `PER_GROUP` (subgroup stream per group) or `DATAGRAM` (one object per datagram; raw QUIC only — see Limitations).
+`StreamMapping` selects the data-plane shape: `PER_GROUP` (subgroup stream per group) or `DATAGRAM` (one object per datagram, raw QUIC or WebTransport; the object must fit one packet).
 
 ### Auth
 
@@ -180,6 +180,9 @@ Auth is control-plane only; there is no per-object authentication.
 # Publish an mp4 as an MSF broadcast — LOC packaging, catalog + video + audio
 python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \
     --target-latency 500 --draft 16 -t 3600
+
+# Keep 1 MiB of recent objects per media track to answer FETCH (default 0 refuses it)
+python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop --fetch-history 1048576
 
 # Same content, CMAF packaging (requires --mp4)
 python -m aiomoqt.tools.pub_media $RELAY -N cmsf/live --mp4 clip.mp4 --packaging cmaf --loop
@@ -278,7 +281,7 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 | `tools.load_sim` | `moq-load-sim` | multi-session load generator |
 | `tools.relay_probe` | `moq-relay-probe` | relay liveness and draft-version probe |
 | `tools.moq_interop_client` | `moq-interop-client` | interop test client (TAP output) |
-| `tools.moq_interop_relay` | `moq-interop-relay` | interop test relay (forwards; not production) |
+| `tools.moq_interop_relay` | `aiomoqt-relay`, `moq-interop-relay` | MoQT relay: raw QUIC and WebTransport, FETCH cache |
 
 Examples under `aiomoqt.examples` are minimal, readable clients rather than instrumented tools:
 
@@ -295,6 +298,7 @@ Common options across clients: `--namespace`, `--trackname`, `--path`, `--draft`
 python -m aiomoqt.examples.pub_example moqt://relay.ex.com
 python -m aiomoqt.examples.sub_example moqt://relay.ex.com
 python -m aiomoqt.tools.loopback_bench -s 4096 -P 4 -t 20
+python -m aiomoqt.tools.loopback_bench --fanout -s 4096 -t 20   # through the send lane
 python -m aiomoqt.tools.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
 ```
 
@@ -313,14 +317,14 @@ python -m aiomoqt.tools.moq_interop_client -r "moqt://relay.ex.com:4433" -t subs
 python -m aiomoqt.tools.moq_interop_client -l                                         # list cases
 ```
 
-### Interop relay
+### aiomoqt-relay
 
-`moq_interop_relay` is a **test fixture, not a production relay**. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), and dials upstream origins with `--upstream`. It has no group cache — so no joining FETCH and a late subscriber sees only what arrives next — no forward-state propagation, no `PUBLISH` forwarding to `SUBSCRIBE_TRACKS` subscribers, no authentication, and no backpressure. Use moxygen, moq-rs, or another real relay for any workload.
+`aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; one relay-wide budget (`--cache-bytes`, default 256 MiB) caps all tracks together by dropping the oldest group of the least recently used track, and past the budget plus 32 MiB the largest live group goes uncached. Cache and send lanes charge each object its payload, its properties and about 224 bytes of record overhead. A late subscriber starts at the live edge. For `--startup-hold` seconds after start (default 2, 0 = off), a SUBSCRIBE for a track no publisher serves yet waits for one, so viewers that reconnect after a restart before their publishers are answered, not refused. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
 
-Its purpose is to exercise aiomoqt's server-side primitives — `MOQTServer`, the announce and subscribe handlers, `serve_dual()` — and to be driven by an external conformance suite, so both sides of the stack are covered. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
+Limits: no authentication, authorization or rate limiting; each subscriber's send lane holds up to 4 MiB, counting what its streams still hold in the transport, and a subscriber that falls further behind loses whole groups, their streams reset, and a lane that completes no write for 10 s logs one `lane stalled` WARNING; upstream Forward State is raised for a viewer and lowered once no viewer has forwarded the track for `--pause-after` seconds (default 60, 0 = never); a subscriber's objects older than its OBJECT_DELIVERY_TIMEOUT (the smaller of the publisher's and the subscriber's) or the track's MAX_CACHE_DURATION, or with neither set its live objects older than `--lag-limit` (default 5 s, 0 = never), are dropped, the subgroup reset with DELIVERY_TIMEOUT and the rest of the group skipped; past MAX_CACHE_DURATION a cached object is not served and a FETCH for it goes upstream. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
 ```bash
-python -m aiomoqt.tools.moq_interop_relay --bind 0.0.0.0 --port 4443 \
+aiomoqt-relay --port 4443 \
     --cert cert.pem --key key.pem --dual     # raw QUIC + WT on one port
 ```
 
@@ -359,7 +363,7 @@ uv pip install -e ".[test]"    # or: pip install -e ".[test]"
 pytest aiomoqt/tests/
 ```
 
-Install editable. The standalone bench scripts and the cross-importing loopback tests resolve `certs/` and sibling modules relative to the working tree; a non-editable install skips the loopback suites with "TLS certs not found in certs/". `pytest` generates `certs/` on first run. For the standalone bench scripts, generate them directly:
+Install editable. The standalone bench scripts and the cross-importing loopback tests resolve `certs/` and sibling modules relative to the working tree; a non-editable install skips the loopback suites with "TLS certs not found in certs/". `pytest` generates `certs/` on first run. loopback_bench and adaptive_bench (loopback) need no setup: when they find no cert, they generate a self-signed localhost cert once into `~/.cache/aiomoqt/` (`$XDG_CACHE_HOME`), using the `openssl` CLI or the `cryptography` package. Servers (pub_server, aiomoqt-relay) never self-sign; give them `--cert`/`--key` or generate one:
 
 ```bash
 mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -402,23 +406,21 @@ python -m aiomoqt.versions
 ```
 
 ```
-aiomoqt:   0.13.1 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-21 16:43]
-aiopquic:  0.6.1 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-21 16:43]
-  - picoquic:  1.1.53.0 (2026.10.08.c908872-0-c9088724) [2026-10-08]
+aiomoqt:   0.14.0 (~/.venv/lib/python3.13/site-packages/aiomoqt) [2026-10-27 17:17]
+aiopquic:  0.7.0 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-27 17:17]
+  - picoquic:  1.1.53.0 (2026.10.22.70b5fd5-0-70b5fd5a) [2026-10-22]
   - picotls:   master (f06553b8) [2026-09-30]
   - openssl:   OpenSSL 3.5.8 (~/.venv/lib/python3.13/site-packages/aiopquic.libs/libcrypto-c37e28d8.so.3.5.8)
 ```
 
 ## Limitations
 
-- **WebTransport datagram TX is not implemented.** Datagram publishing and reception work over raw QUIC; on WebTransport, datagram reception works but `StreamMapping.DATAGRAM` publishing raises. Use `PER_GROUP` mapping over WebTransport.
 - **`relay_probe -f` and `tests/relays.json` use different schemas.** The probe expects a top-level array of `{id, name, endpoints:[{url}]}`; the interop catalog is `{relays:[{name, urls:{...}, drafts:[...]}]}`. Use `--url` for single-endpoint probes until the loader accepts both.
-- **`moq_interop_relay` is a conformance fixture**, not a production relay — it forwards and fans out, but has no group cache (hence no joining FETCH), no forward-state propagation, no authz, and no backpressure. See [Interop relay](#interop-relay).
+- **`aiomoqt-relay` has no authentication or rate limiting**; a subscriber that falls more than its send lane's bound behind loses whole groups. One session holds at most `--max-namespaces-per-session` (256) namespace requests and `--max-subscriptions-per-session` (1024) SUBSCRIBEs; more are refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16). Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups can exceed it by up to 32 MiB before the largest is dropped from the cache. See [aiomoqt-relay](#aiomoqt-relay).
 
 ## Roadmap
 
 - Single-port interop-runner adapter — one relay image and one port via `serve_dual()`
-- WebTransport datagram TX
 - Binding-deadline reaper for data streams whose track-alias binding never completes
 - Broader CI test coverage — the workflow currently names a subset of the suite explicitly
 

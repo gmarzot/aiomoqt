@@ -11,15 +11,16 @@ import contextlib
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.server import MOQTServer
+from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.types import (
-    FilterType, MOQTMessageType, MOQTRequestError, RequestErrorCode,
-    SubscribeDoneCode,
+    FilterType, ForwardingPreference, MOQTMessageType, MOQTRequestError,
+    RequestErrorCode, SubscribeDoneCode,
 )
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools import moq_interop_relay as relay
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._relay_wait import until_published
 
 pytestmark = requires_certs
 
@@ -142,7 +143,7 @@ async def _publish_cycle(port, namespace="relay/ns"):
     await pub_session.client_session_init()
     track = _Pub(pub_session, namespace, "video")
     await track.publish(announce_namespace=False, publish_track=True)
-    await asyncio.sleep(0.1)
+    await until_published(namespace, ["video"])
 
     got = []
     sub_client = MOQTClient("localhost", port, path="/", use_quic=True,
@@ -199,11 +200,11 @@ async def test_publish_first_is_answered_then_raised():
                                 publish_track=True)
             for _ in range(100):
                 t = _track_for("relay/pf")
-                if t is not None and t.parked is not None:
+                if t is not None and t.paused:
                     break
                 await asyncio.sleep(0.02)
             t = _track_for("relay/pf")
-            assert t is not None and t.parked is not None, (
+            assert t is not None and t.paused, (
                 "PUBLISH was held with no subscriber to wait for")
 
             got = []
@@ -224,7 +225,7 @@ async def test_publish_first_is_answered_then_raised():
                         break
                     await asyncio.sleep(0.02)
             assert got == _FRAMES, f"publish-first delivered {got}"
-            assert _track_for("relay/pf").parked is None, (
+            assert not _track_for("relay/pf").paused, (
                 "forward state was never raised")
     finally:
         handle.close()
@@ -257,7 +258,7 @@ async def test_no_subscriber_to_offer_means_the_reply_is_answered(draft):
             await asyncio.sleep(0.3)
             t = _track_for("relay/pre18")
             assert t is not None, "no track registered"
-            assert t.parked is not None, (
+            assert t.paused, (
                 f"d{draft} held the PUBLISH with nobody to offer it to; "
                 f"a publisher waiting on PUBLISH_OK before it subscribes "
                 f"deadlocks")
@@ -309,7 +310,7 @@ async def test_a_waiting_prefix_subscriber_still_holds_the_reply():
                     await asyncio.sleep(0.02)
                 t = _track_for("relay/sf")
                 assert t is not None, "no track registered"
-                assert t.parked is None, (
+                assert not t.paused, (
                     "the reply was answered early instead of held")
             assert got == _FRAMES, f"subscribe-first delivered {got}"
     finally:
@@ -448,7 +449,7 @@ async def test_tracks_published_on_one_session_each_reach_a_subscriber(draft):
                 track.frames = [name.encode() + f for f in _FRAMES]
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
-            await asyncio.sleep(0.1)
+            await until_published("relay/multi", names)
             sub_client = MOQTClient("localhost", port, path="/",
                                     use_quic=True, verify_tls=False,
                                     supported_drafts=draft)
@@ -515,12 +516,13 @@ async def _flowing(port, use_quic, draft=18):
             for name, size in _SIZES.items():
                 track = PublishedTrack(pub, namespace=_FLOW_NS,
                                        trackname=name, object_size=size,
-                                       group_size=_GROUP, rate=500)
+                                       group_size=_GROUP, rate=500,
+                                       fetch_history_bytes=1 << 20)
                 track.prefill(2)
                 await track.publish(announce_namespace=False,
                                     publish_track=True)
             for _ in range(100):
-                if all(_relayed(n) is not None and _relayed(n).parked
+                if all(_relayed(n) is not None and _relayed(n).paused
                        for n in _SIZES):
                     break
                 await asyncio.sleep(0.02)
@@ -576,7 +578,7 @@ async def test_a_forward_0_subscriber_gets_nothing_until_it_updates(
                                    wait_response=True)
         await asyncio.sleep(0.3)
         assert objects["video"] == [] and objects["audio"]
-        assert _relayed("video").parked is not None
+        assert _relayed("video").paused
         await rx.request_update(video.request_id, forward=1,
                                 wait_response=True)
         for _ in range(100):
@@ -834,8 +836,8 @@ async def test_a_subscribe_tracks_offer_carries_largest_and_the_cache(
 @requires_certs
 @pytest.mark.asyncio
 @_TRANSPORTS
-async def test_d14_parked_publishes_are_raised_by_subscribe_update(use_quic):
-    # d14 §9.10: the update that raises a parked PUBLISH is SUBSCRIBE_UPDATE,
+async def test_d14_paused_publishes_are_raised_by_subscribe_update(use_quic):
+    # d14 §9.10: the update that raises a paused PUBLISH is SUBSCRIBE_UPDATE,
     # which carries Start, End Group, Priority and Forward as fields.
     async with _flowing(_flow_port(6, use_quic), use_quic,
                         draft=14) as subscriber:
@@ -847,7 +849,7 @@ async def test_d14_parked_publishes_are_raised_by_subscribe_update(use_quic):
                 break
             await asyncio.sleep(0.02)
         assert all(objects[n] for n in _SIZES), objects
-        assert all(_relayed(n).parked is None for n in _SIZES)
+        assert not any(_relayed(n).paused for n in _SIZES)
         assert rx._close_err is None
 
 
@@ -1023,7 +1025,8 @@ class _Obj:
 async def test_relay_flags_reach_the_server(monkeypatch):
     monkeypatch.setattr("sys.argv", ["moq_interop_relay"])
     transport = relay.transport_settings(relay.parse_args())
-    assert transport == {"congestion_control_algorithm": "cubic",
+    assert transport == {"congestion_control_algorithm": "bbr",
+                         "congestion_control_options": None,
                          "max_connections": 4096,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10}
@@ -1031,4 +1034,56 @@ async def test_relay_flags_reach_the_server(monkeypatch):
                                  **transport)
     assert (server.congestion_control_algorithm, server.max_connections,
             server.stream_ring_cap, server.tx_max_inflight_bytes) == (
-                "cubic", 4096, 1 << 20, 512 << 10)
+                "bbr", 4096, 1 << 20, 512 << 10)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+@_TRANSPORTS
+async def test_datagram_track_is_relayed_as_datagrams(draft, use_quic):
+    port = _BASE_PORT + 170 + 2 * (draft == 22) + (not use_quic)
+    ns = "relay/dgram"
+    mapping = {"dg": ForwardingPreference.DATAGRAM,
+               "st": ForwardingPreference.SUBGROUP}
+    got = {name: [] for name in mapping}
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                assert s._is_wt is (not use_quic)
+                return s
+
+            pub = await _session()
+            for name, fwd in mapping.items():
+                track = PublishedTrack(pub, namespace=ns, trackname=name,
+                                       object_size=200, group_size=_GROUP,
+                                       rate=200, forwarding=fwd)
+                await track.publish(announce_namespace=False,
+                                    publish_track=True)
+            await until_published(ns, mapping)
+            rx = await _session()
+            for name in mapping:
+                await rx.subscribe(
+                    ns, name, forward=1, wait_response=True,
+                    on_object=lambda m, *a, n=name: got[n].append(m))
+            for _ in range(150):
+                if all(len(v) >= 10 for v in got.values()):
+                    break
+                await asyncio.sleep(0.02)
+            assert rx._close_err is None
+    finally:
+        handle.close()
+        _reset_relay_state()
+    assert len(got["dg"]) >= 10 and len(got["st"]) >= 10, {
+        n: len(v) for n, v in got.items()}
+    assert all(isinstance(m, ObjectDatagram) for m in got["dg"])
+    assert not any(isinstance(m, ObjectDatagram) for m in got["st"])

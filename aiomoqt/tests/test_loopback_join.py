@@ -7,7 +7,6 @@ case in test_loopback_fetch.py:
 
 Shares the loopback server harness defined in test_loopback_fetch.
 """
-import asyncio
 
 import pytest
 

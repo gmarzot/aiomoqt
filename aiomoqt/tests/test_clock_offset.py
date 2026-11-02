@@ -32,14 +32,30 @@ def test_track_stats_warns_once_and_marks(capsys):
     s = TrackStats()
     _feed(s.on_object)
     _feed(s.on_object)
+    assert s.interval_row(time.monotonic() + 1).endswith(
+        stats.CLOCK_OFFSET_MARK)
+    summ = s.summary()
+    assert summ["clock_offset"] and summ["lat_mean"] < 0
     err = capsys.readouterr().err
     assert err.count(WARNING) == 1, err
     assert "at least 455 ms" in err
     assert "chrony/NTP" in err
-    summ = s.summary()
-    assert summ["clock_offset"] and summ["lat_mean"] < 0
-    assert s.interval_row(time.monotonic() + 1).endswith(
-        stats.CLOCK_OFFSET_MARK)
+
+
+def test_wall_clock_step_is_not_an_offset(capsys):
+    """A backward step of the shared clock turns only the objects in
+    flight across it negative."""
+    s = TrackStats()
+    now = int(time.time() * 1e6)
+    for oid in range(1000):
+        step = 1_500 if oid in (500, 501, 502) else 0
+        s.on_object(Obj(oid, now + oid * 60), 100,
+                    now + oid * 60 + 350 - step)
+    assert s.summary()["lat_min"] < stats.CLOCK_OFFSET_MIN_MS
+    assert not s.summary()["clock_offset"]
+    assert stats.CLOCK_OFFSET_MARK not in s.interval_row(
+        time.monotonic() + 1)
+    assert WARNING not in capsys.readouterr().err
 
 
 def test_positive_latency_is_not_marked(capsys):

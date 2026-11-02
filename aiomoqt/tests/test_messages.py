@@ -3,6 +3,7 @@ import pytest
 from aiomoqt.tests.conftest import moqt_message_serialization, moqt_test_id
 
 from aiomoqt.types import *
+from aiomoqt.types import MOQTProtocolViolation
 from aiomoqt.messages import *
 from aiomoqt.utils.buffer import Buffer
 
@@ -463,7 +464,6 @@ def test_subgroup_header_explicit():
         publisher_priority=10, subgroup_id_mode=SUBGROUP_ID_EXPLICIT,
     )
     buf = sg.serialize()
-    buf_len = buf.tell()
     buf.seek(0)
     type_val = buf.pull_uint_var()
     assert type_val == 0x14  # base 0x10 | (2 << 1) = 0x14
@@ -484,7 +484,6 @@ def test_subgroup_header_zero():
         publisher_priority=128, subgroup_id_mode=SUBGROUP_ID_ZERO,
     )
     buf = sg.serialize()
-    buf_len = buf.tell()
     buf.seek(0)
     type_val = buf.pull_uint_var()
     assert type_val == 0x10  # base, mode=0, no flags
@@ -751,7 +750,6 @@ def test_object_datagram_status_basic():
         publisher_priority=0, status=ObjectStatus.END_OF_GROUP
     )
     buf = ds.serialize()
-    buf_len = buf.tell()
     buf.seek(0)
     type_val = buf.pull_uint_var()
     assert type_val == 0x20
@@ -1660,7 +1658,7 @@ from aiomoqt.messages.data import (
     FETCH_FLAG_SG_ZERO, FETCH_FLAG_SG_PRIOR, FETCH_FLAG_SG_PRIOR_PLUS,
     FETCH_FLAG_SG_PRESENT, FETCH_FLAG_OBJECT_ID_PRESENT,
     FETCH_FLAG_GROUP_ID_PRESENT, FETCH_FLAG_PRIORITY_PRESENT,
-    FETCH_FLAG_EXTENSIONS_PRESENT, FETCH_FLAG_DATAGRAM,
+    FETCH_FLAG_DATAGRAM,
     FETCH_FLAGS_END_NON_EXISTENT, FETCH_FLAGS_END_UNKNOWN,
 )
 
@@ -1931,7 +1929,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(1)
         buf.push_bytes(b'x')
         buf.seek(0)
-        with pytest.raises(ValueError, match="first object"):
+        with pytest.raises(MOQTProtocolViolation, match="first object"):
             FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
     def test_invalid_flags_high_bit(self):
@@ -1942,7 +1940,7 @@ class TestFetchObjectD16:
         buf.push_uint_var(0)
         buf.push_uint_var(0)
         buf.seek(0)
-        with pytest.raises(ValueError, match="invalid serialization flags"):
+        with pytest.raises(MOQTProtocolViolation, match="invalid serialization flags"):
             FetchObject.deserialize(buf, prior=None, prof=profile_for(16))
 
 

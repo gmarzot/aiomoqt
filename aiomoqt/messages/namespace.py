@@ -4,7 +4,7 @@ from typing import Dict, Tuple, Any, Optional
 from . import MOQTMessageType, D18MessageType, MOQTMessage, BUF_SIZE
 from ..types import wire_control_type
 from ..context import is_draft16_or_later, DraftProfile
-from ..utils.buffer import Buffer, BufferReadError
+from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -25,7 +25,7 @@ class PublishNamespace(MOQTMessage):
         payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
 
         payload.push_vint(self.request_id)
-        
+
         # Serialize namespace tuple
         payload.push_vint(len(self.namespace))
         for part in self.namespace:
@@ -43,9 +43,9 @@ class PublishNamespace(MOQTMessage):
     @classmethod
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'PublishNamespace':
         request_id = buf.pull_vint()
-        
+
         namespace = MOQTMessage._pull_tuple(buf, prof=prof)
-        
+
         params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
                                                  scope=cls.__name__)
         return cls(request_id=request_id, namespace=namespace, parameters=params)
@@ -92,7 +92,7 @@ class PublishNamespaceError(MOQTMessage):
 
         payload.push_vint(self.request_id)
         payload.push_vint(self.error_code)
-        
+
         reason_bytes = self.reason.encode()
         payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
@@ -372,7 +372,7 @@ class SubscribeNamespaceError(MOQTMessage):
 
         payload.push_vint(self.request_id)
         payload.push_vint(self.error_code)
-        
+
         reason_bytes = self.reason.encode()
         payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
@@ -390,7 +390,7 @@ class SubscribeNamespaceError(MOQTMessage):
         return cls(request_id=request_id, error_code=error_code, reason=reason)
 
 
-@dataclass 
+@dataclass
 class UnsubscribeNamespace(MOQTMessage):
     """UNSUBSCRIBE_NAMESPACE message."""
     namespace_prefix: Tuple[bytes, ...] = None

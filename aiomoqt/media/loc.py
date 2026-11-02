@@ -30,8 +30,9 @@ from ..delivery import StreamMapping
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
 from ..utils.buffer import Buffer, BufferReadError
-from ..utils.logger import get_logger
+from ..utils.logger import TRACE, get_logger
 from ..utils.timing import OBJECT_TIMESTAMP
+from .sources import avcc_param_sets, hvcc_param_sets, lp_to_annexb
 
 logger = get_logger(__name__)
 
@@ -69,6 +70,13 @@ _CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,
 LOC_PRIVATE_PROPERTIES = 0x0A
 _EMPTY_PRIVATE_PROPERTIES = bytes([LOC_PRIVATE_PROPERTIES, 0x00])
 
+# Annex B codec family → (parameter sets from config, NAL header byte is
+# a parameter set).
+_ANNEXB = {
+    'h264': (avcc_param_sets, lambda h: (h & 0x1F) in (7, 8)),
+    'h265': (hvcc_param_sets, lambda h: 32 <= ((h >> 1) & 0x3F) <= 34),
+}
+
 # MoQ Streaming Format registry (loc-02 §6.2; dropped in loc-04).
 LOC_STREAMING_FORMAT_TYPE = 0x002
 
@@ -93,9 +101,11 @@ class LocTrackPublisher(PublishedTrack):
     forward-state handling, delivery to each peer, and PUBLISH_DONE come
     from PublishedTrack; produce() consumes the frame queue.
 
-    `config` (codec extradata) is emitted on Object 0 of every group so
-    mid-stream joiners can configure a decoder, under VIDEO_CONFIG or
-    AUDIO_CONFIG per `media_kind`.
+    `config` (codec extradata) rides VIDEO_CONFIG or AUDIO_CONFIG per
+    `media_kind`, where `config_property` says: 'object' on Object 0 of
+    every group, so mid-stream joiners can configure a decoder; 'track'
+    as a Track Property (d16+); None nowhere, for a catalog that carries
+    it.
 
     `codec_string` makes every object self-describing for receivers
     without a catalog: each carries CODECSTRING, and TIMESCALE when
@@ -106,9 +116,16 @@ class LocTrackPublisher(PublishedTrack):
     `loc_bare` sends the media without the Private Properties block, for
     receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
 
+    `annexb` ('h264' or 'h265') sends length-prefixed video payloads as
+    Annex B (loc-04 §2.1.4) with the parameter sets from `config` ahead of
+    every key frame that lacks its own (§2.1.1); no VIDEO_CONFIG is sent.
+
     `frindell` (a utils.timing.MediaTimestamps) adds
     draft-frindell-moq-timestamp Track Properties, and OBJECT_TIMESTAMP
     from each frame's `capture_us`, beside the LOC timestamp.
+
+    `fetch_history_bytes` of recent objects are kept to answer FETCH; 0
+    refuses FETCH.
     """
 
     def __init__(self, session, namespace: str, trackname: str, *,
@@ -121,11 +138,25 @@ class LocTrackPublisher(PublishedTrack):
                  queue_size: int = 256,
                  loc01_compat: bool = False,
                  codec_string: Optional[str] = None,
-                 loc_bare: bool = False):
+                 loc_bare: bool = False,
+                 config_property: Optional[str] = 'object',
+                 annexb: Optional[str] = None,
+                 fetch_history_bytes: int = 0):
         super().__init__(session, namespace, trackname,
-                         priority=priority, auth_token=auth_token)
+                         priority=priority, auth_token=auth_token,
+                         fetch_history_bytes=fetch_history_bytes)
+        if config_property not in ('object', 'track', None):
+            raise ValueError(f"config_property {config_property!r}")
+        if annexb is not None and (annexb not in _ANNEXB
+                                   or media_kind != 'video'):
+            raise ValueError(f"annexb {annexb!r} for {media_kind}")
+        self.annexb = annexb
+        self._param_sets: tuple = (None, b'')
+        if annexb is not None:
+            config_property = None
         self.loc_bare = loc_bare
         self.config = config
+        self.config_property = config_property
         self.mapping = mapping
         self.timescale = timescale
         self.media_kind = media_kind
@@ -177,6 +208,13 @@ class LocTrackPublisher(PublishedTrack):
             return super()._timing_properties(vi64)
         return self.frindell.track_properties(vi64)
 
+    def _track_properties(self, session) -> Optional[Dict[int, Any]]:
+        props = super()._track_properties(session)
+        if (self.config_property != 'track' or self.config is None
+                or not session._profile.track_properties):
+            return props
+        return {**(props or {}), self._config_id: self.config}
+
     async def finish(self) -> None:
         """Signal end of track; generation drains the queue then stops."""
         await self._frames.put(None)
@@ -185,9 +223,27 @@ class LocTrackPublisher(PublishedTrack):
                  object_id: int) -> Optional[bytes]:
         """Object payload for a numbered frame; None drops the frame
         without using its object id."""
+        if self.annexb is not None:
+            payload = self._annexb(payload, object_id == 0)
         if self.loc_bare:
             return payload
         return _EMPTY_PRIVATE_PROPERTIES + payload
+
+    def _annexb(self, payload: bytes, key_frame: bool) -> bytes:
+        """Length-prefixed NAL units as Annex B; a key frame without
+        parameter sets of its own gets those of `config` first."""
+        out = lp_to_annexb(payload)
+        if not key_frame or self.config is None:
+            return out
+        from_config, is_param_set = _ANNEXB[self.annexb]
+        pos = 0
+        while pos + 4 < len(payload):
+            if is_param_set(payload[pos + 4]):
+                return out
+            pos += 4 + int.from_bytes(payload[pos:pos + 4], 'big')
+        if self._param_sets[0] is not self.config:
+            self._param_sets = (self.config, from_config(self.config))
+        return self._param_sets[1] + out
 
     def _now(self) -> int:
         """The wall clock in this track's timestamp units."""
@@ -215,47 +271,90 @@ class LocTrackPublisher(PublishedTrack):
         if group_start:
             if self.timescale is not None:
                 exts[LOC_PROP_TIMESCALE] = self.timescale
-            if self.config is not None:
+            if self.config is not None and self.config_property == 'object':
                 exts[self._config_id] = self.config
         return exts
+
+    @staticmethod
+    def _next_group(frame: LocFrame, group_id: int) -> int:
+        """The group a key frame opens: its `group_id` when above the
+        current one, else the next."""
+        if frame.group_id is not None and frame.group_id > group_id:
+            return frame.group_id
+        return group_id + 1
+
+    def _prepare(self, frame: LocFrame, group_id: int,
+                 obj_id: int) -> Optional[bytes]:
+        """Stamp a numbered frame and package it; None drops it."""
+        if frame.timestamp is None:
+            frame.timestamp = self._now()
+        if self.frindell is not None and frame.capture_us is not None:
+            frame.extensions = {
+                **(frame.extensions or {}),
+                **self.frindell.object_properties(group_id, obj_id,
+                                                  frame.capture_us)}
+        return self._package(frame.payload, group_id, obj_id)
 
     async def produce(self, out) -> None:
         """Consume the frame queue until finish(), numbering each object
         once; groups rotate on key frames. Properties are built per peer,
-        since the timestamp ids a peer accepts depend on its draft."""
+        since the timestamp ids a peer accepts depend on its draft.
+
+        With a FETCH history, the group in progress while paused is
+        packaged into it, and a resume continues that group at its next
+        object when the history holds its head."""
+        history = self._history
         group_id = -1
         obj_id = 0
         resume_on_key = True  # first group opens on a key frame
+        paused_group = None   # a group opened on a key frame while paused
         while True:
             frame = await self._frames.get()
             if frame is None:
                 break
             if not self.producing:
-                # Forward State 0: drop the frame unnumbered, reset the open
-                # group, resume only at a key frame in a new group.
+                # Forward State 0: number the frame so Largest follows the
+                # source, but send nothing; reset the open group. A history
+                # keeps the open group only.
                 out.reset_group()
                 resume_on_key = True
-                self.frames_dropped += 1
+                if frame.key_frame or group_id < 0:
+                    if paused_group is not None:
+                        history.discard(paused_group)
+                        paused_group = None
+                    group_id = self._next_group(frame, group_id)
+                    obj_id = 0
+                    if history is not None and frame.key_frame:
+                        paused_group = group_id
+                if history is not None and (
+                        group_id == paused_group and obj_id == 0
+                        or history.first_held(group_id) == 0):
+                    payload = self._prepare(frame, group_id, obj_id)
+                    if payload is None:
+                        self.frames_dropped += 1
+                        continue
+                    self._on_produced(group_id, obj_id, payload,
+                                      functools.partial(
+                                          self._object_extensions, frame,
+                                          obj_id == 0))
+                else:
+                    self._note_largest(group_id, obj_id)
+                    self.frames_dropped += 1
+                obj_id += 1
                 continue
             if resume_on_key and not frame.key_frame:
-                self.frames_dropped += 1
-                continue
+                # With its head held the open group continues; each peer's
+                # lane rejoins it as its Forward State returns to 1.
+                if history is None or history.first_held(group_id) != 0:
+                    self.frames_dropped += 1
+                    continue
             resume_on_key = False
+            paused_group = None
             if frame.key_frame or group_id < 0:
-                if frame.group_id is not None and frame.group_id > group_id:
-                    group_id = frame.group_id
-                else:
-                    group_id += 1
+                group_id = self._next_group(frame, group_id)
                 obj_id = 0
             group_start = obj_id == 0
-            if frame.timestamp is None:
-                frame.timestamp = self._now()
-            if self.frindell is not None and frame.capture_us is not None:
-                frame.extensions = {
-                    **(frame.extensions or {}),
-                    **self.frindell.object_properties(group_id, obj_id,
-                                                      frame.capture_us)}
-            payload = self._package(frame.payload, group_id, obj_id)
+            payload = self._prepare(frame, group_id, obj_id)
             if payload is None:
                 self.frames_dropped += 1
                 continue
@@ -273,7 +372,8 @@ class LocTrackPublisher(PublishedTrack):
 class LocTrackSubscriber(SubscribedTrack):
     """Subscribes to a LOC track and delivers LocFrames in arrival
     order via on_frame(frame, group_id, object_id). Decoder config is
-    captured from VIDEO_CONFIG / AUDIO_CONFIG properties (set_config()
+    captured from VIDEO_CONFIG / AUDIO_CONFIG Object or Track Properties
+    (set_config()
     seeds it from a catalog initRef instead); timestamps are read under
     any LOC numbering, newest first. Arrival order == decode order for
     single-subgroup tracks; temporal-layer merge is not implemented.
@@ -308,6 +408,15 @@ class LocTrackSubscriber(SubscribedTrack):
         """Seed decoder config out-of-band (catalog initRef, §5.2.13)."""
         self.config = config
 
+    def take_track_properties(self, msg) -> None:
+        """Track Properties as SubscribedTrack keeps them, and decoder
+        config from a VIDEO_CONFIG or AUDIO_CONFIG among them."""
+        super().take_track_properties(msg)
+        for prop_id in _CONFIG_IDS:
+            value = (self.properties or {}).get(prop_id)
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                self.config = bytes(value)
+
     def _unpackage(self, msg, group_id: int) -> Optional[bytes]:
         """Frame payload of a received object; None rejects it (no
         on_frame)."""
@@ -330,8 +439,8 @@ class LocTrackSubscriber(SubscribedTrack):
 
     def _reject(self, msg, group_id: int, why: str) -> None:
         self.objects_rejected += 1
-        logger.debug(f"LOC {self.trackname}: g{group_id} "
-                     f"o{msg.object_id} rejected: {why}")
+        logger.log(TRACE, f"LOC {self.trackname}: g{group_id} "
+                          f"o{msg.object_id} rejected: {why}")
         return None
 
     def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:

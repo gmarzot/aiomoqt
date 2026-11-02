@@ -29,7 +29,7 @@ from aiomoqt.types import GroupOrder, MOQTRequestError
 from aiomoqt.context import profile_for
 from aiomoqt.utils.buffer import Buffer
 
-_PLOG = "aiomoqt.protocol"
+_PLOG = ("aiomoqt.protocol", "aiomoqt.control")
 
 
 def _session(is_client=True):
@@ -145,16 +145,19 @@ async def test_reply_parsed_before_the_reset_wins():
 
 @pytest.fixture
 def plog(caplog):
-    """Capture aiomoqt.protocol records despite propagate=False."""
-    lg = logging.getLogger(_PLOG)
-    lg.addHandler(caplog.handler)
-    prev = lg.level
-    lg.setLevel(logging.DEBUG)
+    """Capture aiomoqt.protocol and aiomoqt.control records despite
+    propagate=False."""
+    loggers = [logging.getLogger(n) for n in _PLOG]
+    prev = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.addHandler(caplog.handler)
+        lg.setLevel(logging.DEBUG)
     try:
         yield caplog
     finally:
-        lg.setLevel(prev)
-        lg.removeHandler(caplog.handler)
+        for lg, level in zip(loggers, prev):
+            lg.setLevel(level)
+            lg.removeHandler(caplog.handler)
 
 
 def _levels(caplog, needle):

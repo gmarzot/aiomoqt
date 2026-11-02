@@ -146,7 +146,7 @@ async def test_forward_state_zero_drops_until_key_frame():
     finally:
         server.close()
     assert sorted((g, o, f.payload) for g, o, f in got) == [
-        (0, 0, b"idr-1"), (0, 1, b"p-4")]
+        (1, 0, b"idr-1"), (1, 1, b"p-4")]
     assert pubs[0].frames_dropped == 3
 
 

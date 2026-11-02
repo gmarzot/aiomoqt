@@ -7,39 +7,38 @@ Measures pure Python throughput on the aiopquic stack without relay overhead.
 Usage:
   python -m aiomoqt.tools.loopback_bench -s 4096 -r 5000 -t 20
   python -m aiomoqt.tools.loopback_bench -P 4 -s 16384 -r 60 -t 20
+  python -m aiomoqt.tools.loopback_bench --fanout -s 4096 -t 20
+  python -m aiomoqt.tools.loopback_bench -Q --rtt-ms 50 -r 200 -t 10
 """
 import argparse
 import asyncio
-import logging
+import os
+import shutil
+import signal
+import subprocess
 import sys
+import time
 
 from aiomoqt.types import MOQTMessageType, parse_draft_spec
 from aiomoqt.client import MOQTClient
+from aiomoqt.delivery import StreamMapping
 from aiomoqt.server import MOQTServer
-from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import ForwardingPreference
+from aiomoqt.track import (_PACED_YIELD_EVERY, PublishedTrack,
+                           SubscribedTrack)
+from aiomoqt.types import LOC_TIMESTAMP, ForwardingPreference
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils import wait_cond_timeout
-from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.tools.sub_bench import BenchReporter
 
 
-def _find_default_cert():
-    """Search common locations for test certificates."""
-    import os
-    candidates = [
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-        os.path.expanduser('~/.local/share/moqt/cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
+CERT = find_cert()
+KEY = find_key(CERT)
 
-
-CERT = _find_default_cert()
-KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
+# Set in the re-exec'd child that runs inside the emulated-link netns.
+NETNS_ENV = "AIOMOQT_LOOPBACK_NETNS"
+NETEM_LIMIT = 200000
 
 
 def parse_args():
@@ -75,8 +74,8 @@ def parse_args():
              'without the measurement in it.')
     parser.add_argument(
         '--bind', type=str, default='localhost',
-        help='Address the subscriber dials; the publisher listens on '
-             'all interfaces (default: localhost)')
+        help='Address the publisher listens on and the subscriber '
+             'dials (default: localhost)')
     parser.add_argument(
         '-p', '--port', type=int, default=4434,
         help='Local port (default: 4434)')
@@ -100,10 +99,20 @@ def parse_args():
         help='H3/WebTransport (the default)')
     parser.add_argument(
         '-D', '--datagram', action='store_true',
-        help='ObjectDatagrams instead of subgroup streams (requires '
-             '-q; object must fit one packet, ~1150B max payload). '
+        help='ObjectDatagrams instead of subgroup streams (object '
+             'must fit one packet, ~1150B max payload). '
              'The stream/datagram A/B lever: run twice at the same -s '
              'and -r, once with and once without.')
+    parser.add_argument(
+        '--fanout', action='store_true',
+        help='Publish through produce() and its per-subscriber send lane '
+             '(FanoutDelivery), the path LOC media tracks take, instead '
+             'of the per-subscriber generator. One subgroup per group.')
+    parser.add_argument(
+        '--per-peer-props', action='store_true',
+        help='With --fanout: object properties as a callable resolved '
+             'per subscriber, as LOC media tracks build them, instead of '
+             'the generator\'s one dict per object.')
     parser.add_argument(
         '--draft', type=parse_draft_spec, default=14,
         help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
@@ -114,10 +123,18 @@ def parse_args():
              'd14 server offers only "moq-00" while a d16+ client offers '
              '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
     parser.add_argument(
-        '--cc-algo', type=str, default=None,
-        help='Congestion control algorithm '
-             '(bbr | bbr1 | newreno | cubic | dcubic | prague | fast). '
-             'Default: aiopquic default (bbr1)')
+        '--cc-algo', type=str, default='bbr',
+        help='Congestion control (bbr | bbr1 | c4 | cubic | dcubic | '
+             'fast | newreno | prague). Default: bbr')
+    parser.add_argument(
+        '--cc-options', type=str, default=None, metavar='OPTS',
+        help='Option string for the congestion controller, e.g. Q0.02: '
+             'bbr sends bursts of 20 ms of pacing rate')
+    parser.add_argument(
+        '--fc-window', type=int, default=None, metavar='BYTES',
+        help='QUIC flow-control window, per stream and per connection; the '
+             'receiver buffers this much per stream. Above rate x RTT for '
+             '--rtt-ms runs. Default: 16 MiB')
     parser.add_argument(
         '--max-inflight-bytes', type=int, default=None,
         help='Per-stream TX budget (aiomoqt tx_max_inflight_bytes): '
@@ -131,23 +148,101 @@ def parse_args():
              'at stream rollover while total un-transmitted TX bytes '
              'exceed this. Steady-state latency ~ value / throughput. '
              'Default: aiopquic default (4 MiB). Pass 0 to disable.')
+    parser.add_argument(
+        '--rtt-ms', type=float, default=None, metavar='MS',
+        help='Emulated round-trip time: re-runs the bench in a private '
+             'network namespace with netem delay MS/2 on its lo (each '
+             'packet crosses lo once). The host network is not touched. '
+             'Needs privileges to create a network namespace.')
+    parser.add_argument(
+        '--link-mbps', type=float, default=None, metavar='N',
+        help='Emulated link rate cap (netem rate), in the same netns. '
+             f'The netem queue holds {NETEM_LIMIT} packets: a deep '
+             'buffer. One qdisc on lo carries both directions, so the '
+             'cap also applies to ACKs.')
+    parser.add_argument(
+        '--loss', type=float, default=None, metavar='PCT',
+        help='Emulated random loss percent (netem loss), in the same '
+             'netns. One qdisc on lo carries both directions, so ACKs '
+             'are lost too.')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     _cli.add_timestamps(parser)
     _cli.add_timestamp_checking(parser)
+    _cli.add_payload_check(parser)
     args = parser.parse_args()
     if args.insecure is None:
         # The self-signed test cert cannot verify.
         args.insecure = args.cert is None
     args.cert = args.cert or CERT
     args.key = args.key or KEY
-    if args.datagram and not args.quic:
-        parser.error("-D/--datagram requires -Q (raw QUIC); "
-                     "WT datagram TX is not wired yet")
+    if args.fanout and args.streams > 1:
+        parser.error("--fanout: one subgroup per group; -P must be 1")
+    if args.per_peer_props and not args.fanout:
+        parser.error("--per-peer-props needs --fanout")
     if args.datagram and args.object_size > 1152:
         parser.error(f"--datagram: object_size {args.object_size} can "
                      f"never fit a DATAGRAM frame (max ~1152B payload "
                      f"at 1200B frame ceiling; frames cannot fragment)")
+    if args.rtt_ms is not None and args.rtt_ms < 0:
+        parser.error("--rtt-ms must be >= 0")
+    if args.link_mbps is not None and args.link_mbps <= 0:
+        parser.error("--link-mbps must be > 0")
+    if args.loss is not None and not 0 <= args.loss <= 100:
+        parser.error("--loss must be 0..100")
     return args
+
+
+def _emulated(args) -> bool:
+    return (args.rtt_ms, args.link_mbps, args.loss) != (None, None, None)
+
+
+def _netem_spec(args) -> str:
+    spec = f"delay {(args.rtt_ms or 0) / 2:g}ms"
+    if args.link_mbps:
+        spec += f" rate {args.link_mbps:g}mbit"
+    if args.loss:
+        spec += f" loss {args.loss:g}%"
+    return spec + f" limit {NETEM_LIMIT}"
+
+
+def _succeeds(argv) -> bool:
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL,
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+def _reexec_in_netns(args) -> int:
+    """Run this command again in a private netns with netem on its lo;
+    return the child's exit code. Never touches the host's lo."""
+    if not sys.platform.startswith("linux"):
+        print("  Error: --rtt-ms/--link-mbps/--loss need Linux network "
+              "namespaces", file=sys.stderr)
+        return 2
+    missing = [t for t in ("unshare", "ip", "tc") if shutil.which(t) is None]
+    if missing:
+        print(f"  Error: emulated link needs {', '.join(missing)}",
+              file=sys.stderr)
+        return 2
+    setup = f"ip link set lo up && tc qdisc add dev lo root netem {_netem_spec(args)}"
+    if not _succeeds(["unshare", "-rn", "sh", "-c", setup]):
+        print("  Error: --rtt-ms/--link-mbps/--loss need privileges to create "
+              "a network namespace: run with them (e.g. under sudo) or enable "
+              "unprivileged user namespaces", file=sys.stderr)
+        return 2
+    cmd = [sys.executable, "-m", "aiomoqt.tools.loopback_bench",
+           *sys.argv[1:]]
+    argv = ["unshare", "-rn", "sh", "-c",
+            f'export {NETNS_ENV}=1 && {setup} && exec "$@"', "sh"]
+    # The child gets Ctrl-C from the terminal and exits on its own. A no-op
+    # handler, unlike SIG_IGN, is not inherited by the child.
+    prev = signal.signal(signal.SIGINT, lambda *_: None)
+    try:
+        return subprocess.run(argv + cmd).returncode
+    finally:
+        signal.signal(signal.SIGINT, prev)
 
 
 def print_banner(args):
@@ -156,7 +251,6 @@ def print_banner(args):
     host = f"[{args.bind}]" if ':' in args.bind else args.bind
     url = (f"moqt://{host}:{args.port}" if args.quic
            else f"https://{host}:{args.port}/")
-    cc = args.cc_algo or "bbr1 (default)"
     if args.rate > 0:
         per_stream = (args.rate / args.streams
                       if args.streams > 1 else args.rate)
@@ -173,19 +267,121 @@ def print_banner(args):
     row("draft", args.draft)
     row("url", url)
     row("transport", transport_label)
-    row("delivery", "DATAGRAM" if args.datagram else "subgroup streams")
-    row("cc algorithm", cc)
+    row("delivery", ("DATAGRAM" if args.datagram else "subgroup streams")
+        + (", fanout lane" if args.fanout else "")
+        + (", per-peer props" if args.per_peer_props else ""))
+    row("cc algorithm", args.cc_algo
+        + (f" {args.cc_options}" if args.cc_options else ""))
+    if args.fc_window:
+        row("fc window", f"{args.fc_window} B")
+    if _emulated(args):
+        link = f"rtt {args.rtt_ms or 0:g} ms"
+        if args.link_mbps:
+            link += f", rate {args.link_mbps:g} Mbit/s"
+        if args.loss:
+            link += f", loss {args.loss:g}%"
+        row("link", link + " (netem on netns lo)")
     row("sub-groups", args.streams)
     row("group size", f"{args.group_size} objects")
+    if args.verify_payload:
+        row("payload", f"checked (every {args.verify_payload})")
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
     row("duration", f"{args.duration}s")
+    row("cpu", cpu_summary())
     print("─" * 56)
 
 
-async def _on_subscribe(session, msg, args):
-    """Server-side subscribe handler using PublishedTrack."""
-    track = PublishedTrack(
+class _FanoutTrack(PublishedTrack):
+    """The default generator's objects, written once through produce()
+    so each takes its subscriber's send lane. Unpaced, it pauses once a
+    lane holds more than _LANE_HIGH objects, until it is down to
+    _LANE_LOW. `per_peer_props` builds properties per subscriber."""
+
+    _LANE_HIGH = 16
+    _LANE_LOW = 8
+    per_peer_props = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mapping = (StreamMapping.DATAGRAM
+                        if self.forwarding == ForwardingPreference.DATAGRAM
+                        else StreamMapping.PER_GROUP)
+        self._lane_moved = asyncio.Event()
+        self._waiting = False
+
+    def _on_sent(self, group_id, object_id):
+        if self._waiting:
+            self._lane_moved.set()
+
+    def _stamp_per_peer(self, group_id, object_id):
+        """Stamped now, at production: lane wait counts in latency."""
+        loc = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+        if self.timestamps == 'loc':
+            return loc
+        full = self._timestamp_writer().stamp(group_id, object_id)
+        return lambda s: full if s._profile.track_properties else loc
+
+    async def produce(self, out) -> None:
+        pad = self._payload_tail()
+        await self._await_schedule(0, 0)
+        # As the generator stamps: per object, for the first peer's draft.
+        stamp = self._stamper(self._subs[0].session)
+        per_peer = self.per_peer_props
+        next_t = time.monotonic()
+        tick = 0
+        group_id = 0
+        while True:
+            for object_id in range(self.group_size):
+                payload = (f"{group_id}.{object_id}".encode()
+                           + pad)[:self.object_size]
+                if per_peer:
+                    extensions = self._stamp_per_peer(group_id, object_id)
+                elif stamp is None:
+                    extensions = {LOC_TIMESTAMP: int(time.time() * 1_000_000)}
+                else:
+                    extensions = stamp(group_id, object_id)
+                await out.write(group_id, object_id, payload,
+                                extensions=extensions,
+                                group_start=object_id == 0)
+                tick += 1
+                if self.rate > 0:
+                    next_t += 1.0 / self.rate
+                    lead = next_t - time.monotonic()
+                    if lead > 0.0005:
+                        await asyncio.sleep(lead)
+                        continue
+                elif self._backlog(out) > self._LANE_HIGH:
+                    await self._wait_lanes(out)
+                    continue
+                if tick % _PACED_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
+            group_id += 1
+
+    @staticmethod
+    def _backlog(out) -> int:
+        return max((len(ln.items) for ln in out.lanes), default=0)
+
+    async def _wait_lanes(self, out) -> None:
+        self._waiting = True
+        try:
+            while self._backlog(out) > self._LANE_LOW:
+                self._lane_moved.clear()
+                # Timeout: a lane skipping to the next group drops objects
+                # without calling _on_sent.
+                try:
+                    await asyncio.wait_for(self._lane_moved.wait(), 0.01)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._waiting = False
+
+
+async def _on_subscribe(session, msg, args, tracks):
+    """Server-side subscribe handler using PublishedTrack; the track is
+    added to `tracks`."""
+    track_class = _FanoutTrack if args.fanout else PublishedTrack
+    track = track_class(
         session,
         namespace="aiomoqt",
         trackname="track",
@@ -197,6 +393,9 @@ async def _on_subscribe(session, msg, args):
                     else ForwardingPreference.SUBGROUP),
         timestamps=args.timestamps,
     )
+    if args.fanout:
+        track.per_peer_props = args.per_peer_props
+    tracks.append(track)
     # Suppress publisher periodic stats in loopback mode —
     # both sides print to the same terminal, causing interleaved output
     track._stats_header_printed = True  # skip header
@@ -209,7 +408,7 @@ async def _on_subscribe(session, msg, args):
     await track.generate(session, ok.track_alias)
 
 
-async def run_server(args):
+async def run_server(args, tracks):
     """Run a MOQTServer that generates data when subscribers connect."""
     from functools import partial
 
@@ -220,6 +419,8 @@ async def run_server(args):
         use_quic=args.quic,
         supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
+        congestion_control_options=args.cc_options,
+        flow_control_window=args.fc_window,
         # None = honor protocol default (16 MB); 0 = opt out.
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
@@ -230,12 +431,13 @@ async def run_server(args):
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE,
-        partial(_on_subscribe, args=args))
+        partial(_on_subscribe, args=args, tracks=tracks))
     return await server.serve()
 
 
-async def run_subscriber(args, stats):
-    """Connect as subscriber and collect stats."""
+async def run_subscriber(args, stats, tracks):
+    """Connect as subscriber and collect stats. With --fanout the
+    publisher's `tracks` end first, so no lane fills that nobody reads."""
     client = MOQTClient(
         args.bind, args.port,
         path="/",
@@ -245,6 +447,8 @@ async def run_subscriber(args, stats):
         ca_file=None if args.insecure else args.cert,
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
+        congestion_control_options=args.cc_options,
+        flow_control_window=args.fc_window,
     )
 
     try:
@@ -269,14 +473,22 @@ async def run_subscriber(args, stats):
             if not await wait_cond_timeout(
                     track.wait_closed(), timeout=args.duration):
                 track.completed = True
+            stats.finish()
+            if args.fanout:
+                # End of Track, then PUBLISH_DONE; generator tracks stop
+                # with the session, as they have no lane to fill.
+                for pub in tracks:
+                    pub.end()
+                await wait_cond_timeout(track.wait_closed(), timeout=1.0)
     except Exception as e:
         print(f"  Subscriber error: {e}")
 
 
 async def main():
     args = parse_args()
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    if _emulated(args) and not os.environ.get(NETNS_ENV):
+        return _reexec_in_netns(args)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs SIGUSR1 (task stacks) + SIGUSR2
     # (aiopquic counters) handlers. No-op when env not set.
@@ -295,9 +507,12 @@ async def main():
         _tm.start(25)
 
     stats = BenchReporter(report_interval=args.interval,
-                          minimal=args.no_stats)
+                          minimal=args.no_stats,
+                          verify_payload=args.verify_payload)
     print_banner(args)
 
+    if not args.cert and not args.key:
+        args.cert, args.key = ensure_self_signed()
     if not args.cert or not args.key:
         print("  Error: TLS certificate required. "
               "Use --cert and --key,")
@@ -305,7 +520,8 @@ async def main():
         return 1
 
     print("  Starting server...")
-    quic_server = await run_server(args)
+    tracks = []
+    quic_server = await run_server(args, tracks)
 
     # Give server a moment
     await asyncio.sleep(0.5)
@@ -320,7 +536,7 @@ async def main():
 
     # Run subscriber
     print("  Connecting subscriber...")
-    await run_subscriber(args, stats)
+    await run_subscriber(args, stats, tracks)
 
     # End tracemalloc snap before cleanup; diff against baseline.
     if _trace_enabled and _baseline_snap[0] is not None:
@@ -360,7 +576,7 @@ async def main():
         except Exception as _e2:
             print(f"(post-shutdown counter dump failed: {_e2})",
                   file=_sys2.stderr)
-    return 0 if received else 1
+    return 0 if received and not stats.payload_bad else 1
 
 
 def cli():

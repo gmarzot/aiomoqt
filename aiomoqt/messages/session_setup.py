@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 
-from . import MOQTMessageType, MOQTMessage, SetupParamType, BUF_SIZE
+from . import MOQTMessageType, MOQTMessage, BUF_SIZE
 from ..context import DraftProfile
+from ..types import MOQTProtocolViolation
 from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 
@@ -93,7 +94,7 @@ class ClientSetup(MOQTMessage):
         params = MOQTMessage._deserialize_params(buf, prof=prof,
                                                  buf_end=buf_end)
         return cls(versions=versions, parameters=params)
-        
+
 
 @dataclass(slots=True)
 class GoAway(MOQTMessage):
@@ -142,7 +143,10 @@ class GoAway(MOQTMessage):
             raise BufferReadError(
                 "New Session URI exceeds maximum length (8 KiB)")
 
-        uri = buf.pull_bytes(uri_len).decode()
+        try:
+            uri = buf.pull_bytes(uri_len).decode()
+        except UnicodeDecodeError:
+            raise MOQTProtocolViolation("New Session URI is not UTF-8") from None
         timeout = 0
         request_id = None
         if prof.draft >= 18:

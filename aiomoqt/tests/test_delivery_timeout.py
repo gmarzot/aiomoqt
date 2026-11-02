@@ -9,7 +9,8 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
-from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
+from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
+                              StreamMapping, SubgroupDelivery)
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack, _Subscription, _min_nonzero
 from aiomoqt.types import MOQTMessageType, StreamResetCode
@@ -86,11 +87,11 @@ async def _run_lane(mapping, items, timeout):
     session = _FakeSession()
     delivery = SubgroupDelivery(session, 1, mapping=mapping)
     out = FanoutDelivery()
-    lane = out.add(delivery, joining=False, deadline=lambda: timeout)
+    lane = out.add(delivery, joining=False, deadline=timeout)
     for group_id, object_id, age in items:
-        lane.queue.put_nowait((group_id, object_id, b"p", None,
-                               object_id == 0, time.monotonic() - age,
-                               None))
+        lane.offer((group_id, OBJECT_RECORD_BYTES + 1, True,
+                    time.monotonic() - age, object_id, b"p", None,
+                    object_id == 0, None))
     await out.close()
     return session, delivery, lane
 
@@ -143,18 +144,29 @@ class _Paced(PublishedTrack):
 
 def _stall_once(session, after: int, seconds: float):
     """Hold every stream write of the publisher for `seconds`, starting
-    at its `after`-th write: the drain is blocked for all lanes."""
+    at its `after`-th write: the drain is blocked for all lanes, and a
+    write that would not wait is refused."""
     orig = session.stream_write_drain
+    orig_nowait = session.stream_write_nowait
     count, until = [0], [None]
 
-    async def held(sid, data, end_stream=False):
+    def stalled():
         count[0] += 1
         if count[0] == after:
             until[0] = time.monotonic() + seconds
-        if until[0] is not None and time.monotonic() < until[0]:
+        return until[0] is not None and time.monotonic() < until[0]
+
+    async def held(sid, data, end_stream=False):
+        if stalled():
             await asyncio.sleep(until[0] - time.monotonic())
         return await orig(sid, data, end_stream=end_stream)
+
+    def refused(sid, data):
+        if stalled():
+            return False
+        return orig_nowait(sid, data)
     session.stream_write_drain = held
+    session.stream_write_nowait = refused
 
 
 @requires_certs
@@ -170,7 +182,7 @@ async def test_late_objects_reset_the_subgroup(draft, use_quic):
 
     async def on_publish_namespace(session, msg):
         rx["session"] = session
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
                             on_publish_namespace)
     quic_server = await server.serve()

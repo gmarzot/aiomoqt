@@ -69,7 +69,7 @@ async def test_a_d14_teardown_withdraws_nothing_onto_the_wire():
     withdrawn = []
 
     async def _on_publish_namespace(session, msg):
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 

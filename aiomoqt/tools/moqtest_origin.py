@@ -5,7 +5,7 @@ A moq-test track is a deterministic function of its 16-field namespace
 tuple, so an origin can compute any group, object, or range on demand —
 no relay, no cache, no fan-out. This makes the plain aiomoqt server-role
 API the SUT for moxygen's moqtest_client (subscribe modes; publish mode
-needs the ersatz-relay).
+needs aiomoqt-relay).
 
 Parameter tuple (mirrors moxygen moqtest/Utils.cpp):
   [0]  "moq-test-00"
@@ -37,11 +37,10 @@ from aiomoqt.types import (
     GroupOrder, MOQTMessageType, ObjectStatus, RequestErrorCode,
     SubscribeDoneCode, parse_draft_spec,
 )
-from aiomoqt.tools.moq_interop_relay import (
-    _find_default_cert, _find_default_key,
-)
-from aiomoqt.utils.cli import add_help
-from aiomoqt.utils.logger import get_logger, set_log_level
+from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
+                                 server_cert_dirs)
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -393,7 +392,8 @@ def _build_server(bind, port, cert, key, use_quic, draft):
 def parse_args():
     ap = argparse.ArgumentParser(description="moqtest origin (SUT)",
                                  add_help=False)
-    ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--bind", default=None,
+                    help="Bind address (default: all interfaces, IPv4 and IPv6)")
     ap.add_argument("--port", type=int, default=4443)
     ap.add_argument("--cert")
     ap.add_argument("--key")
@@ -403,17 +403,18 @@ def parse_args():
                     help="both transports on one port")
     ap.add_argument("--draft", type=parse_draft_spec, default=None)
     ap.add_argument("--debug", action="store_true")
+    add_logging(ap)
     add_help(ap)
     return ap.parse_args()
 
 
 async def main():
     args = parse_args()
-    set_log_level(logging.DEBUG if args.debug else logging.INFO)
+    apply_logging(args, default=logging.INFO)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(message)s")
-    cert = args.cert or _find_default_cert()
-    key = args.key or _find_default_key(cert)
+    cert = args.cert or find_cert(server_cert_dirs())
+    key = args.key or find_key(cert, SERVER_KEY_NAMES)
     if not cert or not key:
         print("Error: TLS cert/key required", file=sys.stderr)
         sys.exit(2)

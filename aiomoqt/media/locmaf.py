@@ -21,7 +21,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from ..delivery import StreamMapping
 from ..utils.buffer import Buffer, BufferReadError
-from ..utils.logger import get_logger
+from ..utils.logger import TRACE, get_logger
 from .loc import LocTrackPublisher, LocTrackSubscriber
 
 logger = get_logger(__name__)
@@ -1234,6 +1234,6 @@ class LocmafTrackSubscriber(LocTrackSubscriber):
             return self.decoder.push(group_id, msg.object_id, msg.payload)
         except LocmafMalformed as e:
             self.objects_rejected += 1
-            logger.debug(f"LOCMAF {self.trackname}: g{group_id} "
-                         f"o{msg.object_id} rejected: {e}")
+            logger.log(TRACE, f"LOCMAF {self.trackname}: g{group_id} "
+                              f"o{msg.object_id} rejected: {e}")
             return None

@@ -51,7 +51,7 @@ class _Receiver:
 
     async def on_publish_namespace(self, session, msg):
         self.session = session
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
 
 
 @contextlib.asynccontextmanager

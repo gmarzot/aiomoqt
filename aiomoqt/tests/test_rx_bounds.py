@@ -126,6 +126,70 @@ def test_bytes_held_in_incomplete_objects_are_bounded_per_session():
     assert s.closed and s.closed[0][0] == SessionCloseCode.INTERNAL_ERROR
 
 
+def _count_underflows(s):
+    """Wrap the data-stream parser; returns the per-stream underflow tally."""
+    tally = {}
+    parse = s._moqt_handle_data_stream
+
+    def counted(sid, buf, n):
+        try:
+            return parse(sid, buf, n)
+        except protocol_mod.MOQTUnderflow:
+            tally[sid] = tally.get(sid, 0) + 1
+            raise
+    s._moqt_handle_data_stream = counted
+    return tally
+
+
+def test_a_split_object_is_reparsed_only_once_its_bytes_arrive():
+    s = _stub(max_object_bytes=4000)
+    hdrs = {3: _open(s, 3, BOUND), 7: _open(s, 7, OTHER)}
+    tally = _count_underflows(s)
+    bodies = {sid: [bytes(h.next_object(payload=b"o" * 3396).data)
+                    for _ in range(3)] for sid, h in hdrs.items()}
+    ends = [sum(map(len, bodies[3][:i + 1])) for i in range(3)]
+    body = {sid: b"".join(objs) for sid, objs in bodies.items()}
+    chunks = range(0, len(body[3]), 1200)
+    # No chunk ends inside an object's header or at an object's end.
+    assert not any(e % 1200 == 0 or (e % 1200) > 1200 - 8 for e in ends)
+    for off in chunks:
+        for sid in (3, 7):
+            s._on_stream_data(sid, body[sid][off:off + 1200], False)
+            assert s._rx_held_bytes == sum(
+                st.held for st in s._data_streams.values())
+    assert tally == {3: 3, 7: 3}
+    assert sorted(s.delivered) == [(a, o) for a in (BOUND, OTHER)
+                                   for o in range(3)]
+    assert s._rx_held_bytes == 0 and not s.closed and not s.stopped
+
+
+def test_a_skipped_reparse_still_stops_an_oversize_object():
+    s = _stub(max_object_bytes=1000)
+    _open(s, 3, BOUND)
+    other = _open(s, 7, OTHER)
+    head = _vint(0, 1001)
+    s._on_stream_data(3, head[:2], False)            # inside Payload Length
+    assert not s.stopped
+    s._on_stream_data(3, head[2:] + b"x" * 8, False)
+    assert s.stopped == [(3, StreamResetCode.EXCESSIVE_LOAD)]
+    _send(s, 7, other)
+    assert s.delivered == [(OTHER, 0)] and s._rx_held_bytes == 0
+
+
+def test_a_whole_object_after_a_split_one_is_parsed_at_once():
+    s = _stub(max_object_bytes=4000)
+    hdr = _open(s, 3, BOUND)
+    other = _open(s, 7, OTHER)
+    first = bytes(hdr.next_object(payload=b"o" * 3000).data)
+    s._on_stream_data(3, first[:1000], False)
+    s._on_stream_data(3, first[1000:], False)
+    s._on_stream_data(3, bytes(hdr.next_object(payload=b"o" * 5).data),
+                      False)
+    _send(s, 7, other)
+    assert s.delivered == [(BOUND, 0), (BOUND, 1), (OTHER, 0)]
+    assert s._data_streams[3].need == 1 and s._rx_held_bytes == 0
+
+
 def test_a_stream_on_an_alias_nothing_binds_is_reaped():
     s = _stub()
     UNBOUND, OFFERED, HANDLED, LATE = 9, 10, 11, 12

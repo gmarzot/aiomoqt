@@ -142,20 +142,20 @@ async def test_a_held_subscriber_has_the_publish_answered_forwarding(
     names = ("video", "audio")
     got = {name: 0 for name in names}
     answered, raised = {}, []
-    answer, resume = relay._answer_publish, relay._resume_parked_publish
+    answer, resume = relay._answer_publish, relay._resume_paused
 
     def answer_spy(track, forward=None):
         pending = track.pending_publish is not None
         answer(track, forward)
         if pending and track.pending_publish is None:
-            answered[bytes(track.key[1])] = track.parked is None
+            answered[bytes(track.key[1])] = not track.paused
 
     def resume_spy(track):
-        if track.parked is not None:
+        if track.paused:
             raised.append(track.key)
         resume(track)
     monkeypatch.setattr(relay, "_answer_publish", answer_spy)
-    monkeypatch.setattr(relay, "_resume_parked_publish", resume_spy)
+    monkeypatch.setattr(relay, "_resume_paused", resume_spy)
     relay._announced.clear()
     relay._tracks.clear()
     server = relay._build_server("localhost", port, CERT, KEY,

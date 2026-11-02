@@ -14,19 +14,19 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/protocol.py` | session state machine, control + data plane (~300 KB) |
 | `aiomoqt/client.py`, `server.py` | `MOQTClient`; `MOQTServer.serve()` / `serve_dual()` |
 | `aiomoqt/track.py` | `Track`, `PublishedTrack`, `SubscribedTrack`, `VideoTrack` |
-| `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `FanoutDelivery` |
+| `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `SendLane`, `FanoutDelivery` |
 | `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
 | `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
 | `aiomoqt/types.py`, `context.py` | draft numbers, error codes, `DraftProfile`, `profile_for()` |
 | `aiomoqt/media/` | MSF catalog, `broadcast.py` composer, LOC, CMAF, LOCMAF packaging; ingest (PyAV, DASH, MPEG-TS) and synthetic sources |
-| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (ersatz relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
+| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (aiomoqt-relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
 | `aiomoqt/utils/` | CLI grid (`cli.py`), stats, URL parsing, logging, bench workers |
 | `aiomoqt/examples/` | minimal pub, sub, join and server examples; ship in the wheel |
 | `aiomoqt/versions.py` | `aiomoqt-versions`: aiomoqt, aiopquic, picoquic and picotls build info |
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
 | `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
-| `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public ersatz relay |
+| `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public aiomoqt-relay |
 | `docs/` | bench and demo runbooks |
 
 ## Setup
@@ -77,7 +77,8 @@ test with at least two tracks on one session, over raw QUIC and WebTransport
 
 ## CI
 
-- `ci.yml` (pull requests, push to main): `pin-guard`; `core` = unit + integration on the full
+- `ci.yml` (pull requests, push to main): `pin-guard`; `lint` (ruff); `types` (ty, report only);
+  `core` = unit + integration on the full
   matrix, macOS adding `--skip-suite loopback-fetch` (the native QUIC close stalls ~10 s on an
   un-drained fetch stream); `multi-proc` = `pub_server` against `sub_bench`; `peer-interop` =
   cloudflare `moq-rs` plus the `ghcr.io/openmoq/moqx` image; `microbenchmark`
@@ -97,21 +98,26 @@ unreleased aiopquic change. `pin-guard` hard-fails it on main or a release-label
 ## Release flow
 
 1. Work lands on the dev branch `gmarzot-X.Y.Z`, which has an open tracking PR to main.
-2. Squash-merge the tracking PR to main.
-3. Dispatch `release.yml` on main with the version (`N.N.N`, optionally `a`/`b`/`rcN`).
+2. Release candidates: dispatch `release.yml` on the dev branch with `N.N.NrcN` (or `a`/`b`).
+3. Final release: squash-merge the tracking PR to main, then dispatch `release.yml` on main with
+   `N.N.N`.
    `verify` requires a green `ci.yml` run and a green `moq-conformance.yml` run on a commit with
    the identical tree; it does not re-run them. The wheel is built once and smoke-tested, then
    tagged and published. `dry_run` stops after the smoke test.
-4. Merge main back into the dev branch, then open the next dev branch and its tracking PR.
+4. Merge main back into the dev branches. Start the next dev branch from the release tag and open
+   its tracking PR.
 
-Version trap: release tags sit on squash commits that are not ancestors of the dev branch, so
-dev builds report a stale base such as `0.13.0rc3.devN`. Check releases with
-`git diff <commit> <tag>`, not ancestry.
+Versions: setuptools_scm describes from the last final tag (rc, a and b tags are ignored) with
+`release-branch-semver`, so a dev build reports the next minor, e.g. `0.14.0.devN` after 0.13.3;
+N is not meaningful. Release tags sit on squash commits that are not ancestors of the dev
+branch: check releases with `git diff <commit> <tag>`, not ancestry.
 
 ## Lint and types
 
 `[tool.ruff]` in `pyproject.toml`: `line-length = 100`, `select = ["E","F","W"]`,
-`ignore = ["E501"]`. `ruff` and `ty` are `[dev]` extras, run locally; there is no CI lint job.
+`ignore = ["E501"]`, with per-file ignores for the star-import modules. CI's `lint` job runs a
+pinned ruff and must pass. `types` runs a pinned `ty` and reports a count above
+`.github/ty-baseline` without failing the run; lower the baseline as diagnostics are fixed.
 Do not run `ruff format` across existing files: it reflows code the change never touched.
 
 The package ships `py.typed`, so downstream `mypy --strict` follows these annotations. Keep
@@ -143,8 +149,9 @@ track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's 
 request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
 handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
-**Drafts.** 14, 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported. Draft
-numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the
+**Drafts.** 14, 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported. 14 is
+deprecated and will be removed in 0.15.0.
+Draft numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the
 IETF code `0xff0000NN` and the ALPN (`moq-00` for d14, `moqt-NN` for d16+) exist only at the
 wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)`.
 Route behavior differences through `profile_for(draft)` / `DraftProfile` in `context.py`
@@ -156,9 +163,21 @@ codecs can agree on valid bytes while diverging on invalid ones.
 draft-N`) and close; each control message where it crosses the wire (`MOQT send:` out,
 `control message parsed:` in); and request or track outcomes no message carries (cancellations,
 refusals, forward-state changes, `Track:` and `relay:` summaries). DEBUG is a second view of a
-message already logged, transport plumbing, and anything per object or per data stream. WARNING
-is a tolerated peer deviation or a bound hit; ERROR ends a session. `MOQTServer(quiet_peers=…)`
-logs a health probe's sessions at DEBUG; the relay's SIGUSR1 toggles DEBUG at runtime.
+message already logged, transport plumbing, per-stream lifecycle (open, close, reset) and request
+or track bookkeeping; its volume does not grow with the object count. TRACE (`TRACE = 5` in
+`aiomoqt.utils.logger`, registered by name only) is per object, per chunk, per datagram and wire
+hex: emit it as `log.log(TRACE, …)`, behind `log.isEnabledFor(TRACE)` on hot paths. WARNING is a
+tolerated peer deviation or a bound hit; ERROR ends a session.
+
+Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
+(subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
+`aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the
+relay). A line that belongs to none uses its module logger. Tools take `--log-level
+{error,warning,info,debug,trace}` (`-d`/`--debug` = `debug`) and `--log CAT=LEVEL[,…]` from the
+grid (`add_logging`, `apply_logging`); `AIOMOQT_LOG` takes the same spec, where a bare `LEVEL`
+sets every logger, and the flags win. `MOQTServer(quiet_peers=…)` logs a health probe's sessions
+at DEBUG. The relay's SIGUSR1 steps INFO → DEBUG → TRACE → INFO; its `--control` socket's
+`POST /debug` toggles DEBUG.
 
 **CHANGELOG, commits, comments.** One short CHANGELOG line per user-visible change; commits
 `area: short imperative summary`; comments say what or why in few words, never history.

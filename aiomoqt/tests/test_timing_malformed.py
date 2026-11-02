@@ -48,10 +48,10 @@ def test_malformed_track_properties(vi64, props, dups, why):
     props = dict(props)
     raw = props.get(TIMESTAMP_MAPPING)
     if raw is not None:
-        four = encode_mapping(0, 1, 2, 3, vi64)
+        four = encode_mapping(0, 1, 2, 3)
         props[TIMESTAMP_MAPPING] = {
             "3": four[:-1], "5": four + four[-1:], "trail": four + b"\xff",
-            "cut": four[:-1] + (b"\xc0" if not vi64 else b"\xff")}[raw]
+            "cut": four[:-1] + b"\xff"}[raw]
     with pytest.raises(TimestampMalformed, match=why):
         TrackTiming.from_properties(props, vi64, dups)
 
@@ -247,3 +247,43 @@ def test_object_before_subscribe_returns_cancels_its_own_alias(props, exts):
     check(NS(object_id=0, group_id=0, extensions=exts), 16, 0, 0, 0)
     assert sub.malformed and cancelled == [3]
     assert sess._timing_watch == {}
+
+
+# -- mapping values alone never cancel a track ---------------------------
+
+_W_MS = 1_767_225_600_000          # 2026-01-01T00:00:00Z
+_A1_RFC9000 = bytes.fromhex("00008000ea9c43e9")   # vi64: (0, 0, 0, 178013161)
+
+_SHAPES = {
+    "A.1": {TIMESCALE: 30_000, CLOCK_ID: 0, TIMESTAMP_ORIGIN: _W_MS * 30,
+            TIMESTAMP_MAPPING: encode_mapping(0, 0, 60060, 1001)},
+    "A.3": {TIMESCALE: 1_000_000,
+            TIMESTAMP_MAPPING: encode_mapping(0, 0, 1, 0)},
+    "A.4-live": {TIMESCALE: 1000, CLOCK_ID: 0,
+                 TIMESTAMP_ORIGIN: _W_MS - 5000,
+                 TIMESTAMP_MAPPING: encode_mapping(7, 5000, 2000, 0)},
+    "A.4-on-demand": {TIMESCALE: 1000,
+                      TIMESTAMP_MAPPING: encode_mapping(7, 5000, 2000, 0)},
+    "unix-second-groups": {TIMESCALE: 1,
+                           TIMESTAMP_MAPPING: encode_mapping(0, 0, 1, 0)},
+    "garbage-rfc9000": {TIMESCALE: 30_000, CLOCK_ID: 0,
+                        TIMESTAMP_ORIGIN: _W_MS * 30,
+                        TIMESTAMP_MAPPING: _A1_RFC9000},
+    "garbage-9e16": {TIMESCALE: 1000,
+                     TIMESTAMP_MAPPING: encode_mapping(0, 9 * 10**16, 33, 0)},
+}
+
+
+@pytest.mark.parametrize("name", list(_SHAPES))
+def test_spec_and_far_off_mappings_are_not_cancelled(name):
+    from types import SimpleNamespace as NS
+    sub, sess, _ = _subscribed(_SHAPES[name])
+    assert sub.timing_error is None and sub.malformed is None
+    cancelled = []
+    sess._malformed_track = lambda alias, *a: cancelled.append(alias)
+    for gid in (7, 8):
+        for oid in (0, 1, 2):
+            sess._pending_object_handlers[0](
+                NS(object_id=oid, group_id=gid, extensions={}), 16, 0, 0, 0)
+    assert sub.timing.timestamp(8, 2, None) is not None
+    assert sub.malformed is None and cancelled == []

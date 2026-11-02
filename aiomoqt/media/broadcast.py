@@ -35,9 +35,15 @@ from .locmaf import (
 logger = get_logger(__name__)
 
 # §5.2: the catalog track SHOULD outrank every track it describes.
-# MoQT priority is ascending-urgency, so this sits below the
-# PublishedTrack default of 128 that the media tracks take.
+# MoQT priority is ascending-urgency (lower = more urgent).
 CATALOG_PUBLISHER_PRIORITY = 64
+# Audio outranks video: a video group's long stream must not hold audio.
+AUDIO_PUBLISHER_PRIORITY = 64
+VIDEO_PUBLISHER_PRIORITY = 128
+_DEFAULT_PUBLISHER_PRIORITY = 128
+
+# Catalog history kept for FETCH: players fetch the catalog.
+CATALOG_FETCH_HISTORY = 64 << 10
 
 
 class CatalogTrackPublisher(PublishedTrack):
@@ -54,9 +60,10 @@ class CatalogTrackPublisher(PublishedTrack):
     # Queued when forwarding resumes: send the current catalog.
     _RESUME = object()
 
-    def __init__(self, session, namespace: str, catalog: Catalog):
+    def __init__(self, session, namespace: str, catalog: Optional[Catalog]):
         super().__init__(session, namespace, CATALOG_TRACK_NAME,
-                         priority=CATALOG_PUBLISHER_PRIORITY)
+                         priority=CATALOG_PUBLISHER_PRIORITY,
+                         fetch_history_bytes=CATALOG_FETCH_HISTORY)
         self.catalog = catalog
         # The catalog track has content by construction: the current
         # independent catalog is emitted as (0, 0) on first demand, so
@@ -66,6 +73,15 @@ class CatalogTrackPublisher(PublishedTrack):
         # A relay holding later groups would read a restarted 0 as stale.
         self._next_group = 0
         self._emitter: Optional[asyncio.Task] = None
+
+    @property
+    def next_group(self) -> int:
+        """Group ID the next independent catalog opens."""
+        return self._next_group
+
+    @next_group.setter
+    def next_group(self, group_id: int) -> None:
+        self._next_group = group_id
 
     def _serving(self) -> bool:
         return self._emitter is not None and not self._emitter.done()
@@ -123,6 +139,25 @@ class CatalogTrackPublisher(PublishedTrack):
                               priority=self.priority)
         await super()._on_fetch(session, msg)
 
+    async def _end_track(self, session, track_alias: int, header,
+                         stream_id) -> None:
+        """End of Track one past the last object on the open stream, else
+        at the start of the next group on a new stream."""
+        data = b""
+        if stream_id is None:
+            stream_id = await session.open_uni_stream()
+            session.set_stream_priority(stream_id, self._stream_band(session))
+            self._stream_count += 1
+            header = SubgroupHeader(
+                track_alias=track_alias, group_id=self._next_group,
+                subgroup_id=0, publisher_priority=self.priority,
+                prof=session._profile)
+            self._next_group += 1
+            data = header.serialize().data
+        data += header.next_object(payload=b"", object_id=header.next_object_id,
+                                   status=ObjectStatus.END_OF_TRACK).data
+        session.stream_write(stream_id, data, end_stream=True)
+
     async def _emit_loop(self, session, track_alias: int):
         sub = self._sub_for(session)
         prof = session._profile
@@ -140,6 +175,8 @@ class CatalogTrackPublisher(PublishedTrack):
                                          end_stream=True)
                     stream_id = None
                 stream_id = await session.open_uni_stream()
+                session.set_stream_priority(stream_id,
+                                            self._stream_band(session))
                 self._stream_count += 1
                 header = SubgroupHeader(
                     track_alias=track_alias, group_id=self._next_group,
@@ -190,7 +227,12 @@ class CatalogTrackPublisher(PublishedTrack):
             if session._close_err is None:
                 logger.warning(f"Catalog: emitter stopped: {e}")
             return
-        if stream_id is not None:
+        if sub.forward:
+            try:
+                await self._end_track(session, track_alias, header, stream_id)
+            except Exception as e:
+                logger.debug(f"Catalog: End of Track not sent: {e!r}")
+        elif stream_id is not None:
             buf = header.end_group(object_id=header.next_object_id)
             session.stream_write(stream_id, buf.data, end_stream=True)
         self._send_publish_done(session)
@@ -198,17 +240,26 @@ class CatalogTrackPublisher(PublishedTrack):
 
 class MediaPublisher:
     """Publishes an MSF broadcast: catalog + LOC media tracks on one
-    session, with control demux by track name / request id."""
+    session, with control demux by track name / request id.
 
-    def __init__(self, session, namespace: str, catalog: Catalog):
+    With `catalog` None no catalog track is published or served;
+    `catalog_track` stays, unpublished, so callers need no special case."""
+
+    def __init__(self, session, namespace: str,
+                 catalog: Optional[Catalog]):
         self.session = session
         self.namespace = namespace
         self.catalog_track = CatalogTrackPublisher(session, namespace,
                                                    catalog)
-        self._by_name: Dict[str, PublishedTrack] = {
-            CATALOG_TRACK_NAME: self.catalog_track}
+        self._by_name: Dict[str, PublishedTrack] = (
+            {} if catalog is None else {CATALOG_TRACK_NAME: self.catalog_track})
 
     def add_track(self, track: LocTrackPublisher) -> LocTrackPublisher:
+        """A track left at the default priority takes its media kind's."""
+        if track.priority == _DEFAULT_PUBLISHER_PRIORITY:
+            track.priority = (AUDIO_PUBLISHER_PRIORITY
+                              if getattr(track, 'media_kind', None) == "audio"
+                              else VIDEO_PUBLISHER_PRIORITY)
         self._by_name[track.trackname] = track
         return track
 

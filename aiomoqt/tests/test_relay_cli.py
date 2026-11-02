@@ -22,11 +22,11 @@ def test_unusable_control_path_is_a_clean_error(tmp_path):
     assert "Traceback" not in out, out
 
 
-def _control(path, method):
+def _control(path, method, target="/debug"):
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(5)
         s.connect(str(path))
-        s.sendall(f"{method} /debug HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        s.sendall(f"{method} {target} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
         data = b""
         while chunk := s.recv(4096):
             data += chunk
@@ -79,6 +79,12 @@ def test_relay_operator_flags(tmp_path, short_dir):
                       "-T", "t", "-t", 2, "-i", 1, timeout=30)
         assert objects_received(out) > 0, out
         assert rc == 0, out
+
+        sessions = _control(ctl, "GET", "/sessions")
+        assert sessions["trace_subscribers"] is False
+        assert sessions["sessions"], sessions  # pub_bench is still connected
+        assert all({"rtt", "cwin", "lost", "timer_losses"} <= set(row)
+                   for row in sessions["sessions"]), sessions
 
         relay_info = _status(status_dir / "status.json")["relay"]
         assert relay_info["port"] == port

@@ -7,6 +7,7 @@ frindell Track Properties are parsed once into a TrackTiming; a
 violation of the draft's rules raises TimestampMalformed (the track is
 malformed, MOQT §12.1).
 """
+import math
 import time
 from fractions import Fraction
 from math import gcd
@@ -57,31 +58,40 @@ def zigzag_decode(u: int) -> int:
 
 
 def encode_mapping(base_group: int, base_timestamp: int,
-                   group_multiplier: int, object_multiplier: int,
-                   vi64: bool) -> bytes:
-    """TIMESTAMP_MAPPING value (§4.4): four integers in the session's
-    variable-length integer encoding."""
-    buf = Buffer(capacity=40, vi64=vi64)
+                   group_multiplier: int, object_multiplier: int) -> bytes:
+    """TIMESTAMP_MAPPING value (§4.4): four vi64 integers on every draft.
+    Relays forward the value unchanged, so it cannot follow the session."""
+    buf = Buffer(capacity=40, vi64=True)
     for v in (base_group, base_timestamp, group_multiplier,
               object_multiplier):
         buf.push_vint(v)
     return bytes(buf.data_slice(0, buf.tell()))
 
 
-def decode_mapping(raw: bytes, vi64: bool) -> Tuple[int, int, int, int]:
-    """§4.4: exactly four integers, else TimestampMalformed."""
-    raw = bytes(raw)
+def _four_ints(raw: bytes, vi64: bool) -> Optional[Tuple[int, int, int, int]]:
+    """Exactly four integers filling `raw`, else None."""
     buf = Buffer(data=raw, vi64=vi64)
     out = []
     try:
         while buf.tell() < len(raw) and len(out) < 4:
             out.append(buf.pull_vint())
     except (BufferReadError, ValueError):
-        raise TimestampMalformed(
-            "TIMESTAMP_MAPPING is not four integers") from None
+        return None
     if len(out) != 4 or buf.tell() != len(raw):
-        raise TimestampMalformed("TIMESTAMP_MAPPING is not four integers")
+        return None
     return out[0], out[1], out[2], out[3]
+
+
+def decode_mapping(raw: bytes, vi64: bool) -> Tuple[int, int, int, int]:
+    """§4.4: exactly four vi64 integers, else TimestampMalformed. A pre-d18
+    session (`vi64` False) also reads the RFC 9000 form older peers send."""
+    raw = bytes(raw)
+    four = _four_ints(raw, True)
+    if four is None and not vi64:
+        four = _four_ints(raw, False)
+    if four is None:
+        raise TimestampMalformed("TIMESTAMP_MAPPING is not four integers")
+    return four
 
 
 def _name(ptype: int) -> str:
@@ -281,7 +291,7 @@ class TimestampWriter:
             return {}
         props: Dict[int, Any] = {TIMESCALE: self.timescale}
         if self.mapping is not None:
-            props[TIMESTAMP_MAPPING] = encode_mapping(*self.mapping, vi64)
+            props[TIMESTAMP_MAPPING] = encode_mapping(*self.mapping)
         return props
 
     def scheduled_us(self, group_id: int, object_id: int) -> Optional[int]:
@@ -318,6 +328,11 @@ class TimestampWriter:
         return exts
 
 
+def round_us(t) -> int:
+    """µs `t` (int or Fraction) rounded to the nearest, half up."""
+    return t if isinstance(t, int) else math.floor(t + Fraction(1, 2))
+
+
 class MediaTimestamps:
     """Timing properties for a media track whose objects carry known
     capture times (wall-clock µs).
@@ -326,9 +341,9 @@ class MediaTimestamps:
     TIMESTAMP_MAPPING anchored at `wall0_us`, and OBJECT_TIMESTAMP only
     on an object off schedule. Otherwise Appendix A.2: TIMESCALE 1e6 and
     each object's capture time as OBJECT_TIMESTAMP. No CLOCK_ID or
-    TIMESTAMP_ORIGIN: these are wall-clock tracks. `wall0_us` times the
-    timescale should be a whole number of µs·ticks/1e6, or every mapped
-    time is off by the remainder."""
+    TIMESTAMP_ORIGIN: these are wall-clock tracks. `wall0_us` 0 anchors
+    the mapping at the Unix epoch. Capture times may be Fractions of a µs,
+    so that times on the tick grid are exact."""
 
     def __init__(self, wall0_us: int, timescale: int = 1_000_000,
                  group_multiplier: Optional[int] = None,
@@ -339,13 +354,13 @@ class MediaTimestamps:
         self.group_multiplier = group_multiplier
         self.object_multiplier = object_multiplier
         self.base = wall0_us * self.timescale // 1_000_000
+        self._group = -1
 
     def track_properties(self, vi64: bool) -> Dict[int, Any]:
         props: Dict[int, Any] = {TIMESCALE: self.timescale}
         if self.mapped:
             props[TIMESTAMP_MAPPING] = encode_mapping(
-                0, self.base, self.group_multiplier,
-                self.object_multiplier, vi64)
+                0, self.base, self.group_multiplier, self.object_multiplier)
         return props
 
     def _ticks(self, capture_us: int) -> int:
@@ -353,17 +368,23 @@ class MediaTimestamps:
         d = (capture_us - self.wall0_us) * self.timescale
         return (2 * d + 1_000_000) // 2_000_000
 
-    def group_for(self, capture_us: int) -> Optional[int]:
-        """The scheduled group of a group-opening object."""
+    def group_of(self, capture_us) -> int:
+        """The group whose span holds `capture_us` (mapped only)."""
+        assert self.group_multiplier, "not mapped with groups"
+        return self._ticks(capture_us) // self.group_multiplier
+
+    def group_for(self, capture_us) -> Optional[int]:
+        """The group of a group-opening object, above every group returned
+        before: an off-schedule group never reuses an ID."""
         if not self.mapped or not self.group_multiplier:
             return None
-        g = self.group_multiplier
-        return max(0, (2 * self._ticks(capture_us) + g) // (2 * g))
+        self._group = max(self._group + 1, self.group_of(capture_us))
+        return self._group
 
     def object_properties(self, group_id: int, object_id: int,
                           capture_us: int) -> Dict[int, Any]:
         if not self.mapped:
-            return {OBJECT_TIMESTAMP: capture_us}
+            return {OBJECT_TIMESTAMP: round_us(capture_us)}
         c = self._ticks(capture_us) - (group_id * self.group_multiplier
                                        + object_id * self.object_multiplier)
         return {OBJECT_TIMESTAMP: (c << 1) ^ (c >> 63)} if c else {}

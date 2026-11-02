@@ -89,6 +89,9 @@ class _StubSession:
     def _unbind_request(self, request_id):
         pass
 
+    def set_stream_priority(self, _sid, _band):
+        return True
+
     async def open_uni_stream(self):
         self._sid += 4
         return self._sid

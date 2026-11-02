@@ -71,7 +71,7 @@ def install() -> bool:
             print(f"(SIGUSR2 counter-dump: aiopquic unavailable: {e})",
                   file=sys.stderr, flush=True)
             return
-        print(f"\n=== aiopquic counter-dump (SIGUSR2) ===",
+        print("\n=== aiopquic counter-dump (SIGUSR2) ===",
               file=sys.stderr, flush=True)
         try:
             dump_all_counters(file=sys.stderr)

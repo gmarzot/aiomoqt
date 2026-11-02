@@ -60,9 +60,10 @@ async def test_padding_stream_cancel_is_cancelled(use_quic, sent):
                 if any(s is sessions[0] for s, *_ in sent):
                     break
                 await asyncio.sleep(0.02)
+            # Before teardown, which resets the control streams.
+            stops = [(k, code) for s, i, k, code in sent if s is sessions[0]]
     finally:
         server.close()
-    stops = [(k, code) for s, i, k, code in sent if s is sessions[0]]
     assert stops == [("stop", StreamResetCode.CANCELLED)]
     assert int(stops[0][1]) == 0x1
     assert sid is not None

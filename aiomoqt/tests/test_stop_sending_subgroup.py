@@ -93,7 +93,7 @@ async def _direct(port, use_quic, cls):
     peer = asyncio.get_running_loop().create_future()
 
     async def on_pub_ns(session, msg):
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 

@@ -5,7 +5,6 @@ from .base import MOQTMessage, BUF_SIZE
 from .params import LocationFilter
 from ..types import (
     MOQTMessageType, FetchType, GroupOrder, MOQTProtocolViolation, ParamType,
-    SessionCloseCode,
 )
 from ..context import is_draft16_or_later, DraftProfile
 from ..utils.buffer import Buffer
@@ -356,7 +355,7 @@ class FetchError(MOQTMessage):
 
         payload.push_vint(self.request_id)
         payload.push_vint(self.error_code)
-        
+
         reason_bytes = self.reason.encode()
         payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)
@@ -378,7 +377,7 @@ class FetchError(MOQTMessage):
             error_code=error_code,
             reason=reason
         )
-    
+
 @dataclass(slots=True)
 class FetchCancel(MOQTMessage):
     """FETCH_CANCEL message to cancel an ongoing fetch."""

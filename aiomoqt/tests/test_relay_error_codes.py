@@ -1,4 +1,4 @@
-"""The ersatz relay answers a refused SUBSCRIBE with the publisher's own
+"""aiomoqt-relay answers a refused SUBSCRIBE with the publisher's own
 error code and reason, encoded in the subscriber's draft."""
 import contextlib
 

@@ -237,16 +237,28 @@ async def test_the_watchdog_summarises_its_probes(monkeypatch):
         "relay: watchdog: 0/1 probes ok in the last 0 h"]
 
 
-def test_sigusr1_toggles_debug_logging():
+async def test_sigusr1_steps_the_log_level():
+    import signal
     from aiomoqt.tests.test_log_contract import _captured
-    from aiomoqt.utils.logger import get_log_level
-    with _captured(logging.INFO) as records:
-        relay._toggle_debug()
-        assert get_log_level() == logging.DEBUG
-        relay._toggle_debug()
-        assert get_log_level() == logging.INFO
-    assert [m for m in records.at(logging.INFO) if "debug logging" in m] == [
-        "relay: debug logging on", "relay: debug logging off"]
+    from aiomoqt.utils.logger import TRACE, get_log_level
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGUSR1, relay._step_log_level)
+    levels = []
+    try:
+        with _captured(logging.INFO) as records:
+            for _ in range(3):
+                os.kill(os.getpid(), signal.SIGUSR1)
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    if len(levels) < len(records.at(logging.INFO)):
+                        break
+                levels.append(get_log_level())
+    finally:
+        loop.remove_signal_handler(signal.SIGUSR1)
+    assert levels == [logging.DEBUG, TRACE, logging.INFO]
+    assert [m for m in records.at(logging.INFO) if "log level" in m] == [
+        "relay: log level DEBUG", "relay: log level TRACE",
+        "relay: log level INFO"]
 
 
 async def test_the_control_socket_reports_and_toggles_debug():

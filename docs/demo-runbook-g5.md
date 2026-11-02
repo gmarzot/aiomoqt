@@ -8,7 +8,12 @@ are in [demo-runbook.md](demo-runbook.md); synthetic load in
 
 Actors: SHELL = a shell with the exports below · BROWSER = Chrome. RELAY =
 https://moqx-main.ci.openmoq.org:4433/moq-relay (deployed; never restart
-it). Draft 18 unless a demo says otherwise.
+it). Draft 18 unless a demo says otherwise. Our own relay,
+aiomoqt-relay, works too: set `RELAY_WT=https://aiomoqt-relay.marzresearch.net:4443/`
+and enter that URL in the broadcaster's Relay WebTransport URL setting;
+the viewer link carries it. The pages offer drafts 14, 16 and 18; the
+tools in Part 2 also take `--draft 22` against aiomoqt-relay, between an
+aiomoqt publisher and subscriber (M3).
 
 ## Setup
 

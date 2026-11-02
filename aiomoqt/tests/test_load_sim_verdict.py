@@ -117,7 +117,7 @@ def _wait_listening(log_path, relay, timeout=30.0):
 
 
 def run_loopback_load_sim(*extra):
-    """A short load_sim against the interop relay on loopback; returns
+    """A short load_sim against aiomoqt-relay on loopback; returns
     (exit code, stdout + stderr)."""
     port = _free_udp_port()
     relay_log = Path(tempfile.mkdtemp(prefix="load-sim-relay-")) / "relay.log"

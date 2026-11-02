@@ -38,7 +38,7 @@ class _Catalog(PublishedTrack):
     the current one once a FETCH has been answered."""
 
     def __init__(self, *args, **kw):
-        super().__init__(*args, **kw)
+        super().__init__(*args, fetch_history_bytes=1 << 20, **kw)
         self.current = _BASE
         self.retained = {_BASE}
         self.fetched = []

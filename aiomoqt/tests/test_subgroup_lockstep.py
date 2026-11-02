@@ -16,6 +16,7 @@ from aiomoqt.track import PublishedTrack
 from aiomoqt.tools import moq_interop_relay as relay
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._relay_wait import until_published
 
 _BASE_PORT = 18500
 _SUBGROUPS = 4
@@ -150,6 +151,7 @@ async def test_a_late_subscriber_gets_every_subgroup_of_each_group(
             track._quiet = True
             await track.publish(announce_namespace=False,
                                 publish_track=True)
+            await until_published(_NS, [_NAME])
 
             early = await _session()
             await early.subscribe(_NS, _NAME, forward=1, wait_response=True)

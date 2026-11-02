@@ -106,6 +106,7 @@ class TestPublishedTrack:
         session.publish = MagicMock(side_effect=publish)
         session.register_handler = MagicMock()
         session._peer_subscribed = MagicMock(return_value=False)
+        session._publishing = MagicMock(return_value=False)
         return session
 
     # ----- Flow B: bare PUBLISH (default) -----
@@ -447,7 +448,7 @@ class TestD18Discovery:
         ns_msg = MagicMock(spec=[])
         ns_msg.namespace_suffix = suffix
         pub_msg = MagicMock(spec=[])
-        pub_msg.track_namespace = (b"bench",)
+        pub_msg.track_namespace = (b"bench", *suffix)
         pub_msg.track_name = trackname
         pub_msg.request_id = 11
         pub_msg.forward = 0

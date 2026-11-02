@@ -6,7 +6,7 @@ from . import MOQTMessage, BUF_SIZE
 from .params import LocationFilter, uses_location_filter
 from ..types import ParamType, SubscribeDoneCode
 from ..context import is_draft16_or_later, DraftProfile
-from ..utils.buffer import Buffer, BufferReadError
+from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -170,7 +170,9 @@ class TrackStatusOk(MOQTMessage):
         request_id = buf.pull_vint()
         track_alias = buf.pull_vint()
         expires = buf.pull_vint()
-        group_order = GroupOrder(buf.pull_uint8())
+        group_order = buf.pull_uint8()
+        MOQTMessage._check_range("group order", group_order, 1, 2)
+        group_order = GroupOrder(group_order)
         content_exists = buf.pull_uint8()
 
         largest_group_id = None
@@ -714,7 +716,7 @@ class SubscribeDone(MOQTMessage):
             code = self._D18_WIRE_SWAP.get(code, code)
         payload.push_vint(code)
         payload.push_vint(self.stream_count)
-        
+
         reason_bytes = self.reason.encode()
         payload.push_vint(len(reason_bytes))
         payload.push_bytes(reason_bytes)

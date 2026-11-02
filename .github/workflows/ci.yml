@@ -64,6 +64,42 @@ jobs:
           echo "::warning::aiopquic pinned to $spec — delete .github/aiopquic-pin before merging to main"
           echo "aiopquic pinned to \`$spec\` — delete the pin before merging" >> "$GITHUB_STEP_SUMMARY"
 
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install ruff==0.17.3
+      - run: ruff check --output-format github .
+
+  # Report only: ty is pre-1.0 and its findings move between releases. Fails
+  # (without failing the run) when the count rises above .github/ty-baseline.
+  types:
+    name: types (report only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-aiomoqt
+        with:
+          python-version: "3.14"
+      - name: ty against the baseline
+        shell: bash
+        run: |
+          python -m pip install ty==0.0.39
+          out=$(ty check --exit-zero --python "$(python -c 'import sys; print(sys.prefix)')" \
+            --exclude 'aiomoqt/tests/**' aiomoqt 2>&1)
+          n=$(echo "$out" | sed -n 's/^Found \([0-9]*\) diagnostic.*/\1/p')
+          n=${n:-0}
+          base=$(cat .github/ty-baseline)
+          echo "ty: $n diagnostics (baseline $base)" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$n" -le "$base" ]
+
   core:
     name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}

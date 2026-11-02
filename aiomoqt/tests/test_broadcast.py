@@ -142,6 +142,7 @@ async def test_demux_routes_d16_update_and_serves_catalog_fetch():
     session = SimpleNamespace(
         fetch_ok=lambda request_id: writes.append(('ok', request_id)),
         open_uni_stream=_open_uni,
+        set_stream_priority=lambda sid, band: True,
         stream_write=lambda sid, data, end_stream=False:
             writes.append(('w', sid, bytes(data), end_stream)),
         _profile=profile_for(18),
@@ -225,6 +226,7 @@ def _recording_session():
         _profile=profile_for(18),
         _close_err=None,
         open_uni_stream=_open_uni,
+        set_stream_priority=lambda sid, band: True,
         stream_write=lambda sid, data, end_stream=False:
             writes.append(('w', sid, bytes(data), end_stream)),
         stream_write_drain=_write_drain,

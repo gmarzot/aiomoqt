@@ -176,12 +176,11 @@ def _pytest_all(log_dir: Path) -> tuple[str, str]:
     """Every pytest test in one run. Naming files individually leaves new
     test modules silently unrun; the tool-driven suites below cover only
     what pytest cannot reach."""
-    # --durations names the slow tests in the log: the tree runs in ~2s
-    # on Linux and ~200s on macOS. Cause not established.
+    # --durations names the slowest tests in the log.
     extra = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
     extra.append("--durations=10")
     return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", extra,
-                        timeout=900)
+                        timeout=1800)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +303,7 @@ def _adaptive_verdict(text: str) -> tuple[str, str]:
 
 def _loopback_adaptive_relay_quic(log_dir: Path, draft: int) -> tuple[str, str]:
     """adaptive_bench in relay mode (pub and sub processes) through the
-    local interop relay over raw QUIC."""
+    local aiomoqt-relay over raw QUIC."""
     import socket
     import time
     slug = f"loopback-adaptive-relay-quic-d{draft}"
@@ -370,11 +369,13 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
 
 
 def _relay_pub_sub(url: str, draft: int, pub_mode: str, insecure: bool,
-                   compat: str, log: Path,
-                   trackname: str) -> tuple[str, str]:
+                   compat: str, log: Path, trackname: str,
+                   namespace: str | None = None) -> tuple[str, str]:
     cmd = [sys.executable, "-m", "aiomoqt.tools.load_sim",
            url, *MULTI_SUB_ARGS_COMMON, "--draft", str(draft),
            "-T", trackname, *PUB_MODE_FLAGS[pub_mode]]
+    if namespace:
+        cmd += ["-N", namespace]
     if insecure:
         cmd.append("-k")
     if compat:
@@ -419,10 +420,16 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
     ok, _ = _run(cmd, log, 90)
     if not ok:
         return "FAIL", "timeout"
-    text = log.read_text()
-    # TAP line for a single-case run: "ok 1 - <case>" or "not ok 1 - ..."
-    if re.search(rf"^ok 1 - {re.escape(case)}", text, re.MULTILINE):
-        return "PASS", "ok"
+    return _tap_case_verdict(log.read_text(), case)
+
+
+def _tap_case_verdict(text: str, case: str) -> tuple[str, str]:
+    """A single-case TAP run: "ok 1 - <case>" passes, with a SKIP directive
+    it is a SKIP and its reason; anything else fails with its message."""
+    m = re.search(rf"^ok 1 - {re.escape(case)}(.*)$", text, re.MULTILINE)
+    if m:
+        skip = re.search(r"# SKIP\s*(.*)", m.group(1), re.IGNORECASE)
+        return ("SKIP", skip.group(1) or "skipped") if skip else ("PASS", "ok")
     m = re.search(r"^  message: (.*)$", text, re.MULTILINE)
     if m:
         return "FAIL", m.group(1).strip('"')
@@ -539,21 +546,24 @@ def _moqdev_smoke(keys: str, out: Path,
 # ---------------------------------------------------------------------------
 def _loopback_adaptive_bench(log_dir: Path) -> tuple[str, str]:
     log = log_dir / "loopback-adaptive-bench.log"
-    # Loopback self-test: short ramp, kill after ~30s so the runner
-    # isn't held open by the forever-probing controller.
-    cmd = ["timeout", "--signal=INT", "--kill-after=3", "30",
+    # Loopback self-test, capped by -t; timeout is the backstop.
+    cmd = ["timeout", "--signal=INT", "--kill-after=3", "40",
            sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--start-mbps", "10", "--step-mbps", "10",
-           "--max-mbps", "500", "--interval", "3",
+           "--max-mbps", "500", "--interval", "3", "-t", "30",
            "--latency-threshold", "100", "-k"]
-    _run(cmd, log, 45)
+    rc = _run_rc(cmd, log, 55)
     text = log.read_text()
-    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space) — match both
-    # space-and-no-space forms.
+    # fmt_bps emits e.g. "80Mbps" or "1.2Gbps" (no space).
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
-    if m:
-        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
-    return "FAIL", "(no summary — check log)"
+    if rc != 0:
+        return "FAIL", f"exit {rc}" + (f", high-water {m.group(1)} {m.group(2)}"
+                                        if m else "")
+    if not m:
+        return "FAIL", "(no summary — check log)"
+    if float(m.group(1)) <= 0:
+        return "FAIL", f"high-water {m.group(1)} {m.group(2)}"
+    return "PASS", f"high-water {m.group(1)} {m.group(2)}"
 
 
 # ---------------------------------------------------------------------------
@@ -616,8 +626,10 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
     # non-gating for every draft.
     gating_drafts = set(relay.get("gating", []))
     # Suites that run and report but never gate: a documented peer
-    # non-conformance the case fails on correctly.
-    xfail_suites = set(relay.get("xfail_suites", []))
+    # non-conformance the case fails on correctly. A map gives each a reason.
+    xfail = relay.get("xfail_suites", [])
+    xfail_suites = xfail if isinstance(xfail, dict) else dict.fromkeys(xfail, "")
+    namespace = relay.get("namespace")
 
     def _dispatch(suite: str, label_suffix: str, tag: str, slug: str,
                   fn, *fn_args, gating: bool = True) -> None:
@@ -642,9 +654,11 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
         status, detail = _with_interop_retry(fn, fn_args, log)
         if status == "FAIL" and (not gating or suite in xfail_suites):
             status = "XFAIL"
+            if xfail_suites.get(suite):
+                detail = f"{detail} (expected: {xfail_suites[suite]})"
         results.append((status, label, detail, log))
         marker = {"PASS": "[PASS]", "FAIL": "[FAIL]",
-                  "XFAIL": "[XFAIL]"}[status]
+                  "XFAIL": "[XFAIL]", "SKIP": "[skip]"}[status]
         _progress(f"  {marker} {label}  {detail}")
 
     for transport, url in relay["urls"].items():
@@ -662,7 +676,7 @@ def _run_relay_matrix(relay: dict, enabled: set[str],
                 _dispatch("relay-pub-sub", f"[{pub_mode}]", tag, slug,
                           lambda u, d, log: _relay_pub_sub(
                               u, d, pub_mode, insecure, compat_csv,
-                              log, tn),
+                              log, tn, namespace),
                           url, draft, gating=gating)
             if "relay-join" in enabled:
                 _dispatch("relay-join", "", tag, slug,

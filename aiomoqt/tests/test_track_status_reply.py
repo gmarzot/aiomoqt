@@ -72,8 +72,10 @@ def test_default_request_update_handler_answers():
     assert s._fins == []                 # the subscription's stream stays open
 
 
-def test_relay_answers_ok_for_served_track_and_error_for_unknown():
+def test_relay_answers_ok_for_served_track_and_error_for_unknown(monkeypatch):
     from aiomoqt.tools import moq_interop_relay as relay
+    # The stub session cannot close, so keep it out of the reaper.
+    monkeypatch.setattr(relay, "_watch_session", lambda *a, **k: None)
 
     class _Track:
         finished = False

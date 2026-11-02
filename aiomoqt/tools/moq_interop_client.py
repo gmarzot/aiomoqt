@@ -22,12 +22,13 @@ import os
 import secrets
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
+from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools.moqtest_origin import parse_namespace as parse_moq_test
 from aiomoqt.types import (
@@ -36,8 +37,7 @@ from aiomoqt.types import (
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
-from aiomoqt.utils.cli import add_help
-from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging
 
 try:
     from aiomoqt import __version__ as AIOMOQT_VERSION
@@ -103,6 +103,7 @@ KNOWN_COMPAT_IMPLS = frozenset({
     "moq-rs-d16",         # itzmanish/moq-rs draft-16 fork (CF endpoint)
     "libquicr",           # Cisco libquicr — accepts SUBSCRIBE to unknown tracks
     "lenient-extensions",  # tolerate truncated trailing extensions block
+    "missing-request-credit",  # d14/d16 peer SETUP without MAX_REQUEST_ID
     "all",                # enable every known compat tolerance
 })
 
@@ -188,6 +189,10 @@ INTEROP_TRACK = f"track-{_unique_suffix()}"
 # model (e.g. moqtail) rather than a failure. Mirrors moq-rs's 5s.
 _SUBSCRIBE_WAIT = 5.0
 
+# How long publish-track-subscribe waits for the PUBLISH reply before
+# subscribing anyway.
+_PUBLISH_REPLY_WAIT = 1.0
+
 # PUBLISH_NAMESPACE parameters used by the standard tests.
 # Default empty: anonymous tests should look anonymous. AUTH_TOKEN is
 # added only when --auth-token / $AUTH_TOKEN is set explicitly. Some
@@ -234,11 +239,14 @@ class TestResult:
 
 
 class TAPReporter:
-    """Emit TAP version 14 output with run-identifying headers."""
+    """Emit TAP version 14 output with run-identifying headers. Given a
+    `stream`, begin() writes the header and plan there and each add() its
+    result, so a run cut short keeps what it reached."""
 
     def __init__(self, *, target_url: str = "",
                  aiomoqt_version: str = "",
-                 compat: frozenset = frozenset()):
+                 compat: frozenset = frozenset(),
+                 stream=None):
         self.results: list[TestResult] = []
         self.target_url = target_url
         self.aiomoqt_version = aiomoqt_version
@@ -246,9 +254,24 @@ class TAPReporter:
         self.started_at = _utc_now_iso()
         self.ended_at = ""
         self.notes: list[str] = []
+        self.stream = stream
+        self._streaming = False
+
+    def begin(self, planned: int) -> None:
+        if self.stream is not None:
+            self._write(self._header(planned))
+            self._streaming = True
 
     def add(self, result: TestResult):
         self.results.append(result)
+        if self._streaming:
+            self._write(self._result_lines(len(self.results), result))
+
+    def end(self) -> None:
+        """Finish a streamed report: end time and totals."""
+        self.finalize()
+        if self._streaming:
+            self._write([f"# ended: {self.ended_at}", *self._trailer()])
 
     def finalize(self):
         if not self.ended_at:
@@ -256,9 +279,20 @@ class TAPReporter:
 
     def report(self) -> str:
         self.finalize()
+        lines = self._header(len(self.results), ended=True)
+        for i, r in enumerate(self.results, 1):
+            lines += self._result_lines(i, r)
+        return "\n".join(lines + self._trailer())
+
+    def _write(self, lines: list) -> None:
+        self.stream.write("\n".join(lines) + "\n")
+        self.stream.flush()
+
+    def _header(self, planned: int, ended: bool = False) -> list:
         lines = ["TAP version 14"]
         lines.append(f"# date: {self.started_at}")
-        lines.append(f"# ended: {self.ended_at}")
+        if ended:
+            lines.append(f"# ended: {self.ended_at}")
         if self.target_url:
             lines.append(f"# target: {self.target_url}")
         if self.aiomoqt_version:
@@ -267,50 +301,53 @@ class TAPReporter:
             lines.append(f"# compat: {','.join(sorted(self.compat))}")
         for note in self.notes:
             lines.append(f"# note: {note}")
-        lines.append(f"1..{len(self.results)}")
-        for i, r in enumerate(self.results, 1):
-            status = "ok" if r.passed else "not ok"
-            skip = f" # SKIP {r.skip_reason}" if r.skipped else ""
-            tag = " # COMPAT" if r.compat and not r.skipped else ""
-            lines.append(f"{status} {i} - {r.name}{skip}{tag}")
-            lines.append("  ---")
-            lines.append(f"  duration_ms: {round(r.duration_ms)}")
-            if self.aiomoqt_version:
-                lines.append(
-                    f"  implementation_version: {_yaml_str(self.aiomoqt_version)}")
-            if r.spec_revision:
-                lines.append(f"  test_spec_revision: {r.spec_revision}")
-            roles = {k: v for k, v in r.sessions.items() if v}
-            if roles:
-                lines.append("  sessions:")
-                for role, meta in roles.items():
-                    lines.append(f"    {role}:")
-                    for k, v in meta.items():
-                        lines.append(f"      {k}: {_yaml_str(v)}")
-            if r.message:
-                lines.append(f"  message: {_yaml_str(r.message)}")
-            if r.expected:
-                lines.append(f"  expected: {_yaml_str(r.expected)}")
-            if r.received:
-                lines.append(f"  received: {_yaml_str(r.received)}")
-            if r.compat:
-                lines.append("  compat: true")
-                if r.compat_note:
-                    lines.append(f"  compat_note: {_yaml_str(r.compat_note)}")
-            if r.wire_noncompliance_count:
-                lines.append(
-                    f"  wire_noncompliance: {r.wire_noncompliance_count}"
-                )
-            lines.append("  ...")
+        lines.append(f"1..{planned}")
+        return lines
+
+    def _result_lines(self, i: int, r: TestResult) -> list:
+        status = "ok" if r.passed else "not ok"
+        skip = f" # SKIP {r.skip_reason}" if r.skipped else ""
+        tag = " # COMPAT" if r.compat and not r.skipped else ""
+        lines = [f"{status} {i} - {r.name}{skip}{tag}"]
+        lines.append("  ---")
+        lines.append(f"  duration_ms: {round(r.duration_ms)}")
+        if self.aiomoqt_version:
+            lines.append(
+                f"  implementation_version: {_yaml_str(self.aiomoqt_version)}")
+        if r.spec_revision:
+            lines.append(f"  test_spec_revision: {r.spec_revision}")
+        roles = {k: v for k, v in r.sessions.items() if v}
+        if roles:
+            lines.append("  sessions:")
+            for role, meta in roles.items():
+                lines.append(f"    {role}:")
+                for k, v in meta.items():
+                    lines.append(f"      {k}: {_yaml_str(v)}")
+        if r.message:
+            lines.append(f"  message: {_yaml_str(r.message)}")
+        if r.expected:
+            lines.append(f"  expected: {_yaml_str(r.expected)}")
+        if r.received:
+            lines.append(f"  received: {_yaml_str(r.received)}")
+        if r.compat:
+            lines.append("  compat: true")
+            if r.compat_note:
+                lines.append(f"  compat_note: {_yaml_str(r.compat_note)}")
+        if r.wire_noncompliance_count:
+            lines.append(
+                f"  wire_noncompliance: {r.wire_noncompliance_count}"
+            )
+        lines.append("  ...")
+        return lines
+
+    def _trailer(self) -> list:
         total_noncompliance = sum(
             r.wire_noncompliance_count for r in self.results
         )
-        if total_noncompliance:
-            lines.append(
-                f"# wire_noncompliance_total: trailing_extensions="
-                f"{total_noncompliance}"
-            )
-        return "\n".join(lines)
+        if not total_noncompliance:
+            return []
+        return [f"# wire_noncompliance_total: trailing_extensions="
+                f"{total_noncompliance}"]
 
 
 def _yaml_str(value) -> str:
@@ -350,6 +387,43 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
         debug=debug,
         supported_drafts=supported_drafts,
     )
+
+
+def _publish_reply(session, request_id: int, track=None) -> asyncio.Future:
+    """The future the relay's reply to our PUBLISH resolves. Take it before
+    the next await. A d14/d16 PUBLISH_OK goes to the track, not the
+    session, so it resolves the future only through `track`."""
+    fut = session._pending_requests.get(request_id)
+    if fut is None:
+        fut = session._loop.create_future()
+        session._pending_requests[request_id] = fut
+    if track is not None:
+        on_ok = track._on_publish_ok
+
+        async def _on_publish_ok(sess, msg):
+            if not fut.done():
+                fut.set_result(msg)
+            await on_ok(sess, msg)
+        track._on_publish_ok = _on_publish_ok
+    return fut
+
+
+def _skip_unsupported_publish(result: TestResult, reply) -> TestResult:
+    """A failure becomes a SKIP when the relay refused our PUBLISH as
+    NOT_SUPPORTED (0x3 in every draft's table)."""
+    if reply is None or not reply.done() or reply.cancelled():
+        return result
+    if reply.exception() is not None or result.passed:
+        return result
+    msg = reply.result()
+    if (not _MOQTSessionMixin._is_error_response(msg)
+            or getattr(msg, "error_code", None)
+            != int(RequestErrorCode.NOT_SUPPORTED)):
+        return result
+    return replace(result, passed=True, skipped=True,
+                   skip_reason="relay does not support PUBLISH",
+                   message=f"PUBLISH refused NOT_SUPPORTED: "
+                           f"{getattr(msg, 'reason', '')}")
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +843,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
     """
     t0 = time.monotonic()
     sessions = {}
+    reply = None
     try:
         async with asyncio.timeout(timeout):
             pub_client = _make_client(host, port, path, use_quic,
@@ -797,6 +872,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
                 # d14/d16 need the PUBLISH for the fused response.
                 await track.publish(announce_namespace=True,
                                     publish_track=True)
+                reply = _publish_reply(pub_session, track.request_id)
 
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
@@ -804,7 +880,10 @@ async def test_namespace_discovery(host, port, path, use_quic,
                     discovered = SubscribedTrack(
                         sub_session, INTEROP_NAMESPACE)
                     discovered._quiet = True
-                    await discovered.subscribe(timeout=timeout / 2)
+                    # The relay may offer other tracks in the namespace.
+                    await discovered.subscribe(
+                        timeout=timeout / 2,
+                        expected_trackname=INTEROP_TRACK)
                     found = discovered.trackname
                     passed = found == INTEROP_TRACK
                     msg = (f"discovered '{found}'" if passed else
@@ -813,23 +892,23 @@ async def test_namespace_discovery(host, port, path, use_quic,
                     sub_session.close()
                 pub_session.close()
 
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name="namespace-discovery", passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=msg,
             expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=str(found),
-        )
+        ), reply)
     except Exception as e:
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name="namespace-discovery", passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected=f"PUBLISH announcing '{INTEROP_TRACK}'",
             received=_format_exc(e),
-        )
+        ), reply)
 
 
 async def test_subscribe_before_announce(host, port, path, use_quic,
@@ -1289,9 +1368,11 @@ async def _relay_history(host, port, path, use_quic, tls_disable_verify,
     async with pub_client.connect() as pub_session:
         await pub_session.client_session_init()
         sessions["publisher"] = _session_meta(pub_session)
+        # A relay may forward the FETCH here rather than serve its cache.
         track = PublishedTrack(pub_session, namespace=namespace,
                                trackname="track", object_size=64,
-                               group_size=_HISTORY_GROUP, rate=50)
+                               group_size=_HISTORY_GROUP, rate=50,
+                               fetch_history_bytes=1 << 20)
         await track.publish(announce_namespace=True, publish_track=False)
         groups = []
         two_groups = loop.create_future()
@@ -1519,6 +1600,7 @@ async def test_publish_track_only(host, port, path, use_quic,
     name = "publish-track-only"
     t0 = time.monotonic()
     sessions = {}
+    reply = None
     client = _make_client(host, port, path, use_quic, tls_disable_verify,
                           debug, supported_drafts=supported_drafts)
     try:
@@ -1528,6 +1610,7 @@ async def test_publish_track_only(host, port, path, use_quic,
                 sessions["publisher"] = _session_meta(session)
                 pub_msg = session.publish(namespace=INTEROP_NAMESPACE,
                                           track_name=INTEROP_TRACK)
+                reply = _publish_reply(session, pub_msg.request_id)
                 await session._await_response(pub_msg.request_id)
                 session.subscribe_done(
                     request_id=pub_msg.request_id,
@@ -1541,13 +1624,13 @@ async def test_publish_track_only(host, port, path, use_quic,
             sessions=sessions,
             message="PUBLISH_OK received, PUBLISH_DONE sent")
     except Exception as e:
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name=name, passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected="PUBLISH_OK",
-            received=_format_exc(e))
+            received=_format_exc(e)), reply)
 
 
 async def test_publish_track_subscribe(host, port, path, use_quic,
@@ -1563,6 +1646,7 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
     sessions = {}
     received = []
     enough = asyncio.Event()
+    reply = None
 
     def _on_object(msg, *_):
         received.append(msg.object_id)
@@ -1589,6 +1673,10 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                 track._quiet = True
                 track._stats_header_printed = True
                 await track.publish(publish_track=True)
+                reply = _publish_reply(pub_session, track.request_id, track)
+                # The relay holds the track only once it has answered; a
+                # SUBSCRIBE on another connection can overtake the PUBLISH.
+                await asyncio.wait({reply}, timeout=_PUBLISH_REPLY_WAIT)
 
                 async with sub_client.connect() as sub_session:
                     await sub_session.client_session_init()
@@ -1606,16 +1694,16 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                     sub_session.close()
                 pub_session.close()
     except Exception as e:
-        return TestResult(
+        return _skip_unsupported_publish(TestResult(
             name=name, passed=False,
             duration_ms=(time.monotonic() - t0) * 1000,
             sessions=sessions,
             message=f"Failed: {_format_exc(e)}",
             expected=f"SUBSCRIBE_OK and {_PUBLISHED_OBJECTS} objects",
-            received=_format_exc(e))
+            received=_format_exc(e)), reply)
 
     passed = len(received) >= _PUBLISHED_OBJECTS
-    return TestResult(
+    return _skip_unsupported_publish(TestResult(
         name=name, passed=passed,
         duration_ms=(time.monotonic() - t0) * 1000,
         sessions=sessions,
@@ -1624,7 +1712,7 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
                  f"{len(received)} of {_PUBLISHED_OBJECTS} objects within "
                  f"{_DATA_DELIVERY_S:g}s"),
         expected=f"{_PUBLISHED_OBJECTS} objects",
-        received=f"{len(received)} objects")
+        received=f"{len(received)} objects"), reply)
 
 
 # ---------------------------------------------------------------------------
@@ -1741,6 +1829,7 @@ def parse_args():
             "sent); some anonymous-scope relays reject any AUTH_TOKEN."
         ),
     )
+    add_logging(parser)
     add_help(parser)
     return parser.parse_args()
 
@@ -1779,13 +1868,23 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
             reporter.notes.append(
                 "preference probe: no offered draft reached SETUP; "
                 f"trying draft-{effective_draft}")
-    for test_name in tests:
+    reporter.begin(len(tests))
+    # Set once SETUP cannot complete: the remaining cases fail unrun.
+    no_setup = ""
+    for i, test_name in enumerate(tests):
         fn = TEST_FUNCTIONS.get(test_name)
         if fn is None:
             reporter.add(TestResult(
                 name=test_name, passed=True, skipped=True,
                 skip_reason="Unknown test case",
             ))
+            continue
+        if no_setup:
+            result = TestResult(name=test_name, passed=False,
+                                message=f"not run: {no_setup}")
+            reporter.add(result)
+            print(f"  [FAIL] {result.name}: {result.message}",
+                  file=sys.stderr)
             continue
         INTEROP_NAMESPACE = f"{base_namespace}/{test_name}"
         nc_before = MOQTMessage._trailing_extensions_truncation_count
@@ -1820,6 +1919,14 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
         status = "PASS" if result.passed else "FAIL"
         tag = " (COMPAT)" if result.compat else ""
         print(f"  [{status}{tag}] {result.name}: {result.message}", file=sys.stderr)
+        # A second attempt confirms SETUP cannot complete.
+        if (test_name == "setup-only" and not result.passed
+                and i < len(tests) - 1
+                and not await _probe_setup_ok(
+                    host, port, path, use_quic, tls_disable_verify, debug,
+                    draft=effective_draft)):
+            no_setup = ("SETUP did not complete: "
+                        f"{result.received or result.message}")
     return reporter
 
 
@@ -1846,8 +1953,7 @@ def main():
             args.draft = usable
 
     # Configure logging
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    log_level = apply_logging(args)
     logging.basicConfig(level=log_level, stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")
 
@@ -1871,6 +1977,8 @@ def main():
     # control-message dispatcher (default policy).
     if _compat_active(compat, "lenient-extensions"):
         MOQTMessage._tolerate_trailing_extensions = True
+    if _compat_active(compat, "missing-request-credit"):
+        _MOQTSessionMixin._tolerate_missing_request_credit = True
 
     # Apply namespace prefix and auth-token, if set, before the
     # tests capture INTEROP_NAMESPACE / _PUB_NS_PARAMS from module
@@ -1909,6 +2017,7 @@ def main():
         target_url=args.relay,
         aiomoqt_version=AIOMOQT_VERSION,
         compat=compat,
+        stream=sys.stdout,
     )
 
     # Select tests
@@ -1933,8 +2042,7 @@ def main():
         print("\n# Interrupted.", file=sys.stderr)
         sys.exit(130)
 
-    # TAP output to stdout
-    print(reporter.report())
+    reporter.end()
 
     # Exit code
     all_passed = all(r.passed for r in reporter.results)

@@ -191,7 +191,7 @@ async def _loopback(port, draft, subscribe_handler=None, use_quic=True):
     peer = asyncio.get_running_loop().create_future()
 
     async def _on_publish_namespace(session, msg):
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 

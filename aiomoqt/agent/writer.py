@@ -312,7 +312,8 @@ def build_writer(session: Any, spec: PublishSpec, *,
 
     A declared publisher priority is mapped to a transport byte once,
     here — constant for the track's life, so it never costs work in the
-    send loop. Undeclared leaves streams at the transport default.
+    send loop. Undeclared takes the track's default band (priority 128,
+    the session's scheduling).
     """
     check_supported(spec)
     mapping = _MAPPINGS.get(spec.mapping)

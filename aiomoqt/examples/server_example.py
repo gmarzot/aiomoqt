@@ -10,8 +10,8 @@ from aiomoqt.utils.logger import get_logger, set_log_level
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MOQT WebTransport Server', add_help=False)
-    parser.add_argument('--bind', dest='host', type=str, default='localhost',
-                        help='Bind address (default: localhost)')
+    parser.add_argument('--bind', dest='host', type=str, default=None,
+                        help='Bind address (default: all interfaces, IPv4 and IPv6)')
     parser.add_argument('-p', '--port', type=int, default=4433,
                         help='Listen port (default: 4433)')
     parser.add_argument('-Q', '--quic', action='store_true',
@@ -28,9 +28,8 @@ def parse_args():
     parser.add_argument('--quic-debug', action='store_true',  help='Enable quic debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
     parser.add_argument('--cc-algo', type=str, default='bbr',
-                        help='Congestion control algorithm '
-                             '(bbr | bbr1 | newreno | cubic | dcubic | '
-                             'prague | fast). Default: bbr')
+                        help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                             'dcubic | fast | newreno | prague). Default: bbr')
 
     add_help(parser)
     return parser.parse_args()
@@ -55,12 +54,12 @@ async def main(args):
     try:
         # run until closed
         if args.quic and args.wt:
-            quic_server = await server.serve_dual()
+            await server.serve_dual()
         else:
-            quic_server = await server.serve()
+            await server.serve()
 
         await server.closed()
-            
+
     except Exception as e:
         logger.error(f"MOQT server: session exception: {e}")
     finally:
@@ -70,6 +69,6 @@ if __name__ == "__main__":
     try:
         args = parse_args()
         asyncio.run(main(args), debug=args.debug)
-    
+
     except KeyboardInterrupt:
         pass

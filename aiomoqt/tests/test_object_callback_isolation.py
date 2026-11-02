@@ -99,7 +99,6 @@ def _serve_datagrams(tasks):
     return on_subscribe
 
 
-# WT datagram TX is not wired, so datagrams run over raw QUIC only.
 @pytest.mark.asyncio
 @pytest.mark.parametrize("draft", _DRAFTS)
 async def test_raising_callback_keeps_the_datagram_batch(draft):

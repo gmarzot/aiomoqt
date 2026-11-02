@@ -107,10 +107,12 @@ async def test_subscriber_sees_the_fin_after_error_and_after_publish_done():
                             verify_tls=False, supported_drafts=18)
         async with client.connect() as session:
             await session.client_session_init()
-            fins = []
+            fins, streams = [], []
             inner = session._on_control_data
 
             def _spy(stream_id, data, end_stream, **kw):
+                if kw.get("is_request_bidi") and stream_id not in streams:
+                    streams.append(stream_id)
                 if end_stream:
                     fins.append(stream_id)
                 return inner(stream_id, data, end_stream, **kw)
@@ -118,13 +120,12 @@ async def test_subscriber_sees_the_fin_after_error_and_after_publish_done():
             session._on_control_data = _spy
             with pytest.raises(MOQTRequestError):
                 await session.subscribe("ns", "reject", wait_response=True)
-            rejected = max(session._bidi_streams.values())
             await session.subscribe("ns", "ok", wait_response=True)
-            done = max(session._bidi_streams.values())
             for _ in range(100):
-                if rejected in fins and done in fins:
+                if len(streams) == 2 and set(streams) <= set(fins):
                     break
                 await asyncio.sleep(0.02)
+            rejected, done = streams
             assert rejected in fins and done in fins
             assert session._close_err is None
     finally:
