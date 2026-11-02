@@ -11,6 +11,7 @@
 - pub_media `--loop` with several mp4s loops every track on the shortest clip, with a WARNING.
 - sub_media writes `<name>.h264` per LOC video track when there are several.
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
+- Bench output: a value that rounds up to a unit's limit shows in the next unit (`10Gbps`, not `10.0Gbps`; `1.0ms`, not `1000us`); loopback_bench prints its table header after the subscriber line.
 
 ## v0.14.0
 

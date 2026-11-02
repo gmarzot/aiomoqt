@@ -52,7 +52,7 @@ def parse_args():
         help='Object payload size bytes (default: 4096)')
     parser.add_argument(
         '-g', '--group-size', type=int, default=4096,
-        help='Objects per group (default: 10000)')
+        help='Objects per group (default: 4096)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
         help='Parallel subgroup streams (default: 1)')
@@ -427,7 +427,7 @@ async def run_server(args, tracks):
         congestion_control_options=args.cc_options,
         packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
-        # None = honor protocol default (16 MB); 0 = opt out.
+        # Unset keeps the 1 MiB default; 0 removes the budget.
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
              else args.max_inflight_bytes)}
@@ -470,11 +470,11 @@ async def run_subscriber(args, stats, tracks):
                 timestamp_errors=args.timestamp_errors,
             )
             stats.stats.timing = track.timing
+            # Objects can arrive before subscribe() returns.
+            print("  Subscriber connected, receiving...\n")
             # Loopback server does not send PUBLISH; use direct SUBSCRIBE.
             # Loopback passes explicit trackname → auto-routes to direct.
             await track.subscribe()
-
-            print("  Subscriber connected, receiving...\n")
             stats.start()
 
             if not await wait_cond_timeout(
