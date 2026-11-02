@@ -791,7 +791,7 @@ def main():
     if args.subs is not None:
         fps = args.rate or 30
         ns = args.namespace or "aiomoqt"
-        scenario = {
+        scenario: Dict[str, Any] = {
             "publishers": [{
                 "namespace": ns, "track": args.trackname,
                 "bitrate_kbps": int(args.object_size * fps * 8 / 1000),

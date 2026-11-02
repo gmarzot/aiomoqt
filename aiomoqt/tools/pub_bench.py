@@ -208,6 +208,11 @@ The URL scheme selects the transport:
     return args
 
 
+class _SideTrack(PublishedTrack):
+    """A --catalog or --audio track: no stats table of its own."""
+    _quiet = True
+
+
 def _side_tracks(session, args):
     """The --catalog and --audio tracks: one object per group, so each
     object opens a subgroup stream."""
@@ -217,7 +222,7 @@ def _side_tracks(session, args):
         shapes.append(('audio', AUDIO_OBJECT_SIZE, AUDIO_RATE))
     tracks = []
     for name, size, rate in shapes:
-        t = PublishedTrack(
+        t = _SideTrack(
             session,
             namespace=args.namespace,
             trackname=name,
@@ -227,8 +232,6 @@ def _side_tracks(session, args):
             auth_token=args.auth_token.encode() or None,
             timestamps=args.timestamps,
         )
-        # The video track's stats table is the only one printed.
-        t._quiet = True
         tracks.append(t)
     return tracks
 
