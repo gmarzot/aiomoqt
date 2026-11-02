@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""aiomoqt adaptive bench — single-process feedback-driven ramp.
+"""aiomoqt adaptive bench — feedback-driven load ramp.
 
-Runs a publisher + subscriber pair in one Python process (loopback
-self-test) or against a relay. The publisher's rate is live-mutated
-by a controller task reading subscriber-side samples (p90 latency,
-loss, achieved throughput) out of a shared BenchState. One continuous
-steady-state publisher whose pacing the controller nudges up or down
-per interval — no subprocess-per-step loop.
+bw mode ramps one publisher's rate; subs mode ramps the subscriber count
+on a fixed-rate track. With no URL it is a loopback self-test (one
+process, or pub and sub processes with --mp); against a relay the
+publisher and subscribers always run in worker processes. A controller
+reads subscriber-side samples (p90 latency, achieved throughput,
+delivering subscribers) each interval and nudges one continuous
+publisher, or the subscriber count, up or down.
 
 Load axes are independent CLI flags: --object-size, -P streams,
 --start-mbps, --step-mbps, --max-mbps. With P > 1, each subgroup gets
@@ -16,7 +17,7 @@ regardless of parallelism.
 Usage:
   python -m aiomoqt.tools.adaptive_bench
   python -m aiomoqt.tools.adaptive_bench -P 4 --step-mbps 20
-  python -m aiomoqt.tools.adaptive_bench -r moqt://host:4433 -k --max-mbps 500
+  python -m aiomoqt.tools.adaptive_bench moqt://host:4433 -k --max-mbps 500
 """
 import argparse
 import asyncio
@@ -33,15 +34,18 @@ from typing import Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
-from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
                            parse_draft_spec)
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.certs import (REPO_CERTS_DIR, ensure_self_signed,
+                                 find_cert, find_key)
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.format import fmt_bps, fmt_ms, fmt_ms_signed
+from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
 from aiomoqt.utils.stats import (CLOCK_OFFSET_MARK, CLOCK_OFFSET_MIN_MS,
+                                 KEY_PRUNE_EVERY, KEY_REORDER_SLACK,
                                  note_clock_offset, send_time_us)
-from aiomoqt.utils.logger import set_log_level
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +81,7 @@ class Sample:
     p90_ms: float
     loss_pct: float
     jitter_ms: float
+    latency_known: bool = True
 
 
 @dataclass
@@ -105,7 +110,8 @@ class Signal:
     jitter_ms: float = 0.0
     # Liveness — meaningful in subs-mode; BWActuator fills defaults.
     target_subs: int = 1    # count the actuator is trying to maintain
-    active_subs: int = 1    # subs currently receiving data
+    active_subs: int = 1    # subs currently subscribed
+    delivering_subs: int = 1  # subscribed subs receiving their rate
     failed_subs: int = 0    # new subscribe/reset failures in this interval
     health: str = "ok"      # "ok" | "degraded" | "failing"
     # aiopquic SPSC TX ring depth (bytes queued in the publisher's
@@ -136,6 +142,8 @@ class BenchState:
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ceiling_reason: Optional[str] = None
     ceiling_mbps: Optional[float] = None
+    received_data: bool = False
+    failed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +156,17 @@ class LiveStats:
     def __init__(self, object_size: int, window_s: float = 5.0):
         self.object_size = object_size
         self.window_s = window_s
-        # Each event: (monotonic_t, bytes, latency_ms_or_None)
+        # Each event: (monotonic_t, bytes, latency_ms_or_None, lost),
+        # lost = objects found missing when this one arrived.
         self._events: deque = deque()
-        # Loss tracking per (group_id, subgroup_id). Auto-detect stride
-        # so multi-subgroup streams (PublishedTrack strides object IDs
-        # by num_subgroups per subgroup) aren't falsely reported as loss.
+        # Loss tracking per (group_id, subgroup_id), for groups within
+        # the stats key horizon. Auto-detect stride so multi-subgroup
+        # streams (PublishedTrack strides object IDs by num_subgroups
+        # per subgroup) aren't falsely reported as loss.
         self._last_seen: dict = {}
         self._stride: dict = {}
-        self._lost = 0
+        self._newest_gid = -1
+        self._prune_at = 0
         # Jitter (RFC 3550)
         self._last_recv_ms = 0
         self._last_send_ms = 0
@@ -193,11 +204,7 @@ class LiveStats:
                 self._last_recv_ms = recv_time_us
                 self._last_send_ms = send_us
 
-        self._events.append((t, size_bytes, latency))
-        cutoff = t - self.window_s
-        while self._events and self._events[0][0] < cutoff:
-            self._events.popleft()
-
+        lost = 0
         if not is_status:
             gid = getattr(msg, 'group_id', group_id)
             sid = subgroup_id if subgroup_id is not None else 0
@@ -207,6 +214,11 @@ class LiveStats:
             if last is None:
                 # First object seen on this (group, subgroup)
                 self._last_seen[key] = oid
+                if gid is not None and gid > self._newest_gid:
+                    self._newest_gid = gid
+                    if gid >= self._prune_at:
+                        self._prune(gid - KEY_REORDER_SLACK)
+                        self._prune_at = gid + KEY_PRUNE_EVERY
             else:
                 stride = self._stride.get(key)
                 if stride is None and oid > last:
@@ -215,10 +227,20 @@ class LiveStats:
                     self._stride[key] = stride
                 if stride is not None and stride > 0 and oid > last + stride:
                     # Objects missing on this subgroup's stride
-                    self._lost += (oid - last - stride) // stride
+                    lost = (oid - last - stride) // stride
                 if oid > last:
                     self._last_seen[key] = oid
                 # else: reorder/duplicate within this subgroup — ignore
+
+        self._events.append((t, size_bytes, latency, lost))
+        cutoff = t - self.window_s
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+    def _prune(self, floor: int) -> None:
+        for d in (self._last_seen, self._stride):
+            for k in [k for k in d if k[0] is not None and k[0] < floor]:
+                del d[k]
 
     def sample(self, target_mbps: float) -> Sample:
         t = time.monotonic()
@@ -229,7 +251,8 @@ class LiveStats:
             return Sample(t=t, target_mbps=target_mbps,
                           rx_rate_ops=0.0, rx_bitrate_mbps=0.0,
                           mean_ms=0.0, p90_ms=0.0,
-                          loss_pct=0.0, jitter_ms=self._jitter)
+                          loss_pct=0.0, jitter_ms=self._jitter,
+                          latency_known=False)
 
         window_t = max(0.01, self._events[-1][0] - self._events[0][0])
         n = len(self._events)
@@ -238,8 +261,8 @@ class LiveStats:
         mean = sum(lats) / len(lats) if lats else 0.0
         p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)] if lats else 0.0
 
-        total_expected = n + self._lost
-        loss_pct = 100.0 * self._lost / total_expected if total_expected else 0.0
+        lost = sum(e[3] for e in self._events)
+        loss_pct = 100.0 * lost / (n + lost) if n + lost else 0.0
 
         return Sample(
             t=t,
@@ -250,6 +273,7 @@ class LiveStats:
             p90_ms=p90,
             loss_pct=loss_pct,
             jitter_ms=self._jitter,
+            latency_known=bool(lats),
         )
 
 
@@ -260,14 +284,15 @@ class LiveStats:
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
 
-    Loopback mode (no -r): publisher + subscriber tasks share the main
-    asyncio loop; rate is mutated by writing self.state.rate_ops which
-    the in-process publisher polls. Stats from the in-process LiveStats.
+    Loopback (no URL, no --mp): publisher + subscriber tasks share the
+    main asyncio loop; rate is mutated by writing self.state.rate_ops
+    which the in-process publisher polls. Stats from the in-process
+    LiveStats.
 
-    Relay mode (-r URL): publisher and subscriber each run in their own
-    multiprocessing.Process. Rate flows pub-ward via a rate_queue;
-    stats flow subscriber-ward via events_queue. Aggregated by the
-    actuator into the same Signal shape so the controller is mode-blind.
+    Relay URL or --mp loopback: publisher and subscriber each run in
+    their own multiprocessing.Process. Rate flows pub-ward via a
+    rate_queue; stats flow back via events_queue. Latency is the one
+    subscriber's own windowed p90 from its latest snapshot.
     """
     unit = "Mbps"
 
@@ -293,8 +318,10 @@ class BWActuator:
         self._events_q = mp_events_queue
         self._stop_ev = mp_stop_event
         # rolling stats aggregated from sub-worker events
-        self._mp_lat_window = []  # (t, lat_ms)
         self._mp_rx_window = []   # (t, rx_bytes)
+        # The one subscriber worker's latest windowed latency (its
+        # TrackStats window matches _mp_window_s): (n, mean, p90).
+        self._mp_lat = (0, 0.0, 0.0)
         self._mp_total_lost = 0
         self._mp_total_objs = 0
         self._mp_window_s = 5.0
@@ -359,17 +386,9 @@ class BWActuator:
                 rx_bytes = ev.get('rx_bytes', 0)
                 if rx_bytes:
                     self._mp_rx_window.append((t, rx_bytes))
-                # TrackStats.snapshot() exposes mean/p99 plus a
-                # raw 'lat_samples' tuple if present; otherwise we
-                # synthesize a single sample at the reported mean.
-                samples = ev.get('lat_samples') or ()
-                if samples:
-                    for lat in samples:
-                        self._mp_lat_window.append((t, lat))
-                else:
-                    m = ev.get('lat_mean_ms')
-                    if m is not None:
-                        self._mp_lat_window.append((t, m))
+                self._mp_lat = (ev.get('lat_n', 0),
+                                ev.get('lat_mean_ms', 0.0),
+                                ev.get('lat_p90_ms', 0.0))
                 self._mp_total_objs += ev.get('rx_objs', 0)
                 self._mp_total_lost += ev.get('iv_lost', 0)
                 # Per-sub-id smoothed jitter; aggregate is averaged
@@ -381,9 +400,6 @@ class BWActuator:
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
-        self._mp_lat_window = [
-            (t, lat) for (t, lat) in self._mp_lat_window if t >= cutoff
-        ]
         self._mp_rx_window = [
             (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
         ]
@@ -412,18 +428,12 @@ class BWActuator:
                 tx_mbps=self.state.tx_rate_mbps,
                 rx_mbps=sample.rx_bitrate_mbps,
                 jitter_ms=sample.jitter_ms,
+                latency_known=sample.latency_known,
             )
         # Multiprocess path
         self._drain_events()
         t = time.monotonic()
-        lats = sorted(lat for (_, lat) in self._mp_lat_window
-                      if lat is not None)
-        if lats:
-            mean = sum(lats) / len(lats)
-            p90 = lats[min(int(len(lats) * 0.90), len(lats) - 1)]
-        else:
-            mean = 0.0
-            p90 = 0.0
+        lat_n, mean, p90 = self._mp_lat
         rx_bytes = sum(b for (_, b) in self._mp_rx_window)
         # tx column reports wire-bytes (picoquic ground truth); falls
         # back to queued bytes if the wire counter isn't available.
@@ -460,7 +470,7 @@ class BWActuator:
             tx_ring_depth_bytes=self._mp_tx_ring_depth,
             tx_ring_depth_max_bytes=self._mp_tx_ring_depth_max,
             tx_ring_streams=self._mp_tx_ring_streams,
-            latency_known=bool(lats),
+            latency_known=lat_n > 0,
         )
 
     async def shutdown(self) -> None:
@@ -482,6 +492,12 @@ class BWActuator:
                 pass
 
 
+def _delivering(batch: dict) -> int:
+    """A batch's slots receiving their rate; 'active' from a worker
+    that does not judge delivery."""
+    return int(batch.get('delivering', batch.get('active', 0)))
+
+
 class SubsActuator:
     """Actuator for subscriber-ramp mode.
 
@@ -492,13 +508,18 @@ class SubsActuator:
     spawns/terminates whole workers to reach ceil(level / K). observe()
     drains batch_stats events and aggregates:
 
-      rx_mbps      = sum of per-worker batch rx_mbps (last 1s each)
-      latency      = worst batch p90 across workers
-      loss_pct     = max per-batch loss_pct
-      shortfall    = active_subs < target_subs for 2+ intervals
-      failed_subs  = subs lost to reaped (dead/silent) workers since
-                     the last observe()
-      active_subs  = sum of workers' currently-subscribed slot counts
+      rx_mbps         = sum of per-worker batch rates (rx_bytes / dt)
+      latency         = worst slot p90 across mature workers
+      loss_pct        = max per-batch loss_pct
+      active_subs     = subscribed slots
+      delivering_subs = subscribed slots receiving >= half their rate
+                        over the keep window (judged in the worker)
+      shortfall       = for 2+ ticks, mature delivering slots short of
+                        the mature target, or rx_mbps under
+                        shortfall_ratio x delivering_subs x per_sub_mbps;
+                        or any failed_subs
+      failed_subs     = subs lost to reaped (dead/silent) workers since
+                        the last observe()
 
     Each worker is GIL-isolated. The publisher runs in its own process
     (spawned by the subs-mode entrypoint) so its event loop is never
@@ -515,7 +536,8 @@ class SubsActuator:
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
-                 keep_alive_interval: float | None = None):
+                 shortfall_ratio: float = 0.85,
+                 transport_options: Optional[dict] = None):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -542,7 +564,11 @@ class SubsActuator:
         # decoupled from interval_s so handshake spacing is tunable
         # without changing the report cadence.
         self.stagger = stagger
-        self.keep_alive_interval = keep_alive_interval
+        self.shortfall_ratio = shortfall_ratio
+        # One window for "delivering" (judged in the worker), "active"
+        # and "kept" (not reaped); floored so jitter doesn't reap.
+        self.keep_window = max(3.0, 1.5 * interval_s)
+        self.transport_options = dict(transport_options or {})
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
@@ -623,7 +649,9 @@ class SubsActuator:
                 insecure=self.insecure,
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
-                keep_alive_interval=self.keep_alive_interval,
+                per_sub_mbps=self.per_sub_mbps,
+                keep_window=self.keep_window,
+                **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
             p = self._mp.Process(
@@ -673,18 +701,11 @@ class SubsActuator:
             if msg.get('active', 0) > 0:
                 self._subscribed_ever.add(wid)
 
-        # "Active" subs = subs delivering recently. A worker self-heals
-        # individual drops, so its reported active count is the truth of
-        # how many of its K slots are currently subscribed; we still gate
-        # the worker on recent bytes so a stalled connection's batch
-        # isn't counted as delivering.
+        # A worker reports how many of its K slots are subscribed
+        # ('active') and how many of those receive their rate
+        # ('delivering'); a worker without recent bytes counts for none.
         now = time.monotonic()
-        # ONE window governs both "active" (counted as delivering) and
-        # "kept" (not reaped) — eliminates the limbo band where a worker
-        # is neither active nor reaped and pins shortfall forever. Scaled
-        # with interval, floored so sub-second intervals don't reap on
-        # normal jitter.
-        keep_window = max(3.0, 1.5 * self.interval_s)
+        keep_window = self.keep_window
         bytes_cutoff = now - keep_window
         live_ids = [wid for wid, t in self._last_bytes_t.items()
                     if t >= bytes_cutoff and wid in self._workers]
@@ -727,27 +748,27 @@ class SubsActuator:
         max_loss_pct = 0.0
         jitter_sum = 0.0
         jitter_n = 0
-        active_subs = 0
+        active_subs = delivering_subs = 0
 
         self._t_last_observe = now
 
         for wid in live_ids:
             s = self._latest_batch.get(wid, {})
             active_subs += int(s.get('active', 0))
-            # rx_bytes is the batch's per-snapshot delta (~1s); convert
-            # to Mbps using STATS_INTERVAL_S.
-            rx_bytes = s.get('rx_bytes', 0)
-            rx_bps_total += rx_bytes * 8
+            delivering_subs += _delivering(s)
+            # rx_bytes is the batch's delta over its dt.
+            rx_bps_total += s.get('rx_bytes', 0) * 8 / max(s.get('dt', 1.0), 1e-3)
             # Latency drives the back-off, so only MATURE workers feed it:
             # a worker still in its startup grace is catching up (old
             # send-timestamps -> seconds-scale p90) and would trip the SLA
             # back-off on every group add. Sustained congestion still
             # registers once it matures.
             if (now - self._spawned_t.get(wid, now)) >= startup_grace:
-                worst_p90 = max(worst_p90, s.get('lat_p90_ms', 0.0))
-                worst_mean = max(worst_mean, s.get('lat_mean_ms', 0.0))
-                # A worker with no samples reports 0.0.
-                lat_known |= bool(s.get('lat_p90_ms') or s.get('lat_mean_ms'))
+                if s.get('lat_n', 0) > 0:
+                    p90, mean = s['lat_p90_ms'], s['lat_mean_ms']
+                    worst_p90 = p90 if not lat_known else max(worst_p90, p90)
+                    worst_mean = mean if not lat_known else max(worst_mean, mean)
+                    lat_known = True
             loss_ct = s.get('loss', 0)
             total = s.get('total_objs', 0) or 1
             lpct = 100.0 * loss_ct / (loss_ct + total) if (loss_ct + total) else 0.0
@@ -774,16 +795,22 @@ class SubsActuator:
         # so a partial final batch isn't over-expected. A group that never
         # delivers is still caught by the starve reaper above
         # (failed_this_window), which forces the shortfall independently.
+        # Mature slots count only while delivering their rate.
         mature_active = 0
         mature_target = 0
         for wid in self._workers:
             if (now - self._spawned_t.get(wid, now)) < startup_grace:
                 continue
-            mature_active += int(self._latest_batch.get(wid, {}).get('active', 0))
+            mature_active += _delivering(self._latest_batch.get(wid, {}))
             mature_target += self.batch_size
         mature_target = min(mature_target, target_subs)
 
-        if mature_active < mature_target:
+        # Aggregate check: the delivering subs together receive their rate.
+        rx_mbps = rx_bps_total / 1e6
+        rx_short = (delivering_subs > 0 and rx_mbps < self.shortfall_ratio
+                    * delivering_subs * self.per_sub_mbps)
+        behind = mature_active < mature_target or rx_short
+        if behind:
             self._shortfall_streak += 1
         else:
             self._shortfall_streak = 0
@@ -791,7 +818,7 @@ class SubsActuator:
 
         if failed_this_window > 0:
             health = "failing"
-        elif mature_active < mature_target:
+        elif behind:
             health = "degraded"
         else:
             health = "ok"
@@ -807,10 +834,11 @@ class SubsActuator:
             shortfall=shortfall,
             target_mbps=target_mbps,
             tx_mbps=target_mbps,   # single publisher; assume delivers
-            rx_mbps=rx_bps_total / 1e6,
+            rx_mbps=rx_mbps,
             jitter_ms=avg_jitter_ms,
             target_subs=target_subs,
             active_subs=active_subs,
+            delivering_subs=delivering_subs,
             failed_subs=failed_this_window,
             health=health,
             latency_known=lat_known,
@@ -852,23 +880,31 @@ class SubsActuator:
 # ---------------------------------------------------------------------------
 
 class AIMDController:
-    """Simple additive-increase / multiplicative-decrease policy.
+    """Additive-increase / multiplicative-decrease over a LoadActuator.
 
-    Keeps probing forever. QUIC windows widen under pressure, so a
-    rate that tripped a signal once may be fine a minute later. The
-    controller never locks in a ceiling — it just backs off on a
-    signal and immediately resumes ramping from the lower rate. Exit
-    is user-driven (Ctrl-C) or --max-mbps.
+    Keeps probing: it backs off on a signal and resumes ramping from the
+    lower level, never locking in a ceiling. Ends at the actuator's max
+    level, -t/--duration, Ctrl-C, or rx=0 for 3 intervals (a failure).
 
-    - Every `interval_s`, snapshot metrics and decide.
-    - Ramp: +step_mbps while loss==0 and p50 stays under SLA.
-    - Back off: multiply aggregate by backoff_factor on any signal.
-    - Signals:
-        * loss_pct > loss_threshold_pct in the last window
-        * p90 > latency_threshold_ms for 2 consecutive intervals
-        * achieved rx_bitrate < shortfall_ratio * commanded for 2 intervals
-    - Tracks high_water_mbps = highest stable rate seen so far.
+    - Every tick, observe a Signal and decide.
+    - headroom = (threshold - p90) / threshold; p90 is over a running
+      baseline when skew_safe.
+    - Ramp: initial_step scaled by headroom (full at >= 0.5, zero at
+      0.05) and shrunk by each direction flip; once the step rounds
+      below step_floor, probe +step_floor only at headroom >= 0.5.
+    - p90 over threshold for 2 intervals: back off by up to
+      backoff_factor (less on a shallow overshoot, at most one step),
+      then drain until headroom >= 0.2.
+    - Shortfall: hold; sustained for 3 intervals, bw backs off toward
+      the delivered rate and subs holds and respawns.
+    - Loss is reported, not acted on; in subs mode a slot losing over
+      half its rate stops counting as delivering, which is a shortfall.
+    - high_water: the best delivered level (bw: rx Mbps; subs:
+      delivering subscribers) seen with headroom >= 0.2 and no shortfall.
     """
+
+    BASELINE_SAMPLES = 1024
+    BASELINE_MATURE = 100
 
     def __init__(self, actuator, state: BenchState,
                  interval_s: float, writer=None,
@@ -876,7 +912,8 @@ class AIMDController:
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
-                 tick_s: float | None = None):
+                 tick_s: float | None = None,
+                 skew_safe: bool = False):
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
@@ -894,10 +931,14 @@ class AIMDController:
         self._tpr = max(1, round(self.report_s / self.tick_s))
         self._last_report_t = 0.0
         self.writer = writer
+        self._cpu = cpu_fields() if writer else []
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
         self.duration_s = duration_s
+        # Skew-safe: act on p90 over a running baseline (see _control_p90).
+        self.skew_safe = skew_safe
+        self._p90_seen: deque = deque(maxlen=self.BASELINE_SAMPLES)
         self.shortfall_streak = 0
         self.pressure_streak = 0
         self.hold_intervals = 0
@@ -939,6 +980,7 @@ class AIMDController:
 
             sig = await a.observe()
             self.samples += 1
+            state.received_data |= sig.rx_mbps > 0
 
             if self.samples < 2:
                 self._emit(sig, "warming")
@@ -952,6 +994,7 @@ class AIMDController:
                 if self.no_data_streak >= 3 * self._tpr:
                     state.ceiling_reason = ("no data received — subscribe "
                                             "failed or publisher stalled")
+                    state.failed = True
                     self._emit(sig, "ABORT: rx=0", force=True)
                     state.stop.set()
                     return
@@ -965,20 +1008,13 @@ class AIMDController:
             #   1.0 = idle (p90 = 0), 0.0 = at SLA, <0 = overshoot.
             # p90 is more sensitive than p50 — catches queue build-up
             # sooner while being less noisy than p99.
-            headroom = (self.latency_threshold_ms - sig.latency_p90_ms) \
+            headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
                 / self.latency_threshold_ms
 
-            # Back-off triggers ONLY on sustained p90 latency overshoot.
-            # Loss is reported in the row but never drives the ramp —
-            # we want the bench to reveal the actual throughput/latency
-            # curve, not throttle on transient dips QUIC will recover
-            # from on its own. Shortfall is tolerated for transients
-            # but HOLDS the ramp when sustained (see below): delivery
-            # structurally below command means a producer/CPU wall, and
-            # ramping past it only inflates the target into fiction.
-            # First bad latency interval just 'watches' — back off
-            # after two consecutive overshoots so transient RTT spikes
-            # don't trigger a cliff.
+            # Back off on sustained p90 overshoot; the first bad interval
+            # only watches, so a transient RTT spike is not a cliff. Loss
+            # does not drive the ramp directly. Shortfall holds the ramp
+            # (see below).
             if sig.shortfall:
                 self.shortfall_streak += 1
             else:
@@ -1059,7 +1095,7 @@ class AIMDController:
             if a.unit == "Mbps":
                 observed = sig.rx_mbps
             else:
-                observed = float(sig.active_subs)
+                observed = float(sig.delivering_subs)
             if (observed > self.high_water
                     and headroom >= 0.2
                     and not sig.shortfall):
@@ -1125,6 +1161,23 @@ class AIMDController:
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
+    def _control_p90(self, sig: Signal) -> float:
+        """The p90 the controller acts on: absolute, or when skew-safe
+        over a baseline (min p90 seen, its 1st percentile once mature)
+        that cancels a constant clock offset between hosts."""
+        if not self.skew_safe:
+            return sig.latency_p90_ms
+        if not sig.latency_known:
+            return 0.0
+        seen = self._p90_seen
+        seen.append(sig.latency_p90_ms)
+        if len(seen) < self.BASELINE_MATURE:
+            baseline = min(seen)
+        else:
+            ordered = sorted(seen)
+            baseline = ordered[len(ordered) // 100]
+        return sig.latency_p90_ms - baseline
+
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
         ticks at tick_s (= --join-rate in subs mode), but rows print at
@@ -1143,6 +1196,7 @@ class AIMDController:
                 f"{sig.latency_mean_ms:.2f}",
                 f"{sig.latency_p90_ms:.2f}",
                 f"{sig.loss_pct:.3f}",
+                *self._cpu,
             ])
         self._print_row(sig, action)
 
@@ -1179,11 +1233,13 @@ class AIMDController:
         actual_span = 7 + 2 + 7 + (3 + 5 if has_subs else 0)
         latency_span = 6 + 2 + 6 + 2 + 6
         time_pad = 10
+        lat_title = ("Latency (worst sub)" if has_subs
+                     else "Latency (window)")
         print(
             f"  {' '*time_pad}"
             f"{'Target'.center(target_span)}    │  "
             f"{'Actual'.center(actual_span)}  │  "
-            f"{'Latency'.center(latency_span)}  │"
+            f"{lat_title.center(latency_span)}  │"
         )
         if has_subs:
             print(
@@ -1224,7 +1280,7 @@ class AIMDController:
             print(
                 f"  {int(round(t_rel)):>5d}s     "
                 f"{bw:<7}    {sig.target_subs:<5}  │  "
-                f"{tx:<7}  {rx:<7}   {sig.active_subs:<5}  │  "
+                f"{tx:<7}  {rx:<7}   {sig.delivering_subs:<5}  │  "
                 f"{mean:<6}  {p90:<6}  {jit:<6}  │  "
                 f"{f'{sig.loss_pct:.1f}%':<5}  {action}",
                 flush=True,
@@ -1248,19 +1304,8 @@ class AIMDController:
 # Loopback server: consumer role, hosts the PublishedTrack.
 # ---------------------------------------------------------------------------
 
-def _find_default_cert():
-    candidates = [
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
-
-
-CERT = _find_default_cert()
-KEY = CERT.replace('cert.pem', 'key.pem') if CERT else None
+CERT = find_cert([REPO_CERTS_DIR])
+KEY = find_key(CERT)
 
 
 async def run_loopback_server(args, state: BenchState):
@@ -1275,14 +1320,14 @@ async def run_loopback_server(args, state: BenchState):
         # PublishedTrack.rate is AGGREGATE across subgroups (the track
         # divides by num_subgroups in its send loop) — pass rate_ops
         # straight through.
-        track = PublishedTrack(
+        from aiomoqt.utils.workers import bench_track
+        track = bench_track(
             session,
-            namespace=args.namespace,
-            trackname=args.trackname,
-            object_size=args.scenario.object_size,
-            group_size=args.group_size,
-            num_subgroups=args.scenario.subgroups,
+            dict(namespace=args.namespace, trackname=args.trackname,
+                 object_size=args.scenario.object_size,
+                 group_size=args.group_size, **_video_cfg(args)),
             rate=state.rate_ops,
+            num_subgroups=args.scenario.subgroups,
         )
         # Silence the per-track stats printer — we print our own.
         track._quiet = True
@@ -1327,12 +1372,7 @@ async def run_loopback_server(args, state: BenchState):
         host="localhost", port=args.port,
         certificate=args.cert, private_key=args.key,
         path="",
-        congestion_control_algorithm=args.cc_algo,
-        tx_max_queued_bytes=args.max_queued_bytes,
-        **({'tx_max_inflight_bytes':
-            (None if args.max_inflight_bytes == 0
-             else args.max_inflight_bytes)}
-           if args.max_inflight_bytes is not None else {}),
+        **_cli.transport_kwargs(args),
     )
     server.register_handler(
         MOQTMessageType.SUBSCRIBE, partial(_on_subscribe))
@@ -1354,7 +1394,7 @@ async def run_subscriber_client(host: str, port: int, path: str,
         use_quic=use_quic,
         verify_tls=verify_tls,
         supported_drafts=args.draft,
-        congestion_control_algorithm=args.cc_algo,
+        **_cli.transport_kwargs(args),
     )
     try:
         async with client.connect() as session:
@@ -1393,92 +1433,6 @@ async def run_subscriber_client(host: str, port: int, path: str,
 
 
 # ---------------------------------------------------------------------------
-# Relay-mode publisher: a second MOQTClient that publishes bench.load at
-# a rate driven by state.rate_ops. Used when -r URL is passed (no local
-# loopback server).
-# ---------------------------------------------------------------------------
-
-async def run_publisher_client(host: str, port: int, path: str,
-                               use_quic: bool, verify_tls: bool,
-                               args,
-                               state: BenchState):
-    client = MOQTClient(
-        host, port,
-        path=path,
-        use_quic=use_quic,
-        verify_tls=verify_tls,
-        supported_drafts=args.draft,
-        congestion_control_algorithm=args.cc_algo,
-        tx_max_queued_bytes=args.max_queued_bytes,
-        **({'tx_max_inflight_bytes':
-            (None if args.max_inflight_bytes == 0
-             else args.max_inflight_bytes)}
-           if args.max_inflight_bytes is not None else {}),
-    )
-    try:
-        async with client.connect() as session:
-            await session.client_session_init()
-            # PublishedTrack.rate is AGGREGATE across subgroups — no
-            # pre-division (the track divides in its send loop).
-            track = PublishedTrack(
-                session,
-                namespace=args.namespace,
-                trackname=args.trackname,
-                object_size=args.scenario.object_size,
-                group_size=args.group_size,
-                num_subgroups=args.scenario.subgroups,
-                rate=state.rate_ops,
-            )
-            track._quiet = True
-            track._stats_header_printed = True
-
-            async def _rate_sync():
-                last = -1.0
-                last_bytes = track._total_bytes
-                last_t = time.monotonic()
-                tick = 0
-                while not state.stop.is_set():
-                    await asyncio.sleep(0.05)
-                    if state.rate_ops != last:
-                        track.rate = (state.rate_ops
-                                      / max(1, args.scenario.subgroups))
-                        last = state.rate_ops
-                    tick += 1
-                    if tick >= 20:  # ~1s at 50ms tick
-                        tick = 0
-                        now = time.monotonic()
-                        cur_bytes = track._total_bytes
-                        dt = now - last_t
-                        if dt > 0:
-                            state.tx_rate_mbps = (cur_bytes - last_bytes) \
-                                * 8.0 / (dt * 1e6)
-                        last_t = now
-                        last_bytes = cur_bytes
-
-            sync = asyncio.create_task(_rate_sync())
-            try:
-                await track.publish(
-                    announce_namespace=(args.pub_ns or args.pub_both),
-                    publish_track=(not args.pub_ns or args.pub_both),
-                )
-                # Keep the session alive until the controller stops us.
-                # track.publish() only emits PUB_NS / PUBLISH; data flow
-                # happens in response to incoming SUBSCRIBE.
-                while not state.stop.is_set():
-                    await asyncio.sleep(0.2)
-            finally:
-                sync.cancel()
-                try:
-                    await sync
-                except (asyncio.CancelledError, Exception):
-                    pass
-                session.close()
-    except Exception as e:
-        print(f"  publisher error: {e}")
-        state.stop.set()
-
-
-# ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1488,18 +1442,22 @@ def parse_args():
         description="aiomoqt adaptive bench — feedback-driven bitrate ramp",
     )
     p.add_argument("-s", "--object-size", type=int, default=4096,
-                   metavar="B", help="bytes per MoQT object (default: 4096)")
+                   metavar="B", action=_cli.StoreGiven,
+                   help="bytes per MoQT object (default: 4096)")
     p.add_argument("-P", "--streams", type=int, default=1,
+                   action=_cli.StoreGiven,
                    help="parallel subgroup streams (default: 1)")
     p.add_argument("-g", "--group-size", type=int, default=4096,
-                   dest="group_size",
-                   help="objects per group (default: 10000)")
+                   dest="group_size", action=_cli.StoreGiven,
+                   help="objects per group (default: 4096)")
+    _cli.add_video(p)
     p.add_argument("--start-mbps", type=float, default=10.0,
                    help="initial aggregate bitrate (default: 10)")
     p.add_argument("--step-mbps", type=float, default=10.0,
                    help="ramp step size (default: 10)")
     p.add_argument("--max-mbps", type=float, default=10000.0,
-                   help="cap; controller stops on signal first (default: 10000)")
+                   help="bw-mode cap; the run ends on reaching it "
+                        "(default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
     p.add_argument("--draft", type=parse_draft_spec, default=None,
@@ -1527,9 +1485,9 @@ def parse_args():
                    metavar="PORT",
                    help="Loopback listen port (default: 4435)")
     p.add_argument("--mp", action="store_true", dest="mp_loopback",
-                   help="Run this role across separate processes rather "
-                        "than one (use when measuring TX ceilings — a "
-                        "single process is GIL-bound).")
+                   help="Loopback self-test: run publisher and subscriber "
+                        "in separate processes (a single process is "
+                        "GIL-bound). Relay runs always do.")
     p.add_argument("--role", choices=("both", "pub", "sub"),
                    default="both",
                    help="Which end(s) this process runs (default: both). "
@@ -1563,10 +1521,12 @@ def parse_args():
                         "Also the batch size: one worker process hosts a "
                         "group of this many self-healing subscriptions.")
     p.add_argument("--max-subs", type=int, default=200,
-                   help="subs-mode: cap (default: 200)")
+                   help="subs-mode: cap; the run ends on reaching it "
+                        "(default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
+                   action=_cli.StoreGiven,
                    help="subs-mode: fixed per-track publisher bitrate "
-                        "(default: 10 Mbps)")
+                        "(default: 10 Mbps; with --video, the profile's)")
     p.add_argument("-j", "--join-rate", type=float, default=None,
                    dest="join_rate", metavar="SEC",
                    help="subs-mode: seconds between subscriber GROUPS "
@@ -1605,11 +1565,9 @@ def parse_args():
                         "worker (publisher / subscriber) gets a "
                         "process-suffixed file: PATH.pub.<pid>, "
                         "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--cc-algo", type=str, default=None,
-                   help="Congestion control algorithm "
-                        "(bbr | bbr1 | newreno | cubic | dcubic | "
-                        "prague | fast). Default: aiopquic default "
-                        "(bbr1)")
+    p.add_argument("--cc-algo", type=str, default="bbr",
+                   help="Congestion control (bbr | bbr1 | c4 | cubic | "
+                        "dcubic | fast | newreno | prague). Default: bbr")
     p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
                    help="QUIC keep-alive interval in seconds (PING) so a "
                         "flow-controlled, consumer-stalled connection "
@@ -1628,6 +1586,7 @@ def parse_args():
                         "one stream's un-transmitted bytes exceed this. "
                         "Default: aiomoqt default (1 MiB). "
                         "Pass 0 to disable.")
+    _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
 
@@ -1653,10 +1612,9 @@ def parse_args():
                 "— subscribe/unsubscribe rate-encoded or additive "
                 "layer tracks — so no out-of-band channel is needed.)")
 
-    # Absolute latency is measured as recv_clock - peer send timestamp:
-    # co-located that is one clock, split it inherits the hosts' offset
-    # straight into the controller's back-off signal. Jitter (a
-    # difference of differences) and shortfall (a count) are immune.
+    # Latency is recv_clock - peer send timestamp: split across hosts it
+    # carries their clock offset, so the controller acts on p90 over a
+    # running baseline instead (AIMDController skew_safe).
     args.skew_safe_signals = args.role != "both"
 
     args.sub_filter = filter_choices[args.sub_filter]
@@ -1672,6 +1630,16 @@ def parse_args():
     if args.trackname is None:
         args.trackname = f"adaptive-bench-{uuid.uuid4().hex[:4]}"
 
+    if args.video:
+        # A profile has a fixed bitrate: nothing for bw mode to ramp.
+        if args.mode != "subs":
+            p.error("--video is subs-mode only: bw mode ramps the "
+                    "publisher's bitrate, which a video profile fixes")
+        if "sub_mbps" in _cli.given(args):
+            p.error("--video sets the track's bitrate; drop --sub-mbps")
+        _cli.check_video(p, args)
+        args.sub_mbps = args.object_size * 8 * args.video_fps / 1e6
+
     args.scenario = Scenario(
         object_size=args.object_size,
         subgroups=args.streams,
@@ -1684,6 +1652,13 @@ def parse_args():
     return args
 
 
+def _video_cfg(args) -> dict:
+    """Worker config keys for a --video publisher; empty without one."""
+    if not args.video:
+        return {}
+    return dict(video=args.video, video_fps=args.video_fps)
+
+
 def _print_banner(args):
     sc = args.scenario
     pub_mode = ("PUB-BOTH" if args.pub_both
@@ -1694,6 +1669,7 @@ def _print_banner(args):
     print("  aiomoqt adaptive bench")
     print("─" * 68)
     print(f"  host:               {platform.node()} ({platform.machine()})")
+    print(f"  cpu:                {cpu_summary()}")
     if args.relay_url:
         from aiomoqt.utils.url import parse_relay_url
         relay = parse_relay_url(args.relay_url)
@@ -1704,14 +1680,21 @@ def _print_banner(args):
     else:
         print(f"  relay:              loopback self-test ({draft_s})")
     print(f"  trackname:          {args.namespace}/{args.trackname}")
-    publish_parts = [pub_mode, f"obj={sc.object_size}B", f"P={sc.subgroups}"]
+    publish_parts = [pub_mode,
+                     (f"video={args.video} gop={args.group_size}"
+                      f" obj={sc.object_size}B mean" if args.video
+                      else f"obj={sc.object_size}B"),
+                     f"P={sc.subgroups}"]
     if args.mode == "subs":
         publish_parts.append(f"rate={args.sub_mbps:.1f}Mbps")
     print(f"  publish:            {', '.join(publish_parts)}")
     if args.mode == "subs":
         cli_name = args.sub_filter.name.lower().replace("_", "-")
         print(f"  subscribe filter:   {cli_name}")
-    print(f"  latency threshold:  {args.latency_threshold:.0f} ms")
+    print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
+          + (" over baseline (split hosts)" if args.skew_safe_signals
+             else ""))
+    print(f"  transport:          {_cli.describe_transport(args)}")
     print("─" * 68)
     print()
     print()
@@ -1736,6 +1719,7 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
     print(f"  Samples:     {samples}")
+    print(f"  Host:        {cpu_summary()}")
     print("═" * 68)
 
 
@@ -1756,37 +1740,62 @@ async def _run_fixed_publisher(args) -> int:
         object_size=args.scenario.object_size,
         group_size=args.group_size,
         num_subgroups=args.scenario.subgroups,
+        **_video_cfg(args),
         initial_rate_ops=args.scenario.aggregate_ops(args.sub_mbps),
         pub_ns=args.pub_ns, pub_both=args.pub_both,
-        debug=args.debug, keep_alive_interval=args.keepalive,
+        debug=args.debug,
+        **_cli.transport_kwargs(args),
     )
     proc = mp.Process(target=pub_worker_entry,
                       args=(cfg, stop, rate_q, events_q), daemon=True)
     proc.start()
     print(f"  role=pub — publishing {args.namespace}/{args.trackname} "
           f"at {args.sub_mbps} Mbps; run the subscriber host with:")
+    shape = (f"--video {args.video} -g {args.group_size}" if args.video
+             else f"--sub-mbps {args.sub_mbps}")
     print(f"    moq-adaptive-bench {args.relay_url} --mode subs "
-          f"--role sub -N {args.namespace} -T {args.trackname} "
-          f"--sub-mbps {args.sub_mbps}")
+          f"--role sub -N {args.namespace} -T {args.trackname} {shape}")
+    published = failed = interrupted = False
+
+    def drain_health():
+        nonlocal published, failed
+        from queue import Empty
+        while True:
+            try:
+                event = events_q.get_nowait()
+            except Empty:
+                break
+            if event.get('kind') == 'pub_stats':
+                published = True
+            elif event.get('kind') == 'pub_health':
+                published |= event.get('state') == 'published'
+                failed |= event.get('state') == 'failed'
+
     try:
         deadline = (time.monotonic() + args.duration
                     if args.duration else None)
         while proc.is_alive():
+            drain_health()
+            if failed:
+                break
             if deadline and time.monotonic() >= deadline:
                 break
             await asyncio.sleep(0.5)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        interrupted = True
     finally:
         stop.set()
         proc.join(timeout=5.0)
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=2.0)
+        drain_health()
         for q in (events_q, rate_q):
             q.cancel_join_thread()
     print("  publisher stopped")
-    return 0
+    if interrupted:
+        return 130
+    return int(failed or not published or proc.exitcode != 0)
 
 
 async def main():
@@ -1796,13 +1805,14 @@ async def main():
     relay_mode = args.relay_url is not None
     # Default to loopback self-test if neither mode flag given
     loopback_port = args.loopback_port or 4435
+    _cli.apply_logging(args)
+    if not relay_mode and not args.cert and not args.key:
+        args.cert, args.key = ensure_self_signed()
     if not relay_mode and (not args.cert or not args.key):
         print("  error: TLS cert/key not found. Set --cert / --key or place "
               "cert.pem/key.pem under <project>/certs/",
               file=sys.stderr)
         return 2
-
-    set_log_level(__import__('logging').WARNING)
 
     state = BenchState()
     stats = LiveStats(object_size=args.scenario.object_size,
@@ -1815,9 +1825,12 @@ async def main():
     if args.report:
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
+        # bw: the subscriber's windowed latency; subs: the worst slot's.
+        lat_cols = (["win_mean_ms", "win_p90_ms"] if args.mode == "bw"
+                    else ["worst_mean_ms", "worst_p90_ms"])
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
-            "mean_ms", "p90_ms", "loss_pct",
+            *lat_cols, "loss_pct", *CPU_FIELDS,
         ])
 
     mp_cleanup_queues: list = []
@@ -1847,7 +1860,8 @@ async def main():
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,
-            keep_alive_interval=args.keepalive,
+            shortfall_ratio=args.shortfall_ratio,
+            transport_options=_cli.transport_kwargs(args),
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
@@ -1887,9 +1901,11 @@ async def main():
                     object_size=args.scenario.object_size,
                     group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
+                    **_video_cfg(args),
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
                     debug=args.debug,
+                    **_cli.transport_kwargs(args),
                 )
                 sub_cfg = dict(
                     sub_id=0,
@@ -1901,6 +1917,7 @@ async def main():
                     force_quic=False,
                     sub_filter=int(FilterType.LATEST_OBJECT),
                     debug=args.debug,
+                    **_cli.transport_kwargs(args),
                 )
                 pub_proc = mp.Process(
                     target=loopback_server_entry,
@@ -1918,6 +1935,7 @@ async def main():
                     object_size=args.scenario.object_size,
                     group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
+                    **_video_cfg(args),
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.scenario.start_mbps),
                     pub_ns=args.pub_ns,
@@ -1925,6 +1943,7 @@ async def main():
                     debug=args.debug,
                     keylogfile=(f"{args.keylogfile}.pub"
                                 if args.keylogfile else None),
+                    **_cli.transport_kwargs(args),
                 )
                 sub_cfg = dict(
                     sub_id=0,
@@ -1938,6 +1957,7 @@ async def main():
                     debug=args.debug,
                     keylogfile=(f"{args.keylogfile}.sub"
                                 if args.keylogfile else None),
+                    **_cli.transport_kwargs(args),
                 )
                 pub_proc = mp.Process(
                     target=pub_worker_entry,
@@ -1969,6 +1989,7 @@ async def main():
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
         tick_s=(args.join_rate if args.mode == "subs" else None),
+        skew_safe=args.skew_safe_signals,
     )
 
     server = None
@@ -1981,6 +2002,7 @@ async def main():
     subs_pub_proc = None
     subs_pub_stop = None
     lag_task = None
+    interrupted = False
     try:
         if relay_mode or (args.mode == "bw" and args.mp_loopback):
             if args.mode == "bw" and pub_proc is not None and sub_proc is not None:
@@ -2047,12 +2069,13 @@ async def main():
                     object_size=args.scenario.object_size,
                     group_size=args.group_size,
                     num_subgroups=args.scenario.subgroups,
+                    **_video_cfg(args),
                     initial_rate_ops=args.scenario.aggregate_ops(
                         args.sub_mbps),
                     pub_ns=args.pub_ns,
                     pub_both=args.pub_both,
                     debug=args.debug,
-                    keep_alive_interval=args.keepalive,
+                    **_cli.transport_kwargs(args),
                 )
                 subs_pub_proc = mp.Process(
                     target=pub_worker_entry,
@@ -2130,7 +2153,7 @@ async def main():
         try:
             await ctrl_task
         except asyncio.CancelledError:
-            pass
+            interrupted = True
     finally:
         state.stop.set()
         if lag_task is not None:
@@ -2176,7 +2199,9 @@ async def main():
         if csv_file:
             csv_file.close()
         _print_summary(state, controller, controller.samples, args)
-    return 0
+    if interrupted:
+        return 130
+    return int(state.failed or not state.received_data)
 
 
 def cli():
@@ -2185,10 +2210,8 @@ def cli():
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        print("\n  Interrupted.")
+    cli()

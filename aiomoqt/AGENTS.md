@@ -22,7 +22,8 @@ Do not reach into `_MOQTSessionMixin` or the other `_`-prefixed classes in `prot
 
 ## Drafts
 
-MoQT drafts 14, 16, 18, 20 and 22 are supported; odd-numbered drafts are not. Draft numbers are
+MoQT drafts 14, 16, 18, 20 and 22 are supported; odd-numbered drafts are not. Draft 14 is
+deprecated and will be removed in 0.15.0. Draft numbers are
 plain ints (`draft=18`, `supported_drafts=[18, 16]`). Clients offer newest-first
 `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)` unless told otherwise; tools take `--draft`.
 
@@ -42,22 +43,54 @@ A dialed URL's scheme selects the transport: `moqt://host:port/path` is raw QUIC
 `-W` (WebTransport), or both on one port. `moq-interop-client` follows the interop runner's
 flags instead. `-h` (also `-?`, `--help`) prints help on every tool.
 
+## Logging
+
+Levels: ERROR, WARNING, INFO (one line per session event and control message), DEBUG (second
+views, transport plumbing, per-stream lifecycle; bounded however many objects flow) and TRACE
+(`aiomoqt.utils.logger.TRACE`, 5: per object, per chunk, per datagram, wire hex). Category
+loggers, stable names: `aiomoqt.control`, `aiomoqt.data`, `aiomoqt.fetch`, `aiomoqt.transport`,
+`aiomoqt.relay`; other lines use module loggers (`aiomoqt.protocol`, ...). aiomoqt loggers do not
+propagate to the root logger: attach a handler with `aiomoqt.utils.logger.set_log_handler()`.
+
+Tools take `--log-level {error,warning,info,debug,trace}` (`-d` = `debug`) and `--log
+CAT=LEVEL[,...]`, e.g. `--log data=trace`. The `AIOMOQT_LOG` environment variable takes the same
+spec, plus a bare `LEVEL` for every logger (`AIOMOQT_LOG=debug,data=trace`); tool flags win. In
+code: `set_log_level(level)` and `set_logger_levels({"data": "trace"})`, or
+`configure_logging(level, spec)`. `moq-interop-relay` steps INFO → DEBUG → TRACE → INFO on
+SIGUSR1.
+
 ## Known traps
 
 - TLS: clients verify the relay's certificate by default. A self-signed relay needs `-k` /
   `verify_tls=False`; a private CA goes in `ca_file=`.
-- Congestion control: aiopquic's default is `bbr1`; `moq-interop-relay` defaults to `cubic`;
-  moqx defaults to BBR2.
-  `--cc-algo` takes `bbr` (v3), `bbr1`, `c4`, `cubic`, `dcubic`, `fast`, `newreno`, `prague`
-  and `reno`. Open theory: BBRv1 ProbeRTT (cwnd floored at 4 packets for ≥200 ms, every 10 s
-  once min-RTT goes stale under jitter) may cause periodic latency spikes on paced flows. It
-  was seen once on a loaded loopback host (10 s-periodic p99 rows of ~70 ms with `bbr1`, none
-  with `newreno`) and is unconfirmed on WAN paths. If you see 10 s-periodic spikes, A/B with
-  `--cc-algo cubic`.
+- Congestion control: the default is `bbr` (BBRv3) everywhere: `MOQTClient`, `MOQTServer`,
+  `aiomoqt-relay`, the tools and the examples, whichever aiopquic is installed.
+  `congestion_control_algorithm=None` defers to a passed `configuration` or to aiopquic's own
+  default. moqx defaults to BBR2. `--cc-algo` takes `bbr`, `bbr1`, `c4`, `cubic`, `dcubic`,
+  `fast`, `newreno`, `prague` and `reno`. `--cc-options` / `congestion_control_options=`
+  passes an option string to that algorithm, e.g. `Q0.02` for bbr's send quantum.
+  `--pacing-trains` / `packet_train_mode=True` lets paced sends release up to 10 packets
+  at once (off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`).
+- Flow-control window: 16 MiB per stream and per connection, so one stream carries at most
+  16 MiB per RTT (2.7 Gbps at 50 ms). `--fc-window` / `flow_control_window=` raises it; the
+  receiver buffers that much per stream.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
+- FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
+  refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
+- Ending a track: a `produce()` track sends End of Track after its last object, then
+  PUBLISH_DONE TRACK_ENDED, when `produce()` returns or on `end()`; `end()` cancels `produce()`
+  at its next await, so keep each object's write whole. A generator track (no `produce()`)
+  resets its open streams on `end()` and sends no End of Track.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
-- `moq-interop-relay` is a conformance and interop fixture, not a production relay: a bounded
-  recent-object cache (8 groups / 32 MiB per track) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
-  but unbounded per-track forwarding queues; no delivery timeout. Its module docstring has the
-  details.
+- `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
+  recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
+  least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
+  and a bounded send lane per subscriber, shedding whole groups (streams reset) from one that falls
+  behind, and logging a `lane stalled` WARNING for one that makes no progress for 10 s;
+  per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,
+  `--max-subscriptions-per-session`), refused past them with EXCESSIVE_LOAD; tracks no subscriber
+  has forwarded for `--pause-after` (60 s) paused upstream until the next one; objects past the
+  OBJECT_DELIVERY_TIMEOUT or MAX_CACHE_DURATION, or live ones past `--lag-limit` (5 s) when
+  neither is set, dropped with their subgroup reset; cached objects past MAX_CACHE_DURATION
+  are fetched upstream, not served. Its module docstring has the details.

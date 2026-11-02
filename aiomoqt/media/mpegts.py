@@ -10,9 +10,12 @@ rather than pipe arrival. Stream types: 0x1B (H.264 Annex-B), 0x24
 others are reported once and ignored.
 """
 import logging
+import statistics
 import time
+from fractions import Fraction
 from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
+from ..utils.timing import MediaTimestamps
 from .sources import _ADTS_FREQ, AnnexBAssembler, HevcAnnexBAssembler
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,12 @@ class TsClock:
         self._pts0: Optional[int] = None
         self._last = 0
         self._wall0_us = 0
+        self._held = False
+
+    def hold(self) -> None:
+        """Keep the current anchor: stamps stay on the PTS schedule even
+        when a unit arrives before its stamp. A restart still re-anchors."""
+        self._held = True
 
     def to_us(self, pts: int) -> int:
         now_us = int(self._now() * 1_000_000)
@@ -65,10 +74,105 @@ class TsClock:
         if pts > self._last:
             self._last = pts
         stamp = self._wall0_us + (pts - self._pts0) * 1000 // 90
-        if stamp > now_us:
+        if stamp > now_us and not self._held:
             self._wall0_us -= stamp - now_us
             stamp = now_us
         return stamp
+
+
+class TsCadence:
+    """A live source's declared fixed cadence (`fps=N[/D],gop=M`): N/D
+    frames per second, a key frame every M frames.
+
+    Video timing per draft-marzot-moq-test-tracks: TIMESCALE 1000 × fps
+    and Object Multiplier 1000, or N and D for a fractional rate (30000
+    and 1001 at 29.97)."""
+
+    def __init__(self, fps: Fraction, gop: int):
+        if fps <= 0 or gop < 1:
+            raise ValueError("fps and gop must be positive")
+        self.fps = fps
+        self.gop = gop
+        if fps.denominator == 1:
+            self.timescale, self.frame_ticks = 1000 * fps.numerator, 1000
+        else:
+            self.timescale, self.frame_ticks = fps.numerator, fps.denominator
+
+    @classmethod
+    def parse(cls, text: str) -> "TsCadence":
+        fields = {}
+        for part in text.split(','):
+            key, sep, value = part.partition('=')
+            if not sep or key.strip() not in ('fps', 'gop'):
+                raise ValueError(f"expected fps=N[/D],gop=M, got {text!r}")
+            fields[key.strip()] = value.strip()
+        if set(fields) != {'fps', 'gop'}:
+            raise ValueError(f"expected fps=N[/D],gop=M, got {text!r}")
+        num, _, den = fields['fps'].partition('/')
+        return cls(Fraction(int(num), int(den or 1)), int(fields['gop']))
+
+    @property
+    def framerate(self) -> float:
+        return round(float(self.fps), 2)
+
+    def video_timestamps(self, wall0_us: int) -> MediaTimestamps:
+        """Mapped timing for video whose first group opens at `wall0_us`."""
+        om = self.frame_ticks if self.gop > 1 else 0
+        return MediaTimestamps(wall0_us, self.timescale,
+                               self.gop * self.frame_ticks, om)
+
+    @staticmethod
+    def audio_timestamps(wall0_us: int, samplerate: int, frame_samples: int,
+                         per_group: int) -> MediaTimestamps:
+        """Mapped timing for audio frames of `frame_samples`, `per_group`
+        to a group, the first opening at `wall0_us`."""
+        om = frame_samples if per_group > 1 else 0
+        return MediaTimestamps(wall0_us, samplerate,
+                               per_group * frame_samples, om)
+
+
+class TsRates:
+    """Catalog values a transport stream does not declare, measured from
+    its units: video frame rate from the PTS spacing, and payload bitrate
+    per kind. Video bitrate spans whole GOPs (key frame to key frame)
+    once `window_s` of media has passed, or any span after five windows;
+    audio spans `window_s`. Values stay None until measured."""
+
+    def __init__(self, window_s: float = 2.0):
+        self.window = int(window_s * 90_000)
+        self.fps: Optional[float] = None
+        self.bps: Dict[str, Optional[int]] = {'video': None, 'audio': None}
+        self._first: Dict[str, int] = {}
+        self._bytes: Dict[str, int] = {'video': 0, 'audio': 0}
+        self._video_pts: List[int] = []
+
+    def add(self, u: TsUnit) -> bool:
+        """Count a unit; True when it completed a measurement."""
+        new = False
+        if u.kind == 'video' and self.fps is None:
+            self._video_pts.append(u.pts)
+            if len(self._video_pts) > 16:
+                steps = [b - a for a, b in zip(self._video_pts,
+                                               self._video_pts[1:])
+                         if b > a]
+                if steps:
+                    self.fps = round(90_000 / statistics.median(steps), 2)
+                    new = True
+        if self.bps[u.kind] is not None:
+            return new
+        first = self._first.get(u.kind)
+        if first is None:
+            if u.kind == 'audio' or u.key:
+                self._first[u.kind] = u.pts
+                self._bytes[u.kind] = len(u.payload)
+            return new
+        span = u.pts - first
+        whole = u.kind == 'audio' or u.key or span >= 5 * self.window
+        if span >= self.window and whole:
+            self.bps[u.kind] = self._bytes[u.kind] * 8 * 90_000 // span
+            return True
+        self._bytes[u.kind] += len(u.payload)
+        return new
 
 
 def adts_split(data: bytes) -> List[Tuple[bytes, int, int, bytes]]:
@@ -176,6 +280,23 @@ def _registered(descriptors: bytes, fourcc: bytes) -> bool:
     return False
 
 
+def _af_stuffed(pkt: bytes, pusi: bool) -> bool:
+    """True when the adaptation field only pads the packet, which a muxer
+    does to the last packet of a PES (ISO 13818-1 §2.4.3.5): stuffing
+    bytes, or a field carrying nothing (indicator flags mark a PES start)."""
+    af_len = pkt[4]
+    if af_len == 0:
+        return True
+    end = 5 + af_len
+    flags = pkt[5]
+    i = 6 + 6 * bool(flags & 0x10) + 6 * bool(flags & 0x08) + bool(flags & 0x04)
+    if flags & 0x02 and i < end:
+        i += 1 + pkt[i]
+    if flags & 0x01 and i < end:
+        i += 1 + pkt[i]
+    return i < end or flags == 0 or (not pusi and not flags & 0x1F)
+
+
 def _pts_at(b: bytes, i: int) -> int:
     return ((((b[i] >> 1) & 7) << 30) | (b[i + 1] << 22)
             | (((b[i + 2] >> 1) & 0x7F) << 15) | (b[i + 3] << 7) | (b[i + 4] >> 1))
@@ -220,6 +341,11 @@ class TsDemuxer:
         self._skip: Set[int] = set()
         self._last_pts: Dict[int, Tuple[int, int]] = {}
         self._video_config: Optional[bytes] = None
+        # Emit a video PES at its stuffed last packet, not the next PUSI.
+        self.eager_video = True
+        self._ended: Set[int] = set()
+        # Samples per audio frame at the audio rate, from the first frame.
+        self.audio_frame_samples: Optional[int] = None
 
     @property
     def has_audio(self) -> Optional[bool]:
@@ -267,8 +393,10 @@ class TsDemuxer:
         if not afc & 1:
             return  # adaptation field only: no payload, CC not advanced
         off = 4
+        stuffed = False
         if afc & 2:
             off += 1 + pkt[4]
+            stuffed = _af_stuffed(pkt, pusi)
         if off >= TS_PACKET:
             return
         payload = pkt[off:]
@@ -288,7 +416,7 @@ class TsDemuxer:
         elif pid == self._pmt_pid:
             self._pmt(payload, pusi)
         elif pid in (self.video_pid, self.audio_pid):
-            self._es(pid, payload, pusi, out)
+            self._es(pid, payload, pusi, out, stuffed)
 
     # ── PSI ─────────────────────────────────────────────────────────
 
@@ -353,23 +481,38 @@ class TsDemuxer:
     # ── PES ─────────────────────────────────────────────────────────
 
     def _es(self, pid: int, payload: bytes, pusi: bool,
-            out: List[TsUnit]) -> None:
+            out: List[TsUnit], stuffed: bool = False) -> None:
         if pusi:
             prev = self._pes.pop(pid, None)
             if prev is not None:
                 self._emit_pes(pid, prev, out)
             self._skip.discard(pid)
+            self._ended.discard(pid)
             self._pes[pid] = bytearray(payload)
+        elif pid in self._ended:
+            # A stuffed packet that did not end its PES: the unit already
+            # sent was cut short; wait for PUSI from now on.
+            self._ended.discard(pid)
+            self._skip.add(pid)
+            self.eager_video = False
+            logger.warning("mpegts: video PES continued past a stuffed "
+                           "packet; units now complete at the next PES")
+            return
         elif pid in self._skip or pid not in self._pes:
             return
         else:
             self._pes[pid] += payload
-        # A bounded PES (audio) is complete as soon as its length is in.
+        # A bounded PES (audio) is complete as soon as its length is in;
+        # an unbounded one (video) at the packet stuffed to end it.
         pes = self._pes[pid]
         if len(pes) >= 6:
             length = (pes[4] << 8) | pes[5]
             if length and len(pes) >= 6 + length:
                 self._emit_pes(pid, self._pes.pop(pid), out)
+            elif (not length and stuffed and self.eager_video
+                  and pid == self.video_pid):
+                self._emit_pes(pid, self._pes.pop(pid), out)
+                self._ended.add(pid)
 
     def _unwrap(self, pid: int, pts: int) -> int:
         last, base = self._last_pts.get(pid, (None, 0))
@@ -417,6 +560,8 @@ class TsDemuxer:
                 self.audio_asc = asc
                 self.audio_samplerate = rate
                 self.audio_channels = chan
+            if self.audio_frame_samples is None:
+                self.audio_frame_samples = _AAC_FRAME_SAMPLES
             out.append(TsUnit('audio', au, True,
                               pts + i * _AAC_FRAME_SAMPLES * 90_000 // rate))
 
@@ -431,6 +576,8 @@ class TsDemuxer:
                     self.config_changed = True
                 self.audio_samplerate = 48000
                 self.audio_channels = channels
+            if self.audio_frame_samples is None:
+                self.audio_frame_samples = opus_samples(pkt)
             out.append(TsUnit('audio', pkt, True,
                               pts + samples * 90_000 // 48_000))
             samples += opus_samples(pkt)

@@ -30,13 +30,20 @@ addressing
 
 identity          -N/--namespace  -T/--trackname
 publisher media   -s/--object-size -g/--group-size -P/--streams
-                  -r/--rate -D/--datagram --video
+                  -r/--rate -D/--datagram, plus video
+video             --video RES: -r = frame rate, -g = GOP frames; refuses
+                  -s/-P/-D (check_video)
 run               -t/--duration -d/--debug --no-stats
+logging           --log-level --log (long only; -d/--debug = --log-level
+                  debug)
 interval          -i/--interval
 session           --draft -k/--insecure --keylogfile --cc-algo
+                  --cc-options --pacing-trains --fc-window
                   --max-queued-bytes --max-inflight-bytes --quic-debug
 keepalive         --keepalive
+fetch history     --fetch-history (long only)
 compat            --compat
+payload check     --verify-payload [N] (long only)
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 
 split execution (tools that can run one end or both)
@@ -44,8 +51,11 @@ split execution (tools that can run one end or both)
   --mp                   spread this role across processes
 """
 import argparse
+import logging
 
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
+from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
+                                  parse_log_spec)
 from aiomoqt.utils.url import parse_relay_url
 
 # Defaults, one place. Powers of two, same on every tool.
@@ -61,6 +71,36 @@ DGRAM_MAX_OBJECT = 1152
 
 VIDEO_PROFILES = ('240p', '270p', '360p', '480p',
                   '720p', '1080p', '1440p', '4k')
+VIDEO_FPS = 30
+
+
+def _note_given(namespace, dest):
+    given_set = getattr(namespace, '_given', None)
+    if given_set is None:
+        given_set = set()
+        setattr(namespace, '_given', given_set)
+    given_set.add(dest)
+
+
+class StoreGiven(argparse._StoreAction):
+    """store, noting that the flag was given (see given())."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        _note_given(namespace, self.dest)
+
+
+class StoreTrueGiven(argparse._StoreTrueAction):
+    """store_true, noting that the flag was given (see given())."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        _note_given(namespace, self.dest)
+
+
+def given(args):
+    """Dests set on the command line by a StoreGiven/StoreTrueGiven flag."""
+    return getattr(args, '_given', set())
 
 
 def make_parser(description, epilog=None):
@@ -117,8 +157,8 @@ def add_listener(p, port=4433):
                    help='Serve H3/WebTransport (default if neither -Q '
                         'nor -W given). With -Q, serves both on one '
                         'port via per-connection ALPN dispatch.')
-    p.add_argument('--bind', type=str, default='localhost',
-                   help='Bind address (default: localhost)')
+    p.add_argument('--bind', type=str, default=None,
+                   help='Bind address (default: all interfaces, IPv4 and IPv6)')
     p.add_argument('-p', '--port', type=int, default=port,
                    help=f'Listen port (default: {port})')
     p.add_argument('--path', type=str, default='/',
@@ -151,30 +191,51 @@ def add_identity(p, namespace='aiomoqt', trackname=None,
 def add_publisher_media(p):
     """Fixed publisher-side media set. Subscriber tools don't call this
     — a subscriber chooses neither object shape nor rate."""
-    p.add_argument('-s', '--object-size', type=int,
+    p.add_argument('-s', '--object-size', type=int, action=StoreGiven,
                    default=DEFAULT_OBJECT_SIZE,
                    help=f'Object payload bytes '
                         f'(default: {DEFAULT_OBJECT_SIZE})')
-    p.add_argument('-g', '--group-size', type=int,
+    p.add_argument('-g', '--group-size', type=int, action=StoreGiven,
                    default=DEFAULT_GROUP_SIZE,
                    help=f'Objects per group (default: '
                         f'{DEFAULT_GROUP_SIZE}). Stream turnover rate = '
                         f'rate / group-size; lower it to exercise churn '
                         f'(e.g. -g 240 for 2 s GOPs at 120 obj/s).')
     p.add_argument('-P', '--streams', type=int, default=1,
+                   action=StoreGiven,
                    help='Parallel subgroup streams (default: 1)')
-    p.add_argument('-r', '--rate', type=float, default=0,
+    p.add_argument('-r', '--rate', type=float, default=0, action=StoreGiven,
                    help='Aggregate objects/sec across all streams '
                         '(0 = max, default: max). Per-stream emit rate '
                         'is rate/streams.')
-    p.add_argument('-D', '--datagram', action='store_true',
+    p.add_argument('-D', '--datagram', action=StoreTrueGiven,
                    help=f'ObjectDatagrams instead of subgroup streams '
-                        f'(raw QUIC only; object must fit one packet, '
+                        f'(object must fit one packet, '
                         f'<= {DGRAM_MAX_OBJECT} B)')
+    add_video(p)
+
+
+def add_video(p):
+    """--video: a video-shaped track. Validate with check_video()."""
     p.add_argument('--video', type=str, default=None, metavar='RES',
                    choices=VIDEO_PROFILES,
-                   help='Video profile — sets object size, rate and GOP '
-                        'from the resolution. Overrides -s/-r/-g.')
+                   help='Video profile: one object per frame, one GOP per '
+                        'group opening on an I-frame, I/P/B frame sizes '
+                        'from the resolution, one subgroup stream. -r is '
+                        f'the frame rate (default: {VIDEO_FPS}) and -g the '
+                        'GOP length in frames (default: 1 s of frames); '
+                        'not with -s, -P or -D.')
+
+
+def add_payload_check(p):
+    """Subscriber side: check received objects against the bench layout
+    (aiomoqt.utils.payload)."""
+    p.add_argument('--verify-payload', type=int, nargs='?', const=1,
+                   default=0, metavar='N',
+                   help='Check each received object, or every Nth, '
+                        'against the bench payload layout; a bad object '
+                        'fails the run. Off by default: it adds '
+                        'per-object CPU to the subscriber.')
 
 
 # -- run / session ---------------------------------------------------
@@ -188,6 +249,43 @@ def add_run(p, duration=DEFAULT_DURATION):
                    help='Count objects and bytes only — no latency, '
                         'jitter, loss or group accounting. Measures the '
                         'delivery ceiling without the measurement in it.')
+
+
+def log_spec(value):
+    """argparse type for --log: CAT=LEVEL[,CAT=LEVEL...]."""
+    try:
+        parse_log_spec(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return value
+
+
+def add_logging(p):
+    """Log levels; resolve with apply_logging()."""
+    p.add_argument('--log-level', type=str.lower, choices=tuple(LEVELS),
+                   default=None, metavar='LEVEL',
+                   help=f'Log level: {", ".join(LEVELS)} (default: the '
+                        f'tool\'s). -d/--debug = --log-level debug.')
+    p.add_argument('--log', type=log_spec, action='append', default=None,
+                   metavar='CAT=LEVEL[,...]',
+                   help=f'Per-category levels; categories: '
+                        f'{", ".join(CATEGORIES)}. Repeatable. The '
+                        f'AIOMOQT_LOG environment variable takes the '
+                        f'same spec; these flags win.')
+
+
+def apply_logging(args, default=logging.WARNING):
+    """Set levels from --log-level, -d/--debug, --log and AIOMOQT_LOG.
+    Exits with the error on a bad AIOMOQT_LOG. Returns the level."""
+    level = getattr(args, 'log_level', None)
+    if level is None and getattr(args, 'debug', False):
+        level = 'debug'
+    spec = ','.join(getattr(args, 'log', None) or ())
+    try:
+        return configure_logging(level=level and LEVELS[level],
+                                 spec=spec or None, default=default)
+    except ValueError as e:
+        raise SystemExit(f'error: {e}')
 
 
 def add_interval(p):
@@ -207,10 +305,20 @@ def add_session(p):
     p.add_argument('--keylogfile', type=str, default=None,
                    help='TLS secrets log (NSS Key Log Format) for '
                         'Wireshark decryption')
-    p.add_argument('--cc-algo', type=str, default=None,
-                   help='Congestion control (bbr | bbr1 | newreno | '
-                        'cubic | dcubic | prague | fast). Default: '
-                        'aiopquic default (bbr1)')
+    p.add_argument('--cc-algo', type=str, default='bbr',
+                   help='Congestion control (bbr | bbr1 | c4 | cubic | '
+                        'dcubic | fast | newreno | prague). Default: bbr')
+    p.add_argument('--cc-options', type=str, default=None, metavar='OPTS',
+                   help='Option string for the congestion controller, e.g. '
+                        'Q0.02: bbr sends bursts of 20 ms of pacing rate')
+    p.add_argument('--pacing-trains', action='store_true', default=None,
+                   help='When pacing holds a connection back, send up to '
+                        '10 packets at once instead of one or two')
+    p.add_argument('--fc-window', type=int, default=None, metavar='BYTES',
+                   help='QUIC flow-control window, per stream and per '
+                        'connection; the receiver buffers this much per '
+                        'stream. Above rate x RTT for long-RTT runs. '
+                        'Default: 16 MiB')
     p.add_argument('--max-queued-bytes', type=int, default=None,
                    help='Aggregate publisher TX budget across ALL '
                         'streams. Default: aiopquic default (4 MiB). '
@@ -220,6 +328,48 @@ def add_session(p):
                         '(1 MiB). 0 disables.')
     p.add_argument('--quic-debug', action='store_true',
                    help='Verbose QUIC-layer logging')
+
+
+def transport_kwargs(args) -> dict:
+    """MOQTClient / MOQTServer transport kwargs from the --cc-algo,
+    --cc-options, --pacing-trains, --fc-window, --max-queued-bytes,
+    --max-inflight-bytes and --keepalive flags. An
+    unset flag is left out so the library default applies;
+    --max-inflight-bytes 0 maps to None (disabled)."""
+    kw = {}
+    for attr, key in (('cc_algo', 'congestion_control_algorithm'),
+                      ('cc_options', 'congestion_control_options'),
+                      ('pacing_trains', 'packet_train_mode'),
+                      ('fc_window', 'flow_control_window'),
+                      ('max_queued_bytes', 'tx_max_queued_bytes'),
+                      ('keepalive', 'keep_alive_interval')):
+        value = getattr(args, attr, None)
+        if value is not None:
+            kw[key] = value
+    inflight = getattr(args, 'max_inflight_bytes', None)
+    if inflight is not None:
+        kw['tx_max_inflight_bytes'] = inflight or None
+    return kw
+
+
+def describe_transport(args) -> str:
+    """One-line effective CC and TX budgets, for tool banners."""
+    def budget(value, default):
+        if value is None:
+            return default
+        return 'off' if value == 0 else f'{value} B'
+    keepalive = getattr(args, 'keepalive', None)
+    cc = getattr(args, 'cc_algo', None) or 'default'
+    cc_options = getattr(args, 'cc_options', None)
+    if cc_options:
+        cc += f" {cc_options}"
+    if getattr(args, 'pacing_trains', None):
+        cc += " trains"
+    return (f"cc={cc}  "
+            f"queued={budget(getattr(args, 'max_queued_bytes', None), 'default')}  "
+            f"inflight={budget(getattr(args, 'max_inflight_bytes', None), 'default')}  "
+            f"window={getattr(args, 'fc_window', None) or 'default'}  "
+            f"keepalive={'off' if not keepalive else f'{keepalive:g}s'}")
 
 
 def add_keepalive(p, default=None):
@@ -232,12 +382,23 @@ def add_keepalive(p, default=None):
                         + ('off' if default is None else f'{default:g}'))
 
 
+def add_fetch_history(p, default=0):
+    """default: bytes of recent objects a published track keeps to
+    answer FETCH; 0 refuses FETCH."""
+    p.add_argument('--fetch-history', type=int, default=default,
+                   metavar='BYTES',
+                   help='Keep BYTES of recently published objects per '
+                        'track to answer FETCH; 0 refuses FETCH. '
+                        f'Default: {default}')
+
+
 def add_compat(p):
     p.add_argument('--compat', type=str, default='',
                    help='Comma-separated relay compat tolerances: '
                         'lenient-extensions (truncated trailing-'
                         'extensions block on control messages), '
-                        'libquicr, all')
+                        'missing-request-credit (a d14/d16 peer SETUP '
+                        'without MAX_REQUEST_ID), libquicr, all')
 
 
 def add_split_role(p):
@@ -265,21 +426,21 @@ def add_timestamps(p):
                         'both = frindell plus 0x10')
 
 
-def add_timestamp_checking(p):
+def add_timestamp_checking(p, default='cancel', default_help=None):
     """Subscriber policy for timing properties that break
     draft-frindell-moq-timestamp."""
     g = p.add_argument_group('timestamp checking')
     g.add_argument('--timestamp-errors', choices=('cancel', 'report'),
-                   default='cancel',
+                   default=default,
                    help='Malformed timestamp properties: cancel the '
-                        'subscription (default, MOQT §12.1) or report '
-                        'them and keep receiving')
+                        'subscription (MOQT §12.1) or report them and keep '
+                        f'receiving (default: {default_help or default})')
 
 
 # -- validation ------------------------------------------------------
 
-def check_datagram(parser, args, serve_quic=None):
-    """-D validity: fits one frame, and raw QUIC is available."""
+def check_datagram(parser, args):
+    """-D validity: the object fits one DATAGRAM frame."""
     if not getattr(args, 'datagram', False):
         return
     size = getattr(args, 'object_size', 0)
@@ -287,9 +448,35 @@ def check_datagram(parser, args, serve_quic=None):
         parser.error(
             f'-D/--datagram: object-size {size} can never fit a DATAGRAM '
             f'frame (max ~{DGRAM_MAX_OBJECT} B; frames cannot fragment)')
-    if serve_quic is False:
-        parser.error('-D/--datagram requires raw QUIC (-Q); '
-                     'WebTransport datagram TX is not wired yet')
+
+
+def check_video(parser, args):
+    """--video: refuse the flags a profile replaces (-s, -P, -D); -r and
+    -g keep their meaning as frame rate and GOP length. Sets object_size
+    to the profile's mean frame size and streams to 1."""
+    if not getattr(args, 'video', None):
+        return
+    clash = [flag for flag, dest in (('-s', 'object_size'),
+                                     ('-P', 'streams'), ('-D', 'datagram'))
+             if dest in given(args)]
+    if clash:
+        parser.error(f"--video cannot be combined with {', '.join(clash)}: "
+                     "the profile sets each frame's size and sends one "
+                     "subgroup stream")
+    fps = args.rate if 'rate' in given(args) else VIDEO_FPS
+    if fps <= 0:
+        parser.error('--video needs a frame rate: -r must be above 0')
+    gop = (args.group_size if 'group_size' in given(args)
+           else max(1, round(fps)))
+    if gop < 1:
+        parser.error('--video: -g must be at least 1 frame')
+    from aiomoqt.track import VideoTrack
+    if hasattr(args, 'rate'):
+        args.rate = fps
+    args.video_fps = fps
+    args.group_size = gop
+    args.streams = 1
+    args.object_size = VideoTrack.mean_object_size(args.video, gop)
 
 
 def check_url_vs_listener(parser, args):

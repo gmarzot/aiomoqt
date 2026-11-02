@@ -15,6 +15,9 @@
   ".bandwidth.loss_pct": [
    "float"
   ],
+  ".bandwidth.spurious_pct": [
+   "float"
+  ],
   ".generated": [
    "float"
   ],
@@ -488,6 +491,15 @@
   ".transport[].tx_event_ring_count_now": [
    "int"
   ],
+  ".transport[].tx_event_ring_pops": [
+   "int"
+  ],
+  ".transport[].tx_wake_lost": [
+   "int"
+  ],
+  ".transport[].tx_worker_idle_now": [
+   "int"
+  ],
   ".transport[].wake_calls": [
    "int"
   ],
@@ -505,11 +517,23 @@
   ".history": [
    "object"
   ],
+  ".history.drops": [
+   "array"
+  ],
+  ".history.drops[]": [
+   "int"
+  ],
   ".history.egress_bps": [
    "array"
   ],
   ".history.egress_bps[]": [
    "int"
+  ],
+  ".history.groups_out_per_s": [
+   "array"
+  ],
+  ".history.groups_out_per_s[]": [
+   "float"
   ],
   ".history.groups_per_s": [
    "array"
@@ -545,11 +569,29 @@
   ".history.media_out_bps[]": [
    "int"
   ],
+  ".history.namespaces": [
+   "array"
+  ],
+  ".history.namespaces[]": [
+   "int"
+  ],
   ".history.objects_in_per_s": [
    "array"
   ],
   ".history.objects_in_per_s[]": [
    "float"
+  ],
+  ".history.objects_out_per_s": [
+   "array"
+  ],
+  ".history.objects_out_per_s[]": [
+   "float"
+  ],
+  ".history.publishers": [
+   "array"
+  ],
+  ".history.publishers[]": [
+   "int"
   ],
   ".history.rtt_p50_ms": [
    "array"
@@ -684,17 +726,38 @@
   ".sessions[].addr": [
    "string"
   ],
+  ".sessions[].cwin_bytes": [
+   "int"
+  ],
+  ".sessions[].dgram_drops": [
+   "int"
+  ],
   ".sessions[].draft": [
    "int"
   ],
   ".sessions[].id": [
    "int"
   ],
+  ".sessions[].in_transit_bytes": [
+   "int"
+  ],
   ".sessions[].loss_pct": [
    "float"
   ],
+  ".sessions[].lost_packets": [
+   "int"
+  ],
+  ".sessions[].namespaces": [
+   "int"
+  ],
+  ".sessions[].pacing_bps": [
+   "int"
+  ],
   ".sessions[].role": [
    "string"
+  ],
+  ".sessions[].rtt_max_ms": [
+   "float"
   ],
   ".sessions[].rtt_min_ms": [
    "float"
@@ -707,6 +770,18 @@
   ],
   ".sessions[].since": [
    "float"
+  ],
+  ".sessions[].spurious_losses": [
+   "int"
+  ],
+  ".sessions[].spurious_pct": [
+   "float"
+  ],
+  ".sessions[].subscriptions": [
+   "int"
+  ],
+  ".sessions[].timer_losses": [
+   "int"
   ],
   ".sessions[].transport": [
    "string"
@@ -729,7 +804,19 @@
   ".totals.by_transport.*": [
    "int"
   ],
+  ".totals.cache_budget": [
+   "int"
+  ],
+  ".totals.cache_bytes": [
+   "int"
+  ],
   ".totals.cache_efficiency": [],
+  ".totals.cache_evictions": [
+   "int"
+  ],
+  ".totals.cache_truncations": [
+   "int"
+  ],
   ".totals.delivered_bytes": [
    "int"
   ],
@@ -750,6 +837,9 @@
   ],
   ".totals.fetches": [
    "int"
+  ],
+  ".totals.groups_out_per_s": [
+   "float"
   ],
   ".totals.groups_per_s": [
    "float"
@@ -778,6 +868,9 @@
   ".totals.objects_in_per_s": [
    "float"
   ],
+  ".totals.objects_out_per_s": [
+   "float"
+  ],
   ".totals.publishers": [
    "int"
   ],
@@ -789,6 +882,9 @@
   ],
   ".totals.sessions": [
    "int"
+  ],
+  ".totals.spurious_pct": [
+   "float"
   ],
   ".totals.subscribers": [
    "int"
@@ -934,10 +1030,34 @@
   ".tracks[].subscriber_list[].forward": [
    "bool"
   ],
+  ".tracks[].subscriber_list[].lane_bytes": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_expired": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_objects": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_stalled_s": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_stalls": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].lane_tx_bytes": [
+   "int"
+  ],
   ".tracks[].subscriber_list[].rtt_ms": [
    "float"
   ],
   ".tracks[].subscriber_list[].session": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].shed_episodes": [
+   "int"
+  ],
+  ".tracks[].subscriber_list[].shed_objects": [
    "int"
   ],
   ".tracks[].subscriber_list[].since": [

@@ -63,16 +63,11 @@ async def parse_stream_chunks(chunks: list, expect_objects: int) -> dict:
     cur_pos = 0
     needed = 0
     parsed_objects = []
-    group_id = None
-    subgroup_id = None
-    prev_object_id = None
     data_stream = {}  # mock _data_streams
 
     from aiomoqt.messages.data import (
-        SubgroupHeader, ObjectHeader, FetchHeader,
-        SUBGROUP_HEADER_BASE, SUBGROUP_ID_EXPLICIT, SUBGROUP_ID_FIRST_OBJ,
+        SubgroupHeader,
     )
-    from aiomoqt.types import ObjectStatus
     from aiomoqt.messages.base import MOQTUnderflow
 
     stream_id = 15  # mock
@@ -97,15 +92,12 @@ async def parse_stream_chunks(chunks: list, expect_objects: int) -> dict:
 
         while cur_pos < msg_len:
             try:
-                pos = msg_buf.tell()
                 # Parse: same logic as _moqt_handle_data_stream
                 if data_stream.get(stream_id) is None:
                     stream_type = msg_buf.pull_uint_var()
                     if 0x10 <= stream_type <= 0x1D and ((stream_type >> 1) & 0x03) != 3:
                         msg_header = SubgroupHeader.deserialize(msg_buf, type_val=stream_type)
                         data_stream[stream_id] = msg_header
-                        group_id = msg_header.group_id
-                        subgroup_id = msg_header.subgroup_id
                     else:
                         raise ValueError(f"Unexpected stream type: 0x{stream_type:x}")
                 else:

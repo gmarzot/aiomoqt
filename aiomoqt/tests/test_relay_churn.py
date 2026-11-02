@@ -112,7 +112,7 @@ class _Closed:
     opening raises CancelledError then."""
     _profile = profile_for(18)
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None):
         raise asyncio.CancelledError()
 
 
@@ -122,7 +122,12 @@ class _Open:
     def __init__(self):
         self.writes = []
 
-    async def open_uni_stream(self):
+    def set_stream_priority(self, _sid, _band):
+        return True
+
+    async def open_uni_stream(self, initial=b"", priority=None):
+        if initial:
+            await self.stream_write_drain(3, initial)
         return 3
 
     def stream_write(self, _sid, data, end_stream=False):
@@ -143,7 +148,8 @@ async def test_a_write_cancelled_by_a_closed_session_drops_one_subscriber():
             msg = SimpleNamespace(payload=b"x", group_id=0, object_id=oid,
                                   extensions=None, publisher_priority=128)
             track.on_object(msg, 1, 0, 0, 0)
-        assert await _until(lambda: len(live.writes) == 4, timeout=1.0)
+        # The header with object 0, then objects 1 and 2.
+        assert await _until(lambda: len(live.writes) == 3, timeout=1.0)
         assert track.task is not None and not track.task.done()
         assert [d.session for d in track.downstream] == [live]
         assert not any(k[0] == id(closed) for k in track._streams)

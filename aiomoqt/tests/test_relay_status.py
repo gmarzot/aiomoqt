@@ -1,4 +1,4 @@
-"""Ersatz-relay dashboard status: host metrics from /proc, MSF catalog
+"""aiomoqt-relay dashboard status: host metrics from /proc, MSF catalog
 classification, and the relay's status snapshot end to end."""
 import asyncio
 import contextlib
@@ -15,9 +15,10 @@ from aiomoqt.media.catalog import Catalog, CatalogTrack
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import relay_status
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import MOQTMessageType
+from aiomoqt.types import FilterType, MOQTMessageType
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._procs import free_udp_port
 
 _PORT = 17500
 _NS = "status/live"
@@ -394,6 +395,10 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert totals["rtt_p50_ms"] is not None
     assert sorted(s["role"] for s in snap["sessions"]) == [
         "pub", "sub", "sub"]
+    # What each session holds against its per-session caps.
+    assert sorted((s["role"], s["namespaces"], s["subscriptions"])
+                  for s in snap["sessions"]) == [
+        ("pub", 1, 0), ("sub", 0, 1), ("sub", 0, 2)]
 
     assert [r["namespace"] for r in snap["namespaces"]] == [_NS]
     space = snap["namespaces"][0]
@@ -422,6 +427,13 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert video["groups_per_s"] > 0 and video["objects_per_s"] > 0
     assert None not in (video["rtt_up_ms"], video["rtt_down_ms"], video["latency_ms"])
     assert totals["objects_in_per_s"] > 0
+    # Two video subscribers: delivered exceeds received.
+    assert totals["objects_out_per_s"] > totals["objects_in_per_s"]
+    assert totals["groups_out_per_s"] > totals["groups_per_s"]
+    hist = snap["history"]
+    assert (hist["publishers"][-1], hist["namespaces"][-1]) == (1, 1)
+    for k in ("objects_out_per_s", "groups_out_per_s", "drops"):
+        assert hist[k][-1] == totals[k], k
 
     # Each video subscriber is listed with its session.
     assert [(s["transport"], s["draft"], s["forward"])
@@ -507,6 +519,22 @@ _SCHEMA = os.path.join(os.path.dirname(__file__), "vectors",
 _DATA_KEYED = ("track_history", "by_draft", "by_transport")
 
 
+async def _delivery_window(status, timeout=3.0):
+    """A snapshot whose window saw the relay send to a subscriber. The
+    first snapshot only sets the baseline; a slow host can send nothing
+    in one short window."""
+    loop = asyncio.get_running_loop()
+    status.snapshot(loop.time(), time.time())
+    deadline = loop.time() + timeout
+    while True:
+        await asyncio.sleep(0.3)
+        snap = status.snapshot(loop.time(), time.time())
+        if loop.time() > deadline or any(
+                "sub" in (s["role"] or "") and s["tx_bps"]
+                for s in snap["sessions"]):
+            return snap
+
+
 @requires_certs
 async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch):
     # A publisher session carries mostly unacked ACK-only packets from the
@@ -527,15 +555,73 @@ async def test_session_loss_only_on_delivery(relay_tables, tmp_path, monkeypatch
         await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
         status = relay._Status(str(tmp_path / "status.json"),
                                {"started": time.time()}, [connect.handle])
-        loop = asyncio.get_running_loop()
-        status.snapshot(loop.time(), time.time())
-        await asyncio.sleep(0.3)
-        snap = status.snapshot(loop.time(), time.time())
+        snap = await _delivery_window(status)
     by_role = {s["role"]: s for s in snap["sessions"]}
     assert by_role["pub"]["loss_pct"] is None
     assert by_role["sub"]["loss_pct"] is not None
     for s in snap["sessions"]:
         assert 0 <= s["rtt_min_ms"] <= s["rtt_ms"], s
+
+
+
+@requires_certs
+async def test_viewer_loss_excludes_spurious(relay_tables, tmp_path, monkeypatch):
+    # Declared lost but acknowledged later is spurious, not loss.
+    real = relay._path_quality
+
+    def lossy(session):
+        pq = dict(real(session))
+        n = pq.get("sent", 0)
+        pq.update(sent=4 * n, lost=2 * n, spurious_losses=n)
+        return pq
+    monkeypatch.setattr(relay, "_path_quality", lossy)
+    async with _relay(_PORT + 12, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        snap = await _delivery_window(status)
+    viewer = next(s for s in snap["sessions"] if s["role"] == "sub")
+    assert viewer["loss_pct"] == 25.0, viewer
+    assert viewer["spurious_pct"] == 25.0, viewer
+    assert snap["totals"]["loss_pct"] == viewer["loss_pct"]
+    assert snap["totals"]["spurious_pct"] == viewer["spurious_pct"]
+
+
+@requires_certs
+async def test_publishing_subscriber_reports_no_loss(relay_tables, tmp_path,
+                                                     monkeypatch):
+    # One loss count per connection: a session that publishes and subscribes
+    # can't split it, so it reports no loss_pct and stays out of the total.
+    real = relay._path_quality
+
+    def lossy(session):
+        pq = dict(real(session))
+        pq["lost"] = pq.get("sent", 0) // 2
+        return pq
+    monkeypatch.setattr(relay, "_path_quality", lossy)
+    async with _relay(_PORT + 11, True, 18) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        both = await connect()
+        PublishedTrack(both, namespace="status/both", trackname="audio",
+                       object_size=100, group_size=10, rate=100).attach()
+        await both.publish_namespace(namespace="status/both", wait_response=True)
+        await SubscribedTrack(both, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        snap = await _delivery_window(status)
+    by_role = {s["role"]: s for s in snap["sessions"]}
+    assert set(by_role) == {"pub", "pub+sub"}, by_role.keys()
+    assert by_role["pub+sub"]["loss_pct"] is None
+    assert by_role["pub+sub"]["lost_packets"] > 0
+    assert snap["totals"]["loss_pct"] == 0.0
 
 
 _KINDS = ((dict, "object"), (list, "array"), (str, "string"), (bool, "bool"),
@@ -660,3 +746,139 @@ async def test_platform_written_less_often_than_status(
     assert written[:2] == ["status.json", "platform.json"]
     assert written.count("platform.json") <= 2
     assert written.count("status.json") >= 6
+
+
+def _tick(status, rows):
+    """One status tick carrying these track rows."""
+    status.history.add({"t": time.time()})
+    status._add_track_history([(None, r) for r in rows])
+
+
+def _row(tid, subs=1):
+    return {"id": tid, "subscribers": subs, "in_bps": 1000, "out_bps": 1000 * subs}
+
+
+def test_live_tracks_take_history_slots_from_ended_ones(tmp_path):
+    # Ended tracks keep their history only while slots are free: a live
+    # track takes the slot of the track gone longest.
+    status = relay._Status(str(tmp_path / "status.json"), {"started": time.time()})
+    cap = relay.TRACK_HISTORY_MAX
+    old = [_row(f"old\x1f{i}") for i in range(cap)]
+    _tick(status, old)
+    _tick(status, old[1:])
+    _tick(status, [])
+    new = [_row(f"new\x1f{i}", subs=i % 2) for i in range(3)]
+    _tick(status, new)
+    hist = status.track_history
+    assert len(hist) == cap
+    assert all(r["id"] in hist for r in new)
+    assert "old\x1f0" not in hist
+    assert list(hist["new\x1f1"]["subscribers"])[-1] == 1
+
+
+def test_live_tracks_keep_their_slots(tmp_path):
+    status = relay._Status(str(tmp_path / "status.json"), {"started": time.time()})
+    cap = relay.TRACK_HISTORY_MAX
+    live = [_row(f"live\x1f{i}") for i in range(cap)]
+    _tick(status, live)
+    _tick(status, live + [_row("late")])
+    assert len(status.track_history) == cap
+    assert "late" not in status.track_history
+
+
+# -- --trace-subscribers and GET /sessions ---------------------------------
+
+class _ThreeGroups(PublishedTrack):
+    """Three groups of three objects once `go` is set; the track stays
+    open, so the relay keeps its subscribers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.go = asyncio.Event()
+
+    async def produce(self, out):
+        await self.go.wait()
+        for group_id in range(3):
+            for object_id in range(3):
+                await out.write(group_id, object_id, b"x" * 64,
+                                group_start=object_id == 0)
+        await asyncio.Event().wait()
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_trace_subscribers_counts_what_each_subscription_is_sent(
+        use_quic, relay_tables, monkeypatch, tmp_path):
+    monkeypatch.setattr(relay, "_trace_subscribers", True)
+    names = ("video", "audio")
+    async with _relay(free_udp_port(), use_quic, 22) as connect:
+        pub = await connect()
+        tracks = {n: _ThreeGroups(pub, namespace=_NS, trackname=n,
+                                  object_size=64, group_size=3, rate=0)
+                  for n in names}
+        for t in tracks.values():
+            t.attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        got = {}
+        for i in range(2):
+            s = await connect()
+            for n in names:
+                ok = await s.subscribe(_NS, n, forward=1,
+                                       filter_type=FilterType.LATEST_OBJECT,
+                                       wait_response=True)
+                got[i, n] = 0
+
+                def count(*_, key=(i, n)):
+                    got[key] += 1
+                s.register_object_handler(ok.track_alias, count)
+        for t in tracks.values():
+            t.go.set()
+        # 3 groups of 3 objects and End of Group on the two closed groups.
+        async with asyncio.timeout(10):
+            while any(v < 11 for v in got.values()):
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
+        report = relay._sessions_report()
+        lanes_of = [d for t in relay._tracks.values() for d in t.downstream]
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        snap = status.snapshot(asyncio.get_running_loop().time(), time.time())
+    assert report["trace_subscribers"] is True
+    sent = {}
+    for row in report["sessions"]:
+        for sub in row.get("subscriptions", ()):
+            sent.setdefault(sub["track"].split("\x1f")[-1], []).append(
+                sub["objects_sent"])
+    for n in names:
+        assert sorted(sent[n]) == sorted(got[i, n] for i in range(2)) \
+            == [11, 11], (n, sent, got)
+    assert all(type(d.lane.writer) is relay._TracedRelayDelivery
+               for d in lanes_of), lanes_of
+    listed = {t["name"]: t["subscriber_list"] for t in snap["tracks"]}
+    for n in names:
+        assert sorted(r["objects_sent"] for r in listed[n]) == [11, 11]
+        assert all(r["largest_sent"] == [2, 2] and r["bytes_sent"] == 9 * 64
+                   for r in listed[n]), listed[n]
+
+
+@requires_certs
+async def test_untraced_relay_counts_nothing_per_object(relay_tables):
+    # Off, a subscription's writer is the plain delivery: nothing extra runs
+    # per object.
+    assert relay._trace_subscribers is False
+    async with _relay(free_udp_port(), True, 22) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video", object_size=64,
+                       group_size=5, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        got = asyncio.Event()
+        sub = await connect()
+        await sub.subscribe(_NS, "video", forward=1,
+                            on_object=lambda *_: got.set(), wait_response=True)
+        await asyncio.wait_for(got.wait(), 5)
+        lanes = [d.lane for t in relay._tracks.values() for d in t.downstream]
+        report = relay._sessions_report()
+    assert lanes and all(type(lane.writer) is relay._RelayDelivery
+                         for lane in lanes), lanes
+    assert report["trace_subscribers"] is False
+    assert all("subscriptions" not in row for row in report["sessions"])

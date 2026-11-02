@@ -71,6 +71,9 @@ class _Quic:
     def get_tx_data_drain_event(self, sid):
         return self._events.setdefault(sid, asyncio.Event())
 
+    def tx_event_ring_fill(self):
+        return 1.0 if self._transport.full else 0.0
+
 
 def _session(draft=18):
     s = object.__new__(_MOQTSessionMixin)
@@ -141,7 +144,7 @@ async def test_reset_on_full_ring_leaves_the_lane_alive(draft):
     lane = fan.lanes[0]
     await fan.write(0, 0, b"a", group_start=True)
     await fan.write(0, 1, b"b")
-    assert await _until(lambda: lane.queue.empty() and delivery._stream_id)
+    assert await _until(lambda: not lane.items and delivery._stream_id)
     first = delivery._stream_id
 
     ring.full = True
@@ -160,21 +163,20 @@ async def test_reset_on_full_ring_leaves_the_lane_alive(draft):
 async def test_lane_truncating_on_full_ring_survives(draft):
     s, ring = _session(draft)
     delivery = SubgroupDelivery(s, track_alias=1)
-    gate = SimpleNamespace(forward=True)
     fan = FanoutDelivery()
-    lane = fan.add(delivery, lambda: gate.forward, joining=False)
+    lane = fan.add(delivery, joining=False)
     await fan.write(0, 0, b"a", group_start=True)
-    assert await _until(lambda: lane.queue.empty() and delivery._stream_id)
+    assert await _until(lambda: not lane.items and delivery._stream_id)
     first = delivery._stream_id
 
     ring.full = True
-    gate.forward = False
+    lane.gate = False
     await fan.write(0, 1, b"b")  # gated: the lane resets the open group
-    assert await _until(lambda: lane.queue.empty())
+    assert await _until(lambda: not lane.items)
     await asyncio.sleep(0.01)
     assert not lane.task.done()
     ring.drain()
-    gate.forward = True
+    lane.gate = True
     await fan.write(1, 0, b"c", group_start=True)
     assert await _until(
         lambda: ('reset', first, int(StreamResetCode.CANCELLED)) in ring.ops)
@@ -223,12 +225,13 @@ async def test_group_header_marker_and_fin_survive_a_full_ring(draft):
     ring.drain()
     assert await _until(lambda: any(fin for _, fin in _data(ring, sid)))
     sent = _data(ring, sid)
-    assert len(sent) == 3, sent
-    assert sent[0][0] == SubgroupHeader(
+    # The header opens the stream together with the first object.
+    assert len(sent) == 2, sent
+    assert sent[0][0].startswith(SubgroupHeader(
         track_alias=1, group_id=0, subgroup_id=0, publisher_priority=128,
         extensions_present=True, prof=s._profile,
-        first_object=True).serialize().data
-    assert sent[2] == (marker, True)
+        first_object=True).serialize().data)
+    assert sent[1] == (marker, True)
 
 
 @pytest.mark.parametrize("draft", DRAFTS)
@@ -240,9 +243,9 @@ async def test_object_stream_header_and_fin_survive_a_full_ring(draft):
     drain = _drain_later(ring)
     await delivery.write(0, 0, b"a", group_start=True)
     await drain
-    assert await _until(lambda: len(ring.ops) == 3)
+    assert await _until(lambda: len(ring.ops) == 2)
     sids = {op[1] for op in ring.ops}
     assert len(sids) == 1
     sent = _data(ring, sids.pop())
-    assert [fin for _, fin in sent] == [False, False, True]
-    assert sent[2][0] == b""
+    assert [fin for _, fin in sent] == [False, True]
+    assert sent[1][0] == b""

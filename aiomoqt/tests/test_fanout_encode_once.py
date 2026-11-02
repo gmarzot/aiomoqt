@@ -34,10 +34,12 @@ class _Session:
         self.fins = set()
         self.dgrams = []
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None):
         sid = self._next
         self._next += 4
         self.streams[sid] = bytearray()
+        if initial:
+            await self.stream_write_drain(sid, initial)
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
@@ -195,15 +197,13 @@ async def test_out_of_step_peers_encode_their_own(monkeypatch):
     fan = FanoutDelivery()
     fan.add(SubgroupDelivery(a, 1), joining=False)
     fan.add(db, joining=False)
-    forward = {"d": False}
-    fan.add(SubgroupDelivery(d, 4), gate=lambda: forward["d"],
-            joining=False)
+    gated = fan.add(SubgroupDelivery(d, 4), gate=False, joining=False)
 
     def between(gid, oid):
         if (gid, oid) == (0, 1):
             fan.add(SubgroupDelivery(c, 3))
         if gid == 1:
-            forward["d"] = True
+            gated.gate = True
 
     objects = [o for o in _OBJECTS if o[3] is not _by_peer]
     spy = _Encodes(monkeypatch)
@@ -282,13 +282,13 @@ async def test_datagram_encodings_kept_are_bounded(monkeypatch, aliases,
         fan.add(SubgroupDelivery(s, alias, mapping=StreamMapping.DATAGRAM),
                 joining=False)
     items = []
-    offer = delivery_mod._Lane.offer
+    offer = delivery_mod.SendLane.offer
 
     def spy(lane, item):
         items.append(item)
         offer(lane, item)
 
-    monkeypatch.setattr(delivery_mod._Lane, "offer", spy)
+    monkeypatch.setattr(delivery_mod.SendLane, "offer", spy)
     await _run(fan, _OBJECTS[:3])
     held = [len(item[-1]) for item in items if isinstance(item, tuple)]
     assert held and max(held) == kept

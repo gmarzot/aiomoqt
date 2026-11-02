@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import contextlib
 import functools
-import logging
 import sys
 
 from aiomoqt.client import MOQTClient
@@ -19,7 +18,7 @@ from aiomoqt.types import (ForwardingPreference, MOQTMessageType,
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level
+from aiomoqt.utils.hostinfo import cpu_summary
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -46,6 +45,9 @@ def _token_validator(rules):
 PRIOR_GROUP_ID_GAP = 0x3C
 PRIOR_OBJECT_ID_GAP = 0x3E
 
+# --fetch-history a --prefill track gets when none is given.
+_PREFILL_HISTORY = 1 << 20
+
 
 class _GapTrack(PublishedTrack):
     """Even Group and Object IDs only, each Object carrying the gap
@@ -53,7 +55,8 @@ class _GapTrack(PublishedTrack):
     ID Gap on the rest."""
 
     async def produce(self, out) -> None:
-        pad = bytes(self.object_size)
+        pad = self._payload_tail()
+        size = self.object_size
         interval = 1.0 / self.rate if self.rate > 0 else 0
         group_id = 0
         while True:
@@ -61,8 +64,9 @@ class _GapTrack(PublishedTrack):
                 object_id = 2 * n
                 props = ({PRIOR_OBJECT_ID_GAP: 1} if object_id
                          else {PRIOR_GROUP_ID_GAP: 1} if group_id else None)
-                await out.write(group_id, object_id, pad, extensions=props,
-                                group_start=object_id == 0)
+                payload = (f"{group_id}.{object_id}".encode() + pad)[:size]
+                await out.write(group_id, object_id, payload,
+                                extensions=props, group_start=object_id == 0)
                 await asyncio.sleep(interval)
             group_id += 2
 
@@ -89,6 +93,7 @@ The URL scheme selects the transport:
     _cli.add_run(parser)
     _cli.add_session(parser)
     _cli.add_timestamps(parser)
+    _cli.add_fetch_history(parser)
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='Flow A: PUB_NS only, wait for SUBSCRIBE '
@@ -149,7 +154,9 @@ The URL scheme selects the transport:
     content.add_argument('--prefill', type=int, default=0, metavar='GROUPS',
                          help='Hold GROUPS groups as already published, '
                               'ready for FETCH before any subscriber; '
-                              'live objects follow them')
+                              'live objects follow them. Sets '
+                              f'--fetch-history {_PREFILL_HISTORY} when '
+                              'that is 0')
     content.add_argument('--no-objects', action='store_true',
                          help='Serve subscriptions but publish no '
                               'objects: a track with nothing published')
@@ -157,18 +164,18 @@ The URL scheme selects the transport:
                          help='Publish even Group and Object IDs only, '
                               'each Object with its Prior Group ID Gap or '
                               'Prior Object ID Gap property')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
-    if args.video and args.datagram:
-        parser.error('--video cannot use -D/--datagram: profile I-frames '
-                     f'({VideoTrack.PROFILES[args.video]["i_frame"]} B) '
-                     'far exceed the one-packet datagram ceiling')
-    _cli.check_datagram(parser, args,
-                       serve_quic=parse_relay_url(args.url).use_quic)
+    _cli.check_video(parser, args)
+    _cli.check_datagram(parser, args)
+    if args.prefill and not args.fetch_history:
+        args.fetch_history = _PREFILL_HISTORY
     if args.trackname is None:
         import uuid
         sz = args.object_size
-        sz_s = f"{sz // 1000}k" if sz >= 1000 else f"{sz}b"
+        sz_s = (args.video if args.video
+                else f"{sz // 1000}k" if sz >= 1000 else f"{sz}b")
         rate_s = f"{int(args.rate)}fps" if args.rate > 0 else "max"
         mode = "dgram" if args.datagram else f"x{args.streams}"
         args.trackname = f"{sz_s}-{rate_s}-{mode}-{uuid.uuid4().hex[:4]}"
@@ -176,7 +183,9 @@ The URL scheme selects the transport:
 
 
 def print_banner(relay, args):
-    mode = "DATAGRAM" if args.datagram else f"SUBGROUP x{args.streams}"
+    mode = ("DATAGRAM" if args.datagram
+            else f"VIDEO {args.video}" if args.video
+            else f"SUBGROUP x{args.streams}")
     if args.rate > 0:
         # rate is aggregate; per-stream is rate/streams (datagrams = 1 stream)
         n = 1 if args.datagram else args.streams
@@ -195,17 +204,18 @@ def print_banner(relay, args):
     print(f"  namespace:   {args.namespace}")
     print(f"  trackname:   {args.trackname}")
     print(f"  mode:        {mode}")
-    print(f"  object size: {args.object_size} B")
+    print(f"  object size: {args.object_size} B"
+          + (" mean" if args.video else ""))
     print(f"  group size:  {args.group_size} objects")
     print(f"  rate:        {rate_s}")
     print(f"  target:      {target_s}")
     print(f"  duration:    {args.duration}s")
+    print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
 
 
 async def run(args):
-    log_level = logging.DEBUG if args.debug else logging.WARNING
-    set_log_level(log_level)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
     # asyncio task's stack to stderr. Useful for diagnosing hangs:
@@ -225,6 +235,9 @@ async def run(args):
         debug=args.debug,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
+        congestion_control_options=args.cc_options,
+        packet_train_mode=bool(args.pacing_trains),
+        flow_control_window=args.fc_window,
         tx_max_queued_bytes=args.max_queued_bytes,
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
@@ -266,15 +279,16 @@ async def run(args):
                 session.track_status(args.namespace, args.trackname)
 
             if args.video:
-                # Profile drives object size, GOP and fps; -r is fps.
                 track = VideoTrack(
                     session,
                     namespace=args.namespace,
                     trackname=args.trackname,
                     resolution=args.video,
-                    fps=args.rate or 30,
+                    fps=args.rate,
+                    gop_size=args.group_size,
                     auth_token=args.auth_token.encode() or None,
                     timestamps=args.timestamps,
+                    fetch_history_bytes=args.fetch_history,
                 )
             else:
                 track_class = (_EmptyTrack if args.no_objects
@@ -293,6 +307,7 @@ async def run(args):
                                 else ForwardingPreference.SUBGROUP),
                     auth_token=args.auth_token.encode() or None,
                     timestamps=args.timestamps,
+                    fetch_history_bytes=args.fetch_history,
                 )
             if args.prefill:
                 track.prefill(args.prefill)

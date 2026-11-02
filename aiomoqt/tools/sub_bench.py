@@ -13,7 +13,6 @@ Usage:
 """
 import asyncio
 import contextlib
-import logging
 import os
 import sys
 import time
@@ -31,8 +30,10 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils import wait_cond_timeout
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.hostinfo import cpu_summary
+from aiomoqt.utils.payload import PayloadCheck
 from aiomoqt.utils.stats import TrackStats
-from aiomoqt.utils.logger import set_log_level, get_logger
+from aiomoqt.utils.logger import get_logger
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -48,9 +49,11 @@ class BenchReporter:
     """
 
     def __init__(self, report_interval: float = 5.0,
-                 minimal: bool = False):
+                 minimal: bool = False, verify_payload: int = 0):
         self.stats = TrackStats(windowed=False, minimal=minimal,
                                 group_loss=True)
+        self.payload_check = (PayloadCheck(verify_payload)
+                              if verify_payload else None)
         self.report_interval = report_interval
         self._last_report = 0.0
         self._header_printed = False
@@ -70,6 +73,10 @@ class BenchReporter:
                   group_id: int = None, subgroup_id: int = None):
         self.stats.on_object(msg, size_bytes, recv_time_us,
                              group_id, subgroup_id)
+        check = self.payload_check
+        if check is not None and not msg.status:
+            check(msg.group_id if group_id is None else group_id,
+                  msg.object_id, msg.payload)
         now = time.monotonic()
         if not self._header_printed:
             self.start()
@@ -77,6 +84,21 @@ class BenchReporter:
         if now - self._last_report >= self.report_interval:
             print(self.stats.interval_row(now))
             self._last_report = now
+
+    def finish(self):
+        """Print the interval still open when the run ends, so a run of
+        -t N reports through second N. A sliver under half an interval,
+        left when an object printed the last row just before the end, is
+        not a row of its own."""
+        now = time.monotonic()
+        if (self._header_printed and self.stats.total_objects
+                and now - self._last_report >= self.report_interval / 2):
+            print(self.stats.interval_row(now))
+            self._last_report = now
+
+    @property
+    def payload_bad(self) -> int:
+        return self.payload_check.bad if self.payload_check else 0
 
     def print_summary(self):
         s = self.stats.summary()
@@ -88,6 +110,7 @@ class BenchReporter:
         print(f"  aiomoqt-bench results  ({s['active_s']:.1f}s active "
               f"/ {s['duration_s']:.1f}s elapsed)")
         print("═" * 56)
+        print(f"  Host:        {cpu_summary()}")
         blind = s.get('datagram') or s.get('minimal')
         grps = 'n/a' if blind else f"{s['groups']:,}"
         print(f"  Groups:      {grps}")
@@ -115,6 +138,14 @@ class BenchReporter:
             print(f"  Jitter:      {s['jitter_ms']:.2f} ms")
             print(f"  Lost:        {s['lost']} ({s['loss_pct']:.2f}%)")
             print(f"  Out-of-order:   {s['ooo']}")
+        check = self.payload_check
+        if check is not None:
+            every = f", every {check.every}" if check.every > 1 else ""
+            print(f"  Payload:     {check.checked:,} checked{every}, "
+                  f"{check.bad} bad")
+            if check.first_bad:
+                g, o, head = check.first_bad
+                print(f"               first bad {g}.{o}: {head!r}")
         print("═" * 56)
 
 
@@ -139,10 +170,12 @@ examples:
     _cli.add_keepalive(parser)
     _cli.add_compat(parser)
     _cli.add_timestamp_checking(parser)
+    _cli.add_payload_check(parser)
     parser.add_argument(
         '--auth-token', type=str, default=None,
         help='Send this token as AUTH_TOKEN parameter on SUBSCRIBE '
              '(required by some relays)')
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     return parser.parse_args()
 
@@ -157,13 +190,14 @@ def print_banner(relay, args):
     print(f"  trackname:   {args.trackname or '(auto-discover)'}")
     print(f"  duration:    {args.duration}s")
     print(f"  interval:    {args.interval}s")
+    if args.verify_payload:
+        print(f"  payload:     checked (every {args.verify_payload})")
+    print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
 
 
 async def run(args):
-    log_level = (logging.DEBUG if args.debug
-                 else logging.WARNING)
-    set_log_level(log_level)
+    _cli.apply_logging(args)
 
     # AIOMOQT_TASK_DUMP=1 installs a SIGUSR1 handler that dumps every
     # asyncio task's stack to stderr. Useful for diagnosing hangs:
@@ -174,7 +208,8 @@ async def run(args):
     relay = parse_relay_url(
         args.url)
     stats = BenchReporter(report_interval=args.interval,
-                          minimal=args.no_stats)
+                          minimal=args.no_stats,
+                          verify_payload=args.verify_payload)
     print_banner(relay, args)
 
     client = MOQTClient(
@@ -185,8 +220,7 @@ async def run(args):
         supported_drafts=args.draft,
         debug=args.debug,
         keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
+        **_cli.transport_kwargs(args),
     )
 
     failed = True
@@ -220,6 +254,7 @@ async def run(args):
                 if not await wait_cond_timeout(
                         track.wait_closed(), timeout=args.duration):
                     track.completed = True
+                stats.finish()
                 failed = False
 
             except MOQTRequestError as e:
@@ -245,8 +280,9 @@ async def run(args):
         for stat in top[:25]:
             print(f"  {stat.size / (1024 * 1024):8.1f} MB  "
                   f"{stat.count:>8d} blocks  {stat.traceback}")
-    # Zero objects is a failed run.
-    return 1 if failed or not stats.stats.total_objects else 0
+    # Zero objects, or a payload that breaks the bench layout, fails.
+    return (1 if failed or not stats.stats.total_objects or stats.payload_bad
+            else 0)
 
 
 def cli():

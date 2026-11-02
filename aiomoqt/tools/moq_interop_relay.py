@@ -1,23 +1,44 @@
 #!/usr/bin/env python3
-"""ERSATZ-RELAY — a stand-in MoQT relay, not a production relay.
+"""aiomoqt-relay: a MoQT relay built on aiomoqt.
 
-It genuinely relays (moxygen's moqtest conformance suite gates our CI
-against it), but it exists for exactly two purposes:
+Relays raw QUIC and WebTransport sessions at drafts 14, 16, 18, 20 and
+22. It runs the public aiomoqt-relay, and moxygen's moqtest conformance
+suite and the interop runner test against it. Written in Python, it
+carries less traffic than the Rust and C++ relays.
 
-  1. exercise aiomoqt's server-role API surface end to end, and
-  2. stand as the SUT for conformance and interop harnesses.
+Limits:
 
-Deliberately absent, and staying absent:
-
-  * NO authentication, authorization, or rate limiting
-  * NO load handling, bounded queues, or production hardening
-  * A bounded recent-object cache only (CACHE_GROUPS / CACHE_BYTES,
-    oldest dropped) — enough to answer a FETCH, standalone or joining,
-    over what it still holds; a late subscriber starts at the live edge
-  * Upstream Forward State is raised for a forwarding subscriber, never
-    lowered again
-  * NO delivery-timeout enforcement
-  * Namespace tables are in-memory and global to the process
+  * No authentication, authorization or rate limiting.
+  * A per-stream send budget (--max-inflight-bytes) and a send lane per
+    subscriber holding at most LANE_BYTES, counting its queued live
+    objects and what its streams still hold in the transport: a
+    subscriber that falls further behind loses whole groups, their
+    streams reset.
+  * Per session, at most --max-namespaces-per-session namespace requests
+    (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
+    --max-subscriptions-per-session SUBSCRIBEs held; past either, a
+    request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
+  * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
+    oldest group dropped) under a relay-wide budget (--cache-bytes),
+    which drops the oldest group of the least recently used track, never
+    the live group of a subscribed one: enough to answer a FETCH,
+    standalone or joining, over what it still holds; a late subscriber
+    starts at the live edge. Past CACHE_BUDGET_BYTES + CACHE_BYTES the
+    largest live group is dropped and the rest of it goes uncached. A
+    replay owed objects the cache no longer holds resets that subgroup
+    stream rather than FIN it.
+    Cache and lanes charge each object its payload, its properties and
+    a per-record overhead (retained_object_bytes).
+  * Upstream Forward State is raised for a forwarding subscriber and
+    lowered again once none has forwarded for --pause-after seconds;
+    a --catalog-probe catalog keeps flowing.
+  * A subscriber's send lane drops objects past their
+    OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
+    and the subscriber's), else live objects past --lag-limit seconds,
+    resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
+    the group. Past the track's MAX_CACHE_DURATION an object is neither
+    sent nor served from the cache: a request for it goes upstream.
+  * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the announcing session under the
@@ -29,13 +50,15 @@ Routing model (cross-session, single relay instance):
     every downstream subscriber of that track. With no match, send
     SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
     0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
-    rejection.
+    rejection. For --startup-hold seconds after start, such a SUBSCRIBE
+    first waits for a publisher, so viewers that reconnect after a
+    restart before their publishers are answered.
   - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
 
 Run on UDP/4443 with the runner's /certs convention:
 
   python -m aiomoqt.tools.moq_interop_relay \\
-      --bind 0.0.0.0 --port 4443 \\
+      --port 4443 \\
       --cert /certs/cert.pem --key /certs/priv.key
 
 Transports: WebTransport by default, raw QUIC with `--quic`, or BOTH
@@ -43,11 +66,20 @@ on one port with `--dual` (per-connection ALPN dispatch via aiopquic
 serve_dispatch). `--quic-port N` remains as the legacy two-listener
 arrangement (second raw-QUIC listener sharing the global namespace
 table) for runners that expect distinct endpoints.
+
+Stopping: SIGTERM or SIGINT drains. From the first signal the transport
+refuses new connections and the relay new sessions until it exits; it
+sends GOAWAY to every session (New Session URI from
+--goaway-uri, else empty: reconnect to this address), waits up to
+--drain-timeout seconds (default 5 with --goaway-uri, 2 without: nothing
+else accepts at this address) for them to leave, closes the rest with
+GOAWAY_TIMEOUT and exits once the closes have left. A second signal
+exits at once.
 """
 
 import argparse
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
@@ -59,18 +91,22 @@ import os
 import signal
 import sys
 import time
+import tomllib
 from collections import Counter
 from types import SimpleNamespace
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.server import MOQTServer
+from aiomoqt.server import MOQTServer, _listen_desc
 from aiomoqt.types import (
     MOQT_DEFAULT_DRAFTS, D18MessageType, FilterType, GroupOrder, MOQTDraft,
     MOQTMessageType, MOQTRequestError, MOQTStreamStopped, ObjectStatus,
     ParamType,
-    RequestErrorCode, StreamResetCode, SubscribeDoneCode,
-    parse_draft_spec,
+    RequestErrorCode, SCHEDULING, SessionCloseCode, StreamResetCode,
+    SubscribeDoneCode,
+    parse_draft_spec, to_stream_priority,
 )
+from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
+                              retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -86,16 +122,20 @@ from aiomoqt.messages.publish import Publish, PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe, SubscribeOk
 from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
-                           _filter_window, _largest_object_param,
+                           _filter_window, _largest_object_param, _min_nonzero,
                            _location_window, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
-from aiomoqt.utils.logger import (get_log_level, get_logger, set_log_handler,
-                                  set_log_level)
-from aiomoqt.utils.cli import add_help
+from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
+                                 server_cert_dirs)
+from aiomoqt.utils.logger import (get_category_logger, get_log_level,
+                                  set_log_handler, set_log_level,
+                                  step_log_level)
+from aiomoqt.utils.buffer import Buffer, BufferReadError
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -107,7 +147,8 @@ _RELAY_DRAFT_DEFAULT = (
     os.environ.get("DRAFT") or os.environ.get("MOQT_DRAFT")
     or ",".join(str(d) for d in MOQT_DEFAULT_DRAFTS)).strip()
 
-logger = get_logger(__name__)
+logger = get_category_logger("relay")
+control_log = get_category_logger("control")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -152,6 +193,10 @@ RENDEZVOUS_TIMEOUT = 0x04
 RENDEZVOUS_MAX_S = 30.0
 # Longest a joining FETCH waits for the SUBSCRIBE it names to attach.
 JOINING_WAIT_S = 5.0
+# A REQUEST_UPDATE to a SUBSCRIBE still pending upstream waits for its
+# answer, no longer than the SUBSCRIBE itself can be held.
+HELD_UPDATE_MAX_S = RENDEZVOUS_MAX_S + UPSTREAM_WAIT_S
+HELD_UPDATE_POLL_S = 0.01
 # Longest the relay waits for a PUBLISH after an upstream refuses its
 # SUBSCRIBE as a duplicate subscription (§5.1: the PUBLISH crossed it).
 PUBLISH_WAIT_S = 1.5
@@ -160,6 +205,9 @@ FILL_UPSTREAM_S = 10.0
 # Longest a SUBSCRIBE waits on an upstream FETCH for the group head the
 # upstream subscription did not deliver.
 BACKFILL_S = 2.0
+# Longest a SUBSCRIBE that resumes a paused upstream waits for its
+# REQUEST_OK and the publisher's Largest.
+RESUME_REPLY_S = 1.0
 # Watchdog: self-probes failed in a row before exiting, the exit status
 # (EX_SOFTWARE), and the longest one probe may take.
 WATCHDOG_MISSES = 3
@@ -185,6 +233,41 @@ CATALOG_TRACK = b"catalog"
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
 DEFAULT_GROUP_ORDER_PROPERTY = 0x22
+# --catalog-probe: subscribe to an announced namespace's catalog after each
+# delay until one succeeds; interop test namespaces ("moq-test...") are skipped.
+CATALOG_PROBE_DELAYS_S = (0.5, 2.0)
+CATALOG_PROBE_SKIP = b"moq-test"
+_catalog_probe = False
+# --pause-after: seconds a pulled track may go with no forwarding
+# subscriber before its upstream Forward State drops to 0; 0 = never.
+PAUSE_AFTER_S = 60.0
+_pause_after = PAUSE_AFTER_S
+# --startup-hold: seconds after start that a SUBSCRIBE no publisher can
+# serve waits for one; 0 = off.
+STARTUP_HOLD_S = 2.0
+# Loop time the startup hold ends, None when off.
+_hold_until = None
+# --lag-limit: delivery deadline in seconds for live objects on a lane
+# with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
+LAG_LIMIT_S = 5.0
+_lag_limit = LAG_LIMIT_S
+# --trace-subscribers: count what each subscription is sent.
+_trace_subscribers = False
+_pause_sweep = None
+
+
+def _begin_startup_hold(seconds: float) -> None:
+    """Hold SUBSCRIBEs for unserved tracks for `seconds` from now."""
+    global _hold_until
+    _hold_until = (asyncio.get_running_loop().time() + seconds
+                   if seconds > 0 else None)
+
+
+def _startup_hold_s() -> float:
+    """Seconds left of the startup hold; 0 once over."""
+    if _hold_until is None:
+        return 0.0
+    return max(_hold_until - asyncio.get_running_loop().time(), 0.0)
 
 
 async def _await_upstream(timeout: float = None) -> bool:
@@ -275,14 +358,6 @@ def _session_live(session) -> bool:
     return not (fut is not None and fut.done())
 
 
-def _cancelling() -> bool:
-    """True when the running task itself is being cancelled. A write to a
-    session that closed under it raises CancelledError too, and that
-    loses one subscriber, not the fan-out."""
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
 def _publishers_for(ns: tuple) -> list:
     """Publisher sessions that announced `ns` or a prefix of it."""
     out, seen = [], set()
@@ -324,6 +399,79 @@ def _fetch_sources(ns: tuple, track_name) -> list:
 # Recent-object cache bounds, per track: whichever is hit first.
 CACHE_GROUPS = 8
 CACHE_BYTES = 32 * 1024 * 1024
+# Relay-wide cache budget (--cache-bytes).
+CACHE_BUDGET_BYTES = 256 * 1024 * 1024
+
+# Requests one session may hold open; see the module docstring.
+MAX_NAMESPACES_PER_SESSION = 256
+MAX_SUBSCRIPTIONS_PER_SESSION = 1024
+# Retry Interval of a cap refusal: milliseconds before a retry, plus one.
+CAP_RETRY_MS = 1000
+# id(session) -> its SUBSCRIBE handlers still running.
+_subscribing: Counter = Counter()
+# (id(session), cap) already warned about.
+_cap_warned: set = set()
+
+# Tiebreak within a data stream band (--stream-scheduling).
+STREAM_SCHEDULING = "fifo"
+
+
+def _stream_band(session, priority) -> int:
+    """Transport band for a downstream data stream of this publisher
+    priority."""
+    if priority is None or not 0 <= priority <= 255:
+        priority = 128
+    return to_stream_priority(priority, discipline=getattr(
+        session, 'stream_scheduling', STREAM_SCHEDULING))
+
+
+def _no_tx(_stream_id) -> int:
+    return 0
+
+
+def _stream_budget(session):
+    """The per-stream send budget (--max-inflight-bytes)."""
+    return getattr(getattr(session, "_session", None),
+                   "tx_max_inflight_bytes", None)
+
+
+def _conn_gate(session):
+    """The connection's TX gate on new streams (tx_max_queued_bytes)."""
+    quic = getattr(session, "_quic", None)
+    gate = getattr(quic, "tx_max_queued_bytes", None)
+    if gate is None:
+        gate = getattr(getattr(quic, "configuration", None),
+                       "tx_max_queued_bytes", None)
+    return gate
+
+
+def _kib(n) -> str:
+    if not n:
+        return "none"
+    return f"{n >> 20} MiB" if n % (1 << 20) == 0 else f"{n >> 10} KiB"
+
+
+def _check_lanes() -> None:
+    now = time.monotonic()
+    for lane in list(_lanes):
+        lane.check(now, LANE_STALL_S)
+
+
+async def _watch_lanes() -> None:
+    """Check every send lane for a stall, a few times per LANE_STALL_S."""
+    while True:
+        await asyncio.sleep(min(STATUS_INTERVAL_S, LANE_STALL_S / 4))
+        try:
+            _check_lanes()
+        except Exception:
+            logger.debug("relay: lane check failed", exc_info=True)
+
+
+def _tx_used(session):
+    """The session's per-stream count of bytes queued in the transport."""
+    quic = getattr(session, "_quic", None)
+    return getattr(quic, "tx_data_ring_used", None) or _no_tx
+
 
 # MAX_FILTER_RANGES advertised at d20+ (§9.1.6).
 MAX_FILTER_RANGES = 16
@@ -337,7 +485,9 @@ class _Downstream:
 
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
-                 "fills", "range_params", "filters")
+                 "fills", "range_params", "filters", "lane", "lost",
+                 "fence", "timeout", "objects_sent", "bytes_sent",
+                 "largest_sent")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -363,6 +513,28 @@ class _Downstream:
         # form for this track; None passes every object.
         self.range_params: dict = {}
         self.filters = None
+        # Its _RelayLane, created with the first object for it.
+        self.lane = None
+        # Groups whose replay lacked objects it was owed: their streams
+        # end in a reset.
+        self.lost = ()
+        # The track's fence when it joined: its joining FETCH and fills
+        # start after that group.
+        self.fence = None
+        # Its OBJECT_DELIVERY_TIMEOUT in ms (§8); 0 sets none.
+        self.timeout = 0
+        # What its lane sent, counted with --trace-subscribers.
+        self.objects_sent = self.bytes_sent = 0
+        self.largest_sent = None
+
+    def take_timeout(self, params) -> bool:
+        """Record the OBJECT_DELIVERY_TIMEOUT a SUBSCRIBE or REQUEST_UPDATE
+        carries; absent keeps it. True when it changed."""
+        value = (params or {}).get(ParamType.DELIVERY_TIMEOUT)
+        if not isinstance(value, int) or value == self.timeout:
+            return False
+        self.timeout = value
+        return True
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -397,6 +569,187 @@ class _Downstream:
         return self.window[0]
 
 
+class _CacheBudget:
+    """Cache bytes across all tracks, held to CACHE_BUDGET_BYTES by
+    dropping the oldest group of the least recently used track."""
+
+    def __init__(self) -> None:
+        # Tracks holding cached objects, least recently used first.
+        self.lru: OrderedDict = OrderedDict()
+        self.bytes = 0
+        self.evictions = 0
+        # Live groups dropped at the hard ceiling.
+        self.truncations = 0
+        self._overrun = False
+
+    def touch(self, track) -> None:
+        """`track`'s cache was written, replayed or fetched from."""
+        if track._cache:
+            self.lru[track] = None
+            self.lru.move_to_end(track)
+
+    def forget(self, track) -> None:
+        self.lru.pop(track, None)
+
+    def enforce(self) -> None:
+        while self.bytes > CACHE_BUDGET_BYTES:
+            victim = next((t for t in self.lru if t._evictable()), None)
+            if victim is None and self.bytes > CACHE_BUDGET_BYTES + CACHE_BYTES:
+                largest = max(self.lru, key=lambda t: t._cache_bytes,
+                              default=None)
+                if largest is not None:
+                    largest._truncate_live()
+                    self.truncations += 1
+                    continue
+            if victim is None:
+                if not self._overrun:
+                    self._overrun = True
+                    logger.warning(
+                        f"relay: cache {self.bytes} bytes over its "
+                        f"{CACHE_BUDGET_BYTES}-byte budget: the rest is "
+                        f"subscribed tracks' live groups")
+                return
+            victim._drop_oldest_group()
+            self.evictions += 1
+        self._overrun = False
+
+
+_budget = _CacheBudget()
+
+# Send lanes still running, including those draining past their track.
+_lanes: set = set()
+
+
+def _tightest(*limits):
+    """The smallest of the non-zero, non-None limits; None for none."""
+    return min((x for x in limits if x), default=None)
+
+
+def _item(gid, live, sgid, oid, payload, exts, prio, status, shape,
+          encoded=None, cost=None, born=None) -> tuple:
+    """A SendLane item for a relayed object, or for a stream marker when
+    `oid` is None. `live` objects count against LANE_BYTES, a cache
+    replay does not; `cost` is the object's retained_object_bytes, when
+    already known; `born` its arrival time, None to never expire it."""
+    if cost is None:
+        cost = 0 if oid is None else retained_object_bytes(payload, exts)
+    return (gid, cost, live, born, sgid, oid, payload, exts, prio, status,
+            shape, encoded)
+
+
+class _RelayDelivery:
+    """A subscriber's side of a relayed track, written by its SendLane:
+    streams keep the upstream (group, subgroup) structure."""
+
+    __slots__ = ("track", "d", "session", "lane")
+
+    def __init__(self, track, d):
+        self.track = track
+        self.d = d
+        self.session = d.session
+        self.lane = None
+
+    async def send(self, item) -> bool:
+        (gid, _cost, _live, _born, sgid, oid, payload, exts, prio, status,
+         shape, encoded) = item
+        track, d = self.track, self.d
+        await track._forward_one(self.session, d.alias, gid, sgid, oid,
+                                 payload, exts, prio, status, shape, encoded,
+                                 start=d.start, lost=d.lost, lane=self.lane)
+        if oid is not None:
+            track._objects_out += 1
+            track._bytes_out += len(payload or b"")
+        return True
+
+    def reset_below(self, floor) -> None:
+        self.track._reset_streams(self.session, floor)
+
+    def close_streams(self) -> None:
+        self.track._close_streams(self.session)
+
+    def final(self, status_code, reason) -> None:
+        self.track._end(self.d, status_code, None, reason)
+
+    def tx_queued(self, floor=None) -> int:
+        return self.track._tx_queued(self.session, floor)
+
+    def expire(self, group_id) -> bool:
+        return self.track._expire(self.session, group_id)
+
+
+class _TracedRelayDelivery(_RelayDelivery):
+    """--trace-subscribers: also counts what the subscription is sent."""
+
+    __slots__ = ()
+
+    async def send(self, item) -> bool:
+        await super().send(item)
+        oid = item[5]
+        if oid is not None:
+            d = self.d
+            d.objects_sent += 1
+            d.bytes_sent += len(item[6] or b"")
+            loc = (item[0], oid)
+            if d.largest_sent is None or loc > d.largest_sent:
+                d.largest_sent = loc
+        return True
+
+
+class _RelayLane(SendLane):
+    """One subscriber's SendLane, bounded by LANE_BYTES and registered
+    for the stall check and the status page. A failed write drops the
+    subscriber."""
+
+    log = logger
+    prefix = "relay: "
+
+    def __init__(self, track, d):
+        writer = (_TracedRelayDelivery if _trace_subscribers
+                  else _RelayDelivery)(track, d)
+        super().__init__(writer, max_bytes=LANE_BYTES)
+        writer.lane = self
+        self.track = track
+        self.d = d
+        _lanes.add(self)
+        track._lanes.add(self)
+
+    def _exit(self) -> None:
+        _lanes.discard(self)
+        self.track._lanes.discard(self)
+        super()._exit()
+
+    def _who(self) -> str:
+        session = self.d.session
+        info = _sessions.get(id(session))
+        key = self.track.key
+        addr = _addr_of(session)
+        peer = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) else addr
+        return (f"sub {info['id'] if info else '?'} {peer}"
+                f" track {_ns_str(key[0])}/{_name_str(key[1])}"
+                f" request {self.d.request_id}")
+
+    def _stall_detail(self) -> str:
+        session = self.d.session
+        backlog = sum(t._tx_queued(session) for t in list(_tracks.values()))
+        ring = _tx_used(session)(self.sid) if self.sid is not None else 0
+        return (f"tx_backlog={backlog} stream {self.sid} ring_used={ring} "
+                f"(budget {_kib(_stream_budget(session))}, "
+                f"conn gate {_kib(_conn_gate(session))})")
+
+    def _woke(self) -> bool:
+        if _session_live(self.d.session):
+            return True
+        self.track.drop_session(self.d.session)
+        return False
+
+    def _failed(self, item, error) -> bool:
+        logger.debug("relay: forward failed, dropping subscriber",
+                     exc_info=error)
+        self.track._drops += 1
+        self.track.drop_session(self.d.session)
+        return False
+
+
 class _RelayedTrack:
     """One upstream subscription fanned out to N downstream subscribers.
 
@@ -405,9 +758,9 @@ class _RelayedTrack:
     for the same track joins this fan-out instead of opening a second
     upstream SUBSCRIBE.
 
-    Objects arrive on a synchronous callback but forwarding has to open
-    streams, which is async — inbound objects go through a queue drained
-    by one task per track, which also keeps them in arrival order.
+    Objects arrive on a synchronous callback. One task per track takes
+    them in arrival order, caches and filters them, and hands each to
+    every subscriber's _RelayLane, which does the writing.
     """
 
     def __init__(self, key):
@@ -415,10 +768,31 @@ class _RelayedTrack:
         self.upstream = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
-        # Answered with Forward State 0 because nobody could be offered
-        # the track yet; raised with REQUEST_UPDATE when one arrives.
-        self.parked = None            # (session, Publish msg)
+        # Upstream Forward State is 0: answered so in PUBLISH_OK, or
+        # lowered by --pause-after; a forwarding subscriber raises it.
+        self.paused = False
+        # Paused by --pause-after, after taking objects.
+        self.lowered = False
+        # Largest group before the last resume: cached groups up to it
+        # are stale for subscribers joining since.
+        self.fence = None
+        # Each pause's gap in the cache, [first Location missing, first
+        # received after the resume or None while paused].
+        self._gaps = []
+        # The publisher's Largest from its REQUEST_OK to the last pause.
+        self.pause_largest = None
+        # Task resolving to that Largest, for a resume sent before it.
+        self.pause_reply = None
+        # The PUBLISH feeding this track, once answered.
+        self.publish_msg = None
+        # Loop time since which no subscriber has forwarded, else None.
+        self.unwatched_since = None
+        # Resumed after a pause: the next object sets complete_from.
+        self._resync = False
         self.downstream: list[_Downstream] = []
+        # Send lanes still running, including those of subscribers that
+        # have left `downstream` and are draining to their PUBLISH_DONE.
+        self._lanes: set = set()
         self.queue = asyncio.Queue()
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
@@ -426,6 +800,9 @@ class _RelayedTrack:
         self.attaching = False
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
+        # id(session) -> {(group, subgroup): stream_id} of the streams
+        # opened, kept past FIN until the transport has drained them.
+        self._tx_streams: dict = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -444,6 +821,12 @@ class _RelayedTrack:
         # Objects cached per group ID; the bound counts groups, as IDs
         # may skip.
         self._groups = {}
+        # Live group dropped at the relay's hard ceiling: the rest of it
+        # is not cached.
+        self._uncached = None
+        # Group -> largest Object ID dropped from, or never put in, the
+        # cache.
+        self._lost = {}
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
         self._ended = set()
@@ -464,6 +847,11 @@ class _RelayedTrack:
         self.complete_from = None
         # Where the upstream filter starts; {0, 0} when unfiltered.
         self.upstream_from = None
+        # Some object arrived as a datagram.
+        self._datagrams = False
+        # (value, Largest Group when sent) of the last NEW_GROUP_REQUEST
+        # sent upstream.
+        self.new_group_request = None
         # Groups whose Object 0 arrived from upstream: complete from it.
         self._heads = set()
         # Locations a backfill FETCH cached; the live copy is dropped.
@@ -521,8 +909,99 @@ class _RelayedTrack:
         if self.task is not None:
             self.task.cancel()
             self.task = None
+        self._release_downstream()
+        self._drop_cache()
+
+    def _release_downstream(self) -> None:
+        """Forget the subscribers; lanes draining to their PUBLISH_DONE
+        keep their streams, the rest stop."""
+        for lane in list(self._lanes):
+            if not lane.final:
+                lane.stop()
+        draining = {id(lane.d.session) for lane in self._lanes}
         self.downstream.clear()
-        self._streams.clear()
+        for k in [k for k in self._streams if k[0] not in draining]:
+            self._streams.pop(k, None)
+        for k in [k for k in self._tx_streams if k not in draining]:
+            del self._tx_streams[k]
+
+    def _lane(self, d) -> "_RelayLane":
+        if d.lane is None:
+            d.lane = _RelayLane(self, d)
+            self.time_lane(d)
+        return d.lane
+
+    def _timeout_s(self, d):
+        """§8: the smaller non-zero of the publisher's and `d`'s
+        OBJECT_DELIVERY_TIMEOUT, in seconds; None when neither sets one."""
+        pub = self.properties.get(ParamType.DELIVERY_TIMEOUT)
+        ms = _min_nonzero(pub if isinstance(pub, int) else 0, d.timeout)
+        return ms / 1000 if ms else None
+
+    def _max_age_s(self):
+        """MAX_CACHE_DURATION (§12.3; d22 §10.3) in seconds, or None."""
+        ms = self.properties.get(ParamType.MAX_CACHE_DURATION)
+        return ms / 1000 if isinstance(ms, int) and ms else None
+
+    def time_lane(self, d) -> None:
+        """Set `d`'s lane deadline: its delivery timeout, else --lag-limit,
+        capped by MAX_CACHE_DURATION."""
+        if d.lane is not None:
+            d.lane.deadline = _tightest(self._timeout_s(d) or _lag_limit,
+                                        self._max_age_s())
+
+    def _expire_cache(self) -> None:
+        """Drop cached objects past MAX_CACHE_DURATION, and every object at
+        or before the newest of them, keeping the cache contiguous: their
+        state is unknown (§12.3), so a request for them goes upstream."""
+        age = self._max_age_s()
+        if age is None or not self._cache:
+            return
+        oldest = time.monotonic() - age
+        last = max(((c[0], c[2]) for c in self._cache if c[8] < oldest),
+                   default=None)
+        if last is None:
+            return
+        kept = deque()
+        size = 0
+        for c in self._cache:
+            if (c[0], c[2]) > last:
+                kept.append(c)
+                continue
+            size += retained_object_bytes(c[3], c[4])
+            self._note_lost(c[0], c[2])
+            left = self._groups.pop(c[0]) - 1
+            if left:
+                self._groups[c[0]] = left
+        self._cache = kept
+        self._cache_bytes -= size
+        _budget.bytes -= size
+        self._prune()
+
+    def _expire(self, session, group_id) -> bool:
+        """§8: reset the session's open streams of the group with
+        DELIVERY_TIMEOUT. True, skipping the rest of the group, unless the
+        track sends datagrams: those are only dropped."""
+        sk = id(session)
+        streamed = False
+        for k, (sid, _hdr) in list(self._streams.items()):
+            if k[0] == sk and k[1] == group_id:
+                session.stream_reset(sid, StreamResetCode.DELIVERY_TIMEOUT)
+                self._streams.pop(k, None)
+                streamed = True
+        return streamed or not self._datagrams
+
+    def _queued(self, d) -> bool:
+        """`d`'s lane still holds or is writing something."""
+        return d.lane is not None and not d.lane.idle
+
+    def _drop_cache(self) -> None:
+        """Empty the cache and return its bytes to the relay budget."""
+        _budget.bytes -= self._cache_bytes
+        _budget.forget(self)
+        self._cache.clear()
+        self._cache_bytes = 0
+        self._groups.clear()
 
     def _release_publish(self) -> None:
         """Drop the PUBLISH's handlers on the publisher's session, unless a
@@ -545,13 +1024,20 @@ class _RelayedTrack:
             return
         self._finished = True
         for d in list(self.downstream):
-            self._end(d, status_code, reset_code, reason)
+            if reset_code is None and self._queued(d):
+                d.lane.finish(status_code, reason)
+            else:
+                self._end(d, status_code, reset_code, reason)
 
     def end_downstream(self, d) -> None:
         """A subscription whose End is behind production (§5.1.2) ends
         with PUBLISH_DONE SUBSCRIPTION_ENDED; from d20 it stays open and
-        only its streams close (d22 §3.3.1)."""
+        only its streams close (d22 §3.3.1). Either follows what its lane
+        holds."""
         if not d.session._profile.publish_done_subscription_ended:
+            if self._queued(d):
+                d.lane.close_streams()
+                return
             try:
                 self._close_streams(d.session)
             except Exception:
@@ -560,12 +1046,18 @@ class _RelayedTrack:
             return
         if d in self.downstream:
             self.downstream.remove(d)
+            if self._queued(d):
+                d.lane.finish(SubscribeDoneCode.SUBSCRIPTION_ENDED,
+                              "subscription ended")
+                return
             self._end(d, SubscribeDoneCode.SUBSCRIPTION_ENDED, None,
                       "subscription ended")
 
     def _close_streams(self, session, reset_code=None) -> None:
         """FIN the session's open streams, or reset them with
         `reset_code`."""
+        if reset_code is not None:
+            self._tx_streams.pop(id(session), None)
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == id(session):
                 if reset_code is None:
@@ -574,9 +1066,46 @@ class _RelayedTrack:
                     session.stream_reset(sid, int(reset_code))
                 self._streams.pop(k, None)
 
+    def _reset_streams(self, session, below) -> None:
+        """Reset the session's streams of groups below `below`: open ones,
+        and FINed ones the transport has not yet sent out."""
+        sk = id(session)
+        tx = self._tx_streams.get(sk) or {}
+        used = _tx_used(session)
+        for k, sid in list(tx.items()):
+            if k[0] < below:
+                del tx[k]
+                if (sk, *k) not in self._streams and used(sid):
+                    session.stream_reset(sid, StreamResetCode.CANCELLED)
+        for k, (sid, _hdr) in list(self._streams.items()):
+            if k[0] == sk and k[1] < below:
+                session.stream_reset(sid, StreamResetCode.CANCELLED)
+                self._streams.pop(k, None)
+
+    def _tx_queued(self, session, floor=None) -> int:
+        """Bytes the transport still holds on the session's streams of
+        this track, groups below `floor` excepted. Drained FINed streams
+        are forgotten."""
+        tx = self._tx_streams.get(id(session))
+        if not tx:
+            return 0
+        sk = id(session)
+        used = _tx_used(session)
+        total = 0
+        for k, sid in list(tx.items()):
+            n = used(sid)
+            if not n and (sk, *k) not in self._streams:
+                del tx[k]
+            elif floor is None or k[0] >= floor:
+                total += n
+        return total
+
     def _end(self, d, status_code, reset_code, reason) -> None:
-        """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE."""
+        """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE.
+        Objects its lane still held are dropped, so its streams are reset."""
         session = d.session
+        if (d.lane is not None and d.lane.stop() and reset_code is None):
+            reset_code = StreamResetCode.CANCELLED
         try:
             self._close_streams(session, reset_code)
             session.subscribe_done(
@@ -642,7 +1171,7 @@ class _RelayedTrack:
             # Nothing from this track may be served or cached (§2.4.2):
             # drop the fan-out so a later SUBSCRIBE starts clean rather
             # than joining a dead one.
-            _tracks.pop(self.key, None)
+            _drop_track(self.key, self)
             self.close()
             return
         self.queue.put_nowait(
@@ -685,6 +1214,12 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add(gid)
+        if self._gaps and self._gaps[-1][1] is None and not self.paused:
+            self._gaps[-1][1] = (gid, msg.object_id)
+        if self._resync:
+            # Objects before this one went unsent while paused.
+            self._resync = False
+            self.complete_from = (gid, msg.object_id)
         if self.key[1] == CATALOG_TRACK and msg.object_id == 0:
             _note_catalog(self.key[0], payload)
         # On arrival, so a SUBSCRIBE sees it; objects for the subscriber
@@ -700,6 +1235,7 @@ class _RelayedTrack:
         shape = getattr(msg, "stream_flags", None)
         if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
             shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
+            self._datagrams = True
         elif isinstance(shape, tuple) and shape:
             # FIRST_OBJECT holds for the object that opened the upstream
             # stream only; a downstream stream opened later must not claim it.
@@ -740,6 +1276,7 @@ class _RelayedTrack:
         window go to the subscriber first, then live ones."""
         self.attaching = False
         d = _Downstream(session, track_alias, request_id, forward, window)
+        d.fence = self.fence
         if forward:
             # A joining FETCH from this subscriber backfills to here.
             d.joined_at = self.largest
@@ -757,6 +1294,9 @@ class _RelayedTrack:
                      and d.request_id == request_id), None)
 
     def drop_session(self, session):
+        for lane in [lane for lane in self._lanes
+                     if lane.d.session is session]:
+            lane.stop()
         for d in self.downstream:
             if d.session is session:
                 # d22 §3.4.1: a cancelled subscription resets its fills.
@@ -768,41 +1308,53 @@ class _RelayedTrack:
             self._streams.pop(k, None)
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
+        self._tx_streams.pop(id(session), None)
 
     async def _forward_loop(self):
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
             if status == "DONE":
-                # Terminal, in queue order: everything already queued has
-                # been written downstream before PUBLISH_DONE goes out.
+                # Terminal, in queue order: each subscriber's PUBLISH_DONE
+                # follows what its lane already holds.
                 code, reason, key = shape
+                # Replays still queued behind the terminal go first.
+                for d in list(self.downstream):
+                    if d.replaying:
+                        self._replay(d)
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
-                self.downstream.clear()
-                self._streams.clear()
+                self._release_publish()
+                self._release_downstream()
+                self._drop_cache()
                 self.task = None
-                _tracks.pop(key, None)
+                _drop_track(key, self)
                 return
             if self._finished:
                 continue
             if status == "REPLAY":
-                await self._replay(shape)
+                self._replay(shape)
                 continue
             if oid is not None:
                 if (gid, oid) in self._backfilled:
                     self._backfilled.discard((gid, oid))
                     continue
+                cost = retained_object_bytes(payload, exts)
+                born = time.monotonic()
                 self._remember(gid, sgid, oid, payload, exts, prio, status,
-                               shape)
-            encoded = {}
+                               shape, cost, born)
+            else:
+                cost = 0
+                born = None
+            item = _item(gid, True, sgid, oid, payload, exts, prio, status,
+                         shape, {}, cost, born)
             for d in list(self.downstream):
                 if d.replaying:
                     continue
                 if not _session_live(d.session):
                     self.drop_session(d.session)
                     continue
-                out = (oid, payload, exts, status, shape)
+                out = item
                 if oid is not None:
                     if d.past_end(gid):
                         self.end_downstream(d)
@@ -814,49 +1366,103 @@ class _RelayedTrack:
                                           ObjectStatus.END_OF_TRACK):
                             continue
                         # A filtered-out end marker still ends its stream.
-                        out = (None, None, None, "END", None)
-                try:
-                    self._objects_out += 1
-                    self._bytes_out += len(payload or b"")
-                    o_oid, o_payload, o_exts, o_status, o_shape = out
-                    await self._forward_one(
-                        d.session, d.alias, gid, sgid, o_oid, o_payload,
-                        o_exts, prio, o_status, o_shape, encoded,
-                        start=d.start)
-                except (Exception, asyncio.CancelledError):
-                    if _cancelling():
-                        raise
-                    logger.debug("relay: forward failed, dropping subscriber",
-                                 exc_info=True)
-                    self._drops += 1
-                    self.drop_session(d.session)
-                    continue
+                        out = _item(gid, True, sgid, None, None, None, prio,
+                                    "END", None)
+                self._lane(d).offer(out)
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
-                  shape=None) -> None:
-        """Keep one object, with its stream shape or datagram mode, for a
-        later FETCH or replay, dropping oldest past the bound."""
+                  shape=None, cost=None, born=None) -> None:
+        """Keep one object, with its stream shape or datagram mode and
+        arrival time, for a later FETCH or replay, dropping oldest past
+        the bound."""
+        if self._uncached is not None:
+            if gid == self._uncached:
+                self.note_largest((gid, oid))
+                self._note_lost(gid, oid)
+                return
+            if gid > self._uncached:
+                self._uncached = None
         self._cache.append((gid, sgid, oid, payload, exts, prio, status,
-                            shape))
-        self._cache_bytes += len(payload or b"")
+                            shape, time.monotonic() if born is None
+                            else born))
+        size = (retained_object_bytes(payload, exts) if cost is None
+                else cost)
+        self._cache_bytes += size
+        _budget.bytes += size
         self._groups[gid] = self._groups.get(gid, 0) + 1
         self.note_largest((gid, oid))
+        _budget.touch(self)
         self._evict()
 
     def _evict(self) -> None:
         """Drop the oldest objects past CACHE_GROUPS groups or
-        CACHE_BYTES."""
+        CACHE_BYTES, then hold the relay to its budget."""
         while self._cache and (len(self._groups) > CACHE_GROUPS
                                or self._cache_bytes > CACHE_BYTES):
             dropped = self._cache.popleft()
-            self._cache_bytes -= len(dropped[3] or b"")
+            size = retained_object_bytes(dropped[3], dropped[4])
+            self._note_lost(dropped[0], dropped[2])
+            self._cache_bytes -= size
+            _budget.bytes -= size
             left = self._groups.pop(dropped[0]) - 1
             if left:
                 self._groups[dropped[0]] = left
-        if self._cache:
+        self._prune()
+        _budget.enforce()
+
+    def _evictable(self) -> bool:
+        """Holds a group the budget may drop: anything but the newest
+        group of a track with a live subscriber."""
+        if len(self._groups) > 1:
+            return True
+        return bool(self._groups) and not any(
+            _session_live(d.session) for d in self.downstream)
+
+    def _drop_oldest_group(self) -> None:
+        """Drop every cached object of the oldest group, so the cache
+        stays a contiguous run of the newest groups."""
+        self._drop_group(min(self._groups))
+
+    def _truncate_live(self) -> None:
+        """At the relay's hard ceiling: drop the newest cached group and
+        cache none of the rest of it. Live delivery is unaffected."""
+        gid = max(self._groups)
+        logger.warning(
+            f"relay: cache {_budget.bytes} bytes over its "
+            f"{CACHE_BUDGET_BYTES + CACHE_BYTES}-byte ceiling: dropping "
+            f"live group {gid} of {self.key} ({self._cache_bytes} bytes)")
+        self._uncached = gid
+        self._drop_group(gid)
+
+    def _note_lost(self, gid, oid) -> None:
+        if oid > self._lost.get(gid, -1):
+            self._lost[gid] = oid
+
+    def _drop_group(self, gid) -> None:
+        size = sum(retained_object_bytes(c[3], c[4]) for c in self._cache
+                   if c[0] == gid)
+        self._note_lost(gid, max(c[2] for c in self._cache if c[0] == gid))
+        self._cache = deque(c for c in self._cache if c[0] != gid)
+        del self._groups[gid]
+        self._cache_bytes -= size
+        _budget.bytes -= size
+        self._prune()
+
+    def _prune(self) -> None:
+        """Forget per-group state below the oldest cached group; an
+        empty cache leaves the budget's LRU."""
+        floor = (self._cache[0][0] if self._cache
+                 else self.largest[0] if self.largest else 0)
+        self._lost = {g: o for g, o in self._lost.items() if g >= floor}
+        oldest = (self._cache[0][0], self._cache[0][2]) if self._cache else None
+        self._gaps = [g for g in self._gaps if g[1] is None
+                      or (oldest is not None and g[1] > oldest)]
+        if not self._cache:
+            _budget.forget(self)
+        else:
             first = self._cache[0][0]
             self._ended = {k for k in self._ended if k[0] >= first}
             self._opened = {k for k in self._opened if k[0] >= first}
@@ -865,36 +1471,34 @@ class _RelayedTrack:
                                 if k[0] >= first}
             self._stopped = {k for k in self._stopped if k[1] >= first}
 
-    async def _replay(self, d) -> None:
-        """The cached objects inside `d`'s window, in Location order,
-        then FIN for the subgroups the publisher has already ended."""
+    def _replay(self, d) -> None:
+        """Queue on `d`'s lane the cached objects inside its window, in
+        Location order, then FIN for the subgroups the publisher has
+        already ended; live objects follow."""
         d.replaying = False
         if d not in self.downstream:
             return
+        self._expire_cache()
+        d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
         objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
                        and d.admits(c[1], c[2], c[5], c[4])),
                       key=lambda c: (c[0], c[1], c[2]))
-        try:
-            for gid, sgid, oid, payload, exts, prio, status, shape in objs:
-                self._objects_out += 1
-                self._bytes_out += len(payload or b"")
-                await self._forward_one(d.session, d.alias, gid, sgid, oid,
-                                        payload, exts, prio, status, shape,
-                                        start=d.start)
-            for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
-                if (gid, sgid) in self._ended:
-                    await self._forward_one(d.session, d.alias, gid, sgid,
-                                            None, None, None, None, "END",
-                                            start=d.start)
-        except (Exception, asyncio.CancelledError):
-            if _cancelling():
-                raise
-            logger.debug("relay: replay failed, dropping subscriber",
-                         exc_info=True)
-            self._drops += 1
-            self.drop_session(d.session)
-            return
-        logger.info(f"relay: replayed {len(objs)} cached object(s) of "
+        if objs:
+            _budget.touch(self)
+        lane = self._lane(d)
+        # Replays expire by OBJECT_DELIVERY_TIMEOUT or MAX_CACHE_DURATION,
+        # never --lag-limit: stamps shift by that limit minus the deadline.
+        limit = _tightest(self._timeout_s(d), self._max_age_s())
+        shift = None if limit is None else limit - lane.deadline
+        for gid, sgid, oid, payload, exts, prio, status, shape, born in objs:
+            lane.offer(_item(gid, False, sgid, oid, payload, exts, prio,
+                             status, shape,
+                             born=None if shift is None else born + shift))
+        for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
+            if (gid, sgid) in self._ended:
+                lane.offer(_item(gid, False, sgid, None, None, None, None,
+                                 "END", None))
+        logger.info(f"relay: replaying {len(objs)} cached object(s) of "
                     f"{self.key} to request {d.request_id}")
 
     def cache_covers(self, start) -> bool:
@@ -902,10 +1506,35 @@ class _RelayedTrack:
         oldest object is the boundary: anything before it was evicted
         and has to come from the publisher, or the subscriber gets a
         short answer with no way to tell."""
+        self._expire_cache()
         if not self._cache:
             return False
         first = (self._cache[0][0], self._cache[0][2])
         return start >= first
+
+    def holds_through(self, end) -> bool:
+        """The cache reaches `end`: it holds an object at or past it, the
+        End of Group of `end`'s group, or End of Track."""
+        return any((c[0], c[2]) >= end
+                   or c[6] == ObjectStatus.END_OF_TRACK
+                   or (c[0] == end[0] and c[6] == ObjectStatus.END_OF_GROUP)
+                   for c in reversed(self._cache))
+
+    def open_gap(self) -> None:
+        """Note a pause: what is published from just past Largest, or
+        from (0, 0) with none known, until objects flow again may never
+        reach the cache."""
+        if self._gaps and self._gaps[-1][1] is None:
+            return
+        start = ((0, 0) if self.largest is None
+                 else (self.largest[0], self.largest[1] + 1))
+        self._gaps.append([start, None])
+
+    def crosses_gap(self, start, end) -> bool:
+        """True when [start, end] (None: to the live edge) overlaps a
+        pause's gap, which the cache does not cover."""
+        return any((end is None or g[0] <= end)
+                   and (g[1] is None or start < g[1]) for g in self._gaps)
 
     def group_end(self, group_id, start):
         """The last cached Location of a group, which is its END_OF_GROUP
@@ -918,14 +1547,17 @@ class _RelayedTrack:
         """Cached objects within [start, end], each (group, object)
         inclusive; `end` None means to the live edge. In Location order,
         across subgroups (§3.2.1)."""
+        self._expire_cache()
         out = []
-        for gid, sgid, oid, payload, exts, prio, status, _ in self._cache:
+        for gid, sgid, oid, payload, exts, prio, status, *_ in self._cache:
             if (gid, oid) < start:
                 continue
             if end is not None and (gid, oid) > end:
                 continue
             out.append((gid, sgid, oid, payload, exts, prio, status))
         out.sort(key=lambda o: (o[0], o[2]))
+        if out:
+            _budget.touch(self)
         return out
 
     def _short(self, gid, start) -> bool:
@@ -937,14 +1569,13 @@ class _RelayedTrack:
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None):
+                           encoded=None, start=None, lost=(), lane=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
-        (§11.3.2)."""
-        if (isinstance(shape, tuple) and shape and shape[0] == "DGRAM"
-                and not _no_datagrams.get(id(session))):
+        (§11.3.2). `lane` is told what each write awaits."""
+        if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
             if is_status and not prof.merged_datagram_layout:
@@ -959,15 +1590,8 @@ class _RelayedTrack:
                     payload=payload or b"",
                     end_of_group=bool(shape[1]),
                     status=status or ObjectStatus.NORMAL)
-            try:
-                session.send_dgram_message(dgram.serialize(prof=prof))
-                return
-            except NotImplementedError:
-                # WebTransport datagram TX is not wired in aiopquic yet;
-                # deliver on a subgroup stream rather than drop objects.
-                _no_datagrams[id(session)] = True
-                logger.warning("relay: no datagram TX on this session, "
-                               "forwarding objects on streams")
+            _send_datagram(session, dgram.serialize(prof=prof), alias, gid, oid)
+            return
         skey = (id(session), gid, sgid)
         if skey in self._stopped:
             return
@@ -982,7 +1606,8 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         if entry is None:
-            stream_id = await session.open_uni_stream()
+            if lane is not None:
+                lane.parked, lane.sid = "header", None
             # Mirror the upstream stream's shape: END_OF_GROUP,
             # FIRST_OBJECT and the subgroup-id mode are part of the
             # delivery semantics a subscriber checks, and re-encoding
@@ -993,14 +1618,32 @@ class _RelayedTrack:
                 publisher_priority=prio, extensions_present=True,
                 end_of_group=eog, first_object=first_obj,
                 prof=session._profile)
-            session.stream_write(stream_id, header.serialize().data)
+            initial = header.serialize().data
+            first = None
+            if status not in _STREAM_ENDS:
+                # The header and the first object open the stream together.
+                first = _object_data(header, payload, exts, oid, encoded)
+                initial += first
+            try:
+                stream_id = await session.open_uni_stream(
+                    initial=initial, priority=_stream_band(session, prio))
+            except MOQTStreamStopped:
+                self._stopped.add(skey)
+                return
+            if lane is not None:
+                lane.sid = stream_id
             entry = (stream_id, header)
             self._streams[skey] = entry
+            self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
+                stream_id
             self._sent_streams[id(session)] = \
                 self._sent_streams.get(id(session), 0) + 1
+            if first is not None:
+                return
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
-                      ObjectStatus.END_OF_TRACK) and self._short(gid, start):
+                      ObjectStatus.END_OF_TRACK) and (
+                          gid in lost or self._short(gid, start)):
             session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
             self._streams.pop(skey, None)
             return
@@ -1013,27 +1656,40 @@ class _RelayedTrack:
             return
         if status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
             # Upstream sent an explicit marker: forward it, then FIN.
-            buf = header.end_group(
+            buf = header.next_object(
+                payload=b"", status=status,
                 object_id=header.next_object_id if oid is None else oid)
             session.stream_write(stream_id, buf.data, end_stream=True)
             self._streams.pop(skey, None)
             return
-        # One encoding per object per stream state, shared by subscribers.
-        state = header.encoding_state()
-        data = None if encoded is None else encoded.get(state)
-        if data is None:
-            data = header.next_object_bytes(payload=payload, extensions=exts,
-                                            object_id=oid)
-            if encoded is not None:
-                encoded[state] = data
-        else:
-            header.advance(oid)
+        data = _object_data(header, payload, exts, oid, encoded)
+        if lane is not None:
+            lane.parked, lane.sid = "object", stream_id
         try:
             await session.stream_write_drain(stream_id, data)
         except MOQTStreamStopped:
             # The session has reset the stream; the subscription goes on.
             self._streams.pop(skey, None)
             self._stopped.add(skey)
+
+
+# Statuses that end a subgroup stream instead of carrying an object.
+_STREAM_ENDS = ("END", ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)
+
+
+def _object_data(header, payload, exts, oid, encoded):
+    """The object's bytes on header's stream. One encoding per object per
+    stream state, shared by subscribers through `encoded`."""
+    state = header.encoding_state()
+    data = None if encoded is None else encoded.get(state)
+    if data is None:
+        data = header.next_object_bytes(payload=payload, extensions=exts,
+                                        object_id=oid)
+        if encoded is not None:
+            encoded[state] = data
+    else:
+        header.advance(oid)
+    return data
 
 
 _watched: set = set()
@@ -1135,7 +1791,7 @@ def _supersede_namespace(ns: tuple, session) -> None:
                 and not _session_live(owner)):
             logger.info(f"relay: superseding track {key} for a new publisher")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
 
 
 def _forget_session(session) -> None:
@@ -1146,7 +1802,10 @@ def _forget_session(session) -> None:
         del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
-    _no_datagrams.pop(id(session), None)
+    _dgram_drops.pop(id(session), None)
+    _subscribing.pop(id(session), None)
+    _cap_warned.difference_update(
+        [k for k in _cap_warned if k[0] == id(session)])
     for k in [k for k in _announce_requests if k[0] == id(session)]:
         del _announce_requests[k]
     for ns in list(_announced):
@@ -1154,9 +1813,8 @@ def _forget_session(session) -> None:
                 not _announced[ns]:
             del _announced[ns]
             _retract_namespace(ns)
-            # This session's own prefix subscriptions were dropped just
-            # above, so this reaches the observers that remain.
-            _retract_namespace(ns)
+    for lane in [lane for lane in _lanes if lane.d.session is session]:
+        lane.track.drop_session(session)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
         if _upstream_session(track) is session or (
@@ -1166,7 +1824,7 @@ def _forget_session(session) -> None:
             # before dropping the fan-out.
             track.finish()
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
 
 
 def _ns_tuple(namespace):
@@ -1182,11 +1840,53 @@ def _ns_tuple(namespace):
     return tuple()
 
 
+def _session_namespaces(session) -> int:
+    """Namespace requests the session holds."""
+    held = sum(1 for sid, _ in _announce_requests if sid == id(session))
+    subs = {e[2] for table in (_ns_subs, _track_subs, _announce_subs)
+            for e in table if e[0] is session}
+    return held + len(subs)
+
+
+def _session_subscriptions(session) -> int:
+    """SUBSCRIBEs the session has in flight or attached to a track."""
+    return _subscribing[id(session)] + sum(
+        1 for t in _tracks.values() for d in t.downstream
+        if d.session is session)
+
+
+def _refused_over_cap(session, msg, what: str, cap: int, held: int) -> bool:
+    """Refuse `msg` with EXCESSIVE_LOAD when the session holds `cap`
+    of `what`; one WARNING per session and cap."""
+    if held < cap:
+        return False
+    if (id(session), what) not in _cap_warned:
+        _cap_warned.add((id(session), what))
+        logger.warning(f"relay: session {_addr_of(session)} holds {held} "
+                       f"{what} (cap {cap}): refusing more with "
+                       f"EXCESSIVE_LOAD")
+    session._refuse_peer_request(
+        msg, RequestErrorCode.EXCESSIVE_LOAD,
+        f"too many {what} on this session", retry_interval=CAP_RETRY_MS + 1)
+    return True
+
+
+def _namespaces_full(session, msg) -> bool:
+    return _refused_over_cap(session, msg, "namespaces",
+                             MAX_NAMESPACES_PER_SESSION,
+                             _session_namespaces(session))
+
+
 async def _on_publish_namespace(session, msg):
     """Record the announcing session, ack with default OK path."""
+    if _namespaces_full(session, msg):
+        return
     ns = _ns_tuple(msg.namespace)
     _watch_session(session, ns)
     _supersede_namespace(ns, session)
+    if not any(_session_live(s) for s in _announced.get(ns, ())):
+        # A new broadcast under this namespace: probe its catalog again.
+        _catalogs.pop(ns, None)
     holders = _announced.setdefault(ns, {})
     holders[session] = holders.get(session, 0) + 1
     _announce_requests[(id(session), msg.request_id)] = ns
@@ -1200,7 +1900,9 @@ async def _on_publish_namespace(session, msg):
     _forward_announcements(ns, session)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
-    session.publish_namepace_ok(msg)
+    session.publish_namespace_ok(msg)
+    if _catalog_probe and _probe_wanted(ns):
+        _spawn(_probe_catalog(ns))
 
 
 async def _on_publish_namespace_done(session, msg):
@@ -1280,6 +1982,8 @@ class _Establishing:
         self.forwards: list[bool] = []
         # subscribe() filter kwargs for the upstream SUBSCRIBE.
         self.filter: dict = {}
+        # The SUBSCRIBE's NEW_GROUP_REQUEST, carried upstream (§10.2.13).
+        self.params: dict = {}
         self.task = None
 
     def resolve(self, result) -> None:
@@ -1310,9 +2014,13 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
                 return track, None
             logger.info(f"relay: dropping stale track {key}")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
         entry = _Establishing(key)
         entry.filter = _upstream_filter(sub)
+        value = (getattr(sub, "parameters", None) or {}).get(
+            ParamType.NEW_GROUP_REQUEST)
+        if isinstance(value, int):
+            entry.params = {ParamType.NEW_GROUP_REQUEST: value}
         _establishing[key] = entry
         entry.task = asyncio.create_task(_subscribe_upstream(entry))
     entry.forwards.append(bool(forward))
@@ -1392,17 +2100,22 @@ async def _backfill(track, msg, largest) -> None:
                           start_group=start[0], start_object=start[1],
                           end_group=end[0], end_object=end[1])
     _, objs, _ = await _fetch_upstream(ns, name, rng, timeout=BACKFILL_S)
-    if objs is None or track.complete_from != cf:
+    if (objs is None or track.complete_from != cf or track._closed
+            or track.finished):
         return
     held = {(c[0], c[2]) for c in track._cache}
+    now = time.monotonic()
     new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
-            o.extensions or None, o.publisher_priority, o.status, None)
+            o.extensions or None, o.publisher_priority, o.status, None, now)
            for o in objs if (o.group_id, o.object_id) not in held]
     track._cache = deque(sorted([*new, *track._cache],
                                 key=lambda c: (c[0], c[2])))
-    track._cache_bytes += sum(len(c[3]) for c in new)
+    size = sum(retained_object_bytes(c[3], c[4]) for c in new)
+    track._cache_bytes += size
+    _budget.bytes += size
     for c in new:
         track._groups[c[0]] = track._groups.get(c[0], 0) + 1
+    _budget.touch(track)
     track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)
     # Groups before complete_from's came whole: a replay FINs them.
@@ -1413,7 +2126,71 @@ async def _backfill(track, msg, largest) -> None:
                 f"{start}..{cf}")
 
 
-def _parked_publish(key):
+def _probe_wanted(ns) -> bool:
+    return (bool(ns) and not _internal_ns(ns)
+            and not ns[0].startswith(CATALOG_PROBE_SKIP))
+
+
+def _probing(track) -> bool:
+    """--catalog-probe forwards this catalog with no subscriber."""
+    return (_catalog_probe and track.key[1] == CATALOG_TRACK
+            and _probe_wanted(track.key[0]))
+
+
+async def _probe_catalog_head(track) -> None:
+    """Backfill the catalog's current group from its head, as a viewer's
+    SUBSCRIBE would, when it was published before the relay subscribed."""
+    if track.largest is None or track.key[0] in _catalogs:
+        return
+    g = track.largest[0]
+    head = SimpleNamespace(filter_type=FilterType.ABSOLUTE_START,
+                           start_group=g, start_object=0, end_group=None)
+    await _backfill(track, head, track.largest)
+    for c in list(track._cache):
+        if c[0] == g and c[2] == 0:
+            _note_catalog(track.key[0], c[3])
+            return
+
+
+async def _probe_catalog(ns) -> None:
+    """Subscribe to an announced namespace's catalog as a viewer would, so
+    the dashboard knows its format before anyone plays it."""
+    key = (ns, CATALOG_TRACK)
+    for delay in CATALOG_PROBE_DELAYS_S:
+        await asyncio.sleep(delay)
+        track = _tracks.get(key)
+        if (not _announced_match(ns) or ns in _catalogs
+                or key in _establishing
+                or (track is not None and _track_live(track))):
+            return
+        track, refusal = await _establish_upstream(ns, CATALOG_TRACK)
+        if track is None:
+            reason = refusal[1] if refusal else "no publisher served it"
+            logger.info(f"relay: catalog probe ns={ns} -> none ({reason})")
+            continue
+        await _probe_catalog_head(track)
+        if not track.downstream:
+            track.attaching = False
+            track._ensure_drain()
+        logger.info(f"relay: catalog probe ns={ns} -> "
+                    f"{_catalogs.get(ns) or 'no MSF catalog yet'}")
+        return
+
+
+def _spawn(coro) -> None:
+    """Run `coro` in the background, held until it ends."""
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+def _drop_track(key, track) -> None:
+    """Remove `track` from the table, only if `key` still maps to it."""
+    if _tracks.get(key) is track:
+        del _tracks[key]
+
+
+def _live_published(key):
     """The live track a PUBLISH registered for `key`, else None."""
     track = _tracks.get(key)
     if (track is not None and _track_live(track)
@@ -1497,8 +2274,12 @@ async def _subscribe_publishers(entry):
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
         upstream_filter = _filter_for(pub, entry.filter)
+        # d14 defines no NEW_GROUP_REQUEST.
+        params = ({} if pub._profile.update_has_location
+                  else entry.params)
         try:
-            await upstream.subscribe(timeout=10.0, **upstream_filter)
+            await upstream.subscribe(timeout=10.0, parameters=params,
+                                     **upstream_filter)
         except Exception as e:
             if entry.fut.done():
                 break
@@ -1531,19 +2312,23 @@ async def _subscribe_publishers(entry):
                 pub.unregister_object_handler(upstream.track_alias)
             refusal = _MANDATORY_REFUSAL
             continue
-        parked = _parked_publish(key)
-        if parked is not None:
+        owned = _live_published(key)
+        if owned is not None:
             # A PUBLISH from another session landed meanwhile and owns
             # the track: never overwrite it.
             _cancel_upstream_subscribe(pub, ns, track_name)
             if upstream.track_alias is not None:
                 pub.unregister_object_handler(upstream.track_alias)
-            return parked, None
+            return owned, None
         track.upstream = upstream
         track.upstream_alias = upstream.track_alias
         track.properties = props
         # §10.2.11: Largest includes what the upstream SUBSCRIBE_OK reports.
         track.note_largest(upstream.largest)
+        if params:
+            track.new_group_request = (
+                params[ParamType.NEW_GROUP_REQUEST],
+                None if track.largest is None else track.largest[0])
         track.complete_from = _delivery_start(upstream_filter,
                                               upstream.largest)
         unfiltered = ("location_filter" not in upstream_filter
@@ -1551,6 +2336,9 @@ async def _subscribe_publishers(entry):
         track.upstream_from = (0, 0) if unfiltered else track.complete_from
         pub.register_stream_end_handler(upstream.track_alias,
                                         track.on_stream_end)
+        old = _tracks.get(key)
+        if old is not None and old is not track:
+            old.close()
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
@@ -1616,7 +2404,7 @@ def _upstream_done(track, key, done) -> None:
         # Nothing queued and no subscriber attached.
         track.finish(status_code=status, reason=reason)
         track.close()
-        _tracks.pop(key, None)
+        _drop_track(key, track)
         return
     track.note_upstream_done(status, reason, key,
                              getattr(done, "stream_count", 0))
@@ -1654,7 +2442,7 @@ async def _on_publish_done(session, msg):
             # Nothing queued and no subscriber attached.
             track.finish(status_code=status, reason=reason)
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
         else:
             track.note_upstream_done(status, reason, key,
                                      getattr(msg, "stream_count", 0))
@@ -1699,11 +2487,13 @@ async def _on_publish(session, msg):
             logger.info(f"relay: retiring the track registered for {key}")
             track.finish(reason="superseded by a new publisher")
             track.close()
-            _tracks.pop(key, None)
+            _drop_track(key, track)
             track = None
     if track is None:
         track = _RelayedTrack(key)
         _tracks[key] = track
+        if msg.track_name == CATALOG_TRACK:
+            _catalogs.pop(ns, None)
     entry = _establishing.get(key)
     crossing = (entry is not None and entry.pub is session
                 and not entry.fut.done())
@@ -1739,6 +2529,8 @@ async def _on_publish(session, msg):
         # would otherwise deadlock — it cannot subscribe until we
         # answer, and we would not answer until it subscribed.
         _answer_publish(track)
+        if _probing(track) and not track.downstream:
+            _spawn(_probe_catalog_head(track))
 
 
 def _forwarding(track) -> bool:
@@ -1754,7 +2546,7 @@ def _answer_publish(track, forward=None) -> None:
         return
     session, msg = track.pending_publish
     if forward is None:
-        forward = _forwarding(track)
+        forward = _forwarding(track) or _probing(track)
     session._track_aliases[msg.track_alias] = msg.request_id
     session.register_object_handler(msg.track_alias, track.on_object)
     session.register_stream_end_handler(msg.track_alias, track.on_stream_end)
@@ -1770,11 +2562,54 @@ def _answer_publish(track, forward=None) -> None:
                        filter_type=FilterType.LATEST_OBJECT)
     logger.info(f"relay: PUBLISH_OK forward={int(forward)} "
                 f"alias={msg.track_alias}"
-                + ("" if forward else " — parked until a subscriber forwards"))
+                + ("" if forward else " — paused until a subscriber forwards"))
     track.upstream = session
     track.upstream_request_id = msg.request_id
-    track.parked = None if forward else (session, msg)
+    track.paused = not forward
+    if track.paused:
+        track.open_gap()
+    track.publish_msg = msg
     track.pending_publish = None
+    _ensure_pause_sweep()
+
+
+def _new_group_outstanding(track, value) -> bool:
+    """A NEW_GROUP_REQUEST of at least `value` was sent upstream and the
+    Largest Group has not increased since (§10.2.13)."""
+    sent = track.new_group_request
+    largest = None if track.largest is None else track.largest[0]
+    return sent is not None and sent[1] == largest and sent[0] >= value
+
+
+def _forward_new_group(track, params) -> None:
+    """Pass a subscriber's NEW_GROUP_REQUEST to the established upstream
+    in a REQUEST_UPDATE (§10.2.13): when it is 0 or above the Largest
+    Group, the track declares DYNAMIC_GROUPS=1, and no equal or larger
+    request is outstanding."""
+    value = (params or {}).get(ParamType.NEW_GROUP_REQUEST)
+    if not isinstance(value, int):
+        return
+    largest = None if track.largest is None else track.largest[0]
+    if ((value and largest is not None and value <= largest)
+            or track.properties.get(ParamType.DYNAMIC_GROUPS) != 1
+            or _new_group_outstanding(track, value)):
+        return
+    req = _upstream_request(track)
+    if req is None or not _session_live(req[0]):
+        return
+    session, rid, _location = req
+    if session._profile.update_has_location:
+        return
+    try:
+        session.request_update(
+            rid, parameters={ParamType.NEW_GROUP_REQUEST: value})
+    except Exception:
+        logger.debug("relay: forwarding NEW_GROUP_REQUEST failed",
+                     exc_info=True)
+        return
+    track.new_group_request = (value, largest)
+    logger.info(f"relay: NEW_GROUP_REQUEST {value} for {track.key} sent "
+                f"upstream: REQUEST_UPDATE request {rid}")
 
 
 def _refuse_publish(session, msg, reason, code=None) -> None:
@@ -1802,22 +2637,218 @@ def _publish_ok_location(msg) -> dict:
     return {"start": start, "end_group": 0, "priority": 128}
 
 
-def _resume_parked_publish(track) -> None:
-    """Raise a parked publisher's Forward State once a subscriber
-    forwards."""
-    if track.parked is None or not _forwarding(track):
-        return
-    session, msg = track.parked
-    track.parked = None
-    track.complete_from = _publish_ok_location(msg)["start"]
+def _upstream_request(track):
+    """(session, request id, d14 SUBSCRIBE_UPDATE location) of the
+    request feeding `track`, or None."""
+    up = track.upstream
+    if _is_session(up):
+        msg = track.publish_msg
+        if msg is None:
+            return None
+        return up, msg.request_id, _publish_ok_location(msg)
+    session = getattr(up, "session", None)
+    rid = getattr(up, "request_id", None)
+    if session is None or rid is None:
+        return None
+    return session, rid, {}
+
+
+def _resume_paused(track, wanted=False):
+    """Raise a paused upstream's Forward State once a subscriber
+    forwards, or is about to (`wanted`). With `wanted`, returns the
+    awaitable reply when the upstream draft has one (d16+), else None."""
+    if not track.paused or not (wanted or _forwarding(track)):
+        return None
+    req = _upstream_request(track)
+    if req is None:
+        return None
+    session, rid, location = req
+    wait = wanted and not session._profile.update_has_location
+    if track.lowered and track.largest is not None:
+        track.fence = track.largest[0]
+        if track.pause_largest is not None:
+            track.fence = max(track.fence, track.pause_largest[0])
+    track.pause_largest = None
+    track.pause_reply = None
+    track.paused = track.lowered = False
+    track.unwatched_since = None
+    if track._objects_in:
+        track.complete_from = None
+        track._resync = True
+    elif track.publish_msg is not None:
+        track.complete_from = location["start"]
     try:
-        session.request_update(msg.request_id, forward=1,
-                               **_publish_ok_location(msg))
-        logger.info(f"relay: REQUEST_UPDATE forward=1 "
-                    f"alias={msg.track_alias}")
+        reply = session.request_update(rid, forward=1, wait_response=wait,
+                                       **location)
+        logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
+                    f"forward=1 request {rid}")
     except Exception:
-        logger.debug("relay: raising the parked forward state failed",
+        logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
+        return None
+    return reply if wait else None
+
+
+# Track key -> task taking the Largest from a resume's REQUEST_OK.
+_resuming: dict = {}
+
+
+async def _resume_for(track, msg) -> None:
+    """Resume a paused upstream for a forwarding SUBSCRIBE before it is
+    answered, so its reply and joining FETCH resolve against the
+    publisher's live Largest rather than the one at the pause or the
+    PUBLISH."""
+    if not track.paused or (msg.forward is not None and not msg.forward):
+        return
+    task = _resuming.get(track.key)
+    if task is None:
+        paused_at = track.pause_largest
+        pause_reply = track.pause_reply if paused_at is None else None
+        reply = _resume_paused(track, wanted=True)
+        if reply is None:
+            return
+        task = asyncio.create_task(_take_live_largest(
+            track, reply, paused_at, pause_reply))
+        _resuming[track.key] = task
+        task.add_done_callback(
+            lambda t, k=track.key: _resuming.pop(k, None)
+            if _resuming.get(k) is t else None)
+    # Objects the resume brings are held for this subscriber, whose
+    # filter resolves against the Largest the publisher reports.
+    track.attaching = True
+    try:
+        await asyncio.shield(task)
+    finally:
+        track.attaching = False
+        track._ensure_drain()
+
+
+async def _take_live_largest(track, reply, paused_at=None,
+                             pause_reply=None) -> None:
+    """Note the Largest a resume's REQUEST_OK reports, waiting at most
+    RESUME_REPLY_S. Past the publisher's Largest at the pause
+    (`paused_at`, else what `pause_reply` resolves to), its group is live
+    and the fence stops before it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + RESUME_REPLY_S
+    try:
+        ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
+    except TimeoutError:
+        logger.warning(f"relay: resume {track.key}: no REQUEST_OK within "
+                       f"{RESUME_REPLY_S:g}s; answering with the cached "
+                       f"Largest {track.largest}")
+        return
+    except MOQTRequestError as e:
+        logger.info(f"relay: resume {track.key}: upstream refused the "
+                    f"update: {e}")
+        return
+    live = _update_largest(ok)
+    track.note_largest(live)
+    if paused_at is None and pause_reply is not None:
+        # The pause's REQUEST_OK precedes this one on the same request.
+        try:
+            paused_at = await asyncio.wait_for(
+                asyncio.shield(pause_reply),
+                max(deadline - loop.time(), 0))
+        except TimeoutError:
+            paused_at = None
+        if paused_at is not None and track.fence is not None:
+            track.fence = max(track.fence, paused_at[0])
+    if (track.fence is not None and paused_at is not None
+            and live is not None and live > tuple(paused_at)):
+        track.fence = min(track.fence, live[0] - 1)
+
+
+def _update_largest(reply):
+    """The LARGEST_OBJECT a REQUEST_OK carries: a Location from d18, a
+    length-prefixed pair of varints at d16; None without one."""
+    value = (getattr(reply, "parameters", None) or {}).get(
+        ParamType.LARGEST_OBJECT)
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        buf = Buffer(data=bytes(value))
+        try:
+            return (buf.pull_uint_var(), buf.pull_uint_var())
+        except BufferReadError:
+            return None
+    return None
+
+
+def _pause_upstream(track) -> None:
+    """Lower the upstream Forward State of a track nobody forwards."""
+    track.unwatched_since = None
+    req = _upstream_request(track)
+    if req is None or not _session_live(req[0]):
+        return
+    session, rid, location = req
+    wait = not session._profile.update_has_location
+    try:
+        reply = session.request_update(rid, forward=0, wait_response=wait,
+                                       **location)
+    except Exception:
+        logger.debug("relay: lowering the upstream forward state failed",
+                     exc_info=True)
+        return
+    track.paused = True
+    track.lowered = True
+    track.open_gap()
+    track.pause_largest = None
+    track.pause_reply = (asyncio.ensure_future(
+        _take_pause_largest(track, reply)) if wait else None)
+    logger.info(f"relay: paused {track.key} upstream, no forwarding "
+                f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
+                f"forward=0 request {rid}")
+
+
+async def _take_pause_largest(track, reply):
+    """The Largest a pause's REQUEST_OK reports, else None; noted on the
+    track if it arrives while the track is still paused."""
+    try:
+        ok = await reply
+    except Exception:
+        return None
+    largest = _update_largest(ok)
+    if track.lowered:
+        track.pause_largest = largest
+    return largest
+
+
+def _pausable(track) -> bool:
+    """Pulled from upstream with no subscriber forwarding it."""
+    if (track.paused or track.finished or track._closed or track.attaching
+            or track.pending_publish is not None or track.upstream is None
+            or track.key in _establishing or _probing(track)):
+        return False
+    return not (any(d.forward and _session_live(d.session)
+                    for d in track.downstream)
+                or any(_held_forwards.get(track.key, ())))
+
+
+async def _sweep_unwatched() -> None:
+    """Pause each track left unwatched for --pause-after seconds."""
+    loop = asyncio.get_running_loop()
+    while _pause_after > 0:
+        await asyncio.sleep(min(max(_pause_after / 4, 0.02), 1.0))
+        now = loop.time()
+        for track in list(_tracks.values()):
+            if not _pausable(track):
+                track.unwatched_since = None
+            elif track.unwatched_since is None:
+                track.unwatched_since = now
+            elif now - track.unwatched_since >= _pause_after:
+                _pause_upstream(track)
+
+
+def _ensure_pause_sweep() -> None:
+    """Run the sweep on this loop while --pause-after is on."""
+    global _pause_sweep
+    if _pause_after <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    if (_pause_sweep is None or _pause_sweep.done()
+            or _pause_sweep.get_loop() is not loop):
+        _pause_sweep = loop.create_task(_sweep_unwatched())
 
 
 def _largest_kwargs(track) -> dict:
@@ -1891,6 +2922,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
         track._ensure_drain()
         return False
     _watch_session(session, track.key[0])
+    _ensure_pause_sweep()
     ok = session.subscribe_ok(request_msg=msg, **_largest_kwargs(track),
                               track_properties=track.properties)
     # FORWARD omitted means 1 (§10.2.12).
@@ -1905,6 +2937,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     d.group_order = getattr(msg, "group_order", None)
     d.set_filters(merge_range_filters({}, msg.parameters or {}),
                   track.properties)
+    d.take_timeout(msg.parameters)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
     _start_fill(track, d, msg)
@@ -1913,7 +2946,8 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
 
 def _start_fill(track, d, msg) -> None:
     """Open the fill fetch stream a FILL_PARAMETERS asks for (d22 §3.4.1),
-    under `msg`'s Request ID: none while paused or for an empty range."""
+    under `msg`'s Request ID: none while paused or for an empty range,
+    reset at once for one that ends at or before the fence."""
     fill = (msg.parameters or {}).get(D20ParamType.FILL_PARAMETERS)
     if (fill is None or not d.forward
             or d.session._profile.param_table < 20):
@@ -1923,6 +2957,17 @@ def _start_fill(track, d, msg) -> None:
         return
     sid = id(d.session)
     track._sent_streams[sid] = track._sent_streams.get(sid, 0) + 1
+    if d.fence is not None and rng[0][0] <= d.fence:
+        if rng[1][0] <= d.fence:
+            # Non-empty against the reply's Largest: a failure (§3.4.1).
+            logger.info(f"relay: fill {track.key} request {msg.request_id} "
+                        f"{rng[0]}..{rng[1]} at or before fence "
+                        f"{d.fence}, reset")
+            task = asyncio.create_task(_fail_fill(d.session, msg.request_id))
+            d.fills.add(task)
+            task.add_done_callback(d.fills.discard)
+            return
+        rng = ((d.fence + 1, 0), rng[1])
     # FILL_PARAMETERS overrides the subscription's filters by type (§3.4).
     filters = RangeFilters.from_params(
         merge_range_filters(d.range_params, fill)).for_track(
@@ -1947,10 +2992,18 @@ async def _serve_fill(track, d, request_id, fill, rng,
     order = int(fill.get(ParamType.GROUP_ORDER) or d.group_order
                 or GroupOrder.ASCENDING)
     objs, source, serving = None, "cache", False
+    gapped = track.crosses_gap(start, end)
+
+    def cached():
+        # Only a range held from start to end: a short answer would
+        # claim the range is complete.
+        if (track.cache_covers(start) and not gapped
+                and track.holds_through(end)):
+            return track.cached_range(start, end) or None
+        return None
     try:
-        if track.cache_covers(start):
-            objs = track.cached_range(start, end)
-        elif timeout_ms != 0 and _fetch_sources(ns, name):
+        objs = cached()
+        if objs is None and timeout_ms != 0 and _fetch_sources(ns, name):
             wait = FILL_UPSTREAM_S if timeout_ms is None else min(
                 timeout_ms / 1000, FILL_UPSTREAM_S)
             rng_msg = SimpleNamespace(
@@ -1958,21 +3011,29 @@ async def _serve_fill(track, d, request_id, fill, rng,
                 start_object=start[1], end_group=end[0],
                 end_object=0 if end[1] == U64_MAX else end[1] + 1)
             _, up, _ = await _fetch_upstream(ns, name, rng_msg, timeout=wait)
-            if up:
+            if up is not None:
                 objs, source = [(o.group_id, o.subgroup_id, o.object_id,
                                  o.payload, o.extensions,
                                  o.publisher_priority, o.status)
                                 for o in up], "upstream"
-        if objs is None and track.cache_covers(start):
+        if gapped and track.cache_covers(start):
+            # Around the gap.
+            objs = _merged(objs, track.cached_range(start, end)) or objs
+        elif objs is None:
             # Cached while upstream was asked.
-            objs = track.cached_range(start, end)
-        gap = None
+            objs = cached()
+        gap = tail = None
         if objs is None and timeout_ms is not None:
+            # What is held, with Timed-Out gaps for a missing head or tail.
             objs = track.cached_range(start, end)
             g, o = (objs[0][0], objs[0][2]) if objs else (end[0], end[1] + 1)
-            gap = FetchObject(group_id=g if o else g - 1,
-                              object_id=o - 1 if o else U64_MAX,
-                              end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+            if (g, o) > start:
+                gap = FetchObject(group_id=g if o else g - 1,
+                                  object_id=o - 1 if o else U64_MAX,
+                                  end_of_range=FETCH_FLAGS_END_TIMED_OUT)
+            if objs and not track.holds_through(end):
+                tail = FetchObject(group_id=end[0], object_id=end[1],
+                                   end_of_range=FETCH_FLAGS_END_TIMED_OUT)
         if objs is None:
             logger.info(f"relay: fill {track.key} request {request_id} "
                         f"{start}..{end} unavailable, reset")
@@ -1981,11 +3042,14 @@ async def _serve_fill(track, d, request_id, fill, rng,
         objs = _filtered(objs, filters)
         if order == int(GroupOrder.DESCENDING):
             objs = sorted(objs, key=lambda o: (-o[0], o[2]))
-        served = _counted_fetch(objs, track, source)
-        if gap is not None:
-            served = itertools.chain((gap,), served)
+        served = itertools.chain(
+            () if gap is None else (gap,),
+            _counted_fetch(objs, track, source),
+            () if tail is None else (tail,))
         serving = True
-        await session.serve_fetch(request_id, served, group_order=order)
+        await session.serve_fetch(
+            request_id, served, group_order=order,
+            stream_priority=_stream_band(session, objs[0][5] if objs else None))
         logger.info(f"relay: fill {track.key} request {request_id} served "
                     f"{len(objs)} object(s) {start}..{end} from {source}")
     except asyncio.CancelledError:
@@ -1995,6 +3059,16 @@ async def _serve_fill(track, d, request_id, fill, rng,
                      exc_info=True)
         if not serving:
             await _fail_fill(session, request_id)
+
+
+def _merged(objs, cached):
+    """Fetch tuples from `objs` (None: none) and `cached`, one per
+    Location, in Location order."""
+    if not objs:
+        return cached
+    held = {(o[0], o[2]) for o in objs}
+    return sorted([*objs, *(c for c in cached if (c[0], c[2]) not in held)],
+                  key=lambda o: (o[0], o[2]))
 
 
 def _filtered(objs, filters):
@@ -2007,12 +3081,14 @@ def _filtered(objs, filters):
 
 async def _fail_fill(session, request_id) -> None:
     """§3.4.1: a failed fill opens its stream and resets it after the
-    FETCH_HEADER."""
+    FETCH_HEADER, which the reset keeps."""
     try:
         stream_id = await session.open_uni_stream()
-        session.stream_write(stream_id, FetchHeader(
-            request_id=request_id).serialize(prof=session._profile).data)
-        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR)
+        header = FetchHeader(request_id=request_id).serialize(
+            prof=session._profile).data
+        await session.stream_write_drain(stream_id, header)
+        session.stream_reset(stream_id, StreamResetCode.INTERNAL_ERROR,
+                             reliable_size=len(header))
     except Exception:
         logger.debug("relay: resetting a fill stream failed", exc_info=True)
 
@@ -2026,6 +3102,18 @@ async def _on_request_update(session, msg):
     rid = (msg.existing_request_id if d16
            else msg.subscription_request_id)
     found = _joined_subscription(session, rid)
+    held = _held_updates.get((session, rid))
+    if d16 and (held is not None
+                or (found is None and _subscribe_pending(session, rid))):
+        # Answered after the SUBSCRIBE it updates, in arrival order: its
+        # reply must not overtake the SUBSCRIBE_OK on the request stream.
+        if held is None:
+            held = _held_updates[(session, rid)] = []
+            _spawn(_release_held_updates(session, rid))
+        held.append(msg)
+        logger.info(f"relay: update request {msg.request_id} held until "
+                    f"SUBSCRIBE {rid} is answered")
+        return
     if found is None:
         if d16:
             _update_track_sub_filters(session, rid, msg.parameters or {})
@@ -2033,7 +3121,33 @@ async def _on_request_update(session, msg):
         else:
             await session._handle_subscribe_update(msg)
         return
+    _apply_update(session, msg, found, d16)
+
+
+# (session, SUBSCRIBE request id) -> REQUEST_UPDATEs waiting for it.
+_held_updates: dict = {}
+
+
+async def _release_held_updates(session, rid) -> None:
+    """Answer the updates held for SUBSCRIBE `rid` once it is answered:
+    applied after its SUBSCRIBE_OK, else given the session's default."""
+    deadline = time.monotonic() + HELD_UPDATE_MAX_S
+    while (_joined_subscription(session, rid) is None
+           and _subscribe_pending(session, rid) and _session_live(session)
+           and time.monotonic() < deadline):
+        await asyncio.sleep(HELD_UPDATE_POLL_S)
+    found = _joined_subscription(session, rid)
+    for msg in _held_updates.pop((session, rid), []):
+        if found is not None:
+            _apply_update(session, msg, found, True)
+        else:
+            await session._handle_request_update(msg)
+
+
+def _apply_update(session, msg, found, d16: bool) -> None:
+    """Apply an update to a joined downstream subscription and answer it."""
     key, track, d = found
+    rid = msg.existing_request_id if d16 else msg.subscription_request_id
     if d16 and not _update_filters(session, msg, track, d):
         return
     if d16:
@@ -2044,6 +3158,8 @@ async def _on_request_update(session, msg):
         lf = (msg.parameters or {}).get(ParamType.SUBSCRIPTION_FILTER)
         if isinstance(lf, LocationFilter):
             d.location_filter = lf
+        if d.take_timeout(msg.parameters):
+            track.time_lane(d)
     else:
         forward = msg.forward
     if forward is not None:
@@ -2055,11 +3171,12 @@ async def _on_request_update(session, msg):
     if d16:
         params = ({} if track.largest is None
                   else _largest_object_param(session, track.largest))
-        session._send_reply(msg.request_id,
-                            RequestOk(request_id=msg.request_id,
-                                      parameters=params))
+        ok = RequestOk(request_id=msg.request_id, parameters=params)
+        session._send_reply(msg.request_id, ok)
         _start_fill(track, d, msg)
-    _resume_parked_publish(track)
+    _resume_paused(track)
+    if d16:
+        _forward_new_group(track, msg.parameters)
 
 
 def _update_filters(session, msg, track, d) -> bool:
@@ -2091,15 +3208,33 @@ def _update_filters(session, msg, track, d) -> bool:
 
 
 async def _on_subscribe(session, msg):
+    """Relay a SUBSCRIBE within the session's subscription cap."""
+    if _refused_over_cap(session, msg, "subscriptions",
+                         MAX_SUBSCRIPTIONS_PER_SESSION,
+                         _session_subscriptions(session)):
+        return
+    _subscribing[id(session)] += 1
+    try:
+        await _relay_subscribe(session, msg)
+    finally:
+        _subscribing[id(session)] -= 1
+        if _subscribing[id(session)] <= 0:
+            del _subscribing[id(session)]
+
+
+async def _relay_subscribe(session, msg):
     """Relay a SUBSCRIBE: establish upstream, then fan out downstream."""
     ns = _ns_tuple(msg.track_namespace)
 
-    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT.
+    # §10.2.6: hold for a publisher up to RENDEZVOUS_TIMEOUT, then TIMEOUT;
+    # else, within the startup hold, until it ends, then refuse as usual.
     # Once one appears the SUBSCRIBE proceeds as if it had just arrived.
-    wait_s = _rendezvous_s(session, msg)
+    rendezvous_s = _rendezvous_s(session, msg)
+    wait_s = rendezvous_s or _startup_hold_s()
     if wait_s and not _publisher_known(ns, msg.track_name):
         logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                    f"held up to {wait_s:.3f}s for a publisher")
+                    f"held up to {wait_s:.3f}s for a publisher"
+                    + ("" if rendezvous_s else " (startup hold)"))
         key = (ns, msg.track_name)
         wants = msg.forward is None or bool(msg.forward)
         _held_forwards.setdefault(key, []).append(wants)
@@ -2113,12 +3248,14 @@ async def _on_subscribe(session, msg):
         if not found:
             if not _still_wanted(session, msg.request_id):
                 return
-            logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
-                        f"-> ERROR (rendezvous timeout)")
-            session.subscribe_error(
-                msg.request_id, error_code=RequestErrorCode.TIMEOUT,
-                reason="no publisher within the rendezvous timeout")
-            return
+            if rendezvous_s:
+                logger.info(f"relay: subscribe ns={ns} "
+                            f"track={msg.track_name} "
+                            f"-> ERROR (rendezvous timeout)")
+                session.subscribe_error(
+                    msg.request_id, error_code=RequestErrorCode.TIMEOUT,
+                    reason="no publisher within the rendezvous timeout")
+                return
 
     # Flow B first: a track already offered by PUBLISH is served from
     # that offer, no upstream SUBSCRIBE needed.
@@ -2127,8 +3264,10 @@ async def _on_subscribe(session, msg):
         # Cached from an earlier cycle whose sessions have closed.
         logger.info(f"relay: dropping stale track {(ns, msg.track_name)}")
         track.close()
-        _tracks.pop((ns, msg.track_name), None)
+        _drop_track((ns, msg.track_name), track)
         track = None
+    if track is not None and track.paused and track.upstream is not None:
+        await _resume_for(track, msg)
     # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
     seen = None if track is None else track.largest
     if track is not None and (track.pending_publish or track.upstream):
@@ -2136,7 +3275,8 @@ async def _on_subscribe(session, msg):
         await _backfill(track, msg, largest)
         if _attach_subscriber(session, msg, track, largest):
             _answer_publish(track)
-            _resume_parked_publish(track)
+            _resume_paused(track)
+            _forward_new_group(track, msg.parameters)
             logger.info(f"relay: subscribe ns={ns} track={msg.track_name} "
                         f"-> SUBSCRIBE_OK (published track, fanout="
                         f"{len(track.downstream)})")
@@ -2162,7 +3302,8 @@ async def _on_subscribe(session, msg):
             await _backfill(track, msg, largest)
             if _attach_subscriber(session, msg, track, largest):
                 _answer_publish(track)
-                _resume_parked_publish(track)
+                _resume_paused(track)
+                _forward_new_group(track, msg.parameters)
                 logger.info(f"relay: subscribe ns={ns} "
                             f"track={msg.track_name} -> SUBSCRIBE_OK "
                             f"(fanout={len(track.downstream)})")
@@ -2183,46 +3324,30 @@ async def _on_subscribe(session, msg):
                             reason="track does not exist")
 
 
-def _find_default_cert():
-    candidates = [
-        '/certs/cert.pem',
-        os.path.join(os.path.dirname(__file__),
-                     '..', '..', 'certs', 'cert.pem'),
-        os.path.expanduser('~/.local/share/moqt/cert.pem'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.realpath(c)
-    return None
-
-
-def _find_default_key(cert_path):
-    if not cert_path:
-        return None
-    for name in ('priv.key', 'key.pem'):
-        candidate = os.path.join(os.path.dirname(cert_path), name)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-
 def transport_settings(args) -> dict:
     """MOQTServer transport settings from the relay's flags."""
     return {"congestion_control_algorithm": args.cc_algo,
+            "congestion_control_options": args.cc_options,
+            "packet_train_mode": args.pacing_trains,
             "max_connections": args.max_connections,
             "stream_ring_cap": args.stream_ring_cap,
             "tx_max_inflight_bytes": args.max_inflight_bytes}
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="MoQT interop-runner relay (control-plane only)",
+        description="aiomoqt-relay: a MoQT relay (raw QUIC and WebTransport)",
         add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--bind", type=str, default="0.0.0.0",
-                        help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--config", type=str, default=None, metavar="PATH",
+                        help="Read flags from a TOML file. Keys are long "
+                             "flag names: cache-bytes = 268435456, "
+                             "catalog-probe = true, upstream = [\"URL\"]. "
+                             "Flags on the command line override it.")
+    parser.add_argument("--bind", type=str, default=None,
+                        help="Bind address (default: all interfaces, IPv4 and IPv6)")
     parser.add_argument("--port", type=int, default=4443,
                         help="UDP listen port (default: 4443)")
     parser.add_argument("--cert", type=str, default=None,
@@ -2263,10 +3388,55 @@ def parse_args():
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--catalog-probe", action="store_true",
+                        help="Subscribe to each announced or published "
+                             "namespace's catalog track at once, so the "
+                             "dashboard shows its MSF format before anyone "
+                             "plays it. Skips namespaces starting moq-test.")
+    parser.add_argument("--pause-after", type=float, default=PAUSE_AFTER_S,
+                        metavar="SEC",
+                        help="Pause a track upstream (Forward State 0) once "
+                             "no subscriber has forwarded it for SEC "
+                             "seconds; the next subscriber resumes it. "
+                             "--catalog-probe catalogs keep flowing. "
+                             f"0 = never. Default: {PAUSE_AFTER_S:g}")
+    parser.add_argument("--startup-hold", type=float,
+                        default=STARTUP_HOLD_S, metavar="SEC",
+                        help="For SEC seconds after start, hold a SUBSCRIBE "
+                             "for a track no publisher serves until one "
+                             "does, then refuse it as usual, so viewers "
+                             "reconnecting after a restart before their "
+                             "publishers are answered. 0 = off. Default: "
+                             f"{STARTUP_HOLD_S:g}")
+    parser.add_argument("--trace-subscribers", action="store_true",
+                        help="Count the objects and bytes each subscription "
+                             "is sent, for status and GET /sessions; off, "
+                             "nothing is counted per object")
+    parser.add_argument("--lag-limit", type=float, default=LAG_LIMIT_S,
+                        metavar="SEC",
+                        help="Drop a subscriber's live objects older than "
+                             "SEC seconds when no OBJECT_DELIVERY_TIMEOUT "
+                             "applies, resetting the subgroup with "
+                             "DELIVERY_TIMEOUT. Cache replays are exempt. "
+                             f"0 = never. Default: {LAG_LIMIT_S:g}")
+    parser.add_argument("--goaway-uri", type=str, default="", metavar="URL",
+                        help="New Session URI sent in GOAWAY on SIGTERM or "
+                             "SIGINT. Default: empty, peers reconnect to "
+                             "the same address")
+    parser.add_argument("--drain-timeout", type=float, default=None,
+                        metavar="SEC",
+                        help="On SIGTERM or SIGINT, wait up to SEC seconds "
+                             "after GOAWAY for sessions to leave before "
+                             "exiting; GOAWAY's Timeout carries it. "
+                             f"Default: {DRAIN_TIMEOUT_S:g} with "
+                             "--goaway-uri, "
+                             f"{DRAIN_TIMEOUT_NO_URI_S:g} without")
     parser.add_argument("--control", type=str, default=None, metavar="PATH",
                         help="Serve HTTP on the Unix socket PATH: GET /debug "
-                             "reports DEBUG logging, POST /debug toggles it "
-                             "(as SIGUSR1)")
+                             "reports DEBUG logging, POST /debug toggles it, "
+                             "GET /sessions reports each session's transport "
+                             "state (and, with --trace-subscribers, what each "
+                             "subscription was sent)")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -2277,12 +3447,18 @@ def parse_args():
                              f"{LOG_FILE_BYTES >> 20} MB x {LOG_FILE_BACKUPS}) "
                              "and send crash and stall dumps to "
                              "DIR/crash.log. Off by default.")
-    # cubic: about 65% more fan-out than bbr on one worker, whose sends
-    # are syscall-bound; bbr's per-peer pacing defeats send batching.
-    parser.add_argument("--cc-algo", type=str, default="cubic",
-                        help="Congestion control (cubic | bbr | bbr1 | c4 | "
-                             "newreno | dcubic | prague | fast). Default: "
-                             "cubic")
+    parser.add_argument("--cc-algo", type=str, default="bbr",
+                        help="Congestion control (bbr | bbr1 | c4 | cubic | "
+                             "dcubic | fast | newreno | prague). Default: "
+                             "bbr")
+    parser.add_argument("--cc-options", type=str, default=None,
+                        metavar="OPTS",
+                        help="Option string for the congestion controller, "
+                             "e.g. Q0.02: bbr sends bursts of 20 ms of "
+                             "pacing rate")
+    parser.add_argument("--pacing-trains", action="store_true",
+                        help="When pacing holds a connection back, send up "
+                             "to 10 packets at once instead of one or two")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")
@@ -2295,11 +3471,124 @@ def parse_args():
                         metavar="BYTES",
                         help="Per-stream send budget, below "
                              "--stream-ring-cap. Default: 512 KiB")
+    parser.add_argument("--cache-bytes", type=int,
+                        default=CACHE_BUDGET_BYTES, metavar="BYTES",
+                        help="Object cache budget across all tracks; past "
+                             "it the least recently used tracks lose their "
+                             "oldest groups. Default: 256 MiB")
+    parser.add_argument("--max-namespaces-per-session", type=int,
+                        default=MAX_NAMESPACES_PER_SESSION, metavar="N",
+                        help="PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and "
+                             "SUBSCRIBE_TRACKS requests one session may "
+                             "hold; more are refused with EXCESSIVE_LOAD. "
+                             f"Default: {MAX_NAMESPACES_PER_SESSION}")
+    parser.add_argument("--max-subscriptions-per-session", type=int,
+                        default=MAX_SUBSCRIPTIONS_PER_SESSION, metavar="N",
+                        help="SUBSCRIBEs one session may hold; more are "
+                             "refused with EXCESSIVE_LOAD. Default: "
+                             f"{MAX_SUBSCRIPTIONS_PER_SESSION}")
+    parser.add_argument("--stream-scheduling", choices=SCHEDULING,
+                        default=STREAM_SCHEDULING,
+                        help="Order among data streams of one priority: "
+                             "fifo keeps each track's groups in order, "
+                             "round_robin shares the band. Default: fifo")
     parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging (SIGUSR1 toggles it at "
-                             "runtime)")
+                        help="Enable debug logging (= --log-level debug). "
+                             "SIGUSR1 steps the level at runtime: INFO, "
+                             "DEBUG, TRACE, INFO")
+    add_logging(parser)
     add_help(parser)
-    return parser.parse_args()
+    args = _parse_with_config(parser, argv)
+    if args.drain_timeout is None:
+        args.drain_timeout = (DRAIN_TIMEOUT_S if args.goaway_uri
+                              else DRAIN_TIMEOUT_NO_URI_S)
+    return args
+
+
+def _parse_with_config(parser, argv=None):
+    """Parse `argv`, filling flags it does not give from --config."""
+    args = parser.parse_args(argv)
+    if args.config is None:
+        return args
+    try:
+        with open(args.config, "rb") as f:
+            table = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        parser.error(f"--config {args.config}: {e}")
+    given = _given_dests(parser, argv)
+    for key, value in table.items():
+        action = _config_action(parser, key)
+        if action is None:
+            parser.error(f"--config {args.config}: unknown key '{key}'")
+        try:
+            value = _config_value(action, value)
+        except (TypeError, ValueError, argparse.ArgumentTypeError) as e:
+            parser.error(f"--config {args.config}: {key}: {e}")
+        if action.dest not in given:
+            setattr(args, action.dest, value)
+    return args
+
+
+def _given_dests(parser, argv) -> set:
+    """Dests the command line itself sets."""
+    saved = [(a, a.default) for a in parser._actions]
+    for a, _ in saved:
+        a.default = argparse.SUPPRESS
+    try:
+        return set(vars(parser.parse_args(argv)))
+    finally:
+        for a, default in saved:
+            a.default = default
+
+
+def _config_action(parser, key):
+    """The action a --config key names: a long flag, not --config or
+    --help."""
+    for a in parser._actions:
+        if (f"--{key}" in a.option_strings and a.dest != "config"
+                and not isinstance(a, argparse._HelpAction)):
+            return a
+    return None
+
+
+def _config_value(action, value):
+    """A TOML value as the action would store it."""
+    if isinstance(action, (argparse._StoreTrueAction,
+                           argparse._StoreFalseAction,
+                           argparse._StoreConstAction)):
+        if not isinstance(value, bool):
+            raise TypeError(f"expected true or false, got {value!r}")
+        return action.const if value else action.default
+    if isinstance(action, argparse._AppendAction) or action.nargs in (
+            "*", "+") or isinstance(action.nargs, int):
+        if not isinstance(value, list):
+            raise TypeError(f"expected a list, got {value!r}")
+        return [_config_scalar(action, v) for v in value]
+    return _config_scalar(action, value)
+
+
+def _config_scalar(action, value):
+    """One TOML scalar through the action's type and choices."""
+    kind = action.type
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise TypeError(f"expected a {getattr(kind, '__name__', 'string')}, "
+                        f"got {value!r}")
+    if kind is int:
+        if not isinstance(value, int):
+            raise TypeError(f"expected an integer, got {value!r}")
+    elif kind is float:
+        if isinstance(value, str):
+            raise TypeError(f"expected a number, got {value!r}")
+        value = float(value)
+    elif kind is None or kind is str:
+        if not isinstance(value, str):
+            raise TypeError(f"expected a string, got {value!r}")
+    else:
+        value = kind(str(value))
+    if action.choices is not None and value not in action.choices:
+        raise ValueError(f"{value!r} is not one of "
+                         f"{', '.join(map(str, action.choices))}")
+    return value
 
 
 # SUBSCRIBE_TRACKS subscribers: (session, prefix_tuple, request_id).
@@ -2349,6 +3638,15 @@ async def _offer_track(session, track, key, request_id=None):
         _forget_session(session)
         return
     ns, name = key
+    # The relay's Largest as it makes the offer: the reply's filter
+    # resolves against it, as a SUBSCRIBE's does (§3.1.4).
+    seen = track.largest
+    if track.paused and track.upstream is not None:
+        # As for a SUBSCRIBE: resume first, so the offer carries the
+        # publisher's live Largest and the subscriber takes the fence.
+        await _resume_for(track, SimpleNamespace(forward=1))
+        if not _session_live(session):
+            return
     # A session that subscribed to a prefix gets every track under it,
     # including one it publishes itself: the subscription is explicit,
     # and moq-test's publish cases use one session for both roles.
@@ -2369,7 +3667,7 @@ async def _offer_track(session, track, key, request_id=None):
         # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
         forward = (getattr(reply, 'parameters', None) or {}).get(
             ParamType.FORWARD, 1)
-    window = _reply_window(session, reply, track.largest) or _UNFILTERED
+    window = _reply_window(session, reply, seen) or _UNFILTERED
     # Cached objects inside the subscriber's window go first.
     d = track.add_downstream(session, pub_msg.track_alias,
                              pub_msg.request_id, forward=bool(forward),
@@ -2380,7 +3678,7 @@ async def _offer_track(session, track, key, request_id=None):
         pub_msg.request_id,
         lambda rid, t=track, s=session: t.drop_session(s))
     _answer_publish(track)
-    _resume_parked_publish(track)
+    _resume_paused(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
                 f"alias={pub_msg.track_alias} forward={int(bool(forward))} "
                 f"(fanout={len(track.downstream)})")
@@ -2403,8 +3701,32 @@ def _reply_window(session, reply, largest):
         raw, prof=session._profile), largest)
 
 
-# id(session) -> True once a datagram send proved unsupported there.
-_no_datagrams: dict = {}
+# id(session) -> datagram objects dropped for not fitting that session.
+_dgram_drops: dict = {}
+
+
+def _send_datagram(session, buf, alias, gid, oid) -> None:
+    """Send one datagram object, or drop it silently when it exceeds the
+    session's datagram limit (0 = no datagram TX): an object keeps its
+    forwarding preference, never moving to a stream."""
+    wire = buf.data
+    limit = session.datagram_max_payload()
+    why = f"{len(wire)}B > {limit}B"
+    if len(wire) <= limit:
+        try:
+            session.send_dgram_message(buf)
+            return
+        except (NotImplementedError, ValueError) as e:
+            why = f"{len(wire)}B: {e}"
+    drops = _dgram_drops.get(id(session), 0) + 1
+    _dgram_drops[id(session)] = drops
+    if drops == 1:
+        logger.warning(f"relay: dropping datagram objects that do not fit "
+                       f"this session (alias={alias}, {why})")
+    elif logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"relay: datagram object {gid}.{oid} alias={alias} "
+                     f"dropped ({why})")
+
 
 # (id(session), request_id) -> objects collected from an upstream FETCH.
 _fetch_sinks: dict = {}
@@ -2548,6 +3870,17 @@ async def _on_fetch(session, msg):
         start_group = int(msg.joining_start or 0)
         if int(msg.fetch_type) == FETCH_RELATIVE_JOINING:
             start_group = max(0, anchor[0] - start_group)
+        if d.fence is not None and start_group <= d.fence:
+            start_group = d.fence + 1
+            if start_group > anchor[0]:
+                logger.info(f"relay: joining FETCH {key} -> INVALID_RANGE "
+                            f"(nothing since the resume after group "
+                            f"{d.fence})")
+                session.fetch_error(
+                    request_id=msg.request_id,
+                    error_code=RequestErrorCode.INVALID_RANGE,
+                    reason="nothing published since the resume")
+                return
         msg.start_group, msg.start_object = start_group, 0
         msg.end_group, msg.end_object = anchor[0], anchor[1] + 1
         ns, track_name = key
@@ -2555,8 +3888,9 @@ async def _on_fetch(session, msg):
                     f"{anchor[0]} (anchor {anchor})")
     track = _tracks.get((ns, track_name))
     start, end = _fetch_range(msg, None if track is None else track.largest)
-    have_cache = (track is not None and _track_live(track)
-                  and track.cache_covers(start))
+    live = track is not None and _track_live(track)
+    gapped = live and track.crosses_gap(start, end)
+    have_cache = live and track.cache_covers(start) and not gapped
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
     props = track.properties if track is not None else {}
@@ -2589,16 +3923,12 @@ async def _on_fetch(session, msg):
                 error_code=RequestErrorCode.DOES_NOT_EXIST,
                 reason="track does not exist")
             return
-        elif not upstream:
-            session.fetch_error(
-                request_id=msg.request_id,
-                error_code=RequestErrorCode.INVALID_RANGE,
-                reason="requested range unavailable")
-            return
         else:
             objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                      o.extensions, o.publisher_priority, o.status)
                     for o in upstream]
+            if gapped and track.cache_covers(start):
+                objs = _merged(objs, track.cached_range(start, end))
             end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
             props = dict(getattr(up_ok, "track_extensions", None) or {})
             source = "upstream"
@@ -2609,19 +3939,27 @@ async def _on_fetch(session, msg):
             if o[2] == 0:
                 _note_catalog(ns, o[3])
     order = msg.group_order or GroupOrder.ASCENDING
-    last_g, last_o = objs[-1][0], objs[-1][2]
     # FETCH_OK End Location (d22 §9.12): the requested End, at most
     # Largest; a whole End Group ends at its last Object. From upstream,
-    # the last Object served, with the publisher's End Of Track.
-    end_loc = (last_g, last_o)
-    if source == "cache" and end is not None:
-        end_loc = (end if end[1] != U64_MAX
-                   else track.group_end(end[0], start))
+    # the last Object served, with the publisher's End Of Track; with
+    # none served, the publisher's End.
     # fetch_ok() takes End as the last Object plus one at every draft.
+    last = (objs[-1][0], objs[-1][2]) if objs else None
+    if objs:
+        end_loc = last
+        if source == "cache" and end is not None:
+            end_loc = (end if end[1] != U64_MAX
+                       else track.group_end(end[0], start))
+        end_next = (end_loc[0], end_loc[1] + 1)
+    else:
+        end_next = (up_ok.largest_group_id, up_ok.largest_object_id)
+        if not end_next[1] and session._profile.fetch_location_filter:
+            # A d20+ End is inclusive: no whole-group form.
+            end_next = (end_next[0], 1)
     session.fetch_ok(request_id=msg.request_id,
                      end_of_track=end_of_track,
-                     largest_group_id=end_loc[0],
-                     largest_object_id=end_loc[1] + 1,
+                     largest_group_id=end_next[0],
+                     largest_object_id=end_next[1],
                      group_order=int(order), track_extensions=props)
     # Range Filters drop objects, never the FETCH_OK End (§3.2.2).
     objs = _filtered(objs, RangeFilters.from_params(msg.parameters))
@@ -2629,9 +3967,10 @@ async def _on_fetch(session, msg):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
     await session.serve_fetch(
         msg.request_id, _counted_fetch(objs, track, source),
-        group_order=int(order))
+        group_order=int(order),
+        stream_priority=_stream_band(session, objs[0][5] if objs else None))
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
-                f"{len(objs)} object(s) {start}..({last_g}.{last_o})")
+                f"{len(objs)} object(s) {start}..{last} from {source}")
 
 
 async def _on_subscribe_namespace(session, msg):
@@ -2640,6 +3979,8 @@ async def _on_subscribe_namespace(session, msg):
     with SUBSCRIBE_TRACKS. d16 sends NAMESPACE, a PUBLISH per matching
     track, or both, as its Subscribe Options ask. d14 forwards matching
     PUBLISH_NAMESPACEs and a PUBLISH per matching track."""
+    if _namespaces_full(session, msg):
+        return
     prefix = _ns_tuple(msg.namespace_prefix)
     _watch_session(session, prefix)
     session.subscribe_namespace_ok(
@@ -2758,6 +4099,8 @@ def _retract_namespace(ns) -> None:
 async def _on_subscribe_tracks(session, msg):
     """§9.5: a SUBSCRIBE_TRACKS subscriber gets a PUBLISH for every
     matching track, present and future."""
+    if _namespaces_full(session, msg):
+        return
     prefix = _ns_tuple(msg.namespace_prefix)
     _watch_session(session, prefix)
     session.subscribe_tracks_ok(msg)
@@ -2791,9 +4134,14 @@ async def _on_track_status(session, msg):
     ns = _ns_tuple(msg.track_namespace)
     _watch_session(session, ns)
     track = _tracks.get((ns, msg.track_name))
+    d14 = not is_draft16_or_later(session.negotiated_draft)
     if track is None or not _track_live(track):
         logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                     f"-> DOES_NOT_EXIST")
+        if d14:
+            session._refuse_peer_request(msg, RequestErrorCode.DOES_NOT_EXIST,
+                                         "track not served here")
+            return
         err = RequestError(
             request_id=msg.request_id,
             error_code=request_error_code(RequestErrorCode.DOES_NOT_EXIST,
@@ -2808,6 +4156,9 @@ async def _on_track_status(session, msg):
               else _largest_object_param(session, largest))
     logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                 f"-> OK largest={largest}")
+    if d14:
+        session._d14_track_status_ok(msg.request_id, largest)
+        return
     ok = RequestOk(request_id=msg.request_id, parameters=params,
                    track_properties=track.properties)
     session._send_reply(msg.request_id, ok, fin=True)
@@ -2827,6 +4178,10 @@ def _answered(handler):
             if request_id is None:
                 return
             try:
+                if not is_draft16_or_later(session.negotiated_draft):
+                    session._refuse_peer_request(
+                        msg, RequestErrorCode.INTERNAL_ERROR, "relay error")
+                    return
                 session._send_reply(request_id, RequestError(
                     request_id=request_id,
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),
@@ -2851,6 +4206,7 @@ def _build_server(bind, port, cert, key, use_quic, draft, **transport):
         max_filter_ranges=MAX_FILTER_RANGES,
         **transport,
     )
+    server.stream_scheduling = STREAM_SCHEDULING
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE, _answered(_on_publish_namespace))
     server.register_handler(
@@ -2983,11 +4339,13 @@ async def _heartbeat(stall_s: float) -> None:
         await asyncio.sleep(min(1.0, stall_s / 4))
 
 
-# aiopquic counters that show the RX wake state and worker progress.
+# aiopquic counters that show the RX/TX wake state and worker progress;
+# a key the installed aiopquic lacks reports null.
 TRANSPORT_COUNTERS = (
     "rx_notify_pending_now", "rx_event_ring_count_now",
     "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
-    "rx_event_drops", "tx_event_ring_count_now", "loop_callbacks",
+    "rx_event_drops", "tx_event_ring_count_now", "tx_event_ring_pops",
+    "tx_worker_idle_now", "tx_wake_lost", "loop_callbacks",
     "wake_calls", "wake_skipped_coalesced")
 
 
@@ -3142,16 +4500,17 @@ def _track_state(track, flowing) -> str:
         return "ended"
     if track.pending_publish is not None:
         return "held"
-    if track.parked is not None:
-        return "parked"
+    if track.paused:
+        return "paused"
     return "live" if flowing else "idle"
 
 
 _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
-                 "media_out_bps", "sessions", "subscribers", "subscriptions",
-                 "tracks",
+                 "media_out_bps", "sessions", "publishers", "namespaces",
+                 "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
-                 "groups_per_s")
+                 "objects_out_per_s", "groups_per_s", "groups_out_per_s",
+                 "drops")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -3160,7 +4519,7 @@ _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "udp_errors", "sock_drops", "sock_rx_queue",
                   "disk_read_Bps", "disk_write_Bps", "psi_cpu", "psi_io",
                   "psi_memory", "ctxt_per_s", "lag_p99_ms")
-# Tracks with their own history; later ones go without until one ends.
+# Tracks with their own history; a present track takes an ended one's slot.
 TRACK_HISTORY_MAX = 24
 # Subscribers listed per track.
 TRACK_SUBSCRIBERS_MAX = 50
@@ -3274,7 +4633,18 @@ class _Status:
                     "addr": relay_status.display_addr(_addr_of(d.session)),
                     "rtt_ms": None if r is None else round(r, 1),
                     "forward": bool(d.forward),
-                    "since": info["since"] if info else None})
+                    "lane_bytes": (lane.bytes + lane.replay_bytes
+                                   if (lane := d.lane) else 0),
+                    "lane_objects": lane.objects if lane else 0,
+                    "lane_tx_bytes": lane.tx_bytes if lane else 0,
+                    "shed_objects": lane.shed if lane else 0,
+                    "shed_episodes": lane.sheds if lane else 0,
+                    "lane_expired": lane.expired if lane else 0,
+                    "lane_stalled_s": (int(lane.stalled_s(time.monotonic()))
+                                       if lane else 0),
+                    "lane_stalls": lane.stalls if lane else 0,
+                    "since": info["since"] if info else None,
+                    **(_sent_fields(d) if _trace_subscribers else {})})
             tracks.append((key, {
                 "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
                 "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
@@ -3341,23 +4711,30 @@ class _Status:
             sp["peak"] = self._ns_peak[ns]
 
         sessions, quic = [], {}
-        tx = rx = sent = lost = 0
+        held_subs = Counter(id(d.session) for t in _tracks.values()
+                            for d in t.downstream)
+        held_subs.update(_subscribing)
+        tx = rx = sent = lost = spurious = 0
         rtts = []
         for info in live:
             s = info["session"]
             pq = pqs[id(s)]
             cur = (pq.get("bytes_sent", 0), pq.get("bytes_received", 0),
-                   pq.get("sent", 0), pq.get("lost", 0))
+                   pq.get("sent", 0), pq.get("lost", 0),
+                   pq.get("spurious_losses", 0))
             last = self._quic_prev.get(id(s))
             quic[id(s)] = cur
             d = ([max(0, c - p) for c, p in zip(cur, last)]
-                 if last is not None else [0, 0, 0, 0])
+                 if last is not None else [0, 0, 0, 0, 0])
             tx, rx = tx + d[0], rx + d[1]
             # Loss counts on delivery only: toward a publisher the relay sends
-            # mostly ACK-only packets, which picoquic counts lost unacked.
-            delivery = id(s) in subs
+            # mostly ACK-only packets, which picoquic counts lost unacked, and
+            # a session that also publishes can't split its count by direction.
+            delivery = id(s) in subs and id(s) not in pubs
+            # Real loss excludes packets declared lost and acknowledged later.
+            real = max(0, d[3] - d[4])
             if delivery:
-                sent, lost = sent + d[2], lost + d[3]
+                sent, lost, spurious = sent + d[2], lost + real, spurious + d[4]
             rtt = round(pq.get("rtt") / 1000, 2) if pq.get("rtt") else None
             if rtt is not None:
                 rtts.append(rtt)
@@ -3372,8 +4749,23 @@ class _Status:
                                if pq.get("rtt_min") else None),
                 "tx_bps": bps(d[0]) if last is not None else None,
                 "rx_bps": bps(d[1]) if last is not None else None,
-                "loss_pct": (round(100 * d[3] / d[2], 2)
+                "loss_pct": (round(100 * real / d[2], 2)
                              if delivery and d[2] else None),
+                "spurious_pct": (round(100 * d[4] / d[2], 2)
+                                 if delivery and d[2] else None),
+                "rtt_max_ms": (round(pq["rtt_max"] / 1000, 1)
+                               if pq.get("rtt_max") else None),
+                "cwin_bytes": pq.get("cwin"),
+                "in_transit_bytes": pq.get("bytes_in_transit"),
+                "pacing_bps": (round(pq["pacing_rate"] * 8)
+                               if pq.get("pacing_rate") else None),
+                # picoquic's raw count, ACK-only packets toward a publisher included.
+                "lost_packets": pq.get("lost"),
+                "timer_losses": pq.get("timer_losses"),
+                "spurious_losses": pq.get("spurious_losses"),
+                "namespaces": _session_namespaces(s),
+                "subscriptions": held_subs[id(s)],
+                "dgram_drops": _dgram_drops.get(id(s), 0),
             })
         self._quic_prev = quic
 
@@ -3397,6 +4789,11 @@ class _Status:
                 sum(r["objects_per_s"] or 0 for _, r in tracks), 1)),
             "groups_per_s": (None if dt is None else round(
                 sum(r["groups_per_s"] or 0 for _, r in tracks), 1)),
+            # Delivered rates: each track's input rate times its subscribers.
+            "objects_out_per_s": (None if dt is None else round(sum(
+                (r["objects_per_s"] or 0) * r["subscribers"] for _, r in tracks), 1)),
+            "groups_out_per_s": (None if dt is None else round(sum(
+                (r["groups_per_s"] or 0) * r["subscribers"] for _, r in tracks), 1)),
             # Share of egress not received upstream ("CDN efficiency").
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
@@ -3405,7 +4802,12 @@ class _Status:
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
             "cache_efficiency": _cache_efficiency(),
+            "cache_budget": CACHE_BUDGET_BYTES,
+            "cache_bytes": _budget.bytes,
+            "cache_evictions": _budget.evictions,
+            "cache_truncations": _budget.truncations,
             "loss_pct": round(100 * lost / sent, 2) if sent else 0.0,
+            "spurious_pct": round(100 * spurious / sent, 2) if sent else 0.0,
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
@@ -3417,12 +4819,17 @@ class _Status:
             "t": round(wall), "ingress_bps": totals["ingress_bps"],
             "egress_bps": totals["egress_bps"], "media_in_bps": media_in,
             "media_out_bps": media_out, "sessions": totals["sessions"],
+            "publishers": totals["publishers"],
+            "namespaces": totals["namespaces"],
             "subscribers": totals["subscribers"],
             "subscriptions": totals["subscriptions"], "tracks": len(tracks),
             "loss_pct": totals["loss_pct"], "rtt_p50_ms": totals["rtt_p50_ms"],
             "lag_p99_ms": lag["p99"],
             "objects_in_per_s": totals["objects_in_per_s"],
+            "objects_out_per_s": totals["objects_out_per_s"],
             "groups_per_s": totals["groups_per_s"],
+            "groups_out_per_s": totals["groups_out_per_s"],
+            "drops": totals["drops"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)
@@ -3446,22 +4853,42 @@ class _Status:
 
     def _add_track_history(self, tracks) -> None:
         """One point per tracked track, None for one absent this tick; a
-        track absent for the whole window is dropped."""
+        track absent for the whole window is dropped. With every slot
+        taken, a present track (subscribed ones first) takes the slot of
+        the track absent longest."""
         length = self.history.length
         filled = len(self.history.series["t"])
         now = {row["id"]: row for _, row in tracks}
-        for tid, row in now.items():
-            if (tid not in self.track_history
-                    and len(self.track_history) < TRACK_HISTORY_MAX):
-                self.track_history[tid] = {
-                    k: deque([None] * (filled - 1), maxlen=length)
-                    for k in ("subscribers", "in_bps", "out_bps")}
+        for tid in sorted(now, key=lambda t: -(now[t]["subscribers"] or 0)):
+            if tid in self.track_history:
+                continue
+            if len(self.track_history) >= TRACK_HISTORY_MAX:
+                gone = self._longest_gone(now)
+                if gone is None:
+                    continue
+                del self.track_history[gone]
+            self.track_history[tid] = {
+                k: deque([None] * (filled - 1), maxlen=length)
+                for k in ("subscribers", "in_bps", "out_bps")}
         for tid, series in list(self.track_history.items()):
             row = now.get(tid)
             for k, col in series.items():
                 col.append(None if row is None else row[k])
             if row is None and all(v is None for v in series["subscribers"]):
                 del self.track_history[tid]
+
+    def _longest_gone(self, now):
+        """The tracked track absent from `now` for the most ticks, or None."""
+        def absent(tid):
+            col = self.track_history[tid]["subscribers"]
+            ticks = 0
+            for v in reversed(col):
+                if v is not None:
+                    break
+                ticks += 1
+            return ticks
+        gone = [tid for tid in self.track_history if tid not in now]
+        return max(gone, key=absent, default=None)
 
     def _platform(self, wall: float, host: dict, totals: dict,
                   lag: dict) -> dict:
@@ -3514,7 +4941,8 @@ class _Status:
             "host": host,
             "bandwidth": {"ingress_bps": totals["ingress_bps"],
                           "egress_bps": totals["egress_bps"],
-                          "loss_pct": totals["loss_pct"]},
+                          "loss_pct": totals["loss_pct"],
+                          "spurious_pct": totals["spurious_pct"]},
             "loop_lag_ms": lag,
             "transport": transport_counters(self.handles),
             "history": self.platform_history.to_json(),
@@ -3600,14 +5028,68 @@ def _start_log_dir(log_dir: str) -> None:
     logger.info(f"relay: crash and stall dumps go to {path}")
 
 
+def _debug_on() -> bool:
+    return (get_log_level() or logging.INFO) <= logging.DEBUG
+
+
+def _step_log_level() -> None:
+    """SIGUSR1: aiomoqt logging INFO -> DEBUG -> TRACE -> INFO."""
+    level = step_log_level()
+    logger.info(f"relay: log level {logging.getLevelName(level)}")
+
+
 def _toggle_debug() -> None:
-    """SIGUSR1: switch aiomoqt logging between DEBUG and INFO."""
-    if get_log_level() == logging.DEBUG:
+    """POST /debug: switch aiomoqt logging between DEBUG and INFO."""
+    if _debug_on():
         set_log_level(logging.INFO)
         logger.info("relay: debug logging off")
     else:
         set_log_level(logging.DEBUG)
         logger.info("relay: debug logging on")
+
+
+def _sent_fields(d) -> dict:
+    return {"objects_sent": d.objects_sent, "bytes_sent": d.bytes_sent,
+            "largest_sent": list(d.largest_sent) if d.largest_sent else None}
+
+
+# GET /sessions: path_quality() fields, in picoquic's units (µs, bytes,
+# bytes/s, packets).
+_PATH_QUALITY_KEYS = ("rtt", "rtt_min", "rtt_max", "cwin", "bytes_in_transit",
+                      "pacing_rate", "sent", "lost", "timer_losses",
+                      "spurious_losses", "bytes_sent", "bytes_received")
+
+
+def _sessions_report() -> dict:
+    """GET /sessions: each live session's transport state now and, with
+    --trace-subscribers, what each of its subscriptions was sent."""
+    subs: dict = {}
+    if _trace_subscribers:
+        for key, t in list(_tracks.items()):
+            track = "\x1f".join((_ns_str(key[0]), _name_str(key[1])))
+            for d in t.downstream:
+                lane = d.lane
+                subs.setdefault(id(d.session), []).append({
+                    "track": track, **_sent_fields(d),
+                    "lane_bytes": (lane.bytes + lane.replay_bytes
+                                   if lane else 0),
+                    "lane_tx_bytes": lane.tx_bytes if lane else 0,
+                    "shed_objects": lane.shed if lane else 0,
+                    "lane_expired": lane.expired if lane else 0})
+    rows = []
+    for info in list(_sessions.values()):
+        s = info["session"]
+        if not _session_live(s) or _internal_session(info):
+            continue
+        pq = _path_quality(s)
+        row = {"id": info["id"], "addr": relay_status.display_addr(_addr_of(s)),
+               "transport": _transport(s), "draft": _draft(s),
+               **{k: pq.get(k) for k in _PATH_QUALITY_KEYS}}
+        if _trace_subscribers:
+            row["subscriptions"] = subs.get(id(s), [])
+        rows.append(row)
+    return {"time": time.time(), "trace_subscribers": _trace_subscribers,
+            "sessions": rows}
 
 
 async def _on_control(reader, writer) -> None:
@@ -3616,13 +5098,15 @@ async def _on_control(reader, writer) -> None:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
-        if path != "/debug" or method not in ("GET", "POST"):
+        if path == "/sessions" and method == "GET":
+            status, body = "200 OK", _sessions_report()
+        elif path != "/debug" or method not in ("GET", "POST"):
             status, body = "404 Not Found", {"error": "not found"}
         else:
             if method == "POST":
                 _toggle_debug()
             status = "200 OK"
-            body = {"debug": get_log_level() == logging.DEBUG}
+            body = {"debug": _debug_on()}
         data = json.dumps(body).encode()
         writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json"
                      f"\r\nContent-Length: {len(data)}\r\n"
@@ -3646,15 +5130,135 @@ async def _serve_control(path: str) -> None:
     logger.info(f"relay: control socket {path}")
 
 
+# Seconds between drain passes.
+DRAIN_POLL_S = 0.05
+# Default drain wait with a --goaway-uri successor, and without one.
+DRAIN_TIMEOUT_S = 5.0
+DRAIN_TIMEOUT_NO_URI_S = 2.0
+
+
+def _shutdown_reason(uri: str) -> str:
+    """Reason Phrase for a shutdown close; GOAWAY carries the successor URI."""
+    return "relay shutting down" if uri else "relay restarting"
+
+
+def _setup_done(session) -> bool:
+    fut = getattr(session, "_moqt_session_setup", None)
+    return (fut is not None and fut.done() and not fut.cancelled()
+            and fut.result() is True)
+
+
+async def _wait_closed(sessions, timeout: float) -> None:
+    """Wait up to `timeout` for closed sessions' connections to leave."""
+    done = [getattr(s, "_cnx_closed", None) or getattr(s, "_closed", None)
+            for s in sessions]
+    waits = [asyncio.ensure_future(ev.wait()) for ev in done
+             if ev is not None]
+    if waits:
+        _, pending = await asyncio.wait(waits, timeout=timeout)
+        for w in pending:
+            w.cancel()
+
+
+# Bound on retries while a transport's TX event ring is full.
+REFUSE_RETRIES = 50
+REFUSE_RETRY_S = 0.01
+
+
+async def _refuse_connections(handles) -> None:
+    """Have each listener's transport refuse new connections; existing
+    ones keep running."""
+    transports = {}
+    for h in handles:
+        t = _transport_of(h)
+        if t is not None:
+            transports[id(t)] = t
+    for t in transports.values():
+        refuse = getattr(t, "set_max_connections", None)
+        if refuse is None:
+            logger.debug("relay: aiopquic lacks set_max_connections")
+            return
+        try:
+            for _ in range(REFUSE_RETRIES):
+                if refuse(0) == 0:
+                    break
+                await asyncio.sleep(REFUSE_RETRY_S)
+            else:
+                logger.warning("relay: refusing new connections: TX event "
+                               "ring full")
+        except (ConnectionError, ValueError):
+            logger.debug("relay: refusing new connections failed",
+                         exc_info=True)
+    if transports:
+        logger.info("relay: refusing new connections")
+
+
+async def _drain(servers, uri: str, timeout: float, why: str) -> None:
+    """GOAWAY to every set-up session, refusing any other from now on,
+    then wait up to `timeout` seconds for them to leave; close the rest
+    with GOAWAY_TIMEOUT."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    reason = _shutdown_reason(uri)
+    for srv in servers:
+        srv.refuse_sessions(reason)
+
+    def live():
+        return [(srv, s) for srv in servers for s in list(srv._live)
+                if _session_live(s)]
+    held = {s for _srv, s in live() if _setup_done(s)}
+    logger.info(f"relay: {why}: draining {len(held)} sessions, GOAWAY "
+                f"{'to ' + uri if uri else 'to this address'}, up to "
+                f"{timeout:g}s")
+    for s in held:
+        try:
+            s.drain()
+            s.goaway(uri, timeout=int(timeout * 1000))
+        except Exception:
+            logger.debug("relay: GOAWAY failed", exc_info=True)
+    while True:
+        left = []
+        for srv, s in live():
+            if s in held:
+                left.append(s)
+            else:
+                try:
+                    srv.refuse(s)
+                except Exception:
+                    logger.debug("relay: refusing a session failed",
+                                 exc_info=True)
+        if not left:
+            logger.info("relay: drained, all sessions gone")
+            return
+        if loop.time() >= deadline:
+            logger.info(f"relay: drain timed out, {len(left)} sessions "
+                        f"left")
+            for s in left:
+                s.close(SessionCloseCode.GOAWAY_TIMEOUT, reason)
+            await _wait_closed(left, 1.0)
+            return
+        await asyncio.sleep(DRAIN_POLL_S)
+
+
 async def main():
+    global _catalog_probe, _pause_after, _lag_limit, _trace_subscribers
     args = parse_args()
+    _trace_subscribers = args.trace_subscribers
+    _catalog_probe = args.catalog_probe
+    if args.pause_after < 0:
+        sys.exit("error: --pause-after must be 0 or above")
+    _pause_after = args.pause_after
+    if args.lag_limit < 0:
+        sys.exit("error: --lag-limit must be 0 or above")
+    _lag_limit = args.lag_limit
+    if args.startup_hold < 0:
+        sys.exit("error: --startup-hold must be 0 or above")
     speaks = sorted(int(d) for d in MOQTDraft)
     wanted = args.draft if isinstance(args.draft, list) else [args.draft]
     if any(d not in speaks for d in wanted):
         sys.exit(f"error: draft {','.join(map(str, wanted))} not supported; "
                  f"aiomoqt speaks {speaks}")
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    set_log_level(log_level)
+    log_level = apply_logging(args, default=logging.INFO)
     logging.basicConfig(
         level=log_level, stream=sys.stderr,
         format=LOG_FORMAT,
@@ -3662,19 +5266,16 @@ async def main():
     if args.log_dir:
         _start_log_dir(args.log_dir)
     asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1,
-                                                  _toggle_debug)
+                                                  _step_log_level)
     if args.control:
         try:
             await _serve_control(args.control)
         except OSError as e:
             sys.exit(f"error: --control {args.control}: {e.strerror or e}")
     logger.info(f"relay: start {_versions_line()} pid {os.getpid()}")
-    print("aiomoqt ERSATZ-RELAY: an API demonstrator and conformance "
-          "SUT — not a production relay (no auth, no hardening).",
-          file=sys.stderr)
 
-    cert = args.cert or _find_default_cert()
-    key = args.key or _find_default_key(cert)
+    cert = args.cert or find_cert(server_cert_dirs())
+    key = args.key or find_key(cert, SERVER_KEY_NAMES)
     if not cert or not key:
         print("Error: TLS cert/key required. Use --cert/--key or place "
               "cert.pem+priv.key at /certs/", file=sys.stderr)
@@ -3689,6 +5290,24 @@ async def main():
         print("Error: --max-inflight-bytes must be above 0 and below "
               "--stream-ring-cap", file=sys.stderr)
         sys.exit(2)
+    if args.cache_bytes <= 0:
+        print("Error: --cache-bytes must be above 0", file=sys.stderr)
+        sys.exit(2)
+    if args.drain_timeout < 0:
+        print("Error: --drain-timeout must be 0 or more", file=sys.stderr)
+        sys.exit(2)
+    global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
+    CACHE_BUDGET_BYTES = args.cache_bytes
+    if (args.max_namespaces_per_session <= 0
+            or args.max_subscriptions_per_session <= 0):
+        print("Error: --max-namespaces-per-session and "
+              "--max-subscriptions-per-session must be above 0",
+              file=sys.stderr)
+        sys.exit(2)
+    global MAX_NAMESPACES_PER_SESSION, MAX_SUBSCRIPTIONS_PER_SESSION
+    MAX_NAMESPACES_PER_SESSION = args.max_namespaces_per_session
+    MAX_SUBSCRIPTIONS_PER_SESSION = args.max_subscriptions_per_session
+    STREAM_SCHEDULING = args.stream_scheduling
     transport = transport_settings(args)
 
     # Primary listener: WebTransport unless --quic; both with --dual.
@@ -3714,21 +5333,26 @@ async def main():
 
     handles = [await (server.serve_dual() if args.dual else server.serve())
                for server, _port, _label in listeners]
+    _begin_startup_hold(args.startup_hold)
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
-    upstream_tasks = [asyncio.create_task(_dial_upstream(url, args.draft))
-                      for url in args.upstream]
+    _background.update(asyncio.create_task(_dial_upstream(url, args.draft))
+                       for url in args.upstream)
     for url in args.upstream:
         print(f"  upstream origin: {url}")
 
+    _background.add(asyncio.create_task(_watch_lanes()))
+
+    watchdog = None
     if args.watchdog > 0:
         host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(args.bind,
                                                         args.bind)
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
-        _background.add(asyncio.create_task(_watchdog(
+        watchdog = asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft, handles)))
+            args.draft, handles))
+        _background.add(watchdog)
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -3741,37 +5365,64 @@ async def main():
                            else ["quic"] if args.quic else ["wt"]),
             "started": time.time(),
             "watchdog_s": args.watchdog,
-            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES},
+            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
+                      "budget": CACHE_BUDGET_BYTES},
+            "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
+                            "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},
         }, handles)
         _background.add(asyncio.create_task(status.run()))
 
     print(
         "=" * 64
-        + "\n EXPERIMENTAL aiomoqt interop relay.\n"
-        " NOT a production relay: no auth, no scale handling.\n"
+        + "\n aiomoqt-relay: a MoQT relay in Python.\n"
+        " No authentication or rate limiting.\n"
         + "=" * 64,
         file=sys.stderr,
     )
     for _server, port, label in listeners:
-        print(f"Listening on all interfaces, UDP port {port} "
+        print(f"Listening on {_listen_desc(args.bind)}, UDP port {port} "
               f"({label}, draft-{args.draft})", file=sys.stderr)
     if args.watchdog > 0:
         print(f"Watchdog: self-probe every {args.watchdog:g}s, exit after "
               f"{WATCHDOG_MISSES} misses or a {args.watchdog:g}s stall",
               file=sys.stderr)
 
-    # SIGTERM shuts down like Ctrl-C: peers get a CONNECTION_CLOSE.
-    asyncio.get_running_loop().add_signal_handler(
-        signal.SIGTERM, asyncio.current_task().cancel)
+    # SIGTERM or SIGINT drains; a second one exits at once.
+    stop = asyncio.Event()
+    stopped_by = []
+    main_task = asyncio.current_task()
+
+    def _on_stop(sig):
+        if stop.is_set():
+            logger.info(f"relay: {sig.name} again, exiting now")
+            main_task.cancel()
+            return
+        stopped_by.append(sig.name)
+        stop.set()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, _on_stop, sig)
+    servers = [server for server, _port, _label in listeners]
+    wait = 1.0
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
+        if watchdog is not None:
+            watchdog.cancel()
+        await _refuse_connections(handles)
+        await _drain(servers, args.goaway_uri, args.drain_timeout,
+                     stopped_by[0])
     except asyncio.CancelledError:
-        pass
+        wait = 0
     finally:
-        await asyncio.gather(*(server.close_sessions()
-                               for server, _port, _label in listeners))
+        reason = _shutdown_reason(args.goaway_uri)
+        for server in servers:
+            server.refuse_sessions(reason)
+            for s in list(server._live):
+                server.refuse(s)
+        await asyncio.gather(*(server.close_sessions(timeout=wait)
+                               for server in servers))
         for h in handles:
             h.close()
+        logger.info("relay: exit")
 
 
 def cli():

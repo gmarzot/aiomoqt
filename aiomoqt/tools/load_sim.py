@@ -51,7 +51,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import io
 import json
+import logging
 import math
 import random
 import signal
@@ -63,17 +66,19 @@ from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import MOQT_DEFAULT_DRAFTS, FilterType, parse_draft_spec
+from aiomoqt.types import FilterType
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.format import fmt_bps
+from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
 from aiomoqt.utils.stats import TrackStats
 
 from aiomoqt.utils.workers import (
     _bridge_stop_event,
     _post,
     _setup_quiet_logging,
+    _transport_options,
     apply_compat,
     pub_worker_entry,
     MP_CTX,
@@ -156,7 +161,7 @@ EXAMPLE_SCENARIO = {
 # Commands on cmd_queue:  ('add', n) | ('remove', n) | ('stop',)
 # Events on events_queue (all tagged group/shard):
 #   {'kind':'evt','ev': 'joined'|'join_failed'|'left'|'ended'|'died', ...}
-#   {'kind':'group_stats', 'live', 'rx_bytes', 'rx_objs',
+#   {'kind':'group_stats', 'live', 'dt', 'rx_bytes', 'rx_objs' (over dt),
 #    'lat_p90_ms', 'total_bytes', 'total_objs', ...}   every STATS_INTERVAL_S
 # ---------------------------------------------------------------------------
 
@@ -172,6 +177,9 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
     if start_delay > 0:
         try:
             await asyncio.wait_for(stop_ev.wait(), timeout=start_delay)
+            slot["done"] = True
+            _post(events_q, {"kind": "evt", "ev": "join_cancelled",
+                             "group": group, "shard": shard})
             return
         except asyncio.TimeoutError:
             pass
@@ -182,6 +190,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                         subgroup_id)
 
     outcome = "died"
+    detail = None
     try:
         client = MOQTClient(
             relay.host, relay.port,
@@ -189,8 +198,9 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             use_quic=relay.use_quic,
             verify_tls=not cfg.get("insecure", False),
             supported_drafts=cfg.get("draft"),
-            keep_alive_interval=cfg.get("keep_alive_interval"),
+            keylog_filename=cfg.get("keylogfile"),
             libquicr_compat=apply_compat(cfg.get("compat")),
+            **_transport_options(cfg),
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -225,7 +235,9 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                         continue
                     break
             if not subscribed:
-                _post(events_q, {"kind": "evt", "ev": "join_failed",
+                # Stopped mid-join is a cancellation, not a failure.
+                ev = "join_cancelled" if stop_ev.is_set() else "join_failed"
+                _post(events_q, {"kind": "evt", "ev": ev,
                                  "group": group, "shard": shard,
                                  "why": last_err})
                 outcome = "reported"   # finally must not post again
@@ -243,16 +255,22 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             else:
                 outcome = "left"
             session.close()
-    except Exception:
+    except Exception as e:
         if not slot["live"]:
-            outcome = "join_failed"
+            outcome = ("join_cancelled" if stop_ev.is_set()
+                       else "join_failed")
+        # str() of some exceptions (TimeoutError) is empty.
+        detail = f"{type(e).__name__}: {e}"
     finally:
         was_live = slot["live"]
         slot["live"] = False
         slot["done"] = True
-        if outcome != "reported" and (was_live or outcome == "died"):
+        if outcome != "reported" and (
+                was_live
+                or outcome in ("died", "join_failed", "join_cancelled")):
             _post(events_q, {"kind": "evt", "ev": outcome,
-                             "group": group, "shard": shard})
+                             "group": group, "shard": shard,
+                             "why": detail})
 
 
 async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
@@ -304,8 +322,11 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
 
     async def _stats_loop():
         nonlocal reaped_bytes, reaped_objs
+        last_t = time.monotonic()
         while not stop_ev.is_set():
             await asyncio.sleep(STATS_INTERVAL_S)
+            now = time.monotonic()
+            dt, last_t = now - last_t, now
             # Reap finished slots, folding their cumulative totals into
             # the group's running counters so departed subscribers keep
             # counting toward total_bytes.
@@ -329,7 +350,8 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
                     live += 1
             _post(events_q, {
                 "kind": "group_stats", "group": group, "shard": shard,
-                "live": live, "rx_bytes": rx_bytes, "rx_objs": rx_objs,
+                "live": live, "dt": dt,
+                "rx_bytes": rx_bytes, "rx_objs": rx_objs,
                 "lat_p90_ms": worst_p90, "total_bytes": total_bytes,
                 "total_objs": total_objs, "t": time.monotonic(),
             })
@@ -588,6 +610,9 @@ def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
                 shard.live += 1
                 g.iv["join"] += 1
                 g.max_live = max(g.max_live, g.live())
+            elif ev == "join_cancelled":
+                if shard.pending:
+                    shard.pending.popleft()
             elif ev == "join_failed":
                 if shard.pending:
                     shard.pending.popleft()
@@ -613,6 +638,11 @@ def _drain_sub_events(events_q, groups: Dict[int, GroupRT]):
                     g.deaths += 1
                 elif ev == "ended":
                     g.ended += 1
+
+
+def _rx_Bps(group_stats: dict) -> float:
+    """A shard's latest receive rate, bytes/s."""
+    return group_stats.get("rx_bytes", 0) / max(group_stats.get("dt", 1.0), 1e-3)
 
 
 def _accrue_expected(groups: Dict[int, GroupRT], pubs: Dict[str, PubRT],
@@ -684,15 +714,10 @@ def parse_args(argv=None):
                        help="quick mode: PUB_NS + PUBLISH")
     p.add_argument("--compat", default=None,
                    help="comma-separated peer compat tolerances "
-                        "(lenient-extensions, libquicr, all) — same keys "
+                        "(lenient-extensions, missing-request-credit, libquicr, "
+                        "all) — same keys "
                         "as moq_interop_client")
-    p.add_argument("-k", "--insecure", action="store_true",
-                   help="Skip TLS verification")
-    p.add_argument("--draft", type=parse_draft_spec, default=None,
-                   help="MoQT draft: "
-                        f"{', '.join(map(str, sorted(MOQT_DEFAULT_DRAFTS)))}; "
-                        "a comma list offers several in order. Default: "
-                        f"offer {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
+    _cli.add_session(p)
     p.add_argument("--duration-scale", type=float, default=1.0,
                    help="Multiply publisher start/duration timelines")
     p.add_argument("--subs-per-proc", type=int, default=100,
@@ -713,6 +738,7 @@ def parse_args(argv=None):
     p.add_argument("--logdir", default=None,
                    help="Per-process debug log directory")
     p.add_argument("-d", "--debug", action="store_true")
+    _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args(argv)
     return p, args
@@ -720,6 +746,7 @@ def parse_args(argv=None):
 
 def main():
     p, args = parse_args()
+    _cli.apply_logging(args, default=logging.INFO)
 
     if args.example:
         print(json.dumps(EXAMPLE_SCENARIO, indent=2))
@@ -785,6 +812,8 @@ def main():
           f"(duration-scale {args.duration_scale:g})")
     print(f"  worst-case egress if all peaks align: "
           f"{fmt_bps(total_bps)}")
+    print(f"  transport:   {_cli.describe_transport(args)}")
+    print(f"  cpu:         {cpu_summary()}")
     for ps in pub_specs:
         subs = per_track_subs.get(ps.key, 0)
         print(f"    {ps.key:<28} {fmt_bps(ps.bps):>10} x {subs:>4} subs"
@@ -796,7 +825,8 @@ def main():
     common = dict(
         relay_url=relay_url, force_quic=False, insecure=args.insecure,
         draft=args.draft, debug=args.debug, logdir=args.logdir,
-        compat=args.compat,
+        compat=args.compat, keylogfile=args.keylogfile,
+        **_cli.transport_kwargs(args),
     )
 
     stopping = False
@@ -838,7 +868,8 @@ def main():
     if args.report:
         csv_f = open(args.report, "w")
         csv_f.write("t,namespace,track,live,target,rx_mbps,p90_ms,"
-                    "joins,leaves,fails\n")
+                    f"joins,leaves,fails,{','.join(CPU_FIELDS)}\n")
+        cpu_csv = _csv_line(cpu_fields())
 
     start = time.monotonic()
     last_report = start
@@ -907,7 +938,7 @@ def main():
             if now - last_report >= args.interval:
                 last_report = now
                 live_total = sum(g.live() for g in groups.values())
-                rx_bps = sum(s.stats.get("rx_bytes", 0) * 8
+                rx_bps = sum(_rx_Bps(s.stats) * 8
                              for g in groups.values() for s in g.shards)
                 p90 = max((s.stats.get("lat_p90_ms", 0.0)
                            for g in groups.values() for s in g.shards),
@@ -933,7 +964,7 @@ def main():
                             g.spec.key, [0, 0, 0, 0.0])
                         row[0] += g.live()
                         row[1] += g.spec.max_subs
-                        row[2] += sum(s.stats.get("rx_bytes", 0)
+                        row[2] += sum(_rx_Bps(s.stats)
                                       for s in g.shards)
                         row[3] = max(row[3],
                                      max((s.stats.get("lat_p90_ms", 0.0)
@@ -942,7 +973,7 @@ def main():
                         ns, tr = key.split("/", 1)
                         csv_f.write(f"{t:.0f},{ns},{tr},{row[0]},{row[1]},"
                                     f"{row[2] * 8 / 1e6:.2f},"
-                                    f"{row[3]:.1f},,,\n")
+                                    f"{row[3]:.1f},,,,{cpu_csv}\n")
                     csv_f.flush()
 
             # --- end conditions ---
@@ -1048,8 +1079,16 @@ def _verdict(groups: Dict[int, "GroupRT"],
         lines.append(f"  Total objects: {all_objs}")
         lines.append(f"  Total bytes: {all_bytes}")
         lines.append(f"  Expected objects: {all_expected}")
+    lines.append(f"  Host: {cpu_summary()}")
     lines.append(f"  {'RESULT: FAIL' if failed else 'RESULT: OK'}")
     return lines, failed
+
+
+def _csv_line(values) -> str:
+    """`values` as one CSV line, quoted where needed, no newline."""
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="").writerow(values)
+    return buf.getvalue()
 
 
 def _run():

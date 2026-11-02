@@ -1,6 +1,7 @@
 """utils.timing: one resolver for object capture times — frindell
 (draft-frindell-moq-timestamp-00) over LOC TIMESTAMP over bench 0x20 —
 and the tools that report latency from it."""
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -9,12 +10,13 @@ from aiomoqt.agent.reader import Reader
 from aiomoqt.agent.spec import SubscribeSpec
 from aiomoqt.media.loc import LocFrame
 from aiomoqt.messages.subscribe import SubscribeOk
-from aiomoqt.utils.media_stats import MediaAnalysis
+from aiomoqt.utils.media_stats import SOURCE_FRINDELL_MEDIA, MediaAnalysis
 from aiomoqt.utils.stats import TrackStats, send_time_us
 from aiomoqt.utils.timing import (
     BENCH_TIMESTAMP, CLOCK_ID, LOC_TIMESCALE, LOC_TIMESTAMP,
     OBJECT_TIMESTAMP, SOURCE_BENCH, SOURCE_FRINDELL, SOURCE_LOC, TIMESCALE,
-    TIMESTAMP_MAPPING, TIMESTAMP_ORIGIN, TrackTiming, capture_time_us,
+    TIMESTAMP_MAPPING, TIMESTAMP_ORIGIN, TrackTiming,
+    capture_time_us,
     encode_mapping, zigzag_encode,
 )
 
@@ -34,7 +36,7 @@ def test_zigzag_order(v, u):
 def test_mapped_track_takes_schedule_plus_correction(vi64):
     # 30 fps at 30000 ticks/s, 60-object groups, anchored at wall W.
     t = _timing({TIMESCALE: 30000, TIMESTAMP_MAPPING: encode_mapping(
-        10, W * 30000 // 1_000_000, 60060, 1001, vi64)}, vi64)
+        10, W * 30000 // 1_000_000, 60060, 1001)}, vi64)
     sched = W + (2 * 60060 + 3 * 1001) * 1_000_000 // 30000
     assert capture_time_us(t, 12, 3, None) == (sched, SOURCE_FRINDELL)
     late = {OBJECT_TIMESTAMP: zigzag_encode(30)}       # +1 ms
@@ -119,7 +121,7 @@ def test_track_stats_counts_malformed_timestamps():
 
 def test_media_analysis_reports_frindell_latency_and_source():
     timing = _timing({TIMESCALE: 48000, TIMESTAMP_MAPPING: encode_mapping(
-        0, W * 48000 // 1_000_000, 960, 0, True)})
+        0, W * 48000 // 1_000_000, 960, 0)})
     a = MediaAnalysis(timing_of=lambda name: timing)
     a.add_track('audio', role='audio')
     a.start(W)
@@ -152,3 +154,77 @@ def test_track_stats_loc_fast_path_reports_and_respects_loc_timescale():
                     10, W + 2000)
     stats.on_object(_msg(0, 2, {LOC_TIMESTAMP: 99}), 10, W + 3000)
     assert stats.lat_count == 1
+
+
+@pytest.mark.parametrize("base_s", [
+    9e16 / 1000,                    # ~2.8 million years ahead
+    1.0,                            # 1970
+    946_684_799,                    # just before 2000
+], ids=["far-future", "1970", "pre-2000"])
+def test_mapping_anchor_is_not_restricted_to_recent_wall_clock(base_s):
+    base = int(base_s * 1000)
+    timing = _timing({TIMESCALE: 1000, TIMESTAMP_MAPPING: encode_mapping(
+        0, base, 33, 0)})
+    assert timing.timestamp(1, 0, None) == base + 33
+
+
+@pytest.mark.parametrize("clock", [{}, {CLOCK_ID: 0}])
+def test_timestamp_group_ids_accept_zero_mapping_anchor(clock):
+    # draft-frindell-moq-timestamp-00 Appendix A.3.
+    timing = _timing({TIMESCALE: 1_000_000, **clock,
+                      TIMESTAMP_MAPPING: encode_mapping(0, 0, 1, 0)})
+    assert capture_time_us(timing, W, 0, None) == (W, SOURCE_FRINDELL)
+
+
+def test_fixed_cadence_accepts_zero_anchor_with_wall_clock_origin():
+    # draft-frindell-moq-timestamp-00 Appendix A.1.
+    origin = W * 30_000 // 1_000_000
+    timing = _timing({TIMESCALE: 30_000, CLOCK_ID: 0,
+                      TIMESTAMP_ORIGIN: origin,
+                      TIMESTAMP_MAPPING: encode_mapping(0, 0, 60060, 1001)})
+    assert timing.media_us(1, 1, None) == (origin + 60060 + 1001) * 1_000_000 // 30_000
+
+
+def test_plausible_wall_clock_mapping_and_clock_id_bases_pass():
+    _timing({TIMESCALE: 30000, TIMESTAMP_MAPPING: encode_mapping(
+        0, W * 30000 // 1_000_000, 60060, 1001)})
+    # An archive captured years ago is still wall clock.
+    _timing({TIMESCALE: 1000, TIMESTAMP_MAPPING: encode_mapping(
+        0, 1_262_304_000_000, 33, 0)})                  # 2010
+    # With CLOCK_ID the base has no wall-clock meaning: any value.
+    _timing({TIMESCALE: 1000, CLOCK_ID: 7,
+             TIMESTAMP_MAPPING: encode_mapping(0, 1, 33, 0)})
+
+
+
+@pytest.mark.parametrize("props", [
+    # A.1 mapping in RFC 9000 varints, read as vi64: (0, 0, 0, 178013161).
+    {TIMESCALE: 30_000, CLOCK_ID: 0, TIMESTAMP_ORIGIN: W * 30_000 // 1_000_000,
+     TIMESTAMP_MAPPING: bytes.fromhex("00008000ea9c43e9")},
+    {TIMESCALE: 1000, TIMESTAMP_MAPPING: encode_mapping(0, 9 * 10**16, 33, 0)},
+], ids=["rfc9000-as-vi64", "base-9e16"])
+def test_media_analysis_reports_far_off_capture_times_without_latency(
+        props, caplog):
+    timing = _timing(props)
+    a = MediaAnalysis(timing_of=lambda name: timing)
+    a.add_track('video', role='video')
+    a.start(W)
+    logger = logging.getLogger('aiomoqt.utils.media_stats')
+    logger.addHandler(caplog.handler)
+    try:
+        # rfc9000-as-vi64 stays within a day until object 15, which drops it.
+        for g in range(2):
+            for o in range(20):
+                recv = W + (20 * g + o) * 33_000
+                a.on_arrival('video', _msg(g, o, {}), recv, g, 0,
+                             LocFrame(b"x", o == 0))
+    finally:
+        logger.removeHandler(caplog.handler)
+    rows, _ = a.summary(W + 1_000_000)
+    r = rows[0]
+    assert r['objects'] == 40 and r['ts_malformed'] == 0
+    assert SOURCE_FRINDELL_MEDIA in r['ts_source']
+    assert not r['wall'] and r['lat_p50_ms'] is None
+    assert r['lat_max_ms'] is None and r['ts_implausible'] >= 10
+    warns = [x for x in caplog.records if 'not within a day' in x.message]
+    assert len(warns) == 1 and warns[0].levelno == logging.WARNING

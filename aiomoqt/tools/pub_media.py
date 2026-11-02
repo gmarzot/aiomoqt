@@ -17,7 +17,9 @@ audio, plus video from an mp4) to a relay.
 The video track sends the mp4's samples byte-for-byte as LOC canonical
 payloads (loc-02 §2.1.3); the avcC extradata rides the catalog
 initDataList and VIDEO_CONFIG group-start properties. Frames pace to
-their timestamps (--no-pace to blast).
+their timestamps (--no-pace to blast). With --annexb, or --no-catalog,
+H.264/H.265 goes out as Annex B with the parameter sets in every key
+frame (loc-04 §2.1.1, §2.1.4) and codec avc3/hev1.
 
   # live H.264 Annex-B ingest (OBS/ffmpeg pipe; frames stamped on arrival)
   ffmpeg -i srt://0.0.0.0:9000?mode=listener -c:v copy -bsf:v h264_mp4toannexb \\
@@ -37,18 +39,29 @@ their timestamps (--no-pace to blast).
 With --player-base or $AIOMOQT_PLAYER_URL set, each run prints a
 ready-to-paste player URL per relay. Relays on different drafts need a
 --draft all of them accept.
+
+When the duration ends, or on SIGINT/SIGTERM, each track ends with End of
+Track, then PUBLISH_DONE TRACK_ENDED, then PUBLISH_NAMESPACE_DONE for an
+announced namespace. `-t 0` sets no duration: the run lasts until a signal.
+
+Exit status: 0 when the duration ends or on SIGINT/SIGTERM; 2 for a usage
+error; 64 when an object does not fit a datagram; 69 when no relay can be
+reached, or every relay is lost (with --reconnect: none is back when the
+duration ends); 70 for an internal error, including a source pub_media
+cannot read.
 """
+import argparse
 import asyncio
 import contextlib
 import functools
 import json
-import logging
 import math
 import os
 import signal
 import sys
 import threading
 import time
+import traceback
 import uuid
 from typing import Optional
 
@@ -60,25 +73,37 @@ from aiomoqt.media import (
     StreamMapping,
 )
 from aiomoqt.media.catalog import (
+    INIT_TYPE_INLINE, INIT_TYPE_OBJECT_PROPERTY, INIT_TYPE_TRACK_PROPERTY,
     MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOC, PACKAGING_LOCMAF,
 )
 from aiomoqt.media.cmaf import CmafChunker, chunk_decode_time, prft_box
 from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
+from aiomoqt.media.loc import LOC_PROP_AUDIO_CONFIG, LOC_PROP_VIDEO_CONFIG
 from aiomoqt.media.locmaf import LOCMAF_VERSION
-from aiomoqt.media.mpegts import TsDemuxer
+from aiomoqt.media.mpegts import TsCadence, TsDemuxer, TsRates
 from aiomoqt.media.sources import (
     AnnexBAssembler, HevcAnnexBAssembler, Mp4Reader, avcc_codec_string,
     hevc_sps_info, hvcc_codec_string, pcm_tone_frames, sps_dimensions,
 )
 from aiomoqt.track import TrackState
 from aiomoqt.utils import cli as _cli
-from aiomoqt.utils.logger import set_log_level
 from aiomoqt.utils.timing import MediaTimestamps
 from aiomoqt.utils.workers import apply_compat
 from aiomoqt.utils.url import parse_relay_url
 
 # Exit status when an object does not fit a datagram.
 EXIT_DATAGRAM_TOO_LARGE = 64
+# No relay reachable, or every relay lost.
+EXIT_UNAVAILABLE = 69
+# An internal error, including a source pub_media cannot read.
+EXIT_SOFTWARE = 70
+
+# A relay that has not answered by then is down.
+_DIAL_TIMEOUT_S = 4.0
+# --reconnect: redial 1, 2, 4 ... s apart, at most this.
+_RECONNECT_MAX_S = 30.0
+# Signal shutdown: the most spent waiting for PUBLISH_DONEs to go out.
+_SHUTDOWN_DRAIN_S = 0.5
 
 _SAMPLERATE = 48000
 _CHANNELS = 2
@@ -148,8 +173,7 @@ def parse_args():
                         help='Send frames as fast as accepted instead '
                              'of pacing to their timestamps')
     parser.add_argument('-D', '--datagram', action='store_true',
-                        help='Send the AUDIO track as ObjectDatagrams '
-                             '(raw QUIC only)')
+                        help='Send the AUDIO track as ObjectDatagrams')
     parser.add_argument('--no-audio', action='store_true',
                         help='Video only — omit the audio track')
     parser.add_argument('--tone', action='store_true',
@@ -196,6 +220,36 @@ def parse_args():
                              '0 (default): send nothing until PUBLISH_OK, '
                              'SUBSCRIBE or an update carries forward=1. '
                              '1: start right after PUBLISH.')
+    parser.add_argument('--no-catalog', action='store_true',
+                        help='Publish no catalog track (LOC only): '
+                             'receivers configure from the media; '
+                             'implies --annexb')
+    parser.add_argument('--annexb', action='store_true',
+                        help='LOC H.264/H.265 video as Annex B: start '
+                             'codes instead of length prefixes, parameter '
+                             'sets in every key frame instead of '
+                             'VIDEO_CONFIG or catalog initData; catalog '
+                             'codec avc3/hev1')
+    parser.add_argument('--catalog-bitrate', type=int, default=None,
+                        metavar='BPS',
+                        help='Catalog bitrate of the video track (of audio '
+                             'when there is no video). Default: the '
+                             'mp4\'s mean; --ts measures it, and the '
+                             'catalog omits it until measured.')
+    parser.add_argument('--catalog-audio-bitrate', type=int, default=None,
+                        metavar='BPS',
+                        help='Catalog bitrate of the audio track, with or '
+                             'without video. Default: as for '
+                             '--catalog-bitrate.')
+    parser.add_argument('--init-data', choices=('catalog', 'track', 'object'),
+                        default=None,
+                        help='LOC decoder config placement: catalog = '
+                             'catalog initData only; track = '
+                             'VIDEO_CONFIG/AUDIO_CONFIG Track Property; '
+                             'object = Object Property on each group\'s '
+                             'first object. Default: catalog initData and '
+                             'the Object Property. cmaf and locmaf: '
+                             'catalog only.')
     parser.add_argument('--catalog-interval', type=float, default=1.0,
                         metavar='SECS',
                         help='Re-emit the full catalog as a new group every '
@@ -204,6 +258,14 @@ def parse_args():
     parser.add_argument('--stats', type=float, default=5.0, metavar='SECS',
                         help='Print per-track publish metrics every SECS '
                              'seconds (0 disables; default: 5)')
+    parser.add_argument('--reconnect', action='store_true',
+                        help='Redial a lost relay 1, 2, 4 ... s apart (at '
+                             'most 30 s) at the draft it negotiated, until '
+                             'the duration ends, and publish to it again; '
+                             'the media timeline runs on meanwhile. A relay '
+                             'GOAWAY redials at once, to its New Session URI '
+                             'if it gives one. '
+                             'Default: a lost relay is dropped')
     map_group = parser.add_argument_group('object mapping')
     map_group.add_argument(
         '--video-subgroups', choices=('group', 'object'), default='group',
@@ -227,20 +289,35 @@ def parse_args():
              'start, group and frame period), OBJECT_TIMESTAMP only on a '
              'frame off schedule, and a prft box on the first CMAF/LOCMAF '
              'object of each group. Sources without a fixed GOP (live '
-             'inputs, irregular keyframes) send OBJECT_TIMESTAMP on every '
-             'object instead. LOC timestamps are unchanged.')
+             'inputs, irregular keyframes; see --ts-cadence) send '
+             'OBJECT_TIMESTAMP on every object instead. LOC timestamps '
+             'are unchanged.')
+    ts_group.add_argument(
+        '--ts-cadence', type=_cadence, default=None,
+        metavar='fps=N[/D],gop=M',
+        help='With --ts: the stream keeps a fixed cadence, N/D frames per '
+             'second and a key frame every M frames. Implies '
+             '--timestamp-mapping, mapped at TIMESCALE 1000 x fps (N for '
+             'a fractional rate) with OBJECT_TIMESTAMP only off schedule, '
+             'and gives the catalog its framerate.')
     out_group = parser.add_argument_group('machine output')
     out_group.add_argument(
         '--stats-json', action='store_true',
-        help='Events as "@mtt <json>" lines on stdout (ready, stats every '
-             '--stats interval, endpoint_lost, done); human output goes '
-             'to stderr')
+        help='Events as "@mtt <json>" lines on stdout (ready once a relay '
+             'is up, stats every --stats interval, endpoint_lost, '
+             'endpoint_up, done); human output goes to stderr')
     _cli.add_run(parser, duration=30)
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
+    _cli.add_fetch_history(parser)
     _cli.add_compat(parser)
+    _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
+    if args.duration < 0:
+        parser.error('-t/--duration: seconds, or 0 for no limit')
+    if args.duration == 0:
+        args.duration = math.inf
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
     if args.input:
@@ -261,6 +338,7 @@ def parse_args():
     if args.loc_timescale is not None and args.loc_timescale <= 0:
         parser.error('--loc-timescale must be positive')
     for flag, on in (('--loc-codecstring', args.loc_codecstring),
+                     ('--annexb', args.annexb),
                      ('--loc-bare', args.loc_bare),
                      ('--loc-timescale', args.loc_timescale)):
         if on and args.packaging != PACKAGING_LOC:
@@ -287,7 +365,59 @@ def parse_args():
     if args.input and (n is not None or args.audio_subgroups != 'group'):
         parser.error('--audio-frames-per-group and --audio-subgroups do '
                      'not apply to --input')
+    if args.ts_cadence is not None:
+        if not args.ts:
+            parser.error('--ts-cadence applies to --ts only')
+        args.timestamp_mapping = True
+    for flag, bps in (('--catalog-bitrate', args.catalog_bitrate),
+                      ('--catalog-audio-bitrate', args.catalog_audio_bitrate)):
+        if bps is not None and bps <= 0:
+            parser.error(f'{flag} must be positive')
+    if args.packaging != PACKAGING_LOC:
+        for flag, on in (('--no-catalog', args.no_catalog),
+                         ('--init-data', args.init_data not in
+                          (None, 'catalog'))):
+            if on:
+                parser.error(f'{flag} applies to LOC packaging only')
+    if args.no_catalog and args.init_data == 'catalog':
+        parser.error('--init-data catalog needs a catalog')
     return args
+
+
+def _cadence(text: str) -> TsCadence:
+    try:
+        return TsCadence.parse(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
+# --init-data → (catalog initData type, LocTrackPublisher config_property).
+_INIT_DATA = {
+    None: (INIT_TYPE_INLINE, 'object'),
+    'catalog': (INIT_TYPE_INLINE, None),
+    'track': (INIT_TYPE_TRACK_PROPERTY, 'track'),
+    'object': (INIT_TYPE_OBJECT_PROPERTY, 'object'),
+}
+
+
+def _init_data(args, ref: str, config: bytes, prop_id: int) -> InitData:
+    """The catalog initDataList entry for a LOC track's decoder config."""
+    kind = _INIT_DATA[getattr(args, 'init_data', None)][0]
+    if kind == INIT_TYPE_INLINE:
+        return InitData.from_bytes(ref, config)
+    return InitData(id=ref, data=f'0x{prop_id:02X}', type=kind)
+
+
+class _SourceError(SystemExit):
+    """Exit EXIT_SOFTWARE for a source pub_media cannot use; main()
+    prints the message."""
+
+    def __init__(self, message: str):
+        super().__init__(EXIT_SOFTWARE)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def _wt_url(relay, url: str) -> str:
@@ -313,11 +443,34 @@ def _player_url(args, relay, url: str, draft=None) -> str:
     return args.player_base + '?' + '&'.join(q)
 
 
+def _annexb_family(args, video) -> Optional[str]:
+    """'h264' or 'h265' when LOC video goes out as Annex B: --annexb, or
+    --no-catalog, which leaves the parameter sets nowhere but the payload."""
+    if (video is None or getattr(args, 'packaging', None) != PACKAGING_LOC
+            or not (getattr(args, 'annexb', False)
+                    or getattr(args, 'no_catalog', False))):
+        return None
+    codec = video.codec_string or ''
+    if codec.startswith(('avc1', 'avc3')):
+        return 'h264'
+    if codec.startswith(('hvc1', 'hev1')):
+        return 'h265'
+    return None
+
+
+def _annexb_codec(codec: str) -> str:
+    """The in-band parameter set form of a codec string: avc3, hev1."""
+    return {'avc1': 'avc3', 'hvc1': 'hev1'}.get(codec[:4], codec[:4]) + codec[4:]
+
+
 def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     packaging = args.packaging
     chunkers = chunkers or {}
     tracks = []
     init = []
+    live_ts = bool(getattr(args, 'ts', None))
+    explicit = getattr(args, 'catalog_bitrate', None)
+    audio_bps = getattr(args, 'catalog_audio_bitrate', None)
     if audio is not None:
         # Opus over LOC needs no decoder description, so no initData.
         a_init = (chunkers['audio'].init_segment() if 'audio' in chunkers
@@ -327,30 +480,40 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=audio.avg_bitrate or 128_000,
+            bitrate=(audio_bps or (explicit if video is None else None)
+                     or audio.avg_bitrate or (None if live_ts else 128_000)),
             initRef='a0' if a_init else None))
-        if a_init:
+        if 'audio' in chunkers:
             init.append(InitData.from_bytes('a0', a_init))
+        elif a_init:
+            init.append(_init_data(args, 'a0', a_init, LOC_PROP_AUDIO_CONFIG))
     elif not args.no_audio:
         tracks.append(CatalogTrack(
             name='audio', packaging='loc', isLive=True, role='audio',
             renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
             channelConfig=str(_CHANNELS),
-            bitrate=_SAMPLERATE * _CHANNELS * 16))
+            bitrate=audio_bps or _SAMPLERATE * _CHANNELS * 16))
     if video is not None:
         cmaf = 'video' in chunkers
+        # Annex B: a decoder description would contradict the payload.
+        annexb = _annexb_family(args, video) is not None
+        v_config = None if annexb else video.config
         tracks.insert(0, CatalogTrack(
             name='video', packaging=packaging, isLive=True, role='video',
-            renderGroup=1, codec=video.codec_string,
+            renderGroup=1,
+            codec=(_annexb_codec(video.codec_string) if annexb
+                   else video.codec_string),
             width=video.width, height=video.height,
             framerate=video.fps,
-            bitrate=video.avg_bitrate or 2_000_000,
-            initRef='v0' if (cmaf or video.config) else None))
+            bitrate=(explicit or video.avg_bitrate
+                     or (None if live_ts else 2_000_000)),
+            initRef='v0' if (cmaf or v_config) else None))
         if cmaf:
             init.append(InitData.from_bytes(
                 'v0', chunkers['video'].init_segment()))
-        elif video.config:
-            init.append(InitData.from_bytes('v0', video.config))
+        elif v_config:
+            init.append(_init_data(args, 'v0', video.config,
+                                   LOC_PROP_VIDEO_CONFIG))
     if getattr(args, 'target_latency', None) is not None:
         for t in tracks:
             t.targetLatency = args.target_latency
@@ -404,13 +567,13 @@ async def _open_ingest(args) -> Ingest:
         stop.set()
         raise
     except ImportError as e:
-        raise SystemExit(f"  error: {e}")
+        raise _SourceError(f"  error: {e}")
     except Exception as e:
-        raise SystemExit(f"  error: {args.input}: {type(e).__name__}: {e}")
+        raise _SourceError(f"  error: {args.input}: {type(e).__name__}: {e}")
     unknown = [t.name for t in ingest.tracks if t.codec is None]
     if unknown:
         ingest.close()
-        raise SystemExit(f"  error: no codec string for {', '.join(unknown)}")
+        raise _SourceError(f"  error: no codec string for {', '.join(unknown)}")
     for t in ingest.tracks:
         size = f" {t.width}x{t.height}" if t.kind == 'video' else ''
         print(f"  input {t.name}: {t.codec}{size}"
@@ -469,7 +632,7 @@ def _open_live_h264(args):
     while asm.config is None:
         chunk = fh.read1(65536)
         if not chunk:
-            raise SystemExit('  error: h264 stream ended before SPS/PPS')
+            raise _SourceError('  error: h264 stream ended before SPS/PPS')
         first += asm.feed(chunk)
     return fh, asm, first, _LiveVideo(asm)
 
@@ -523,7 +686,7 @@ def _open_live_ts(args):
     while not ready():
         chunk = fh.read1(65536)
         if not chunk:
-            raise SystemExit('  error: ts stream ended before PMT and codec configs')
+            raise _SourceError('  error: ts stream ended before PMT and codec configs')
         units = dmx.feed(chunk)
         if units and not first:
             dmx.to_us(units[0].pts)  # anchor at arrival, not at first send
@@ -532,8 +695,8 @@ def _open_live_ts(args):
     audio = (_LiveAudio(dmx)
              if dmx.audio_pid is not None and not args.no_audio else None)
     if video is None and audio is None:
-        raise SystemExit('  error: ts stream has no H.264/H.265 video or '
-                         'AAC/Opus audio')
+        raise _SourceError('  error: ts stream has no H.264/H.265 video or '
+                           'AAC/Opus audio')
     return fh, dmx, first, video, audio
 
 
@@ -541,23 +704,25 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     """A new SPS/PPS or ADTS header: the track's group-start config and
     the catalog follow it, and the catalog is republished."""
     cat = pub.catalog_track.catalog
-    init = {i.id: i for i in (cat.initDataList or [])}
+    init = {i.id: i for i in (cat.initDataList or [])
+            if i.type == INIT_TYPE_INLINE} if cat is not None else {}
     video = tracks.get('video')
     if video is not None and dmx.video.config != video.config:
         video.config = dmx.video.config
         view = _LiveVideo(dmx.video)
+        codec = (_annexb_codec(view.codec_string) if video.annexb
+                 else view.codec_string)
         if video.codec_string is not None:
-            video.codec_string = view.codec_string
-        for t in cat.tracks:
+            video.codec_string = codec
+        for t in (cat.tracks if cat is not None else ()):
             if t.name == 'video':
-                t.codec, t.width, t.height = (view.codec_string, view.width,
-                                              view.height)
+                t.codec, t.width, t.height = codec, view.width, view.height
         if 'v0' in init:
             init['v0'].data = InitData.from_bytes('v0', view.config).data
         print(f"  video config changed: {view.width}x{view.height} "
-              f"{view.codec_string}")
+              f"{codec}")
     audio = tracks.get('audio')
-    entry = cat.find('audio')
+    entry = cat.find('audio') if cat is not None else None
     if audio is not None and (
             dmx.audio_asc != audio.config or (
                 entry is not None
@@ -573,24 +738,49 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
             init['a0'].data = InitData.from_bytes('a0', view.config).data
         print(f"  audio config changed: {view.codec_string} "
               f"{view.samplerate}Hz {view.channels}ch")
+    await _republish(pub)
+
+
+async def _republish(pub) -> None:
+    cat = pub.catalog_track.catalog
+    if cat is None:
+        return
     cat.generatedAt = int(time.time() * 1000)
     if pub.catalog_track.state == TrackState.SUBSCRIBED:
         await pub.catalog_track.publish_catalog(cat)
 
 
+async def _apply_rates(rates: TsRates, args, pub) -> None:
+    """Measured frame rate and bitrates into catalog entries that lack
+    them; the catalog is republished."""
+    cat = pub.catalog_track.catalog
+    if cat is None:
+        return
+    for t in cat.tracks:
+        if t.role == 'video' and t.framerate is None:
+            t.framerate = rates.fps
+        if t.bitrate is None:
+            t.bitrate = rates.bps.get(t.role)
+    await _republish(pub)
+
+
 async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
                         stats: dict, pub, audio_per_group: int = 1):
     """Dispatch demuxed access units to their tracks with PTS-derived
-    stamps; audio opens a group every `audio_per_group` frames."""
+    stamps; audio opens a group every `audio_per_group` frames. Catalog
+    values the stream does not declare are measured from it."""
     loop = asyncio.get_running_loop()
     deadline = time.monotonic() + args.duration
     units = list(first)
     eof = False
     n_audio = 0
+    rates = TsRates()
     while True:
         if dmx.config_changed:
             dmx.config_changed = False
             await _apply_config_change(dmx, tracks, pub)
+        if [u for u in units if rates.add(u)]:
+            await _apply_rates(rates, args, pub)
         for u in units:
             track = tracks.get(u.kind)
             if track is None:
@@ -688,6 +878,22 @@ def _frindell_for(source, wall0: int, per_group=None):
     per_group = per_group or sync_group
     om = dur if per_group > 1 else 0
     return MediaTimestamps(wall0, source.timescale, dur * per_group, om)
+
+
+def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str, wall0: int,
+                   per_group: int = 1) -> MediaTimestamps:
+    """MediaTimestamps for a --ts track: mapped from --ts-cadence at its
+    first group's stamp (audio on its frame size), else explicit."""
+    cadence = args.ts_cadence
+    units = [u for u in first if u.kind == kind]
+    if cadence is None or not units:
+        return MediaTimestamps(wall0)
+    if kind == 'audio':
+        return cadence.audio_timestamps(
+            dmx.to_us(units[0].pts), dmx.audio_samplerate,
+            dmx.audio_frame_samples, per_group)
+    key = next((u for u in units if u.key), units[0])
+    return cadence.video_timestamps(dmx.to_us(key.pts))
 
 
 async def _pace(start: float, ts_us: int, pace: bool):
@@ -808,8 +1014,10 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
     bitrate over the interval, frames dropped before a subscriber
     arrived, frames the track discarded unnumbered (waiting for a key
     frame, Forward State 0), frames shed per relay (index = URL position)
-    and, with several relays, the demand count. `events` also gets a
-    stats event per interval."""
+    and, with several relays, the demand count. A track with subscribers
+    but no peer at Forward State 1 shows ` · paused`. `events` also gets
+    a stats event per interval; each track's `forwarding` counts its
+    peers taking objects (Forward State 1, not idle)."""
     t0 = time.monotonic()
     prev_obj = {name: 0 for name in stats}
     prev_bytes = {name: 0 for name in stats}
@@ -825,9 +1033,11 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
             kbps = (st.bytes - prev_bytes[name]) * 8 / interval / 1000
             prev_obj[name] = objects
             prev_bytes[name] = st.bytes
+            forwarding = sum(1 for sub in getattr(track, 'subscriptions', ())
+                             if sub.forward and sub.generating)
             tracks[name] = dict(objects=objects, groups=st.groups,
                                 kbps=round(kbps), dropped=st.dropped,
-                                discarded=discarded)
+                                discarded=discarded, forwarding=forwarding)
             lag = st.take_lag()
             line = (f"{name}: {objects} obj · {ops:.0f} obj/s · {kbps:.0f} kbps"
                     + (f" · lag {lag[0]:.0f}/{lag[1]:.0f} ms" if lag else "")
@@ -837,6 +1047,8 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
             if track is not None and len(pub.sessions) > 1:
                 have, total = track.demand
                 line += f" · demand {have}/{total}"
+            if track is not None and track.demand[0] > 0 and not forwarding:
+                line += " · paused"
             shed = getattr(track, 'shed', None) or {}
             if shed:
                 line += " · shed " + ",".join(
@@ -855,7 +1067,8 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
                      per_group: int = 1):
     start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
     for i, (payload, ts) in enumerate(pcm_tone_frames(
-            duration_s=args.duration, freq=args.freq,
+            duration_s=None if math.isinf(args.duration) else args.duration,
+            freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
             frame_ms=_FRAME_MS)):
         await _pace(start, ts, not args.no_pace)
@@ -912,6 +1125,146 @@ async def _feed_mp4_track(track, source, args, stats: _TrackStats, *,
     await track.finish()
 
 
+class _Endpoint:
+    """One relay URL: a client per dial, the live session, and the draft
+    the first session negotiated, which a redial keeps."""
+
+    def __init__(self, url: str, relay, args, libquicr: bool):
+        self.url = url
+        self.relay = relay
+        self.args = args
+        self.libquicr = libquicr
+        self.session = None
+        self.draft: Optional[int] = None
+        self._stack: Optional[contextlib.AsyncExitStack] = None
+        # --reconnect: the session's GOAWAY New Session URI ('' = same).
+        self._goaway: Optional[asyncio.Future] = None
+
+    async def open(self):
+        """Dial and set up a session within _DIAL_TIMEOUT_S; None, with
+        the error printed, when the relay does not answer."""
+        args, relay = self.args, self.relay
+        client = MOQTClient(
+            relay.host, relay.port, path=relay.path,
+            use_quic=relay.use_quic, verify_tls=not args.insecure,
+            supported_drafts=([self.draft] if self.draft is not None
+                              else args.draft),
+            debug=args.debug, keylog_filename=args.keylogfile,
+            **_cli.transport_kwargs(args),
+            libquicr_compat=self.libquicr)
+        stack = contextlib.AsyncExitStack()
+
+        async def dial():
+            s = await stack.enter_async_context(client.connect())
+            await s.client_session_init()
+            return s
+        try:
+            session = await asyncio.wait_for(dial(), _DIAL_TIMEOUT_S)
+        except BaseException as e:
+            await stack.aclose()
+            if not isinstance(e, Exception):
+                raise
+            print(f"  error: {self.url}: {str(e) or type(e).__name__}")
+            return None
+        self._stack, self.session = stack, session
+        if self.draft is None:
+            self.draft = getattr(session, 'negotiated_draft', None)
+        if args.reconnect:
+            goaway = self._goaway = asyncio.get_running_loop().create_future()
+
+            def on_goaway(msg, request_id):
+                if request_id is None and not goaway.done():
+                    goaway.set_result(msg.new_session_uri or '')
+            session.on_goaway = on_goaway
+            if session.goaway_received is not None:
+                on_goaway(session.goaway_received, None)
+        return session
+
+    async def lost(self) -> Optional[str]:
+        """Wait for the session to close (None) or, with --reconnect, for
+        a GOAWAY (its New Session URI, '' for this relay)."""
+        closed = asyncio.ensure_future(self.session.async_closed())
+        waits = {closed} if self._goaway is None else {closed, self._goaway}
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            closed.cancel()
+        if self._goaway is not None and self._goaway.done():
+            return self._goaway.result()
+        return None
+
+    def migrate(self, uri: str) -> None:
+        """Dial `uri` from now on; kept as is when it does not parse."""
+        try:
+            relay = parse_relay_url(uri)
+        except ValueError as e:
+            print(f"  error: {self.url}: GOAWAY URI {uri!r}: {e}")
+            return
+        self.url, self.relay = uri, relay
+
+    async def close(self) -> None:
+        """Leave the session's connection, if one is open."""
+        stack, self._stack, self.session = self._stack, None, None
+        if stack is not None:
+            await stack.aclose()
+
+
+async def _close_endpoints(endpoints) -> None:
+    await asyncio.gather(*(ep.close() for ep in endpoints))
+
+
+async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict,
+                  delay: float = 1.0) -> None:
+    """--reconnect: dial `ep` after `delay`, then 1, 2, 4 ... s apart (at
+    most _RECONNECT_MAX_S) until it is up and publishing again; cancelled
+    when the run ends."""
+    while True:
+        await asyncio.sleep(delay)
+        delay = min(max(delay * 2, 1.0), _RECONNECT_MAX_S)
+        session = await ep.open()
+        if session is None:
+            continue
+        try:
+            await pub.add_session(session, **start)
+            return
+        except Exception as e:
+            print(f"  error: {ep.url}: publishing again: "
+                  f"{str(e) or type(e).__name__}")
+            pub.drop(session)
+            await ep.close()
+
+
+async def _shutdown(pub: FanoutPublisher, sessions: list,
+                    announced: bool, ended: bool = False) -> None:
+    """End the run in about a second: refuse new SUBSCRIBEs and
+    FETCHes, End of Track and PUBLISH_DONE on every track (`ended`: the
+    feeders already ended them), PUBLISH_NAMESPACE_DONE for an announced
+    namespace, then close each session once its peer has acknowledged
+    all of it."""
+    for s in sessions:
+        s.drain()
+    if not ended:
+        for track in pub.tracks.values():
+            track.end()
+    await pub.catalog_track.finish()
+    catalogs = getattr(pub.catalog_track, "members", [pub.catalog_track])
+    tracks = [*pub.tracks.values(), *catalogs]
+    # A subscription's PUBLISH_DONE follows its End of Track.
+    deadline = time.monotonic() + _SHUTDOWN_DRAIN_S
+    while time.monotonic() < deadline and not all(
+            sub.done or (sub.request_id is None
+                         and sub.subscribe_request_id is None)
+            for track in tracks for sub in track.subscriptions
+            if sub.session in sessions):
+        await asyncio.sleep(0.02)
+    if announced:
+        for s in sessions:
+            s.publish_namespace_done(namespace=pub.namespace)
+    await asyncio.gather(*(s.wait_delivered() for s in sessions))
+    for s in sessions:
+        s.close()
+
+
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
@@ -950,7 +1303,7 @@ async def run(args):
 
 async def _run(args, events: Optional[_MttEvents]) -> str:
     """The run; 'duration' or 'signal' for how it ended."""
-    set_log_level(logging.DEBUG if args.debug else logging.WARNING)
+    _cli.apply_logging(args)
     libquicr = apply_compat(getattr(args, 'compat', ''))
     urls = args.url if isinstance(args.url, list) else [args.url]
     relays = [parse_relay_url(u) for u in urls]
@@ -963,6 +1316,10 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     ts_audio = None
     if ts:
         video, ts_audio = ts[3], ts[4]
+        if args.ts_cadence is not None:
+            ts[1].clock.hold()
+            if video is not None:
+                video.fps = args.ts_cadence.framerate
         if ts_audio is None:
             args.no_audio = True
     mp4_audio = (reader.audio
@@ -976,57 +1333,41 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             print(f"  note: {args.packaging} packaging — tone audio skipped "
                   "(no AAC or Opus track in the mp4)")
             args.no_audio = True
+    annexb = _annexb_family(args, video)
+    if args.annexb and annexb is None:
+        print("  note: --annexb applies to H.264/H.265 video; off")
+    v_codec = (_annexb_codec(video.codec_string) if annexb
+               else video.codec_string if video is not None else None)
     ingest = await _open_ingest(args) if args.input else None
     if ingest is not None:
         catalog = _build_ingest_catalog(args, ingest)
     else:
         catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
 
-    clients = [MOQTClient(
-        relay.host, relay.port, path=relay.path,
-        use_quic=relay.use_quic, verify_tls=not args.insecure,
-        supported_drafts=args.draft, debug=args.debug,
-        keylog_filename=args.keylogfile,
-        congestion_control_algorithm=args.cc_algo,
-        keep_alive_interval=args.keepalive,
-        libquicr_compat=libquicr,
-    ) for relay in relays]
+    endpoints = [_Endpoint(u, r, args, libquicr)
+                 for u, r in zip(urls, relays)]
     print(f"  relay: {', '.join(str(r) for r in relays)}  "
           f"namespace: {args.namespace}")
     print(f"  tracks: {', '.join(t.name for t in catalog.tracks)}")
     async with contextlib.AsyncExitStack() as stack:
         if ingest is not None:
             stack.callback(ingest.close)
-
-        async def _open(url, client):
-            try:
-                s = await stack.enter_async_context(client.connect())
-                await s.client_session_init()
-                return s
-            except Exception as e:
-                print(f"  error: {url}: {e}")
-                return None
-
+        stack.push_async_callback(_close_endpoints, endpoints)
         # A relay that cannot be reached is left out; the run fails only
         # when none can.
-        opened = await asyncio.gather(*(_open(u, c)
-                                        for u, c in zip(urls, clients)))
-        up = [i for i, s in enumerate(opened) if s is not None]
-        if events is not None:
-            endpoints = [dict(url=u, state='up' if s is not None else 'down',
-                              draft=getattr(s, 'negotiated_draft', None))
-                         for u, s in zip(urls, opened)]
+        await asyncio.gather(*(ep.open() for ep in endpoints))
+        up = [ep for ep in endpoints if ep.session is not None]
         if not up:
-            if events is not None:
-                events.emit('ready', endpoints=endpoints)
-            raise SystemExit(1)
-        urls = [urls[i] for i in up]
-        relays = [relays[i] for i in up]
-        sessions = [opened[i] for i in up]
-        for url, relay, s in zip(urls, relays, sessions):
-            if args.player_base:
-                draft = getattr(s, 'negotiated_draft', None)
-                print(f"  player: {_player_url(args, relay, url, draft)}")
+            print("  error: no relay reachable")
+            raise SystemExit(EXIT_UNAVAILABLE)
+        ready = [dict(url=ep.url,
+                      state='up' if ep.session is not None else 'down',
+                      draft=ep.draft) for ep in endpoints]
+        sessions = [ep.session for ep in up]
+        if args.player_base:
+            for ep in up:
+                print(f"  player: "
+                      f"{_player_url(args, ep.relay, ep.url, ep.draft)}")
 
         def _cs(codec):
             return codec if args.loc_codecstring else None
@@ -1039,15 +1380,18 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         session = sessions[0]
         # CMAF objects are not LOC: no Private Properties block.
         loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
+        cfg_at = _INIT_DATA[args.init_data][1]
 
         def _track(name, **kwargs):
+            kwargs['fetch_history_bytes'] = args.fetch_history
             if args.packaging == PACKAGING_LOCMAF:
                 init = catalog.resolve_init(catalog.find(name))
                 return LocmafTrackPublisher(session, args.namespace, name,
                                             init=init, **kwargs)
             return LocTrackPublisher(session, args.namespace, name,
                                      loc_bare=loc_bare,
-                                     timescale=args.loc_timescale, **kwargs)
+                                     timescale=args.loc_timescale,
+                                     config_property=cfg_at, **kwargs)
         # One start for every paced feeder; with --timestamp-mapping its
         # wall clock anchors each track's TIMESTAMP_MAPPING.
         timescales = [_SAMPLERATE] + [
@@ -1060,7 +1404,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             if args.timestamp_mapping:
                 track.frindell = frindell
             return track
-        pub = FanoutPublisher(sessions, args.namespace, catalog)
+        pub = FanoutPublisher(sessions, args.namespace,
+                              None if args.no_catalog else catalog)
         stats = {}
         feeders = []
         if ingest is not None:
@@ -1079,18 +1424,20 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
-                    timescale=args.loc_timescale,
-                    codec_string=_cs(video.codec_string)),
-                    MediaTimestamps(wall0)))
+                    timescale=args.loc_timescale, config_property=cfg_at,
+                    codec_string=_cs(v_codec), annexb=annexb,
+                    fetch_history_bytes=args.fetch_history),
+                    _ts_timestamps(args, dmx, first, 'video', wall0)))
                 stats['video'] = _TrackStats()
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
                     config=ts_audio.config, mapping=a_map,
                     loc01_compat=args.loc01_compat, loc_bare=loc_bare,
-                    timescale=args.loc_timescale,
-                    codec_string=_cs(ts_audio.codec_string)),
-                    MediaTimestamps(wall0)))
+                    timescale=args.loc_timescale, config_property=cfg_at,
+                    codec_string=_cs(ts_audio.codec_string),
+                    fetch_history_bytes=args.fetch_history),
+                    _ts_timestamps(args, dmx, first, 'audio', wall0, a_per)))
                 stats['audio'] = _TrackStats()
             feeders.append(_feed_ts_live(tracks, fh, dmx, first, args,
                                          stats, pub, a_per))
@@ -1130,8 +1477,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
                     mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
-                    timescale=args.loc_timescale,
-                    codec_string=_cs(video.codec_string)),
+                    timescale=args.loc_timescale, config_property=cfg_at,
+                    codec_string=_cs(v_codec), annexb=annexb,
+                    fetch_history_bytes=args.fetch_history),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
         elif video is not None and ts is None:   # --ts wired both tracks above
@@ -1142,25 +1490,26 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     'video', mapping=v_map,
                     config=None if v_ck else video.config,
                     loc01_compat=args.loc01_compat,
-                    codec_string=_cs(video.codec_string)),
+                    codec_string=_cs(v_codec), annexb=annexb),
                     _frindell_for(video, wall0))),
                 video, args, stats['video'],
                 gap_us=int(1e6 / (video.fps or 30)),
                 wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
                 clock=clock))
-        await pub.start(announce_namespace=(args.pub_ns or args.pub_both),
-                        publish_track=(not args.pub_ns or args.pub_both),
-                        forward=args.forward)
+        start = dict(announce_namespace=(args.pub_ns or args.pub_both),
+                     publish_track=(not args.pub_ns or args.pub_both),
+                     forward=args.forward)
+        await pub.start(**start)
         print("  publishing...")
         if events is not None:
-            events.emit('ready', endpoints=endpoints)
+            events.emit('ready', endpoints=ready)
         reporter = (asyncio.ensure_future(
             _report_stats(stats, args.stats, pub, events))
             if args.stats > 0 and stats else None)
         refresher = (asyncio.ensure_future(
             _refresh_catalog(pub, args.catalog_interval))
-            if args.catalog_interval > 0 else None)
-        # SIGINT and SIGTERM: PUBLISH_DONE on every track, drain, exit 0.
+            if args.catalog_interval > 0 and not args.no_catalog else None)
+        # SIGINT and SIGTERM: _shutdown(), exit 0.
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         signals = _on_stop_signals(loop, stop.set)
@@ -1173,49 +1522,65 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         # Ctrl-C exits quietly instead of logging an unretrieved exception.
         feed.add_done_callback(
             lambda f: f.cancelled() or f.exception())
-        closed = {asyncio.ensure_future(s.async_closed()): s
-                  for s in sessions}
-        # A relay lost mid-run is dropped and the rest continue; the
-        # run fails only when no relay is left.
-        while True:
-            done, _ = await asyncio.wait({feed, stopping, *closed},
-                                         return_when=asyncio.FIRST_COMPLETED)
-            if feed in done or stopping in done:
-                break
-            for fut in done:
-                s = closed.pop(fut)
-                code, reason = getattr(s, '_close_err', None) or ('?', '')
-                url = urls[sessions.index(s)]
-                if events is not None:
-                    events.emit('endpoint_lost', url=url,
-                                reason=f"code={code} {reason}".strip())
-                if closed:
-                    print(f"  error: {url} closed: code={code} "
-                          f"reason='{reason}' — continuing on {len(closed)}")
-                    pub.drop(s)
-                    continue
-                if reporter is not None:
-                    reporter.cancel()
-                if refresher is not None:
-                    refresher.cancel()
-                print(f"  error: session closed: code={code} "
-                      f"reason='{reason}'")
-                feed.cancel()
-                stopping.cancel()
-                raise SystemExit(1)
-        if reporter is not None:
-            reporter.cancel()
-        if refresher is not None:
-            refresher.cancel()
-        for fut in closed:
-            fut.cancel()
-        stopping.cancel()
+        live = {asyncio.ensure_future(ep.lost()): ep for ep in up}
+        redial = {}
+        # A relay lost mid-run is dropped, or redialled with --reconnect;
+        # without it the run fails once no relay is left.
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {feed, stopping, *live, *redial},
+                    return_when=asyncio.FIRST_COMPLETED)
+                if feed in done or stopping in done:
+                    break
+                for fut in done:
+                    if fut in redial:
+                        ep = redial.pop(fut)
+                        fut.result()
+                        live[asyncio.ensure_future(ep.lost())] = ep
+                        print(f"  reconnected: {ep.url} (draft-{ep.draft})")
+                        if events is not None:
+                            events.emit('endpoint_up', url=ep.url,
+                                        draft=ep.draft)
+                        continue
+                    ep = live.pop(fut)
+                    uri = fut.result()
+                    if uri is not None:
+                        lost = f"GOAWAY {uri}".strip()
+                    else:
+                        code, reason = (getattr(ep.session, '_close_err',
+                                                None) or ('?', ''))
+                        lost = f"code={code} {reason}".strip()
+                    if events is not None:
+                        events.emit('endpoint_lost', url=ep.url, reason=lost)
+                    pub.drop(ep.session)
+                    await ep.close()
+                    if uri is not None:
+                        print(f"  {ep.url}: {lost} — reconnecting")
+                        if uri:
+                            ep.migrate(uri)
+                        redial[asyncio.ensure_future(
+                            _redial(ep, pub, start, delay=0))] = ep
+                        continue
+                    lost = f"{ep.url} closed: code={code} reason='{reason}'"
+                    if args.reconnect:
+                        print(f"  error: {lost} — reconnecting")
+                        redial[asyncio.ensure_future(
+                            _redial(ep, pub, start))] = ep
+                    elif live:
+                        print(f"  error: {lost} — continuing on {len(live)}")
+                    else:
+                        print(f"  error: {lost}")
+                        feed.cancel()
+                        raise SystemExit(EXIT_UNAVAILABLE)
+        finally:
+            for task in (reporter, refresher, stopping, *live, *redial):
+                if task is not None:
+                    task.cancel()
+        alive = [ep.session for ep in live.values()]
         if stop.is_set():
             feed.cancel()
-            for track in pub.tracks.values():
-                track.end()
-            await pub.catalog_track.finish()
-            await asyncio.sleep(1.0)
+            await _shutdown(pub, alive, start['announce_namespace'])
             print("  done (signal)")
             return 'signal'
         error = None if feed.cancelled() else feed.exception()
@@ -1227,8 +1592,10 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             await asyncio.sleep(1.0)
             raise SystemExit(EXIT_DATAGRAM_TOO_LARGE)
         await feed
-        await pub.catalog_track.finish()
-        await asyncio.sleep(1.0)  # drain tail before teardown
+        if not alive:
+            print("  error: no relay back when the duration ended")
+            raise SystemExit(EXIT_UNAVAILABLE)
+        await _shutdown(pub, alive, start['announce_namespace'], ended=True)
     print("  done")
     return 'duration'
 
@@ -1240,6 +1607,12 @@ def main():
         asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
         pass
+    except _SourceError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(EXIT_SOFTWARE)
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(EXIT_SOFTWARE)
 
 
 if __name__ == '__main__':

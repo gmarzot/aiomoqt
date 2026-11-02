@@ -12,7 +12,8 @@ Synthetic load, ramps and churn are in
 Actors: SHELL = a shell set up as in the next section (repo, venv,
 exports) · OBS = OBS Studio · BROWSER = Chrome. RELAY =
 https://moqx-main.ci.openmoq.org:4433/moq-relay (deployed; never
-restart it). Draft 18 everywhere (`--draft 18` / `v=18`).
+restart it). Draft 18 everywhere (`--draft 18` / `v=18`) unless a flow
+says otherwise; see [Other relays and draft 22](#other-relays-and-draft-22).
 
 Each publisher below prints the player URL to paste. What still has to
 be right:
@@ -59,6 +60,27 @@ audience in the benchmarking runbook — does not need the namespace
 typed either: `sub_media -N aiomoqt --discover` treats `-N` as a prefix
 and finds whichever run is publishing under it. Copy the publisher's
 `namespace:` line only when pinning a specific one.
+
+### Other relays and draft 22
+
+Every flow on `$RELAY_WT` also runs through our own relay, aiomoqt-relay, a public test
+relay that runs development builds and may restart without notice. Point
+the exports at it instead:
+
+```
+export RELAY_WT=https://aiomoqt-relay.marzresearch.net:4443/
+export RELAY_QUIC=moqt://aiomoqt-relay.marzresearch.net:4443
+```
+
+It negotiates drafts 14 to 22. Draft 22 is a `--draft 22` on the tools,
+against a relay that serves it (aiomoqt-relay does; moqx-main serves 16
+and 18). The browser player's `v=` takes 14, 16 and 18, so a draft-22
+run is tool to tool: publisher first, then the wire check.
+
+```
+python -m aiomoqt.tools.pub_media "$RELAY_WT" --draft 22 -k --pub-both --mp4 "$ASSETS"/bbb-1080p-2500k.mp4 --loop --keepalive 10 --catalog-interval 1 -t 600
+python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 22 --analyze -t 60
+```
 
 ## Prep (once)
 
@@ -229,9 +251,15 @@ arrival. Prefer `--ts`.
   not play and A/V skew grows with runtime.
 - Muxer flags: `-pes_payload_size 0` stops ffmpeg bundling AAC frames into
   ~2930-byte PES (≈180 ms at 128 kbps, up to `muxdelay`/2 on silence);
-  `-omit_video_pes_length 0` lets pub_media emit a video frame when it
-  completes instead of when the next one starts (keyframes > 64 KB still
-  wait); `-muxdelay 0` drops the 0.7 s default bound.
+  `-muxdelay 0` drops the 0.7 s default bound. pub_media emits a video
+  frame at the stuffed last packet of its PES, so `-omit_video_pes_length 0`
+  is no longer needed.
+- A source on a fixed cadence (no B-frames, a key frame every M frames)
+  can say so: `--ts-cadence fps=30,gop=60` sends TIMESCALE 30000 and
+  TIMESTAMP_MAPPING, OBJECT_TIMESTAMP only off schedule, and the catalog
+  framerate. `--catalog-bitrate BPS` sets the catalog bitrate; without
+  it `--ts` measures one over the first seconds and republishes the
+  catalog.
 - Measure: burn-in clock vs player frame (screenshot both), overlay
   latency P50/P95 (pub_media→arrival, see below), cushion, stalls. Glass: 09-09
   640 ms (before the 64 KB read fix and the cushion knob); 09-16 1.17 s
@@ -405,8 +433,8 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   `-analyzeduration 0 -probesize 32768` is fine, but `nobuffer` alone
   yields an empty file. Not retested against an OBS source, which is why
   the flag is still in the demo C command above.
-- Publisher dies ~30 s after start with `session closed: code=0
-  reason='ConnectionTerminated'` and 0 objects sent → **keepalive off**
+- Publisher dies ~30 s after start with `MOQT: connection closed:
+  NO_ERROR (0x0)` and 0 objects sent → **keepalive off**
   (`--keepalive 0`, or aiomoqt before 0.11.0). While Forward State is 0
   the publisher correctly sends nothing, so the QUIC connection is silent
   and moxygen's 30 s idle timeout closes it. Any gap between starting a

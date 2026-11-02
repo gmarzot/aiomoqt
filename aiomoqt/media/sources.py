@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import math
 import struct
 from dataclasses import dataclass
@@ -19,15 +20,17 @@ from typing import Iterator, List, Optional, Tuple
 
 # -- audio ------------------------------------------------------------
 
-def pcm_tone_frames(duration_s: float = 5.0, freq: float = 440.0,
+def pcm_tone_frames(duration_s: Optional[float] = 5.0, freq: float = 440.0,
                     samplerate: int = 48000, channels: int = 2,
                     frame_ms: int = 20,
                     amplitude: float = 0.25) -> Iterator[Tuple[bytes, int]]:
-    """Yield (payload, timestamp_us) pcm-s16 interleaved sine frames."""
+    """Yield (payload, timestamp_us) pcm-s16 interleaved sine frames;
+    endlessly with `duration_s` None."""
     spf = samplerate * frame_ms // 1000
     peak = int(32767 * amplitude)
-    n_frames = int(duration_s * 1000 / frame_ms)
-    for f in range(n_frames):
+    frames = (itertools.count() if duration_s is None
+              else range(int(duration_s * 1000 / frame_ms)))
+    for f in frames:
         base = f * spf
         pcm = bytearray()
         for i in range(spf):
@@ -396,6 +399,14 @@ def lp_to_annexb(sample: bytes) -> bytes:
     return bytes(out)
 
 
+def as_annexb(payload: bytes) -> bytes:
+    """A LOC video payload as Annex-B: verbatim when it opens with a
+    4-byte start code (loc-04 §2.1.4), else from length prefixes."""
+    if payload[:4] == b'\x00\x00\x00\x01':
+        return bytes(payload)
+    return lp_to_annexb(payload)
+
+
 def avcc_param_sets(avcc: bytes) -> bytes:
     """SPS/PPS out of an avcC box body, as Annex-B — prepend at
     keyframes to make a raw .h264 elementary stream decodable."""
@@ -413,6 +424,22 @@ def avcc_param_sets(avcc: bytes) -> bytes:
         n = struct.unpack_from('>H', avcc, pos)[0]
         out += b'\x00\x00\x00\x01' + avcc[pos + 2:pos + 2 + n]
         pos += 2 + n
+    return bytes(out)
+
+
+def hvcc_param_sets(hvcc: bytes) -> bytes:
+    """VPS/SPS/PPS out of an hvcC box body, as Annex-B."""
+    out = bytearray()
+    pos = 23
+    for _ in range(hvcc[22]):
+        kind = hvcc[pos] & 0x3F
+        count = struct.unpack_from('>H', hvcc, pos + 1)[0]
+        pos += 3
+        for _ in range(count):
+            n = struct.unpack_from('>H', hvcc, pos)[0]
+            if kind in (_HEVC_VPS, _HEVC_SPS, _HEVC_PPS):
+                out += b'\x00\x00\x00\x01' + hvcc[pos + 2:pos + 2 + n]
+            pos += 2 + n
     return bytes(out)
 
 

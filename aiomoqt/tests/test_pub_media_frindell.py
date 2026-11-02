@@ -1,6 +1,6 @@
 """pub_media --timestamp-mapping: draft-frindell-moq-timestamp Track
 Properties and corrections beside LOC TIMESTAMP, a prft on each CMAF and
-LOCMAF group start, end to end through the interop relay into sub_media
+LOCMAF group start, end to end through aiomoqt-relay into sub_media
 --analyze over raw QUIC and WebTransport, audio and video on one
 session."""
 import asyncio
@@ -170,7 +170,8 @@ async def test_analyze_reports_frindell_latency(clip, tmp_path,  # noqa: F811
         assert r['ts_source'] == 'frindell', r
         assert r['ts_malformed'] == '0', r
         assert int(r['objects']) > 0, r
-        assert 0 <= float(r['lat_p50_ms']) < 1000, r
+        # pub_media sends a frame due within 1 ms at once.
+        assert -1 < float(r['lat_p50_ms']) < 1000, r
 
 
 @requires_certs

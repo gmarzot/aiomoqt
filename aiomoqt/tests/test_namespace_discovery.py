@@ -34,7 +34,7 @@ async def _discovery(port, use_quic, draft=18):
     seen: asyncio.Queue = asyncio.Queue()
 
     async def _on_publish_namespace(session, msg):
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 
