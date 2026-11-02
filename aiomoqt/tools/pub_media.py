@@ -42,7 +42,7 @@ ready-to-paste player URL per relay. Relays on different drafts need a
 
 When the duration ends, or on SIGINT/SIGTERM, each track ends with End of
 Track, then PUBLISH_DONE TRACK_ENDED, then PUBLISH_NAMESPACE_DONE for an
-announced namespace.
+announced namespace. `-t 0` sets no duration: the run lasts until a signal.
 
 Exit status: 0 when the duration ends or on SIGINT/SIGTERM; 2 for a usage
 error; 64 when an object does not fit a datagram; 69 when no relay can be
@@ -309,6 +309,10 @@ def parse_args():
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
+    if args.duration < 0:
+        parser.error('-t/--duration: seconds, or 0 for no limit')
+    if args.duration == 0:
+        args.duration = math.inf
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
     if args.input:
@@ -1055,7 +1059,8 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
                      per_group: int = 1):
     start, wall0 = clock or (time.monotonic(), int(time.time() * 1_000_000))
     for i, (payload, ts) in enumerate(pcm_tone_frames(
-            duration_s=args.duration, freq=args.freq,
+            duration_s=None if math.isinf(args.duration) else args.duration,
+            freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
             frame_ms=_FRAME_MS)):
         await _pace(start, ts, not args.no_pace)
@@ -1222,15 +1227,17 @@ async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict,
 
 
 async def _shutdown(pub: FanoutPublisher, sessions: list,
-                    announced: bool) -> None:
-    """Signal shutdown in about a second: refuse new SUBSCRIBEs and
-    FETCHes, End of Track and PUBLISH_DONE on every track,
-    PUBLISH_NAMESPACE_DONE for an announced namespace, then close each
-    session once its peer has acknowledged all of it."""
+                    announced: bool, ended: bool = False) -> None:
+    """End the run in about a second: refuse new SUBSCRIBEs and
+    FETCHes, End of Track and PUBLISH_DONE on every track (`ended`: the
+    feeders already ended them), PUBLISH_NAMESPACE_DONE for an announced
+    namespace, then close each session once its peer has acknowledged
+    all of it."""
     for s in sessions:
         s.drain()
-    for track in pub.tracks.values():
-        track.end()
+    if not ended:
+        for track in pub.tracks.values():
+            track.end()
     await pub.catalog_track.finish()
     catalogs = getattr(pub.catalog_track, "members", [pub.catalog_track])
     tracks = [*pub.tracks.values(), *catalogs]
@@ -1580,8 +1587,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         if not alive:
             print("  error: no relay back when the duration ended")
             raise SystemExit(EXIT_UNAVAILABLE)
-        await pub.catalog_track.finish()
-        await asyncio.sleep(1.0)  # drain tail before teardown
+        await _shutdown(pub, alive, start['announce_namespace'], ended=True)
     print("  done")
     return 'duration'
 
