@@ -10,13 +10,14 @@ QUIC, `https://host:port/path` (or bare `host:port`) is WebTransport.
 ## Sources
 
 One source per run: `--mp4`, `--h264`, `--ts` and `--input` are exclusive. With none, the
-broadcast is audio only, a synthesized tone.
+broadcast is audio only, a synthesized tone. `--mp4` repeats for several video tracks; see
+[Several video tracks](#several-video-tracks).
 
 | Flag | Input | Video | Audio | Timing |
 |---|---|---|---|---|
 | `--mp4 FILE` | mp4 file | H.264, H.265, AV1 | the file's AAC or Opus; tone with `--tone` | sample tables, edit list honoured |
 | `--h264 FILE\|-` | live H.264 Annex B (ffmpeg, OBS) | H.264 | tone; none with `--no-audio` | stamped on arrival |
-| `--ts FILE\|-` | live MPEG-TS | H.264, H.265 | AAC (ADTS), Opus | PES timestamps |
+| `--ts FILE\|-` | live MPEG-TS | H.264, H.265, every stream | AAC (ADTS), Opus: the first stream | PES timestamps |
 | `--input URL` | anything FFmpeg opens: HLS, DASH, files | H.264, H.265, AV1 | AAC, Opus | paced to the source timestamps |
 | none | | | pcm-s16 tone at `--freq` Hz (440) | generated |
 
@@ -24,7 +25,7 @@ broadcast is audio only, a synthesized tone.
   is not sent and an empty edit delays its track; an unsupported edit list is ignored with a
   WARNING. `--loop` repeats the clip for the whole duration, every track on one period (the
   presented duration), so audio and video do not drift apart pass by pass.
-- **MPEG-TS.** One pipe carries both tracks with the encoder's own timing. The stream head (PMT,
+- **MPEG-TS.** One pipe carries every track with the encoder's own timing. The stream head (PMT,
   codec configs) is read before any relay session opens, so start the encoder first. Make the
   muxer flush per frame, or ffmpeg packs about 300 ms of audio into one PES:
   `-f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1`.
@@ -82,7 +83,29 @@ complete catalog.
   (default 1; 0 sends it once at start).
 - `--target-latency MS` sets `targetLatency`, from which players size their playout buffer.
 - `--catalog-bitrate BPS` and `--catalog-audio-bitrate BPS` set the advertised bitrates. Default:
-  the mp4's mean; `--ts` measures it and leaves it out until measured.
+  the mp4's mean; `--ts` measures it and leaves it out until measured. Repeat `--catalog-bitrate`
+  for each video track, in order.
+
+## Several video tracks
+
+`--mp4` given several times, or an MPEG-TS with several video streams, publishes one broadcast
+with video tracks `video`, `video_1`, `video_2`, … in order. The first mp4 gives the audio, the
+others add video only. With `--ts`, every H.264/H.265 stream in the PMT is a track, in PMT order;
+audio is the first audio stream.
+
+- `--video-alt one|each`: one catalog altGroup for all video tracks, an ABR ladder (default), or
+  one per track, for views. A single video track has no altGroup.
+- `--video-label TEXT` and `--catalog-bitrate BPS`, repeated, set each video track's catalog
+  `label` and `bitrate` in track order; fewer values than tracks is fine.
+- **Alignment.** Under `--timestamp-mapping`, tracks on the same frame duration and GOP length
+  in seconds (timescales may differ) carry the same group and object IDs for one capture time.
+  pub_media refuses video tracks that differ. Encode renditions from one source on a fixed
+  GOP: `-g 60 -keyint_min 60 -sc_threshold 0 -bf 0`. `--ts-cadence` applies to every stream.
+- **Loops.** With `--loop` every track loops on the shortest clip's duration; longer clips are
+  trimmed to it with a WARNING.
+- The run's start and `--start-at` follow the first video track. With cmaf or locmaf each track
+  has its own CMAF header (`v0`, `v1`, …).
+- `--video-alt` and `--video-label` take `--mp4` or `--ts` only.
 
 ## Timing
 
@@ -171,6 +194,12 @@ python -m aiomoqt.tools.pub_media $RELAY -N abr --input https://cdn.example/live
 # One broadcast on two relays, redialing either if it drops
 python -m aiomoqt.tools.pub_media moqt://relay-a:4433 moqt://relay-b:4433 -N demo/live --mp4 clip.mp4 --loop --reconnect -t 0
 
+# An ABR ladder: renditions of one source, one altGroup, the same group and object IDs
+python -m aiomoqt.tools.pub_media $RELAY -N demo/abr --mp4 720.mp4 --mp4 480.mp4 --mp4 240.mp4 --video-label 720p --video-label 480p --video-label 240p --loop --timestamp-mapping -t 0
+
+# Two camera views on one MPEG-TS pipe, an altGroup each
+ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v:0 -map 0:v:1 -map 0:a:0 -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media $RELAY -N live/views --ts - --ts-cadence fps=30,gop=60 --video-alt each --video-label wide --video-label close -t 0
+
 # For a player without a catalog
 python -m aiomoqt.tools.pub_media $RELAY -N demo/bare --mp4 clip.mp4 --loop --no-catalog --loc-codecstring
 ```
@@ -179,7 +208,7 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/bare --mp4 clip.mp4 --loop --no
 
 `sub_media` reads the catalog, subscribes every media track it describes, and writes playable
 files to `--out` (default `./media-out`):
-- `video.h264` (Annex B);
+- `video.h264` (Annex B), or `<name>.h264` per track when there are several;
 - `audio.wav` (pcm-s16);
 - `<role>.mp4` for CMAF and LOCMAF tracks.
 
@@ -217,7 +246,8 @@ The top-level [README](../../README.md#api) has a short publisher and subscriber
 
 ## Known limits
 
-- One video track per run, except `--input --rendition all`.
+- Several video tracks come from repeated `--mp4`, one MPEG-TS or `--input --rendition all`;
+  one audio track per run.
 - `--rendition all` fetches renditions in turn; large ladders fall behind real time.
 - Every `--catalog-interval` resend carries a new `generatedAt`, so a player that compares it sees
   a catalog update each interval.
