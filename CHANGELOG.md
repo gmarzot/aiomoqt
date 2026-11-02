@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.1 (unreleased)
+
+- moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
+
 ## v0.14.0
 
 - pub_media `--timestamp-mapping` anchors TIMESTAMP_MAPPING at the Unix epoch (draft-marzot-moq-test-tracks): Base Group and Base Timestamp 0, Group ID = capture ticks // Group Multiplier, so a restarted publisher sends the same Track Properties; the run starts on the next video group boundary, audio on its nearest frame boundary. `--ts-cadence` holds output until then (up to one GOP).
