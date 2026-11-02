@@ -303,13 +303,12 @@ start; Eyevinn's moqlivemock endpoint is always on.
 
   Silence from the `ffmpeg … -f null -` line means a clean decode; it is
   the better check here because it needs no display.
-- **`video.h264` will throw decode errors on this source, and that is
-  the tool, not the wire.** `sub_media` opens one `video.h264` for every
-  non-AV1 video track, so all six AVC and HEVC tracks land in one file
-  interleaved — `PPS changed between slices`, `Could not find ref with
-  POC 1`. `-T` does not narrow a catalog-driven broadcast. `video.ivf`
-  survives because IVF frames its samples. On a single-video-track
-  broadcast (demos A and B) both files are clean.
+- **Each AVC and HEVC track gets its own `<name>.h264`.** With several
+  LOC video tracks `sub_media` writes one Annex-B file per track rather
+  than one `video.h264`; `-T` does not narrow a catalog-driven broadcast.
+  AV1 tracks share `video.ivf`, which survives because IVF frames its
+  samples. On a single-video-track broadcast (demos A and B) the files
+  are `video.h264` and `video.ivf`.
 - Reverse direction unavailable: the pinned `mlmsub` is a d16-era build
   and dies on ALPN at draft 18; no Go toolchain here to build a current
   one. They also host a warp-player and an MSF/CMSF validator.
