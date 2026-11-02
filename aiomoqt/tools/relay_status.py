@@ -1,4 +1,4 @@
-"""Status for the ersatz relay's dashboard: host metrics from /proc,
+"""Status for aiomoqt-relay's dashboard: host metrics from /proc,
 event-loop lag, a rolling history, MSF catalog classification and an
 atomic JSON writer. Host metrics are Linux only; elsewhere they are empty.
 """

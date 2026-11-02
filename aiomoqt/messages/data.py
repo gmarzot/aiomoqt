@@ -3,14 +3,7 @@ from dataclasses import dataclass, field
 from sortedcontainers import SortedDict
 from typing import Optional, Dict, Tuple, Union
 
-# Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
-# self-check in ObjectHeader.serialize (catches publisher-side
-# declared-vs-actual byte mismatches that surface downstream as
-# 'framer desync ext_len exceeds limit'). Off by default; one extra
-# tell() per object on the hot path, so leave it gated.
-_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
-
-from . import (MOQTUnderflow, MOQTMessage, ObjectStatus, DataStreamType,
+from . import (MOQTUnderflow, MOQTMessage, MOQTMalformedKVP, ObjectStatus, DataStreamType,
                MOQT_DEFAULT_PRIORITY, BUF_SIZE,
                SUBGROUP_HEADER_BASE, SUBGROUP_ID_ZERO, SUBGROUP_ID_FIRST_OBJ, SUBGROUP_ID_EXPLICIT,
                OBJECT_DATAGRAM_BASE, OBJECT_DATAGRAM_STATUS_BASE)
@@ -23,6 +16,13 @@ from aiopquic._binding._streamchain import (
     encode_object_subgroup, encode_object_subgroup_vi64)
 
 logger = get_logger(__name__)
+
+# Set AIOMOQT_STRICT_SERIALIZE=1 to enable per-object payload-length
+# self-check in ObjectHeader.serialize (catches publisher-side
+# declared-vs-actual byte mismatches that surface downstream as
+# 'framer desync ext_len exceeds limit'). Off by default; one extra
+# tell() per object on the hot path, so leave it gated.
+_STRICT_SERIALIZE = bool(int(os.environ.get('AIOMOQT_STRICT_SERIALIZE', '0')))
 
 
 
@@ -41,6 +41,16 @@ class MOQTObjectTooLarge(Exception):
 def _check_payload_len(length: int, limit: int) -> None:
     if limit and length > limit:
         raise MOQTObjectTooLarge(length, limit)
+
+
+_U64_MAX = (1 << 64) - 1
+
+
+def _object_status(raw: int) -> ObjectStatus:
+    try:
+        return ObjectStatus(raw)
+    except ValueError:
+        raise MOQTProtocolViolation(f"unknown object status 0x{raw:x}") from None
 
 
 def encode_padding(size: int, *, prof: DraftProfile,
@@ -458,9 +468,15 @@ class ObjectHeader(MOQTMessage):
                     kvp_delta)
             except OverflowError as e:
                 # The fused codec is MoQT-agnostic and cannot raise our
-                # violation type; §1.4.3 makes a Type-space overflow a
-                # session close.
+                # types: a value overrunning its KVP block is a KVP that
+                # cannot be parsed; any other overflow (§1.4.3 Type
+                # space, a length past ssize_t) closes the session.
+                if 'exceeds its block' in str(e):
+                    raise MOQTMalformedKVP(str(e)) from None
                 raise MOQTProtocolViolation(str(e)) from None
+            except RuntimeError as e:
+                # Block length over the limit or a KVP crossing its end.
+                raise MOQTMalformedKVP(str(e)) from None
             except MOQTUnderflow as e:
                 # The fused codec has no limit; a payload underflow
                 # spans the declared length.
@@ -493,10 +509,7 @@ class ObjectHeader(MOQTMessage):
         self.object_id = (delta if prev_object_id is None
                           else prev_object_id + delta + 1)
         self.extensions = exts
-        try:
-            self.status = ObjectStatus(status)
-        except ValueError:
-            raise MOQTProtocolViolation(f"unknown object status 0x{status:x}")
+        self.status = _object_status(status)
         self.payload = payload
 
     @classmethod
@@ -814,12 +827,12 @@ class FetchObject(MOQTMessage):
                        publisher_priority=(-1 if prior is None
                                            else prior.publisher_priority))
         if flags >= 0x80:
-            raise ValueError(
+            raise MOQTProtocolViolation(
                 f"FetchObject: invalid serialization flags 0x{flags:x}")
         if prior is None and (
                 not flags & FETCH_FLAG_GROUP_ID_PRESENT
                 or not flags & FETCH_FLAG_OBJECT_ID_PRESENT):
-            raise ValueError(
+            raise MOQTProtocolViolation(
                 "FetchObject: first object on stream must carry Group ID "
                 "Delta and Object ID Delta (absolute values)")
 
@@ -831,9 +844,12 @@ class FetchObject(MOQTMessage):
             elif group_order == 0x2:
                 group_id = prior.group_id - gd - 1
                 if group_id < 0:
-                    raise ValueError("FetchObject: group id underflow")
+                    raise MOQTProtocolViolation("FetchObject: group id underflow")
             else:
                 group_id = prior.group_id + gd + 1
+                if group_id > _U64_MAX:
+                    raise MOQTProtocolViolation(
+                        "FetchObject: group id past 2^64-1")
         else:
             group_id = prior.group_id
 
@@ -846,12 +862,12 @@ class FetchObject(MOQTMessage):
             subgroup_id = 0
         elif sg_mode == FETCH_FLAG_SG_PRIOR:
             if prior is None or prior.subgroup_id < 0:
-                raise ValueError(
+                raise MOQTProtocolViolation(
                     "FetchObject: first object references prior Subgroup")
             subgroup_id = prior.subgroup_id
         elif sg_mode == FETCH_FLAG_SG_PRIOR_PLUS:
             if prior is None or prior.subgroup_id < 0:
-                raise ValueError(
+                raise MOQTProtocolViolation(
                     "FetchObject: first object references prior Subgroup")
             subgroup_id = prior.subgroup_id + 1
         else:
@@ -864,13 +880,15 @@ class FetchObject(MOQTMessage):
                 else prior.object_id + od
         else:
             object_id = prior.object_id + 1
+        if object_id > _U64_MAX:
+            raise MOQTProtocolViolation("FetchObject: object id past 2^64-1")
 
         if flags & FETCH_FLAG_PRIORITY_PRESENT:
             publisher_priority = buf.pull_uint8()
         elif prior is not None and prior.publisher_priority >= 0:
             publisher_priority = prior.publisher_priority
         else:
-            raise ValueError(
+            raise MOQTProtocolViolation(
                 "FetchObject: first object references prior Priority")
 
         if flags & FETCH_FLAG_EXTENSIONS_PRESENT:
@@ -881,11 +899,11 @@ class FetchObject(MOQTMessage):
         payload_len = buf.pull_vint()
         _check_payload_len(payload_len, max_payload)
         if payload_len == 0:
-            status = (ObjectStatus(buf.pull_vint())
+            status = (_object_status(buf.pull_vint())
                       if prof.fetch_object_status else ObjectStatus.NORMAL)
             payload = b''
             if extensions and status != ObjectStatus.NORMAL:
-                raise ValueError(
+                raise MOQTProtocolViolation(
                     "FetchObject: properties on non-Normal status "
                     "(§11.2.1.2)")
         else:
@@ -913,7 +931,7 @@ class FetchObject(MOQTMessage):
         payload_len = buf.pull_uint_var()
         _check_payload_len(payload_len, max_payload)
         if payload_len == 0:
-            status = ObjectStatus(buf.pull_uint_var())
+            status = _object_status(buf.pull_uint_var())
             payload = b''
         else:
             status = ObjectStatus.NORMAL
@@ -946,13 +964,13 @@ class FetchObject(MOQTMessage):
             )
 
         if flags >= 0x80:
-            raise ValueError(
+            raise MOQTProtocolViolation(
                 f"FetchObject: invalid serialization flags 0x{flags:x}")
 
         if prior is None and (
                 flags & FETCH_FLAG_OBJECT_ID_PRESENT == 0
                 or flags & FETCH_FLAG_GROUP_ID_PRESENT == 0):
-            raise ValueError(
+            raise MOQTProtocolViolation(
                 "FetchObject: first object on stream must have "
                 "Group ID and Object ID present (flags 0x08 | 0x04)")
 
@@ -1117,11 +1135,7 @@ class ObjectDatagram(MOQTMessage):
                 buf, delta=prof is not None and prof.params_delta_coded)
 
         if is_status:
-            raw = pull()
-            try:
-                status = ObjectStatus(raw)
-            except ValueError:
-                raise MOQTProtocolViolation(f"unknown object status 0x{raw:x}")
+            status = _object_status(pull())
             payload = b''
         else:
             status = ObjectStatus.NORMAL
@@ -1197,7 +1211,7 @@ class ObjectDatagramStatus(MOQTMessage):
             extensions = MOQTMessage._extensions_decode(
                 buf, delta=prof is not None and prof.params_delta_coded)
 
-        status = ObjectStatus(buf.pull_uint_var())
+        status = _object_status(buf.pull_uint_var())
         return cls(
             track_alias=track_alias,
             group_id=group_id,

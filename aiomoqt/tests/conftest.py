@@ -1,14 +1,12 @@
 import inspect
 import os
-import subprocess
 from dataclasses import fields
 
-import pytest
 
 from aiomoqt.messages import MOQTMessageType
 from aiomoqt.types import D16MessageType
-from aiomoqt.context import is_draft16_or_later
 from aiomoqt.context import get_major_version, profile_for
+from aiomoqt.utils.certs import generate_self_signed
 
 
 def pytest_configure(config):
@@ -17,8 +15,7 @@ def pytest_configure(config):
 
     Runs at configure time (before collection) so the modules'
     cert-existence skipif sees the freshly written certs. Best-effort:
-    if openssl is missing or fails, the certs stay absent and those
-    suites skip exactly as before — no hard dependency, no failure.
+    if generation fails, the certs stay absent and those suites skip.
 
     Anchors on the pytest rootdir and exports AIOMOQT_TEST_CERTS_DIR so
     aiomoqt.tests._certs resolves the same directory for every importer,
@@ -30,16 +27,10 @@ def pytest_configure(config):
     key = os.path.join(certs_dir, "key.pem")
     if os.path.exists(cert) and os.path.exists(key):
         return
-    os.makedirs(certs_dir, exist_ok=True)
     try:
-        subprocess.run(
-            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-             "-days", "3650", "-keyout", key, "-out", cert,
-             "-subj", "/CN=localhost",
-             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
-            check=True, capture_output=True)
+        generate_self_signed(cert, key)
     except Exception:
-        pass  # openssl absent/failed → loopback suites skip as before
+        pass
 
 
 def _serialize(obj, draft):

@@ -95,19 +95,55 @@ const Dash = (() => {
     return d;
   }
 
-  function spark(container, values, color) {
+  // pathFor's runs, closed down to the baseline `y0`.
+  function areaFor(values, x, y, y0) {
+    let d = '', run = [];
+    const flush = () => {
+      if (run.length) {
+        d += `M${x(run[0]).toFixed(1)},${y0}`
+          + run.map((i) => `L${x(i).toFixed(1)},${y(values[i]).toFixed(1)}`).join('')
+          + `L${x(run[run.length - 1]).toFixed(1)},${y0}Z`;
+      }
+      run = [];
+    };
+    values.forEach((v, i) => { if (none(v)) flush(); else run.push(i); });
+    flush();
+    return d;
+  }
+
+  function sparkSvg(container) {
     let svg = container.querySelector('svg.spark');
     if (!svg) {
       svg = svgEl('svg', {class: 'spark', viewBox: '0 0 100 24', preserveAspectRatio: 'none',
                           'aria-hidden': 'true'});
       container.append(svg);
     }
-    const known = values.filter((v) => !none(v));
+    return svg;
+  }
+
+  // Series share one scale; with more than one, each also gets a translucent area.
+  function spark(container, ...series) {
+    const svg = sparkSvg(container);
+    const known = series.flat().filter((v) => !none(v));
     const max = Math.max(...known, 0) || 1;
-    const n = Math.max(values.length - 1, 1);
-    const path = svgEl('path', {d: pathFor(values, (i) => 100 * i / n, (v) => 22 - 20 * v / max)});
-    if (color) path.setAttribute('style', `stroke:${color}`);
-    svg.replaceChildren(path);
+    const y = (v) => 22 - 20 * v / max;
+    const x = (values) => (i) => 100 * i / Math.max(values.length - 1, 1);
+    const areas = series.length > 1
+      ? series.map((v, k) => svgEl('path', {class: `area s${k}`, d: areaFor(v, x(v), y, 22)}))
+      : [];
+    svg.replaceChildren(...areas,
+      ...series.map((v, k) => svgEl('path', {class: `line s${k}`, d: pathFor(v, x(v), y)})));
+  }
+
+  // One bar per value over a zero baseline.
+  function bars(container, values) {
+    const svg = sparkSvg(container);
+    const max = Math.max(...values.filter((v) => !none(v)), 0) || 1;
+    const w = 100 / Math.max(values.length, 1);
+    svg.replaceChildren(svgEl('path', {class: 'base', d: 'M0,22.5L100,22.5'}),
+      ...values.flatMap((v, i) => (none(v) || v <= 0) ? [] : [svgEl('rect', {
+        class: 'bar', x: (i * w + w * 0.15).toFixed(1), width: (w * 0.7).toFixed(1),
+        y: (22 - 20 * v / max).toFixed(1), height: (20 * v / max).toFixed(1)})]));
   }
 
   // Legend keys mirror the mark: a line for lines, a block for areas.
@@ -292,6 +328,6 @@ const Dash = (() => {
     document.body.classList.toggle('stale', stale && age !== null);
   }
 
-  return {SERIES, OTHER, $, el, svgEl, none, fmt, niceMax, spark, legend, chart, poll,
+  return {SERIES, OTHER, $, el, svgEl, none, fmt, niceMax, spark, bars, legend, chart, poll,
           showFreshness};
 })();

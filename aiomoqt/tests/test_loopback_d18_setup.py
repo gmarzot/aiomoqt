@@ -100,15 +100,15 @@ async def test_d18_subscribe_roundtrip_quic():
             # Reply correlated by stream (request_id injected, not on wire).
             assert isinstance(resp, SubscribeOk)
             assert resp.request_id == 0  # client's first request id
-            # The SUBSCRIBE opened a bidi request stream.
-            assert 0 in session._bidi_streams
             # PUBLISH_DONE arrived on the same stream and was correlated.
             for _ in range(50):
-                if done_seen:
+                if done_seen and 0 not in session._bidi_streams:
                     break
                 await asyncio.sleep(0.02)
             assert len(done_seen) == 1
             assert isinstance(done_seen[0], SubscribeDone)
             assert done_seen[0].request_id == 0
+            # Both ends closed the request stream, which released it.
+            assert 0 not in session._bidi_streams
     finally:
         server.close()

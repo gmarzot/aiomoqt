@@ -50,7 +50,7 @@ track's natural close.
 | `-r, --rate` | Aggregate objects/sec across all streams (0 = max) | 0 |
 | `-t, --duration` | Duration seconds (publisher side) | tool-specific |
 | `-i, --interval` | Report interval seconds | 5 |
-| `--cc-algo` | Congestion control (bbr1, bbr, cubic, newreno, ...) | aiopquic default |
+| `--cc-algo` | Congestion control (bbr, bbr1, c4, cubic, newreno, ...) | bbr |
 | `--draft` | MoQT draft version | tool-specific |
 | `--max-queued-bytes` | Aggregate publisher TX budget, all streams | aiopquic default |
 | `--max-inflight-bytes` | Per-stream publisher TX budget | aiomoqt default |

@@ -1,6 +1,5 @@
 import asyncio
 import errno
-import ipaddress
 import socket
 import weakref
 from asyncio.futures import Future
@@ -21,27 +20,30 @@ from .utils.logger import *
 logger = get_logger(__name__)
 
 
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+_WILDCARDS = (None, "", "::", "0.0.0.0")
+
+# Seconds between checks for new sessions to close while close_sessions waits.
+_CLOSE_POLL_S = 0.05
 
 
-def _check_udp_port_free(host: str, port: int) -> None:
-    """Fail before the transport thread swallows EADDRINUSE. The transport
-    binds every interface (aiopquic takes no bind address), so probe
-    0.0.0.0 and say so when a narrower host was requested."""
-    if port == 0:
+def _cnx_ended(session) -> Optional[asyncio.Event]:
+    """Set once the session's connection has ended: raw QUIC's own close,
+    WT's connection close (the peer drops it)."""
+    return (getattr(session, '_cnx_closed', None)
+            or getattr(session, '_closed', None))
+
+
+def _listen_desc(host: Optional[str]) -> str:
+    if host in (None, "", "::"):
+        return "all interfaces"
+    return "all IPv4 interfaces" if host == "0.0.0.0" else host
+
+
+def _check_udp_port_free(host: Optional[str], port: int) -> None:
+    """Fail before the transport thread swallows EADDRINUSE on a wildcard
+    bind; aiopquic checks a specific host itself."""
+    if port == 0 or host not in _WILDCARDS:
         return
-    if host not in ("", "0.0.0.0"):
-        # A loopback request still works, it is only also exposed; a
-        # named interface silently widening is the surprising case.
-        report = logger.info if _is_loopback(host) else logger.warning
-        report(f"MOQT server: the transport takes no bind address; "
-               f"{host} requested, listening on 0.0.0.0:{port}")
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.bind(("0.0.0.0", port))
@@ -49,7 +51,8 @@ def _check_udp_port_free(host: str, port: int) -> None:
         raise OSError(f"UDP port {port} unavailable: {e.strerror}") from e
     finally:
         probe.close()
-    _warn_if_ipv6_port_taken(port)
+    if host != "0.0.0.0":
+        _warn_if_ipv6_port_taken(port)
 
 
 def _warn_if_ipv6_port_taken(port: int) -> None:
@@ -75,7 +78,7 @@ class MOQTServer(MOQTPeer):
     """Server-side session manager."""
     def __init__(
         self,
-        host: str,
+        host: Optional[str],
         port: int,
         certificate: str,
         private_key: str,
@@ -85,7 +88,9 @@ class MOQTServer(MOQTPeer):
         debug: Optional[bool] = False,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
-        congestion_control_algorithm: Optional[str] = None,
+        congestion_control_algorithm: Optional[str] = "bbr",
+        congestion_control_options: Optional[str] = None,
+        flow_control_window: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
@@ -118,6 +123,10 @@ class MOQTServer(MOQTPeer):
         # default (4 MiB); 0 = disable.
         self.tx_max_queued_bytes = tx_max_queued_bytes
         self.congestion_control_algorithm = congestion_control_algorithm
+        # Algorithm option string, e.g. "Q0.02" for bbr.
+        self.congestion_control_options = congestion_control_options
+        # QUIC flow-control window, per stream and per connection; None = 16 MiB.
+        self.flow_control_window = flow_control_window
         # QUIC keep-alive interval (seconds). None = disabled. PING
         # frames hold a flow-controlled, consumer-stalled connection
         # open past the idle timeout instead of dropping it.
@@ -144,10 +153,15 @@ class MOQTServer(MOQTPeer):
         self._server_closed: Future[Tuple[int, str]] = self._loop.create_future()
         self._next_subscribe_id = 1
         self._live: weakref.WeakSet = weakref.WeakSet()
+        # Close reason for sessions arriving from now on; None accepts them.
+        self._refusal: Optional[str] = None
+        # Sessions this server closed, until their connections end.
+        self._closing: weakref.WeakSet = weakref.WeakSet()
 
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
-        logger.info(f"Starting MOQT server on {self.host}:{self.port}")
+        logger.info(f"Starting MOQT server on {_listen_desc(self.host)}, "
+                    f"UDP port {self.port}")
         _check_udp_port_free(self.host, self.port)
 
         if self.use_quic:
@@ -161,11 +175,14 @@ class MOQTServer(MOQTPeer):
                 max_data=2**24, max_stream_data=2**24,
                 max_datagram_frame_size=64 * 1024,
             )
-            # None defers to the aiopquic default (bbr1) — loss-based
-            # CCs collapse on GIL-induced loss blips and can't recover.
+            # None defers to the aiopquic default.
             if self.congestion_control_algorithm is not None:
                 cfg.congestion_control_algorithm = (
                     self.congestion_control_algorithm)
+            if self.congestion_control_options is not None:
+                cfg.congestion_control_options = self.congestion_control_options
+            if self.flow_control_window is not None:
+                cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
@@ -177,8 +194,8 @@ class MOQTServer(MOQTPeer):
             if self.max_connections is not None:
                 cfg.max_connections = self.max_connections
             cfg.load_cert_chain(self.certificate, self.private_key)
-            protocol = lambda *a, **kw: self._adopt(
-                MOQTSessionQuic(*a, **kw, session=self))
+            def protocol(*a, **kw):
+                return self._adopt(MOQTSessionQuic(*a, **kw, session=self))
             return aiopquic_serve(
                 self.host, self.port,
                 configuration=cfg,
@@ -211,6 +228,10 @@ class MOQTServer(MOQTPeer):
         if self.congestion_control_algorithm is not None:
             wt_cfg.congestion_control_algorithm = (
                 self.congestion_control_algorithm)
+        if self.congestion_control_options is not None:
+            wt_cfg.congestion_control_options = self.congestion_control_options
+        if self.flow_control_window is not None:
+            wt_cfg.max_data = wt_cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
@@ -245,7 +266,8 @@ class MOQTServer(MOQTPeer):
         per-draft MoQT ALPNs; WT connections via WT-Protocol. Replaces
         the two-listener --quic-port arrangement."""
         logger.info(
-            f"Starting dual-stack MOQT server on {self.host}:{self.port}")
+            f"Starting dual-stack MOQT server on {_listen_desc(self.host)}, "
+            f"UDP port {self.port}")
         _check_udp_port_free(self.host, self.port)
         cfg = QuicConfiguration(
             alpn_protocols=[moqt_alpn_for_version(d)
@@ -259,6 +281,10 @@ class MOQTServer(MOQTPeer):
         if self.congestion_control_algorithm is not None:
             cfg.congestion_control_algorithm = (
                 self.congestion_control_algorithm)
+        if self.congestion_control_options is not None:
+            cfg.congestion_control_options = self.congestion_control_options
+        if self.flow_control_window is not None:
+            cfg.max_data = cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
             cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
@@ -293,23 +319,48 @@ class MOQTServer(MOQTPeer):
 
     def _adopt(self, session):
         self._live.add(session)
+        if self._refusal is not None:
+            self._loop.call_soon(self.refuse, session)
         return session
 
+    def refuse_sessions(self, reason: str = "server shutting down") -> None:
+        """Close every session that arrives from now on (NO_ERROR) before
+        its setup completes."""
+        self._refusal = reason
+
+    def refuse(self, session: Any) -> None:
+        """Close `session` (NO_ERROR) unless already closed; a SETUP it
+        has in flight no longer completes."""
+        if session._moqt_session_closed.done():
+            return
+        self._closing.add(session)
+        session._close_session(SessionCloseCode.NO_ERROR,
+                               self._refusal or "server shutting down")
+
     async def close_sessions(self, timeout: float = 1.0) -> None:
-        """Close every live session (NO_ERROR) and wait up to `timeout`
-        for the closes to leave. Call before closing the serve() handle,
-        which stops the transport without telling the peers."""
-        live = [s for s in list(self._live) if s._close_err is None]
-        for s in live:
-            s.close(SessionCloseCode.NO_ERROR, "server shutting down")
-        # Raw QUIC: the connection's own close; WT: the peer drops it.
-        done = [getattr(s, '_cnx_closed', None) or getattr(s, '_closed', None)
-                for s in live]
-        waits = [asyncio.ensure_future(ev.wait()) for ev in done
-                 if ev is not None]
-        if waits:
-            _, pending = await asyncio.wait(waits, timeout=timeout)
-            for w in pending:
+        """Close every live session (NO_ERROR), refuse any that arrive
+        from now on, and wait up to `timeout` for these closes to leave.
+        Call before closing the serve() handle, which stops the transport
+        without telling the peers."""
+        if self._refusal is None:
+            self._refusal = "server shutting down"
+        for s in list(self._live):
+            if not s._moqt_session_closed.done():
+                self._closing.add(s)
+                s.close(SessionCloseCode.NO_ERROR, "server shutting down")
+        deadline = self._loop.time() + timeout
+        while True:
+            left = deadline - self._loop.time()
+            pending = [ev for ev in map(_cnx_ended, list(self._closing))
+                       if ev is not None and not ev.is_set()]
+            if not pending or left <= 0:
+                return
+            # Short rounds pick up sessions refused meanwhile.
+            waits = [asyncio.ensure_future(ev.wait()) for ev in pending]
+            _, unfinished = await asyncio.wait(
+                waits, timeout=min(left, _CLOSE_POLL_S),
+                return_when=asyncio.FIRST_COMPLETED)
+            for w in unfinished:
                 w.cancel()
 
     async def closed(self) -> bool:

@@ -1,5 +1,6 @@
 import itertools
 import os
+import struct
 from typing import Any, Optional, Union, Dict, Tuple
 from dataclasses import dataclass, field, fields
 
@@ -27,6 +28,16 @@ BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 # catchable as MOQTUnderflow in aiomoqt without introducing an upward
 # dependency (aiopquic must not import aiomoqt).
 from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
+
+
+class MOQTMalformedKVP(MOQTProtocolViolation):
+    """A Key-Value-Pair block that cannot be parsed. Closes the session
+    on a control message; makes the track malformed on an Object."""
+
+
+# Data-dependent decode failures that decode() reports as malformed input.
+_DECODE_FAULTS = (ValueError, IndexError, KeyError, OverflowError,
+                  struct.error)
 
 
 class KeyValuePairs(dict):
@@ -146,6 +157,7 @@ class MOQTMessage:
     NAMESPACE_MAX_FIELDS = 32     # §2.4.1
     FULL_TRACK_NAME_MAX = 4096    # §2.4.1
     KVP_TYPE_MAX = (1 << 64) - 1  # §1.4.3
+    KVP_VALUE_MAX = (1 << 16) - 1  # §1.4.3
     # d16+ message parameters with a restricted value range (inclusive).
     PARAM_VALUE_RANGES = {
         ParamType.FORWARD: (0, 1),
@@ -211,7 +223,7 @@ class MOQTMessage:
             nested = MOQTMessage._extensions_decode(
                 Buffer(data=raw, vi64=prof.vi64), with_length=False,
                 buf_end=len(raw), delta=True, lenient=False) or {}
-        except (BufferReadError, MOQTUnderflow, RuntimeError,
+        except (BufferReadError, MOQTUnderflow, MOQTMalformedKVP,
                 ValueError) as e:
             raise MOQTProtocolViolation(
                 f"Immutable Properties do not parse: {e}") from None
@@ -245,7 +257,15 @@ class MOQTMessage:
             raise MOQTProtocolViolation(
                 f"reason phrase {n} bytes "
                 f"(max {MOQTMessage.REASON_PHRASE_MAX})")
-        return buf.pull_bytes(n).decode()
+        return buf.pull_bytes(n).decode(errors='replace')
+
+    @staticmethod
+    def _pull_sized(buf: Buffer, n: int, what: str) -> bytes:
+        """n bytes of a length-prefixed field; a length past the buffer is
+        a protocol violation, refused before the read."""
+        if n > buf.capacity - buf.tell():
+            raise MOQTProtocolViolation(f"{what} length {n} overruns the message")
+        return buf.pull_bytes(n)
 
     @staticmethod
     def _pull_tuple(buf: Buffer, *, prof: DraftProfile,
@@ -264,7 +284,7 @@ class MOQTMessage:
             flen = buf.pull_vint()
             if buf_end is not None and buf.tell() + flen > buf_end:
                 raise MOQTProtocolViolation("namespace field overruns frame")
-            fields.append(buf.pull_bytes(flen))
+            fields.append(MOQTMessage._pull_sized(buf, flen, "namespace field"))
         parts = tuple(fields)
         if prof.draft >= 16:
             if not all(parts):
@@ -282,7 +302,7 @@ class MOQTMessage:
         """Track Namespace + Track Name; over FULL_TRACK_NAME_MAX bytes
         in total is a protocol violation."""
         namespace = MOQTMessage._pull_tuple(buf, prof=prof)
-        name = buf.pull_bytes(buf.pull_vint())
+        name = MOQTMessage._pull_sized(buf, buf.pull_vint(), "track name")
         size = sum(len(f) for f in namespace) + len(name)
         if size > MOQTMessage.FULL_TRACK_NAME_MAX:
             raise MOQTProtocolViolation(
@@ -330,7 +350,7 @@ class MOQTMessage:
                         "(cap=%d) head_hex=%s",
                         exts_len, pos_before, cap, head,
                     )
-                raise RuntimeError(
+                raise MOQTMalformedKVP(
                     f"framer desync: ext_len={exts_len} exceeds "
                     f"limit {MOQTMessage.EXTENSIONS_LEN_LIMIT} "
                     f"at pos={pos_before}"
@@ -384,6 +404,15 @@ class MOQTMessage:
                 else:
                     # odd type → length-prefixed bytes value
                     value_len = buf.pull_vint()
+                    if value_len > MOQTMessage.KVP_VALUE_MAX:
+                        raise MOQTProtocolViolation(
+                            f"KVP value length {value_len} over 2^16-1")
+                    if value_len > exts_end - buf.tell():
+                        if with_length or not lenient:
+                            raise MOQTMalformedKVP(
+                                f"KVP value length {value_len} exceeds its "
+                                f"block at type 0x{ext_id:x}")
+                        raise BufferReadError("KVP value past the message")
                     ext_value = buf.pull_bytes(value_len)
             except (BufferReadError, MOQTUnderflow):
                 # lenient=False: no truncation tolerance (nested blocks).
@@ -396,7 +425,7 @@ class MOQTMessage:
                 # policy so the event is always recorded.
                 MOQTMessage._trailing_extensions_truncation_count += 1
                 if not MOQTMessage._tolerate_trailing_extensions:
-                    raise RuntimeError(
+                    raise MOQTMalformedKVP(
                         f"non-compliant peer: truncated trailing "
                         f"extensions block (kvp_start={kvp_start} "
                         f"tell={buf.tell()} exts_end={exts_end} "
@@ -426,7 +455,7 @@ class MOQTMessage:
                     "kvp_start=%d ext_id=0x%x head_hex=%s",
                     buf.tell(), exts_end, kvp_start, ext_id, head,
                 )
-                raise RuntimeError(
+                raise MOQTMalformedKVP(
                     f"extensions decode overrun: pos={buf.tell()} "
                     f"exts_end={exts_end} kvp_start={kvp_start} "
                     f"ext_id=0x{ext_id:x}"
@@ -439,7 +468,7 @@ class MOQTMessage:
             exts = KeyValuePairs(exts)
             exts.duplicates = frozenset(dups)
         return exts if exts else None
-          
+
     @staticmethod
     def _bytes_encode(value: Any) -> bytes:
         if isinstance(value, int):
@@ -453,7 +482,7 @@ class MOQTMessage:
         buf = Buffer(capacity=8)
         buf.push_uint_var(value)
         return buf.data
-    
+
     @staticmethod
     def _varint_decode(data: bytes) -> int:
         buf = Buffer(data=data)
@@ -509,6 +538,16 @@ class MOQTMessage:
                             "undecodable authorization token")
 
     @classmethod
+    def decode(cls, buf: Buffer, **kwargs) -> 'MOQTMessage':
+        """deserialize(), with a data-dependent decode failure the codec did
+        not anticipate raised as MOQTProtocolViolation."""
+        try:
+            return cls.deserialize(buf, **kwargs)
+        except _DECODE_FAULTS as e:
+            raise MOQTProtocolViolation(
+                f"malformed {cls.__name__}: {type(e).__name__}") from e
+
+    @classmethod
     def deserialize(cls, buf: Buffer,
                     buf_end: Optional[int] = None) -> 'MOQTMessage':
         """Create message from buf containing payload.
@@ -531,45 +570,45 @@ class MOQTMessage:
     def describe(self, prof: Optional[DraftProfile] = None) -> str:
         """All fields, with Message Parameters named at `prof`'s draft."""
         parts = []
-        
-        for field in fields(self.__class__):
-            value = getattr(self, field.name)
-            
+
+        for fld in fields(self.__class__):
+            value = getattr(self, fld.name)
+
             # Skip redundant type field
-            if field.name == 'type':
+            if fld.name == 'type':
                 continue
-                
+
             if value is None:
-                parts.append(f"{field.name}=None")
+                parts.append(f"{fld.name}=None")
                 continue
-            
+
             # Format based on value type
-            if "version" in field.name.lower():
+            if "version" in fld.name.lower():
                 # Version fields - show in hex
                 if isinstance(value, (list, tuple)):
                     str_val = "[" + ", ".join(f"0x{x:x}" for x in value) + "]"
                 else:
                     str_val = f"0x{value:x}"
-                    
-            elif field.name == "parameters":
+
+            elif fld.name == "parameters":
                 # Parameters dict - special formatting
                 str_val = self._format_parameters(value, class_name(self), prof)
-                
+
             elif (isinstance(value, (list, tuple)) and value
                   and all(isinstance(v, bytes) for v in value)):
                 # Namespace tuple - decode each part
                 items = [self._format_bytes(item, prefer_text=True) for item in value]
                 str_val = "[" + ", ".join(items) + "]"
-                
+
             elif isinstance(value, bytes):
                 # Bytes field - try UTF-8 decode
                 str_val = self._format_bytes(value, prefer_text=True)
-                
+
             else:
                 # Everything else - use default string representation
                 str_val = str(value)
-                
-            parts.append(f"{field.name}={str_val}")
+
+            parts.append(f"{fld.name}={str_val}")
 
         return f"{class_name(self)}({', '.join(parts)})"
 
@@ -579,10 +618,10 @@ class MOQTMessage:
         """Format parameters dict for display."""
         if not params:
             return "{}"
-        
+
         # Determine which enum to use based on message type
         is_setup = message_class_name.endswith('Setup')
-        
+
         items = []
         for k, v in params.items():
             if is_setup:
@@ -592,7 +631,7 @@ class MOQTMessage:
                     pname = f"0x{k:02x}"
             else:
                 pname = param_name(k, prof)
-            
+
             # Format value - even types are ints, odd types are bytes
             if k % 2 == 0:
                 items.append(f"{pname}={v}")
@@ -601,7 +640,7 @@ class MOQTMessage:
                     items.append(f"{pname}={MOQTMessage._format_bytes(v, prefer_text=True)}")
                 else:
                     items.append(f"{pname}=\"{v}\"")
-        
+
         return "{" + ", ".join(items) + "}"
 
 
@@ -609,7 +648,7 @@ class MOQTMessage:
     def _format_bytes(data: bytes, prefer_text: bool = False, max_len: int = 32) -> str:
         """
         Format bytes for display, trying UTF-8 decode when appropriate.
-        
+
         Args:
             data: Bytes to format
             prefer_text: If True, strongly prefer text representation
@@ -617,7 +656,7 @@ class MOQTMessage:
         """
         if not data:
             return '""' if prefer_text else "0x"
-        
+
         try:
             decoded = data.decode('utf-8')
             # Check if it's reasonable text (all printable or common whitespace)
@@ -643,7 +682,7 @@ class MOQTMessage:
             truncated = hex_output[:max_len]
             suffix = "..." if len(hex_output) > max_len else ""
             return f"0x{truncated}{suffix}"
-    
+
     @staticmethod
     def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
                           *, prof: DraftProfile,
@@ -924,6 +963,33 @@ class MOQTMessage:
         raise err
 
     @staticmethod
+    def _pull_fill_value(buf: Buffer, prof: DraftProfile,
+                         value_end: int) -> Dict[int, Any]:
+        """A FILL_PARAMETERS value bounded by its Length: a counted block
+        (shape B), or bare parameters to value_end (shape A). No Table 7
+        type is below 0x0A, so a smaller first varint is a count; a
+        larger one is a count only if the counted block ends exactly at
+        value_end, and errors report the bare reading."""
+        start = buf.tell()
+        if buf.pull_vint() >= 0x0A:
+            buf.seek(start)
+            try:
+                params = MOQTMessage._pull_params(
+                    buf, prof=prof, buf_end=value_end,
+                    scope="FillParameters")
+                if buf.tell() == value_end:
+                    return params
+            except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow):
+                pass
+            buf.seek(start)
+            return MOQTMessage._pull_params(
+                buf, prof=prof, buf_end=value_end, scope="FillParameters",
+                bare=True)
+        buf.seek(start)
+        return MOQTMessage._pull_params(
+            buf, prof=prof, buf_end=value_end, scope="FillParameters")
+
+    @staticmethod
     def _pull_params(buf: Buffer, *, prof: DraftProfile,
                      buf_end: Optional[int] = None,
                      delta_keys: bool = None,
@@ -1010,18 +1076,8 @@ class MOQTMessage:
                         raise MOQTProtocolViolation(
                             f"FILL_PARAMETERS length {param_len} exceeds "
                             f"remaining {buf_end - buf.tell()}")
-                    # Value is a counted block, or a bare parameter run
-                    # to its end: no Table 7 type is below 0x0A, so a
-                    # first varint below 0x0A is a Number of Parameters.
-                    fill_bare = False
-                    if param_len:
-                        mark = buf.tell()
-                        fill_bare = buf.pull_vint() >= 0x0A
-                        buf.seek(mark)
-                    param_value = MOQTMessage._pull_params(
-                        buf, prof=prof, buf_end=value_end,
-                        scope="FillParameters", bare=fill_bare) \
-                        if param_len else {}
+                    param_value = MOQTMessage._pull_fill_value(
+                        buf, prof, value_end) if param_len else {}
                     if buf.tell() != value_end:
                         raise MOQTProtocolViolation(
                             "FILL_PARAMETERS does not fill its length")

@@ -101,7 +101,7 @@ async def _loopback(port, use_quic):
 
     async def _on_publish_namespace(session, msg):
         session.on_object_received = _on_object
-        session.publish_namepace_ok(msg)
+        session.publish_namespace_ok(msg)
         if not peer.done():
             peer.set_result(session)
 
@@ -120,7 +120,7 @@ async def _loopback(port, use_quic):
             for name, size in _SIZES.items():
                 track = PublishedTrack(pub, namespace=_NS, trackname=name,
                                        object_size=size, group_size=_GROUP,
-                                       rate=500)
+                                       rate=500, fetch_history_bytes=1 << 20)
                 track.prefill(2)
                 track.attach()
                 tracks[name] = track

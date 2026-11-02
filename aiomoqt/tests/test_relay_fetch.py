@@ -1,4 +1,4 @@
-"""Ersatz-relay standalone FETCH, served from its recent-object cache.
+"""aiomoqt-relay standalone FETCH, served from its recent-object cache.
 
 The relay registered no FETCH handler, so the session default accepted
 with FETCH_OK and never opened the data stream — a peer waited forever.
@@ -15,6 +15,7 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for, request_error_code
+from aiomoqt.delivery import OBJECT_RECORD_BYTES
 from aiomoqt.messages.data import FetchObject
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.fetch import Fetch
@@ -45,7 +46,8 @@ def _session(draft=18):
                           reason)))
     s.fetch_ok = lambda **kw: s._oks.append(kw)
 
-    async def _serve(request_id, objects, group_order=None, fin=True):
+    async def _serve(request_id, objects, group_order=None, fin=True,
+                     stream_priority=None):
         s._served.append((list(objects), group_order))
         return 0
     s.serve_fetch = _serve
@@ -297,11 +299,12 @@ def test_cache_drops_oldest_groups():
 
 
 def test_cache_drops_on_the_byte_bound(monkeypatch):
-    monkeypatch.setattr(relay, "CACHE_BYTES", 100)
+    bound = 10 * (10 + OBJECT_RECORD_BYTES)
+    monkeypatch.setattr(relay, "CACHE_BYTES", bound)
     t = relay._RelayedTrack(((b"live",), b"cam"))
     for oid in range(20):
         t._remember(0, 0, oid, b"x" * 10, None, 128, None)
-    assert t._cache_bytes <= 100
+    assert t._cache_bytes <= bound
     assert [e[2] for e in t._cache] == list(range(10, 20))
 
 
@@ -464,7 +467,8 @@ async def _catalog_relay(port, use_quic, draft):
             pub, sub = sessions
             for name, size in _SIZES.items():
                 track = _FetchOnly(pub, namespace=_NS, trackname=name,
-                                   object_size=size, group_size=_GROUP)
+                                   object_size=size, group_size=_GROUP,
+                                   fetch_history_bytes=1 << 20)
                 track.prefill(1)
                 track.attach()
             await pub.publish_namespace(namespace=_NS, wait_response=True)
@@ -759,7 +763,8 @@ async def _published_relay(port, use_quic, draft):
             pub, sub = sessions
             for name, size in _PUB_SIZES.items():
                 track = _FetchOnly(pub, namespace=_PUB_NS, trackname=name,
-                                   object_size=size, group_size=_GROUP)
+                                   object_size=size, group_size=_GROUP,
+                                   fetch_history_bytes=1 << 20)
                 track.prefill(2)
                 await track.publish(publish_track=True)
             keys = [(relay._ns_tuple(_PUB_NS), n.encode())

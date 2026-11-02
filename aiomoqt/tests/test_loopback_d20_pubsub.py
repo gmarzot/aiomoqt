@@ -78,9 +78,9 @@ class _Seen(_Finite):
         await super()._on_subscribe(session, msg)
 
 
-def _track(session, name, cls=_Finite):
+def _track(session, name, cls=_Finite, **kw):
     return cls(session, namespace=_NS, trackname=name, object_size=32,
-               group_size=len(_OBJECTS), num_subgroups=1, rate=0)
+               group_size=len(_OBJECTS), num_subgroups=1, rate=0, **kw)
 
 
 class _Objects:
@@ -438,7 +438,7 @@ async def test_a_fill_is_counted_and_the_subscription_goes_on(use_quic):
     """FILL_PARAMETERS on a track with Objects: the fill fetch stream is
     counted in PUBLISH_DONE; live Objects flow."""
     async with _loopback(_port(30, use_quic), 22, use_quic) as (session, srv):
-        track = _track(session, "video")
+        track = _track(session, "video", fetch_history_bytes=1 << 20)
         track.prefill(1)
         track.attach()
         done = asyncio.get_running_loop().create_future()

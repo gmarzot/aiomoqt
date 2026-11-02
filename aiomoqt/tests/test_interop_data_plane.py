@@ -1,5 +1,10 @@
-"""moq-interop-runner data-plane scenarios: our interop client against our
-interop relay, in one process."""
+"""moq-interop-runner data-plane scenarios: our interop client against
+aiomoqt-relay, in one process."""
+import io
+import os
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -206,6 +211,101 @@ async def test_a_test_that_raises_fails_and_the_run_continues(monkeypatch):
     assert [(r.name, r.passed) for r in rep.results] == [
         ("raises", False), ("passes", True)]
     assert "AttributeError" in rep.results[0].message
+
+
+def _result(name, passed=True, **kw):
+    async def case(*args, **kwargs):
+        return client.TestResult(name=name, passed=passed, **kw)
+    return case
+
+
+@pytest.mark.asyncio
+async def test_results_stream_as_each_case_finishes(monkeypatch):
+    out = io.StringIO()
+    seen = []
+
+    async def second(*args, **kw):
+        seen.append(out.getvalue())
+        return client.TestResult(name="second", passed=False, message="x")
+
+    monkeypatch.setattr(client, "TEST_FUNCTIONS",
+                        {"first": _result("first"), "second": second})
+    rep = client.TAPReporter(aiomoqt_version="1.2.3", stream=out)
+    await client.run_tests(["first", "second"], "localhost", 1, "/",
+                           True, True, False, supported_drafts=18,
+                           reporter=rep)
+    rep.end()
+    before = seen[0].splitlines()
+    assert before[0] == "TAP version 14"
+    assert "1..2" in before and "ok 1 - first" in before
+    assert "not ok 2 - second" not in before
+    streamed = out.getvalue().splitlines()
+    assert streamed[-1].startswith("# ended: ")
+    report = rep.report().splitlines()
+    assert ([ln for ln in streamed if not ln.startswith("# ended: ")]
+            == [ln for ln in report if not ln.startswith("# ended: ")])
+
+
+@pytest.mark.asyncio
+async def test_no_setup_fails_the_remaining_cases_unrun(monkeypatch):
+    ran = []
+
+    async def case(*args, **kw):
+        ran.append(1)
+        return client.TestResult(name="announce-only", passed=True)
+
+    async def unreachable(*args, **kw):
+        return False
+
+    monkeypatch.setattr(client, "TEST_FUNCTIONS", {
+        "setup-only": _result("setup-only", False,
+                              message="Failed: TimeoutError",
+                              received="TimeoutError"),
+        "announce-only": case, "fetch": case})
+    monkeypatch.setattr(client, "_probe_setup_ok", unreachable)
+    rep = await client.run_tests(["setup-only", "announce-only", "fetch"],
+                                 "localhost", 1, "/", True, True, False,
+                                 supported_drafts=18)
+    assert ran == []
+    unrun = "not run: SETUP did not complete: TimeoutError"
+    assert [(r.name, r.passed, r.message) for r in rep.results[1:]] == [
+        ("announce-only", False, unrun), ("fetch", False, unrun)]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_setup_that_probes_ok_runs_the_rest(monkeypatch):
+    async def reachable(*args, **kw):
+        return True
+
+    monkeypatch.setattr(client, "TEST_FUNCTIONS", {
+        "setup-only": _result("setup-only", False),
+        "announce-only": _result("announce-only")})
+    monkeypatch.setattr(client, "_probe_setup_ok", reachable)
+    rep = await client.run_tests(["setup-only", "announce-only"],
+                                 "localhost", 1, "/", True, True, False,
+                                 supported_drafts=18)
+    assert [(r.name, r.passed) for r in rep.results] == [
+        ("setup-only", False), ("announce-only", True)]
+
+
+def test_an_unreachable_relay_reports_every_case_promptly():
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DRAFT", "MOQT_DRAFT", "TESTCASE", "RELAY_URL")}
+    t0 = time.monotonic()
+    r = subprocess.run(
+        [sys.executable, "-m", "aiomoqt.tools.moq_interop_client",
+         "-r", "moqt://127.0.0.1:9", "--draft", "18"],
+        env=env, capture_output=True, text=True, timeout=110)
+    elapsed = time.monotonic() - t0
+    assert r.returncode == 1
+    assert elapsed < 60, elapsed
+    lines = r.stdout.splitlines()
+    n = len(client.STANDARD_TESTS)
+    assert f"1..{n}" in lines
+    results = [ln for ln in lines if ln.startswith(("ok ", "not ok "))]
+    assert len(results) == n
+    assert all(ln.startswith("not ok ") for ln in results)
+    assert lines[-1].startswith("# ended: ")
 
 
 @requires_certs

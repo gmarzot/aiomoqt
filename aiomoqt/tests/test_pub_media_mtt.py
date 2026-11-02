@@ -227,6 +227,36 @@ async def test_stats_line_counts_objects_produced_not_frames_discarded(
     assert 'video: 2 obj' in line and 'discarded 3' in line, line
 
 
+async def test_stats_report_paused_and_forwarding(capsys):
+    import io
+    from aiomoqt.media import LocTrackPublisher
+    from aiomoqt.track import TrackState
+    track = LocTrackPublisher(None, 'ns', 'video')
+    sub = track._subs[0]
+    sub.state, sub.generating, sub.forward = TrackState.SUBSCRIBED, True, False
+    pub = SimpleNamespace(tracks={'video': track}, sessions=[None])
+
+    async def one_report():
+        fh = io.StringIO()
+        task = asyncio.ensure_future(pub_media._report_stats(
+            {'video': pub_media._TrackStats()}, 0.01, pub,
+            pub_media._MttEvents(fh)))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        line = capsys.readouterr().out.splitlines()[0]
+        event = json.loads(fh.getvalue().splitlines()[0][len('@mtt '):])
+        return line, event
+
+    line, event = await one_report()
+    assert event['subscribers'] == 1, event
+    assert event['tracks']['video']['forwarding'] == 0, event
+    assert line.endswith(' · paused'), line
+    sub.forward = True
+    line, event = await one_report()
+    assert event['tracks']['video']['forwarding'] == 1, event
+    assert ' · paused' not in line, line
+
+
 # -- T2/T3: object mapping -------------------------------------------------
 
 @pytest.fixture
@@ -417,17 +447,19 @@ def publish_dones(monkeypatch):
 
 
 @requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
 async def test_datagram_too_large_exits_64(tmp_path, monkeypatch, arrivals,
-                                           publish_dones, h264_aac, capsys):
+                                           publish_dones, h264_aac, capsys,
+                                           use_quic):
     from aiomoqt.tests._certs import CERT, KEY
     from aiomoqt.tools import moq_interop_relay as relay
     from aiomoqt.tools import sub_media
-    port = _BASE_PORT + 50
-    url = f'moqt://localhost:{port}/'
+    port = _BASE_PORT + (50 if use_quic else 55)
+    url = f"{'moqt' if use_quic else 'https'}://localhost:{port}/"
     relay._announced.clear()
     relay._tracks.clear()
     handle = await relay._build_server('localhost', port, CERT, KEY,
-                                       use_quic=True, draft=18).serve()
+                                       use_quic=use_quic, draft=18).serve()
     # pcm-s16 tone: 3840 B per 20 ms frame, over any datagram limit.
     pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
                      '-t', '6', '--stats', '0', '--pub-ns', '-N', 'mtt/dg',
@@ -461,13 +493,16 @@ async def test_datagram_too_large_exits_64(tmp_path, monkeypatch, arrivals,
 
 
 @requires_certs
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
 async def test_aac_and_opus_fit_datagrams(tmp_path, monkeypatch, arrivals,
-                                          h264_aac):
+                                          h264_aac, use_quic):
     opus = _encode(tmp_path / 'o.mp4', 'mp4', layout='stereo')
     for k, clip in enumerate((h264_aac, opus)):
         arrivals.clear()
-        rows = await _analyze(monkeypatch, tmp_path, _BASE_PORT + 51 + k,
-                              ['--mp4', clip, '--loop', '-D'])
+        rows = await _analyze(monkeypatch, tmp_path,
+                              _BASE_PORT + 51 + k + 2 * (not use_quic),
+                              ['--mp4', clip, '--loop', '-D'],
+                              use_quic=use_quic)
         assert int(rows['audio']['objects']) > 20
         assert {sg for _, sg, _ in _subgroups(arrivals, 'audio')} == {None}
 
@@ -540,7 +575,7 @@ async def test_stats_json_events(monkeypatch, capsys, h264_aac, use_quic):
     port = _BASE_PORT + 70 + (not use_quic)
     scheme = 'moqt' if use_quic else 'https'
     url = f'{scheme}://localhost:{port}/'
-    # Nothing listens there: the dial fails after ~10 s, so only once.
+    # Nothing listens there: the dial fails after ~4 s, so only once.
     dead = [] if use_quic else [f'https://localhost:{port + 5}/']
     pub_args = _argv(monkeypatch, 'pub_media', url, *dead, '-k', '--draft',
                      '18', '-t', '3', '--stats', '0.5', '--pub-ns', '-N',

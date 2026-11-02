@@ -140,15 +140,20 @@ def test_datagram_guard_allows_fitting_object():
     p = cli.make_parser("t")
     cli.add_publisher_media(p)
     args = p.parse_args(["-D", "-s", str(cli.DGRAM_MAX_OBJECT)])
-    cli.check_datagram(p, args, serve_quic=True)   # no raise
+    cli.check_datagram(p, args)   # no raise
 
 
-def test_datagram_guard_rejects_wt_transport():
-    p = cli.make_parser("t")
-    cli.add_publisher_media(p)
-    args = p.parse_args(["-D", "-s", "512"])
-    with pytest.raises(SystemExit):
-        cli.check_datagram(p, args, serve_quic=False)
+@pytest.mark.parametrize("tool,argv", [
+    ("aiomoqt.tools.pub_bench", ["https://localhost:4433/moq"]),
+    ("aiomoqt.tools.pub_bench", ["localhost:4433"]),
+    ("aiomoqt.tools.pub_server", ["-W"]),
+    ("aiomoqt.tools.loopback_bench", ["-W"]),
+    ("aiomoqt.examples.pub_example", ["https://localhost:4433/moq"]),
+])
+def test_datagram_accepted_over_webtransport(tool, argv, monkeypatch):
+    mod = importlib.import_module(tool)
+    monkeypatch.setattr(sys, "argv", [tool, *argv, "--datagram", "-s", "512"])
+    assert mod.parse_args().datagram is True
 
 
 def test_url_and_listener_options_are_mutually_exclusive():
@@ -332,3 +337,29 @@ def test_loopback_bench_insecure(monkeypatch, argv, insecure):
     args = loopback_bench.parse_args()
     assert args.insecure is insecure
     assert args.cert
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_every_tool_takes_the_logging_flags(tool):
+    flags = {o for a in _parser_actions(tool) for o in a.option_strings}
+    assert {"--log-level", "--log"} <= flags
+
+
+@pytest.mark.parametrize("argv, expected", [
+    ([], {}),
+    (["--cc-algo", "cubic", "--cc-options", "Q0.02", "--fc-window", "67108864",
+      "--max-queued-bytes", "0", "--max-inflight-bytes", "0", "--keepalive", "2.5"],
+     {"congestion_control_algorithm": "cubic",
+      "congestion_control_options": "Q0.02",
+      "flow_control_window": 67108864, "tx_max_queued_bytes": 0,
+      "tx_max_inflight_bytes": None, "keep_alive_interval": 2.5}),
+    (["--max-inflight-bytes", "4096"], {"tx_max_inflight_bytes": 4096}),
+])
+def test_transport_kwargs(argv, expected):
+    p = argparse.ArgumentParser()
+    cli.add_session(p)
+    cli.add_keepalive(p)
+    cc_default = p.get_default("cc_algo")
+    if cc_default is not None:
+        expected.setdefault("congestion_control_algorithm", cc_default)
+    assert cli.transport_kwargs(p.parse_args(argv)) == expected

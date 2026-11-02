@@ -111,13 +111,13 @@ async def test_a_track_that_ends_while_its_subscriber_attaches_reaches_it(
 
     monkeypatch.setattr(relay, "_establish_upstream", late)
     finished = []
-    finish = relay._RelayedTrack.finish
+    end = relay._RelayedTrack._end
 
-    def spy(self, *args, **kw):
-        finished.append((len(self.downstream), self._objects_out))
-        return finish(self, *args, **kw)
+    def spy(self, d, *args, **kw):
+        finished.append((d.request_id, self._objects_out))
+        return end(self, d, *args, **kw)
 
-    monkeypatch.setattr(relay._RelayedTrack, "finish", spy)
+    monkeypatch.setattr(relay._RelayedTrack, "_end", spy)
     port = _BASE_PORT + 4 * (draft - 16) + 2
     async with _origin_relay_subscriber(port, draft) as session:
         track = SubscribedTrack(session, _moq_test_namespace(0, False),
@@ -128,6 +128,6 @@ async def test_a_track_that_ends_while_its_subscriber_attaches_reaches_it(
             if finished:
                 break
             await asyncio.sleep(0.02)
-    assert len(finished) == 1 and finished[0][0] == 1, (
-        f"(subscribers, items forwarded) at the terminal: {finished}")
+    assert len(finished) == 1, (
+        f"(request, items forwarded) at PUBLISH_DONE: {finished}")
     assert finished[0][1] >= 15, finished

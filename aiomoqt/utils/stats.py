@@ -19,7 +19,10 @@ Publishers use `SenderStats`, which shares the rate/group accounting but
 has no latency view — there is no round trip to measure.
 
 Memory is bounded regardless of run length: latency percentiles come
-from fixed-size reservoirs (Algorithm L), never a full history.
+from fixed-size reservoirs (Algorithm L), never a full history, and
+per-group loss state is kept only for groups within KEY_HORIZON of the
+newest (KEY_REORDER_SLACK of reorder tolerance); an object older than
+that is counted, but not checked for loss.
 
 on_object runs per received object, so its cost shows up directly in
 every throughput number the tools report. `minimal=True` reduces it to
@@ -39,6 +42,13 @@ from .timing import (
     SOURCE_LOC, TimestampMalformed, TrackTiming, capture_time_us,
 )
 from ..types import ObjectStatus
+
+# Per-group state spans at most KEY_HORIZON groups: every
+# KEY_PRUNE_EVERY new groups, keys over KEY_REORDER_SLACK behind the
+# newest are dropped.
+KEY_REORDER_SLACK = 64
+KEY_PRUNE_EVERY = 16
+KEY_HORIZON = KEY_REORDER_SLACK + KEY_PRUNE_EVERY
 
 __all__ = ['MOQT_TIMESTAMP_EXT', 'LOC_TIMESCALE', 'LOC_TIMESTAMP',
            'SenderStats', 'TrackStats', 'send_time_us']
@@ -69,12 +79,25 @@ _LAT_MAX_US = 600_000_000
 CLOCK_OFFSET_MARK = "(clock offset)"
 # Latency above this is rounding on one clock, not an offset (ms).
 CLOCK_OFFSET_MIN_MS = -1.0
+# An offset shifts every sample; a wall-clock step shifts only objects in
+# flight across it (at most step/interval of them). The offset test reads
+# this low percentile, not the minimum, so a step is not an offset.
+CLOCK_OFFSET_PCT = 1
 _clock_warned = False
 
 
+def _offset_figure(sorted_lat: list) -> Optional[float]:
+    """The CLOCK_OFFSET_PCT latency when it is below CLOCK_OFFSET_MIN_MS,
+    else None."""
+    if not sorted_lat:
+        return None
+    v = _pct(sorted_lat, CLOCK_OFFSET_PCT)
+    return v if v < CLOCK_OFFSET_MIN_MS else None
+
+
 def note_clock_offset(lat_ms: float) -> None:
-    """Warn once per process that a sender-stamped latency came out
-    below CLOCK_OFFSET_MIN_MS. The figures are kept: they still compare
+    """Warn once per process that a sender-stamped latency figure came
+    out below CLOCK_OFFSET_MIN_MS. The figures are kept: they still compare
     relatively."""
     global _clock_warned
     if lat_ms < CLOCK_OFFSET_MIN_MS and not _clock_warned:
@@ -203,9 +226,11 @@ class TrackStats:
 
     group_loss=True also counts objects missing from whole groups, which
     in-stream gaps cannot see (a lost subgroup, a stream's head or tail).
-    It assumes a fixed group size, learned as the largest object id + 1.
-    A group is settled once a group two ahead arrives; the first group
-    (joined mid-way) and the newest two are never settled.
+    It assumes a fixed group size, learned as the largest object id + 1,
+    and contiguous group ids: a group id skipped over counts as a whole
+    group lost (until a late arrival reverses it). A group is settled
+    once a group two ahead arrives; the first group (joined mid-way) and
+    the newest two are never settled.
     """
 
     def __init__(self, window_s: float = 5.0,
@@ -238,7 +263,12 @@ class TrackStats:
         self.total_bytes = 0
         self.total_lost = 0
         self.total_ooo = 0
-        self._groups_seen: set = set()
+        # Group count, and the ids within the key horizon already counted.
+        self.total_groups = 0
+        self._recent_groups: set = set()
+        self._newest_gid = -1
+        self._key_floor = -1
+        self._prune_at = 0
 
         # Cumulative latency: running moments + bounded reservoir.
         self.lat_count = 0
@@ -305,6 +335,7 @@ class TrackStats:
         self._snap_objects = 0
         self._snap_bytes = 0
         self._snap_lost = 0
+        self._snap_t = time.monotonic()
 
         # Track timing context; a subscriber shares its SubscribedTrack's.
         self.timing = TrackTiming()
@@ -387,8 +418,6 @@ class TrackStats:
                 send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
-            if raw < 0:
-                note_clock_offset(raw / 1000.0)
             if _LAT_MIN_US <= raw <= _LAT_MAX_US:
                 lat = raw / 1000.0
                 self.lat_count += 1
@@ -421,9 +450,16 @@ class TrackStats:
         self._iv_bytes += size_bytes
 
         gid = getattr(msg, 'group_id', group_id)
-        if gid is not None and gid not in self._groups_seen:
-            self._groups_seen.add(gid)
+        if (gid is not None and gid not in self._recent_groups
+                and gid >= self._key_floor):
+            self._recent_groups.add(gid)
+            self.total_groups += 1
             self._iv_groups += 1
+            if gid > self._newest_gid:
+                self._newest_gid = gid
+                if gid >= self._prune_at:
+                    self._prune_keys(gid - KEY_REORDER_SLACK)
+                    self._prune_at = gid + KEY_PRUNE_EVERY
 
         oid = getattr(msg, 'object_id', None)
         if oid is None or gid is None:
@@ -496,9 +532,24 @@ class TrackStats:
             return
         grp_rx[gid] = 1
         if gid > self._grp_max:
+            if 0 <= self._grp_max < gid - 1 and self._grp_size:
+                self._settle_skipped(self._grp_max + 1, gid)
             self._grp_max = gid
             for g in [g for g in grp_rx if g <= gid - 2]:
                 self._settle_group(g)
+
+    def _settle_skipped(self, lo: int, hi: int) -> None:
+        """Groups lo..hi-1 never arrived: each is a whole group short.
+        A gap wider than the settled record is a group-id jump, not
+        loss."""
+        if hi - lo > self._SETTLED_CAP:
+            return
+        settled = self._grp_short
+        for g in range(lo, hi):
+            settled[g] = self._grp_size
+            self.total_lost += self._grp_size
+        while len(settled) > self._SETTLED_CAP:
+            settled.pop(next(iter(settled)))
 
     def _settle_group(self, gid: int) -> None:
         n = self._grp_rx.pop(gid)
@@ -512,6 +563,19 @@ class TrackStats:
             settled.pop(next(iter(settled)))
         if gid > self._grp_floor:
             self._grp_floor = gid
+
+    def _prune_keys(self, floor: int) -> None:
+        """Drop per-group state for groups below floor."""
+        if floor <= self._key_floor:
+            return
+        self._key_floor = floor
+        self._flush_key()
+        for d in (self._expected, self._stride):
+            for k in [k for k in d if k[0] < floor]:
+                del d[k]
+        for k in [k for k in self._missing if k[0] < floor]:
+            self._missing_n -= len(self._missing.pop(k))
+        self._recent_groups = {g for g in self._recent_groups if g >= floor}
 
     def _live_key(self) -> tuple:
         return (self._lk_g, self._lk_s if self._lk_s is not None else 0)
@@ -556,8 +620,10 @@ class TrackStats:
     # -- views -------------------------------------------------------
 
     def snapshot(self) -> dict:
-        """Per-call deltas + windowed latency. For controllers summing
-        across workers without double-counting."""
+        """Per-call deltas over `dt` seconds + windowed latency from
+        `lat_n` samples (0 = none; the latency fields are then 0.0, not
+        a measurement). For controllers summing across workers without
+        double-counting."""
         self._flush_key()
         now = time.monotonic()
         cutoff = now - self.window_s
@@ -569,18 +635,23 @@ class TrackStats:
             self._window = deque(list(self._window)[::2])
             self._win_stride *= 2
         lats = sorted(v for _, v in self._window)
+        off = _offset_figure(lats)
+        if off is not None:
+            note_clock_offset(off)
         iv_objs = self.total_objects - self._snap_objects
         iv_bytes = self.total_bytes - self._snap_bytes
         iv_lost = self.total_lost - self._snap_lost
         self._snap_objects = self.total_objects
         self._snap_bytes = self.total_bytes
         self._snap_lost = self.total_lost
+        dt = now - self._snap_t
+        self._snap_t = now
         return dict(
-            t=now, rx_objs=iv_objs, rx_bytes=iv_bytes, iv_lost=iv_lost,
-            lat_mean_ms=(sum(lats) / len(lats)) if lats else 0.0,
+            t=now, dt=dt, rx_objs=iv_objs, rx_bytes=iv_bytes, iv_lost=iv_lost,
+            lat_n=len(lats), lat_mean_ms=(sum(lats) / len(lats)) if lats else 0.0,
             lat_p90_ms=_pct(lats, 90), lat_p99_ms=_pct(lats, 99),
             jitter_ms=self.jitter, loss=self.total_lost,
-            groups=len(self._groups_seen),
+            groups=self.total_groups,
             total_objs=self.total_objects, total_bytes=self.total_bytes,
             ts_source=self.ts_source,
         )
@@ -602,13 +673,16 @@ class TrackStats:
             avg = sum(self._iv_lat_res.items) / len(self._iv_lat_res.items)
             p99, = self._iv_lat_res.percentiles(99)
             lat_s = f"{fmt_ms_signed(avg)} p99:{fmt_ms_signed(p99)}"
-            skewed = min(self._iv_lat_res.items) < CLOCK_OFFSET_MIN_MS
+            off = _offset_figure(sorted(self._iv_lat_res.items))
+            if off is not None:
+                skewed = True
+                note_clock_offset(off)
         else:
             lat_s = "--"
         expected = self.total_objects + self.total_lost
         loss_pct = (100 * self.total_lost / expected) if expected else 0
         blind = self._saw_datagram or self.minimal
-        grps = 'n/a' if blind else str(len(self._groups_seen))
+        grps = 'n/a' if blind else str(self.total_groups)
         grp_rate = ('n/a' if blind else fmt_rate(self._iv_groups / dt))
         jit_s = 'n/a' if self.minimal else fmt_ms(self.jitter)
         loss_s = ('n/a' if self.minimal
@@ -641,22 +715,24 @@ class TrackStats:
         var = ((self.lat_sum_sq / self.lat_count) - mean * mean
                if self.lat_count else 0.0)
         p50, p95, p99 = self._lat_res.percentiles(50, 95, 99)
+        off = _offset_figure(sorted(self._lat_res.items))
+        if off is not None:
+            note_clock_offset(off)
         expected = self.total_objects + self.total_lost
         return dict(
             duration_s=dur, active_s=active,
             datagram=self._saw_datagram,
             minimal=self.minimal,
-            groups=len(self._groups_seen),
+            groups=self.total_groups,
             objects=self.total_objects, bytes=self.total_bytes,
             obj_rate=self.total_objects / active,
-            grp_rate=len(self._groups_seen) / active,
+            grp_rate=self.total_groups / active,
             mbps=(self.total_bytes * 8) / (active * 1e6),
             lat_min=self.lat_min if self.lat_count else 0.0,
             lat_max=self.lat_max if self.lat_count else 0.0,
             lat_mean=mean, lat_sd=var ** 0.5 if var > 0 else 0.0,
             lat_p50=p50, lat_p95=p95, lat_p99=p99,
-            clock_offset=(bool(self.lat_count)
-                          and self.lat_min < CLOCK_OFFSET_MIN_MS),
+            clock_offset=off is not None,
             jitter_ms=self.jitter,
             lost=self.total_lost, ooo=self.total_ooo,
             ts_source=self.ts_source, ts_malformed=self.ts_malformed,
