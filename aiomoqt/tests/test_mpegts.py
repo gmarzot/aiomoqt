@@ -7,9 +7,10 @@ import subprocess
 import pytest
 
 from aiomoqt.media.mpegts import (
-    STREAM_TYPE_AAC_ADTS, STREAM_TYPE_H264, TsClock, TsDemuxer, adts_split,
+    STREAM_TYPE_AAC_ADTS, STREAM_TYPE_H264, TsClock, TsDemuxer, TsRates,
+    TsUnit, adts_split,
 )
-from aiomoqt.media.sources import adts_frame
+from aiomoqt.media.sources import adts_frame, sps_dimensions
 
 PMT_PID = 0x100
 VIDEO_PID = 0x101
@@ -396,3 +397,72 @@ def test_rates_measure_fps_and_bitrate_over_whole_groups():
     assert r.fps == 30.0
     assert r.bps['video'] == (5000 + 14 * 1000) * 8 * 2       # two GOPs a second
     assert r.bps['audio'] == 400 * 8 * 48000 // 1024
+
+
+# ── several video streams ─────────────────────────────────────────────
+
+VIDEO2_PID = 0x103
+
+
+def test_every_video_stream_is_kept_in_pmt_order():
+    d = TsDemuxer()
+    two = pat() + pmt([(STREAM_TYPE_H264, VIDEO_PID),
+                       (STREAM_TYPE_AAC_ADTS, AUDIO_PID),
+                       (STREAM_TYPE_H264, VIDEO2_PID)])
+    d.feed(two)
+    assert d.video_pids == [VIDEO_PID, VIDEO2_PID]
+    assert d.video_pid == VIDEO_PID and d.video is d.videos[0]
+    assembler = d.videos[1]
+    units, cc = [], {VIDEO_PID: 0, VIDEO2_PID: 0}
+    for i in range(3):
+        for pid in (VIDEO_PID, VIDEO2_PID):
+            pkts, cc[pid] = packetize(pid, _video_au(i, 3000 * i), cc[pid])
+            units += d.feed(b''.join(pkts))
+    d.feed(two)                               # a repeated PMT keeps state
+    assert d.videos[1] is assembler
+    units += d.close()
+    assert [(u.index, u.track, u.pts) for u in units] == [
+        (i, name, 3000 * n) for n in range(3)
+        for i, name in ((0, 'video'), (1, 'video_1'))]
+    assert all(a.config is not None for a in d.videos)
+    assert TsUnit('audio', b'', True, 0).track == 'audio'
+
+
+def test_rates_are_measured_per_video_stream():
+    r = TsRates(window_s=1.0)
+    for i in range(120):
+        for index, (rate, size) in enumerate(((3000, 1000), (3600, 500))):
+            r.add(TsUnit('video', bytes(size), i % 30 == 0, i * rate, index))
+    assert r.framerates == {'video': 30.0, 'video_1': 25.0}
+    assert r.fps == 30.0
+    assert r.bps['video'] == 1000 * 8 * 30
+    assert r.bps['video_1'] == 500 * 8 * 25
+
+
+@pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not installed')
+def test_ffmpeg_two_video_streams(tmp_path):
+    out = tmp_path / 't.ts'
+    subprocess.run([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=30',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+        '-t', '2', '-filter_complex', '[0:v]split=2[a][b];[b]scale=160:96[c]',
+        '-map', '[a]', '-map', '[c]', '-map', '1:a', '-c:v', 'libx264',
+        '-preset', 'ultrafast', '-bf', '0', '-g', '30', '-sc_threshold', '0',
+        '-c:a', 'aac', '-b:a', '64k', '-f', 'mpegts', str(out),
+    ], check=True)
+    d = TsDemuxer()
+    units = []
+    data = out.read_bytes()
+    for i in range(0, len(data), 1316):
+        units += d.feed(data[i:i + 1316])
+    units += d.close()
+    assert d.cc_errors == 0 and len(d.video_pids) == 2
+    streams = [[u for u in units if u.kind == 'video' and u.index == i]
+               for i in (0, 1)]
+    assert [len(s) for s in streams] == [60, 60]
+    assert [u.pts for u in streams[0]] == [u.pts for u in streams[1]]
+    assert [u.key for u in streams[0]] == [u.key for u in streams[1]]
+    assert [sps_dimensions(a.sps) for a in d.videos] == [(320, 240),
+                                                         (160, 96)]
+    assert sum(u.kind == 'audio' for u in units) > 90

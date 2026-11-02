@@ -2,9 +2,10 @@
 or H.265 access units and AAC or Opus frames, with the PES presentation
 timestamps preserved.
 
-One pipe (`ffmpeg … -c copy -f mpegts -`) carries both tracks with the
+One pipe (`ffmpeg … -c copy -f mpegts -`) carries every track with the
 encoder's own timing, so A/V sync and frame pacing follow the source
-rather than pipe arrival. Stream types: 0x1B (H.264 Annex-B), 0x24
+rather than pipe arrival. Every video stream in the PMT is kept; audio
+is the first audio stream. Stream types: 0x1B (H.264 Annex-B), 0x24
 (H.265 Annex-B), 0x0F
 (AAC ADTS) and 0x06 registered as 'Opus' (ETSI TS 102 366 Annex D);
 others are reported once and ignored.
@@ -35,11 +36,18 @@ _AAC_FRAME_SAMPLES = 1024
 
 class TsUnit(NamedTuple):
     """One access unit. `pts` is unwrapped 90 kHz; video payloads are
-    LOC canonical (length-prefixed NALs), audio payloads raw AAC AUs."""
+    LOC canonical (length-prefixed NALs), audio payloads raw AAC AUs.
+    `index` numbers the video streams in PMT order."""
     kind: str
     payload: bytes
     key: bool
     pts: int
+    index: int = 0
+
+    @property
+    def track(self) -> str:
+        """'video', 'video_1', ... by `index`; 'audio'."""
+        return f"{self.kind}_{self.index}" if self.index else self.kind
 
 
 class TsClock:
@@ -145,45 +153,51 @@ class TsCadence:
 
 class TsRates:
     """Catalog values a transport stream does not declare, measured from
-    its units: video frame rate from the PTS spacing, and payload bitrate
-    per kind. Video bitrate spans whole GOPs (key frame to key frame)
-    once `window_s` of media has passed, or any span after five windows;
-    audio spans `window_s`. Values stay None until measured."""
+    its units per TsUnit.track: video frame rate from the PTS spacing,
+    and payload bitrate. Video bitrate spans whole GOPs (key frame to key
+    frame) once `window_s` of media has passed, or any span after five
+    windows; audio spans `window_s`. Values stay None until measured."""
 
     def __init__(self, window_s: float = 2.0):
         self.window = int(window_s * 90_000)
-        self.fps: Optional[float] = None
+        self.framerates: Dict[str, float] = {}
         self.bps: Dict[str, Optional[int]] = {'video': None, 'audio': None}
         self._first: Dict[str, int] = {}
-        self._bytes: Dict[str, int] = {'video': 0, 'audio': 0}
-        self._video_pts: List[int] = []
+        self._bytes: Dict[str, int] = {}
+        self._video_pts: Dict[str, List[int]] = {}
+
+    @property
+    def fps(self) -> Optional[float]:
+        """The first video stream's frame rate."""
+        return self.framerates.get('video')
 
     def add(self, u: TsUnit) -> bool:
         """Count a unit; True when it completed a measurement."""
         new = False
-        if u.kind == 'video' and self.fps is None:
-            self._video_pts.append(u.pts)
-            if len(self._video_pts) > 16:
-                steps = [b - a for a, b in zip(self._video_pts,
-                                               self._video_pts[1:])
-                         if b > a]
+        name = u.track
+        if u.kind == 'video' and name not in self.framerates:
+            pts = self._video_pts.setdefault(name, [])
+            pts.append(u.pts)
+            if len(pts) > 16:
+                steps = [b - a for a, b in zip(pts, pts[1:]) if b > a]
                 if steps:
-                    self.fps = round(90_000 / statistics.median(steps), 2)
+                    self.framerates[name] = round(
+                        90_000 / statistics.median(steps), 2)
                     new = True
-        if self.bps[u.kind] is not None:
+        if self.bps.get(name) is not None:
             return new
-        first = self._first.get(u.kind)
+        first = self._first.get(name)
         if first is None:
             if u.kind == 'audio' or u.key:
-                self._first[u.kind] = u.pts
-                self._bytes[u.kind] = len(u.payload)
+                self._first[name] = u.pts
+                self._bytes[name] = len(u.payload)
             return new
         span = u.pts - first
         whole = u.kind == 'audio' or u.key or span >= 5 * self.window
         if span >= self.window and whole:
-            self.bps[u.kind] = self._bytes[u.kind] * 8 * 90_000 // span
+            self.bps[name] = self._bytes[name] * 8 * 90_000 // span
             return True
-        self._bytes[u.kind] += len(u.payload)
+        self._bytes[name] += len(u.payload)
         return new
 
 
@@ -318,24 +332,30 @@ class TsDemuxer:
     """Incremental transport-stream demuxer. feed() returns the access
     units completed by the chunk; close() flushes the last PES at EOF.
 
-    Video: each PES is fed through an AnnexBAssembler (H.264) or
-    HevcAnnexBAssembler (H.265, `video_codec` 'hevc') and closed, so the
+    Video: each stream's PES is fed through its AnnexBAssembler (H.264)
+    or HevcAnnexBAssembler (H.265, codec 'hevc') and closed, so the
     units it held take the PES PTS (one AU per PES in practice);
-    parameter sets land in `video.config`. Audio: ADTS frames are split, the
+    parameter sets land in the assembler's `config`. `videos`,
+    `video_pids` and `video_codecs` list the streams in PMT order;
+    `video`, `video_pid` and `video_codec` are the first. Audio: ADTS frames are split, the
     AudioSpecificConfig derived from the header, and each frame's PTS
     advanced by 1024 samples within the PES; Opus packets are split from
     their control headers (`audio_asc` stays None) and advanced by their
     TOC duration. `audio_codec` is 'aac' or 'opus'.
 
     `config_changed` is raised (and left for the caller to clear) when a
-    later SPS/PPS, ADTS header or Opus channel count differs from the
-    first."""
+    later SPS/PPS (of any video stream), ADTS header or Opus channel
+    count differs from the first."""
 
     def __init__(self, clock: Optional[TsClock] = None):
         self.clock = clock or TsClock()
         self.video: AnnexBAssembler = AnnexBAssembler()
         self.video_codec: Optional[str] = None
         self.video_pid: Optional[int] = None
+        self.videos: List[AnnexBAssembler] = []
+        self.video_pids: List[int] = []
+        self.video_codecs: List[str] = []
+        self._video_index: Dict[int, int] = {}
         self.audio_pid: Optional[int] = None
         self.audio_codec: Optional[str] = None
         self._opus_channels: Optional[int] = None
@@ -352,7 +372,7 @@ class TsDemuxer:
         self._cc: Dict[int, int] = {}
         self._skip: Set[int] = set()
         self._last_pts: Dict[int, Tuple[int, int]] = {}
-        self._video_config: Optional[bytes] = None
+        self._video_configs: Dict[int, bytes] = {}
         # Emit a video PES at its stuffed last packet, not the next PUSI.
         self.eager_video = True
         self._ended: Set[int] = set()
@@ -427,7 +447,7 @@ class TsDemuxer:
             self._pat(payload, pusi)
         elif pid == self._pmt_pid:
             self._pmt(payload, pusi)
-        elif pid in (self.video_pid, self.audio_pid):
+        elif pid == self.audio_pid or pid in self._video_index:
             self._es(pid, payload, pusi, out, stuffed)
 
     # ── PSI ─────────────────────────────────────────────────────────
@@ -461,20 +481,17 @@ class TsDemuxer:
         info_len = ((sec[10] & 0x0F) << 8) | sec[11]
         i = 12 + info_len
         end = len(sec) - 4
-        video = audio = None
+        videos: List[Tuple[int, str]] = []
+        audio = None
         while i + 5 <= end:
             stype = sec[i]
             pid = ((sec[i + 1] & 0x1F) << 8) | sec[i + 2]
             es_len = ((sec[i + 3] & 0x0F) << 8) | sec[i + 4]
             desc = sec[i + 5:i + 5 + es_len]
             i += 5 + es_len
-            if stype in (STREAM_TYPE_H264, STREAM_TYPE_HEVC) and video is None:
-                video = pid
-                codec = 'hevc' if stype == STREAM_TYPE_HEVC else 'h264'
-                if codec != self.video_codec:
-                    self.video_codec = codec
-                    self.video = (HevcAnnexBAssembler() if codec == 'hevc'
-                                  else AnnexBAssembler())
+            if stype in (STREAM_TYPE_H264, STREAM_TYPE_HEVC):
+                videos.append(
+                    (pid, 'hevc' if stype == STREAM_TYPE_HEVC else 'h264'))
             elif stype == STREAM_TYPE_AAC_ADTS and audio is None:
                 audio = pid
                 self.audio_codec = 'aac'
@@ -487,8 +504,25 @@ class TsDemuxer:
                 self.unsupported.add(stype)
                 logger.warning(f"mpegts: stream type {stype:#x} on pid "
                                f"{pid} ignored")
-        self.video_pid, self.audio_pid = video, audio
+        self._set_videos(videos)
+        self.audio_pid = audio
         self.pmt_seen = True
+
+    def _set_videos(self, streams: List[Tuple[int, str]]) -> None:
+        """The PMT's video streams; a stream keeps its assembler while its
+        position and codec hold."""
+        kept = list(zip(self.video_codecs, self.videos))
+        self.videos = [
+            kept[i][1] if i < len(kept) and kept[i][0] == codec
+            else HevcAnnexBAssembler() if codec == 'hevc'
+            else AnnexBAssembler()
+            for i, (_, codec) in enumerate(streams)]
+        self.video_pids = [pid for pid, _ in streams]
+        self.video_codecs = [codec for _, codec in streams]
+        self._video_index = {pid: i for i, pid in enumerate(self.video_pids)}
+        self.video_pid = self.video_pids[0] if streams else None
+        if streams:
+            self.video, self.video_codec = self.videos[0], self.video_codecs[0]
 
     # ── PES ─────────────────────────────────────────────────────────
 
@@ -522,7 +556,7 @@ class TsDemuxer:
             if length and len(pes) >= 6 + length:
                 self._emit_pes(pid, self._pes.pop(pid), out)
             elif (not length and stuffed and self.eager_video
-                  and pid == self.video_pid):
+                  and pid in self._video_index):
                 self._emit_pes(pid, self._pes.pop(pid), out)
                 self._ended.add(pid)
 
@@ -546,20 +580,24 @@ class TsDemuxer:
         data = bytes(pes[9 + hlen:])
         if not data or pts is None:
             return
-        if pid == self.video_pid:
-            self._emit_video(data, pts, out)
+        index = self._video_index.get(pid)
+        if index is not None:
+            self._emit_video(data, pts, out, index)
         else:
             self._emit_audio(data, pts, out)
 
-    def _emit_video(self, data: bytes, pts: int, out: List[TsUnit]) -> None:
-        units = self.video.feed(data) + self.video.close()
+    def _emit_video(self, data: bytes, pts: int, out: List[TsUnit],
+                    index: int = 0) -> None:
+        asm = self.videos[index]
+        units = asm.feed(data) + asm.close()
         for payload, key in units:
-            out.append(TsUnit('video', payload, key, pts))
-        cfg = self.video.config
-        if cfg is not None and cfg != self._video_config:
-            if self._video_config is not None:
+            out.append(TsUnit('video', payload, key, pts, index))
+        cfg = asm.config
+        last = self._video_configs.get(index)
+        if cfg is not None and cfg != last:
+            if last is not None:
                 self.config_changed = True
-            self._video_config = cfg
+            self._video_configs[index] = cfg
 
     def _emit_audio(self, data: bytes, pts: int, out: List[TsUnit]) -> None:
         if self.audio_codec == 'opus':
