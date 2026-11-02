@@ -7,7 +7,8 @@ playable files, or pipes one track straight into a player.
 Reads the catalog track, subscribes every media track it describes
 (--packaging narrows to one packaging), and writes:
   <out>/video.h264   Annex-B elementary stream (SPS/PPS injected from
-                     the catalog/wire decoder config at keyframes)
+                     the catalog/wire decoder config at keyframes);
+                     <name>.h264 when several LOC video tracks
   <out>/audio.wav    pcm-s16 with header from the catalog track entry
   <out>/<role>.mp4   fMP4 for CMAF and LOCMAF tracks (LOCMAF objects
                      rebuilt to CMAF chunks); <name>.mp4 when several
@@ -141,8 +142,9 @@ _CHUNKED = (PACKAGING_CMAF, PACKAGING_LOCMAF)
 
 
 class _Writers:
-    """Per-track sinks: LOC video → Annex-B .h264, pcm audio → .wav, CMAF
-    and LOCMAF → fMP4 (<role>.mp4, or <name>.mp4 when several wanted
+    """Per-track sinks: LOC video → Annex-B .h264 (video.h264, or
+    <name>.h264 when several wanted LOC video tracks), pcm audio → .wav,
+    CMAF and LOCMAF → fMP4 (<role>.mp4, or <name>.mp4 when several wanted
     tracks share the role). One track may stream raw to stdout instead
     (pipe_role)."""
 
@@ -152,7 +154,7 @@ class _Writers:
         self.sub = subscriber
         self.pipe_role = pipe_role
         self.wanted = wanted or (lambda entry: True)
-        self.video = None
+        self.h264 = {}
         self.ivf = None
         self.wav = None
         self.aac = None
@@ -219,11 +221,13 @@ class _Writers:
             if self.pipe_role == 'video':
                 self._pipe(param_sets + as_annexb(frame.payload))
                 return
-            if self.video is None:
-                self.video = open(os.path.join(self.out, 'video.h264'),
-                                  'wb')
-            self.video.write(param_sets)
-            self.video.write(as_annexb(frame.payload))
+            fh = self.h264.get(name)
+            if fh is None:
+                fh = self.h264[name] = open(
+                    os.path.join(self.out, f'{self._h264_stem(entry)}.h264'),
+                    'wb')
+            fh.write(param_sets)
+            fh.write(as_annexb(frame.payload))
         elif role == 'audio' and (entry.codec or '').startswith('mp4a'):
             # Raw AAC AUs; the AudioSpecificConfig arrives via catalog
             # initRef. ADTS-wrapped output is directly playable.
@@ -257,10 +261,18 @@ class _Writers:
                  and self.wanted(t)]
         return entry.name if len(peers) > 1 else entry.role
 
+    def _h264_stem(self, entry) -> str:
+        catalog = self.sub.catalog
+        peers = [t for t in (catalog.tracks if catalog else ())
+                 if t.role == 'video' and t.packaging not in _CHUNKED
+                 and not (t.codec or '').startswith('av01')
+                 and self.wanted(t)]
+        return entry.name if len(peers) > 1 else 'video'
+
     def close(self):
         self.closed = True
-        if self.video:
-            self.video.close()
+        for fh in self.h264.values():
+            fh.close()
         if self.ivf:
             self.ivf.close()
         if self.wav:
@@ -520,10 +532,10 @@ async def run(args):
             line += f", {rejected} rejected"
         _status(line)
     if args.pipe is None:
-        files = [n for n, f in (("video.h264", writers.video),
-                                ("video.ivf", writers.ivf),
-                                ("audio.wav", writers.wav),
-                                ("audio.aac", writers.aac)) if f]
+        files = [os.path.basename(fh.name) for fh in writers.h264.values()]
+        files += [n for n, f in (("video.ivf", writers.ivf),
+                                 ("audio.wav", writers.wav),
+                                 ("audio.aac", writers.aac)) if f]
         files += [os.path.basename(fh.name)
                   for fh in writers.cmaf.values()
                   if fh is not sys.stdout.buffer]
