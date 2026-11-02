@@ -6,6 +6,7 @@ import struct
 import time
 from fractions import Fraction
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -56,7 +57,7 @@ async def test_a_paced_mp4_track_is_stamped_on_schedule():
                              samples=lambda: zip(frames, times))
     track = _Track()
     await pub_media._feed_mp4_track(
-        track, source,
+        track, cast(Any, source),
         SimpleNamespace(duration=1.0, no_pace=False, loop=False),
         pub_media._TrackStats())
     assert [s - track.stamps[0] for s in track.stamps] == offsets
@@ -79,7 +80,7 @@ async def test_looped_cmaf_tfdt_follows_the_paced_timestamps():
                              samples=lambda: zip(frames, times))
     track = _Track()
     await pub_media._feed_mp4_track(
-        track, source,
+        track, cast(Any, source),
         SimpleNamespace(duration=float(3 * period - Fraction(512, scale)),
                         no_pace=True, loop=True),
         pub_media._TrackStats(),

@@ -1726,7 +1726,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                                  if mp4_audio is not None else 'pcm-s16')),
                 a_time))
             stats['audio'] = _TrackStats()
-            if mp4_audio is not None:
+            if a_mp4 is not None:
                 a_ck = chunkers.get('audio')
                 feeders.append(_feed_mp4_track(
                     audio_track, a_mp4, args, stats['audio'],
@@ -1749,7 +1749,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     fetch_history_bytes=args.fetch_history),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
-        elif video is not None and ts is None:   # --ts wired both tracks above
+        elif video is not None and v_mp4 is not None:
             v_ck = chunkers.get('video')
             stats['video'] = _TrackStats()
             feeders.append(_feed_mp4_track(

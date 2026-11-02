@@ -7,6 +7,7 @@ import random
 import struct
 from fractions import Fraction
 from types import SimpleNamespace as NS
+from typing import Any, cast
 
 import pytest
 
@@ -131,7 +132,8 @@ def _numbered(rec):
     group, obj, out = -1, 0, []
     for s in rec.sent:
         if s.key:
-            group = LocTrackPublisher._next_group(NS(group_id=s.hint), group)
+            group = LocTrackPublisher._next_group(
+                cast(Any, NS(group_id=s.hint)), group)
             obj = 0
         else:
             obj += 1
@@ -165,6 +167,7 @@ def test_other_edit_list_shapes_are_unsupported(entries):
 
 def test_clip_has_aac_priming_in_its_edit_list(tmp_path):
     audio = Mp4Reader(_clip(tmp_path / 'c.mp4', 30)).audio
+    assert audio is not None
     assert (audio.media_time, audio.edit_delay) == (1024, 0)
 
 
@@ -174,7 +177,7 @@ def test_unsupported_edit_list_is_ignored_with_a_warning(tmp_path, caplog):
     path.write_bytes(_with_audio_elst(data, [(143_360, 1024, 2, 0)]))
     with caplog.at_level(logging.WARNING, logger='aiomoqt.media.sources'):
         audio = Mp4Reader(str(path)).audio
-    assert audio.media_time == 0
+    assert audio is not None and audio.media_time == 0
     warned = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warned) == 1 and 'track 2' in warned[0].getMessage()
 
@@ -188,6 +191,7 @@ def test_empty_edit_delays_the_track(tmp_path, version):
     path.write_bytes(_with_audio_elst(
         data, [(movie // 4, -1, 1, 0), (movie, 1024, 1, 0)], version))
     audio = Mp4Reader(str(path)).audio
+    assert audio is not None
     starts = [t for _, t in audio.presented()]
     assert starts[:2] == [Fraction(1, 4), Fraction(1, 4) + Fraction(1024,
                                                                     48000)]
@@ -197,7 +201,9 @@ def test_empty_edit_delays_the_track(tmp_path, version):
 
 async def test_no_priming_packet_is_sent_on_any_pass(tmp_path):
     path = _clip(tmp_path / 'c.mp4', 90)
-    priming = next(Mp4Reader(path).audio.samples()).payload
+    audio = Mp4Reader(path).audio
+    assert audio is not None
+    priming = next(audio.samples()).payload
     (video, audio), _ = await _feed(path, 3)
     assert len(video.sent) == 3 * 90
     assert len(audio.sent) == 3 * 140
@@ -279,6 +285,7 @@ async def test_looped_clip_through_the_relay_keeps_audio_on_video(
         tmp_path, monkeypatch):
     path = _clip(tmp_path / 'c.mp4', 90)                  # 3 s, AAC + H.264
     reader = Mp4Reader(path)
+    assert reader.video is not None and reader.audio is not None
     v_first = next(reader.video.samples()).payload
     a_first = list(reader.audio.samples())[1].payload    # after the priming
     seen = []
