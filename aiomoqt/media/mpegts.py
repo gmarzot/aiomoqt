@@ -13,7 +13,9 @@ import logging
 import statistics
 import time
 from fractions import Fraction
-from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import (
+    Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union,
+)
 
 from ..utils.timing import MediaTimestamps
 from .sources import _ADTS_FREQ, AnnexBAssembler, HevcAnnexBAssembler
@@ -58,21 +60,32 @@ class TsClock:
         self._last = 0
         self._wall0_us = 0
         self._held = False
+        self._exact = False
 
     def hold(self) -> None:
         """Keep the current anchor: stamps stay on the PTS schedule even
         when a unit arrives before its stamp. A restart still re-anchors."""
         self._held = True
 
-    def to_us(self, pts: int) -> int:
+    def anchor(self, pts: int, wall_us) -> None:
+        """Map `pts` to `wall_us` (int or Fraction µs) and hold; later
+        stamps are exact Fractions until a restart."""
+        self._pts0 = self._last = pts
+        self._wall0_us = wall_us
+        self._held = self._exact = True
+
+    def to_us(self, pts: int) -> Union[int, Fraction]:
         now_us = int(self._now() * 1_000_000)
         if self._pts0 is None or pts < self._last - self._restart:
             self._pts0 = pts
             self._last = pts
             self._wall0_us = now_us
+            self._exact = False
             return now_us
         if pts > self._last:
             self._last = pts
+        if self._exact:
+            return self._wall0_us + Fraction((pts - self._pts0) * 100, 9)
         stamp = self._wall0_us + (pts - self._pts0) * 1000 // 90
         if stamp > now_us and not self._held:
             self._wall0_us -= stamp - now_us
@@ -115,20 +128,19 @@ class TsCadence:
     def framerate(self) -> float:
         return round(float(self.fps), 2)
 
-    def video_timestamps(self, wall0_us: int) -> MediaTimestamps:
-        """Mapped timing for video whose first group opens at `wall0_us`."""
+    def video_timestamps(self) -> MediaTimestamps:
+        """Mapped video timing, anchored at the Unix epoch."""
         om = self.frame_ticks if self.gop > 1 else 0
-        return MediaTimestamps(wall0_us, self.timescale,
+        return MediaTimestamps(0, self.timescale,
                                self.gop * self.frame_ticks, om)
 
     @staticmethod
-    def audio_timestamps(wall0_us: int, samplerate: int, frame_samples: int,
+    def audio_timestamps(samplerate: int, frame_samples: int,
                          per_group: int) -> MediaTimestamps:
         """Mapped timing for audio frames of `frame_samples`, `per_group`
-        to a group, the first opening at `wall0_us`."""
-        om = frame_samples if per_group > 1 else 0
-        return MediaTimestamps(wall0_us, samplerate,
-                               per_group * frame_samples, om)
+        to a group, anchored at the Unix epoch."""
+        return MediaTimestamps(0, samplerate,
+                               per_group * frame_samples, frame_samples)
 
 
 class TsRates:
@@ -352,7 +364,7 @@ class TsDemuxer:
         """None until the PMT is seen."""
         return None if not self.pmt_seen else self.audio_pid is not None
 
-    def to_us(self, pts: int) -> int:
+    def to_us(self, pts: int) -> Union[int, Fraction]:
         return self.clock.to_us(pts)
 
     # ── packets ─────────────────────────────────────────────────────

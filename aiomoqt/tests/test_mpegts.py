@@ -365,10 +365,10 @@ def test_cadence_timescales():
     c = TsCadence.parse('gop=48, fps=24000/1001')
     assert (c.timescale, c.frame_ticks, c.framerate) == (24000, 1001, 23.98)
     assert c.fps == Fraction(24000, 1001)
-    m = c.video_timestamps(1_000_000)
+    m = c.video_timestamps()
     assert (m.timescale, m.group_multiplier, m.object_multiplier) == (24000, 48 * 1001, 1001)
-    a = TsCadence.audio_timestamps(1_000_000, 48000, 960, 1)
-    assert (a.timescale, a.group_multiplier, a.object_multiplier) == (48000, 960, 0)
+    a = TsCadence.audio_timestamps(48000, 960, 1)
+    assert (a.timescale, a.group_multiplier, a.object_multiplier) == (48000, 960, 960)
     for bad in ('fps=30', 'gop=60', 'fps=0,gop=60', 'fps=30,gop=0', 'rate=30,gop=1',
                 'fps=x,gop=2'):
         with pytest.raises(ValueError):
