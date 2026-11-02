@@ -2,6 +2,11 @@
 
 ## v0.14.0
 
+- pub_media `--mp4` honours the edit list: encoder priming (AAC, Opus pre-skip) is not sent and an empty edit delays the track; an unsupported edit list is ignored with a WARNING.
+- pub_media `--loop` runs every track of a clip on one period, the clip's presented duration, so audio and video no longer drift apart on each pass.
+- pub_media `--timestamp-mapping`: a group that opens off schedule, as at a loop seam after a short last GOP, takes a new group ID instead of the previous one.
+- pub_media `--timestamp-mapping`: mp4 audio whose times lie within half a frame of a regular grid (e.g. 21/22 ms at a 1 ms timescale) is mapped on its frame grid in the sample rate's timescale, without a per-object OBJECT_TIMESTAMP.
+- pub_media `--timestamp-mapping`: the audio Object Multiplier is the frame duration also at one frame per group (was 0), for `--mp4`, `--ts` and the tone.
 - Draft-14: TRACK_STATUS gets TRACK_STATUS_OK or TRACK_STATUS_ERROR from a PublishedTrack, the session default and aiomoqt-relay, and the relay's fallback error reply is the request's own d14 error, instead of d16's REQUEST_OK / REQUEST_ERROR or no reply.
 - A REQUEST_UPDATE that arrives in the same read as its SUBSCRIBE reaches the PublishedTrack instead of being refused as not supported.
 - aiomoqt-relay `--startup-hold SEC` (default 2, 0 = off; `startup-hold` in `--config`): for SEC seconds after start, a SUBSCRIBE for a track no publisher serves waits for one and is answered when it appears, else refused as before when the window ends.

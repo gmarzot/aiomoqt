@@ -11,10 +11,14 @@
 """
 from __future__ import annotations
 
+import logging
 import math
 import struct
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Iterator, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 
 # -- audio ------------------------------------------------------------
@@ -45,6 +49,7 @@ class VideoSample:
     key_frame: bool
     timestamp_us: int
     duration: int = 0   # track-timescale units (CMAF trun)
+    decode_time: int = 0  # track-timescale units
 
 
 class Mp4Error(ValueError):
@@ -72,6 +77,41 @@ def _find(data, start, end, *path):
     return None
 
 
+def parse_elst(d: bytes, body: int, end: int) -> List[Tuple[int, int, int, int]]:
+    """Entries of an elst box body (version 0 or 1): (segment_duration,
+    media_time, media_rate_integer, media_rate_fraction)."""
+    version = d[body]
+    n = struct.unpack_from('>I', d, body + 4)[0]
+    fmt, step = ('>Qqhh', 20) if version == 1 else ('>Iihh', 12)
+    if body + 8 + n * step > end:
+        raise Mp4Error("elst entries overrun the box")
+    return [struct.unpack_from(fmt, d, body + 8 + step * i)
+            for i in range(n)]
+
+
+def edit_offset(entries, movie_timescale: int
+                ) -> Optional[Tuple[Fraction, int]]:
+    """(empty-edit delay in s, media_time in track ticks) of an edit list
+    shaped as leading empty edits then one media edit at rate 1, else
+    None."""
+    if not entries:
+        return None
+    *empty, (_, media_time, rate, frac) = entries
+    if (media_time < 0 or (rate, frac) != (1, 0)
+            or any(e[1] != -1 for e in empty)
+            or (empty and not movie_timescale)):
+        return None
+    delay = (Fraction(sum(e[0] for e in empty), movie_timescale)
+             if empty else Fraction(0))
+    return delay, media_time
+
+
+def _timescale(d: bytes, box) -> int:
+    """timescale of an mvhd or mdhd box."""
+    return struct.unpack_from(
+        '>I', d, box[0] + (20 if d[box[0]] == 1 else 12))[0]
+
+
 def _traks(d: bytes):
     """Yield (sample_entry_type, entry_body, entry_end, trak_span)."""
     moov = _find(d, 0, len(d), b'moov')
@@ -94,10 +134,8 @@ class _TrackReader:
         d = self._data = data
         body, bend = trak
         self._entry_span = (entry[0] - 8, entry[1])
-        mdhd = _find(d, body, bend, b'mdia', b'mdhd')
-        version = d[mdhd[0]]
-        self.timescale = struct.unpack_from(
-            '>I', d, mdhd[0] + (20 if version == 1 else 12))[0]
+        self.timescale = _timescale(d, _find(d, body, bend, b'mdia',
+                                             b'mdhd'))
         self._parse_entry(*entry)
         stbl = _find(d, body, bend, b'mdia', b'minf', b'stbl')
 
@@ -134,6 +172,37 @@ class _TrackReader:
         n = struct.unpack_from('>I', d, pos)[0]
         self._stts = [struct.unpack_from('>II', d, pos + 4 + 8 * i)
                       for i in range(n)]
+        self._edit(trak, _find(d, *stbl, b'ctts') is not None)
+
+    def _edit(self, trak, ctts: bool) -> None:
+        """edit_delay (s) and media_time (ticks) from the edit list; an
+        unsupported one is ignored with a warning."""
+        d = self._data
+        self.edit_delay, self.media_time = Fraction(0), 0
+        elst = _find(d, *trak, b'edts', b'elst')
+        if elst is None:
+            return
+        tkhd = _find(d, *trak, b'tkhd')
+        track_id = struct.unpack_from(
+            '>I', d, tkhd[0] + (20 if d[tkhd[0]] == 1 else 12))[0]
+        etype = d[self._entry_span[0] + 4:self._entry_span[0] + 8]
+        name = f"track {track_id} ({etype.decode('latin-1')})"
+        if ctts:
+            log.warning("mp4 %s: edit list ignored: composition offsets "
+                        "(ctts) are not supported", name)
+            return
+        mvhd = _find(d, 0, len(d), b'moov', b'mvhd')
+        try:
+            edit = edit_offset(parse_elst(d, *elst),
+                               _timescale(d, mvhd) if mvhd else 0)
+        except Mp4Error:
+            edit = None
+        if edit is None:
+            log.warning("mp4 %s: edit list ignored: only leading empty "
+                        "edits and one media edit at rate 1 are supported",
+                        name)
+            return
+        self.edit_delay, self.media_time = edit
 
     def _parse_entry(self, ebody, eend):
         raise NotImplementedError
@@ -183,8 +252,26 @@ class _TrackReader:
                 key_frame=(self._sync is None or (i + 1) in self._sync),
                 timestamp_us=t * 1_000_000 // self.timescale,
                 duration=dur,
+                decode_time=t,
             )
             t += dur
+
+    def presented(self) -> Iterator[Tuple[VideoSample, Fraction]]:
+        """(sample, start in s) per the edit list: decode time minus the
+        media edit's media_time, plus the empty-edit delay. Samples that
+        start before media_time (encoder priming) are skipped."""
+        for s in self.samples():
+            if s.decode_time >= self.media_time:
+                yield s, self.edit_delay + Fraction(
+                    s.decode_time - self.media_time, self.timescale)
+
+    @property
+    def presented_duration(self) -> Fraction:
+        """Presentation length in s: the empty-edit delay plus the media
+        from media_time to the last sample's end."""
+        total = sum(c * delta for c, delta in self._stts)
+        return self.edit_delay + Fraction(max(0, total - self.media_time),
+                                          self.timescale)
 
 
 class Mp4VideoTrack(_TrackReader):

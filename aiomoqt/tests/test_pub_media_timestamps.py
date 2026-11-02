@@ -4,6 +4,7 @@ LOC timestamps is exact whatever the send-time jitter."""
 import asyncio
 import struct
 import time
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
@@ -48,9 +49,11 @@ async def test_a_paced_tone_is_stamped_on_schedule():
 @pytest.mark.asyncio
 async def test_a_paced_mp4_track_is_stamped_on_schedule():
     offsets = [0, 33_366, 66_733, 100_100, 133_466]       # 29.97 fps
-    source = SimpleNamespace(samples=lambda: iter(
-        SimpleNamespace(timestamp_us=t, payload=b"x", key_frame=not i)
-        for i, t in enumerate(offsets)))
+    times = [Fraction(t, 1_000_000) for t in offsets]
+    frames = [SimpleNamespace(payload=b"x", key_frame=not i)
+              for i in range(len(offsets))]
+    source = SimpleNamespace(period=Fraction(0), times=times,
+                             samples=lambda: zip(frames, times))
     track = _Track()
     await pub_media._feed_mp4_track(
         track, source,
@@ -68,18 +71,18 @@ async def test_looped_cmaf_tfdt_follows_the_paced_timestamps():
     # AAC-like: whole frames, then a short last one (padding trimmed).
     scale, durs = 48_000, [1024, 1024, 1024, 256]
     starts = [sum(durs[:i]) for i in range(len(durs))]
-    source = SimpleNamespace(timescale=scale, samples=lambda: iter(
-        SimpleNamespace(timestamp_us=t * 1_000_000 // scale, duration=d,
-                        payload=b"x", key_frame=True)
-        for t, d in zip(starts, durs)))
-    gap_us = 1024 * 1_000_000 // scale
-    pass_us = starts[-1] * 1_000_000 // scale + gap_us
+    period = Fraction(starts[-1] + 1024, scale)
+    times = [Fraction(t, scale) for t in starts]
+    frames = [SimpleNamespace(duration=d, payload=b"x", key_frame=True)
+              for d in durs]
+    source = SimpleNamespace(timescale=scale, period=period, times=times,
+                             samples=lambda: zip(frames, times))
     track = _Track()
     await pub_media._feed_mp4_track(
         track, source,
-        SimpleNamespace(duration=(3 * pass_us - gap_us // 2) / 1e6,
+        SimpleNamespace(duration=float(3 * period - Fraction(512, scale)),
                         no_pace=True, loop=True),
-        pub_media._TrackStats(), gap_us=gap_us,
+        pub_media._TrackStats(),
         wrap=pub_media._cmaf_wrap(CmafChunker(source), video=False),
         clock=(time.monotonic(), 0))
     assert len(track.payloads) == 3 * len(durs)
