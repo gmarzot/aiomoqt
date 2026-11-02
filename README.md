@@ -174,6 +174,8 @@ Auth is control-plane only; there is no per-object authentication.
 
 `aiomoqt.media` implements MSF catalogs with three packagings: **LOC** (per-frame payloads, metadata in MOQ object properties), **CMSF/CMAF** (moof+mdat chunks, CMAF header in the catalog `initDataList`) and **LOCMAF** (draft-einarsson-moq-locmaf, `locmafVersion` 0.3: the same chunks with each moof carried as a compact header, a delta of the previous one within a group; the receiver rebuilds a canonical CMAF chunk).
 
+The [media guide](aiomoqt/media/README.md) covers every source, packaging, timing and delivery option, with recipes.
+
 ### Command line
 
 ```bash
