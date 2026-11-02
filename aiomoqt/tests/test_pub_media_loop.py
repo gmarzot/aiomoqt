@@ -1,6 +1,7 @@
 """pub_media --mp4 timing: the edit list (priming and delay), one loop
 period for every track of a clip, group IDs across loop seams, and
 near-regular audio mapped on its frame grid."""
+import asyncio
 import logging
 import random
 import struct
@@ -10,8 +11,14 @@ from types import SimpleNamespace as NS
 import pytest
 
 from aiomoqt.media.loc import LocTrackPublisher
+from aiomoqt.tests._certs import requires_certs
+from aiomoqt.tests.test_pub_media_frindell import _argv
+from aiomoqt.tests.test_pub_media_service import _serve, _stop, _until
+from aiomoqt.tools import sub_media
+from aiomoqt.utils.media_stats import MediaAnalysis
 from aiomoqt.media import sources
 from aiomoqt.media.sources import Mp4Reader, _boxes, _find
+from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools import pub_media
 from aiomoqt.utils.timing import OBJECT_TIMESTAMP
 
@@ -230,7 +237,7 @@ def _audio(starts, timescale):
 
 @pytest.mark.parametrize('starts,timescale', [
     ([(n * 64 + 1) // 3 for n in range(300)], 1000),    # 21/22 ms
-    ([n * 1024 + (n == 50) * 7 for n in range(300)], 48000),  # one odd
+    ([n * 1024 + (n == 50) for n in range(300)], 48000),  # one odd
 ])
 async def test_near_regular_audio_maps_on_its_frame_grid(starts, timescale):
     mp4 = pub_media._Mp4Pass(_audio(starts, timescale), Fraction(0),
@@ -249,8 +256,66 @@ async def test_near_regular_audio_maps_on_its_frame_grid(starts, timescale):
 
 
 def test_irregular_audio_falls_back_to_explicit_timestamps():
-    starts = [n * 1024 + (n >= 150) * 3 * 1024 for n in range(300)]  # hole
+    starts = [n * 1024 + (n >= 150) * 614 for n in range(300)]  # 0.6 frame
     mp4 = pub_media._Mp4Pass(_audio(starts, 48000), Fraction(0),
                              samplerate=48000)
     assert mp4.cadence is None
     assert not pub_media._frindell_for(mp4, 0).mapped
+
+
+# -- end to end ----------------------------------------------------------
+
+_PORT = 21950
+
+
+@requires_certs
+async def test_looped_clip_through_the_relay_keeps_audio_on_video(
+        tmp_path, monkeypatch):
+    path = _clip(tmp_path / 'c.mp4', 90)                  # 3 s, AAC + H.264
+    reader = Mp4Reader(path)
+    v_first = next(reader.video.samples()).payload
+    a_first = list(reader.audio.samples())[1].payload    # after the priming
+    seen = []
+    orig = MediaAnalysis.on_arrival
+
+    def record(self, name, msg, recv_us, group_id, subgroup_id, frame):
+        if frame is not None:
+            seen.append((name, group_id, frame.timestamp,
+                         bytes(frame.payload)))
+        return orig(self, name, msg, recv_us, group_id, subgroup_id, frame)
+    monkeypatch.setattr(MediaAnalysis, 'on_arrival', record)
+    url = f'moqt://localhost:{_PORT}/'
+    ns = 'loop/e2e'
+    pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '22',
+                     '-t', '10', '--stats', '0', '--pub-ns', '-N', ns,
+                     '--mp4', path, '--loop')
+    sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '22',
+                     '-N', ns, '--analyze', '-t', '12', '-i', '1')
+    srv, handle = await _serve(_PORT, True, 22)
+    try:
+        pub = asyncio.ensure_future(pub_media.run(pub_args))
+        await _until(lambda: relay._announced or pub.done(), 10)
+        sub = asyncio.ensure_future(sub_media.run(sub_args))
+        await asyncio.wait_for(pub, 15)
+        await asyncio.sleep(0.5)
+        sub.cancel()
+    finally:
+        await _stop(srv, handle)
+    frame_us = 1024 * 1_000_000 / 48000
+    seams = {}
+    for kind, first in (('video', v_first), ('audio', a_first)):
+        objs = sorted((ts, g) for n, g, ts, _ in seen if n == kind)
+        assert objs and all(ts is not None for ts, _ in objs), kind
+        groups = [g for _, g in objs]
+        firsts = [g for g, prev in zip(groups[1:], groups) if g != prev]
+        assert all(b > a for a, b in zip(firsts, firsts[1:])), kind
+        assert all(b >= a for a, b in zip(groups, groups[1:])), kind
+        seams[kind] = sorted(ts for n, _, ts, p in seen
+                             if n == kind and p == first)
+    video, audio = seams['video'], seams['audio']
+    pairs = [(v, min(audio, key=lambda a: abs(a - v))) for v in video]
+    assert len(pairs) >= 2 and audio, seams
+    for v, a in pairs:
+        assert abs(a - v) < frame_us, (v, a)
+    for (v0, a0), (v1, a1) in zip(pairs, pairs[1:]):
+        assert abs((a1 - a0) - (v1 - v0)) < frame_us, (v0, v1, a0, a1)

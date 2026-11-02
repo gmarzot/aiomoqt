@@ -843,7 +843,8 @@ def _sample_cadence(samples, timescale: int, samplerate: Optional[int] = None):
     """(cadence, samples) of one pass [(sample, start s)]: on the track's
     timescale when every sample lasts the same and sync samples are evenly
     spaced. Audio (`samplerate` given) whose starts all lie within half a
-    frame of a regular grid is retimed onto it, in samplerate ticks.
+    frame of a regular grid, each step within one container tick plus one
+    sample of the frame, is retimed onto it, in samplerate ticks.
     Else (None, samples)."""
     if not samples:
         return None, samples
@@ -861,8 +862,10 @@ def _sample_cadence(samples, timescale: int, samplerate: Optional[int] = None):
     if samplerate and len(samples) > 1:
         sr = [t * samplerate for _, t in samples]
         spf = round((sr[-1] - sr[0]) / (len(sr) - 1))
-        if spf > 0 and all(2 * abs(x - sr[0] - n * spf) < spf
-                           for n, x in enumerate(sr)):
+        slack = Fraction(samplerate, timescale) + 1
+        if spf > 0 and all(
+                abs(b - a - spf) <= slack for a, b in zip(sr, sr[1:])) and all(
+                2 * abs(x - sr[0] - n * spf) < spf for n, x in enumerate(sr)):
             t0 = samples[0][1]
             return _Cadence(samplerate, spf, per_group), [
                 (s, t0 + Fraction(n * spf, samplerate))
