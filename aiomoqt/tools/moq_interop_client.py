@@ -32,7 +32,7 @@ from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools.moqtest_origin import parse_namespace as parse_moq_test
 from aiomoqt.types import (
-    ParamType, FetchType, MOQTRequestError, MOQTMessageType,
+    ParamType, FetchType, MOQTRequestError, MOQTMessageType, MOQTStreamStopped,
     SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
@@ -1090,6 +1090,8 @@ class _DataPublisher:
         # or UNSUBSCRIBE): there is no request stream left for PUBLISH_DONE.
         self.cancelled = False
         self.done_sent = False
+        # The group whose subgroup stream is being written.
+        self.group = None
         # The MoQT Test parameters the subscribed namespace selected.
         self.params = None
         self.subscribed = asyncio.Event()
@@ -1127,6 +1129,7 @@ class _DataPublisher:
         objects = range(p.start_object, p.last_object + 1, p.o_inc)
         streams = 0
         for group_id in groups:
+            self.group = group_id
             stream_id = await session.open_uni_stream()
             streams += 1
             header = SubgroupHeader(
@@ -1316,6 +1319,9 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
         return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+    except MOQTStreamStopped:
+        return result(False, f"relay stopped the subgroup stream for group "
+                             f"{pub.group}")
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
 
@@ -1892,7 +1898,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
             result = await fn(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=effective_draft,
                               compat=compat)
-        except Exception as e:
+        except (Exception, MOQTStreamStopped) as e:
             result = TestResult(name=test_name, passed=False,
                                 message=f"test raised {_format_exc(e)}")
         nc_delta = (
