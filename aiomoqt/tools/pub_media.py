@@ -42,7 +42,7 @@ ready-to-paste player URL per relay. Relays on different drafts need a
 
 When the duration ends, or on SIGINT/SIGTERM, each track ends with End of
 Track, then PUBLISH_DONE TRACK_ENDED, then PUBLISH_NAMESPACE_DONE for an
-announced namespace.
+announced namespace. `-t 0` sets no duration: the run lasts until a signal.
 
 Exit status: 0 when the duration ends or on SIGINT/SIGTERM; 2 for a usage
 error; 64 when an object does not fit a datagram; 69 when no relay can be
@@ -240,6 +240,11 @@ def parse_args():
                              'when there is no video). Default: the '
                              'mp4\'s mean; --ts measures it, and the '
                              'catalog omits it until measured.')
+    parser.add_argument('--catalog-audio-bitrate', type=int, default=None,
+                        metavar='BPS',
+                        help='Catalog bitrate of the audio track, with or '
+                             'without video. Default: as for '
+                             '--catalog-bitrate.')
     parser.add_argument('--init-data', choices=('catalog', 'track', 'object'),
                         default=None,
                         help='LOC decoder config placement: catalog = '
@@ -321,6 +326,10 @@ def parse_args():
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
+    if args.duration < 0:
+        parser.error('-t/--duration: seconds, or 0 for no limit')
+    if args.duration == 0:
+        args.duration = math.inf
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
     if args.input:
@@ -377,8 +386,10 @@ def parse_args():
             parser.error('--start-at needs --timestamp-mapping')
         if not (args.mp4 or args.ts):
             parser.error('--start-at applies to --mp4 and --ts')
-    if args.catalog_bitrate is not None and args.catalog_bitrate <= 0:
-        parser.error('--catalog-bitrate must be positive')
+    for flag, bps in (('--catalog-bitrate', args.catalog_bitrate),
+                      ('--catalog-audio-bitrate', args.catalog_audio_bitrate)):
+        if bps is not None and bps <= 0:
+            parser.error(f'{flag} must be positive')
     if args.packaging != PACKAGING_LOC:
         for flag, on in (('--no-catalog', args.no_catalog),
                          ('--init-data', args.init_data not in
@@ -476,6 +487,7 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     init = []
     live_ts = bool(getattr(args, 'ts', None))
     explicit = getattr(args, 'catalog_bitrate', None)
+    audio_bps = getattr(args, 'catalog_audio_bitrate', None)
     if audio is not None:
         # Opus over LOC needs no decoder description, so no initData.
         a_init = (chunkers['audio'].init_segment() if 'audio' in chunkers
@@ -485,7 +497,7 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=((explicit if video is None else None)
+            bitrate=(audio_bps or (explicit if video is None else None)
                      or audio.avg_bitrate or (None if live_ts else 128_000)),
             initRef='a0' if a_init else None))
         if 'audio' in chunkers:
@@ -497,7 +509,7 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             name='audio', packaging='loc', isLive=True, role='audio',
             renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
             channelConfig=str(_CHANNELS),
-            bitrate=_SAMPLERATE * _CHANNELS * 16))
+            bitrate=audio_bps or _SAMPLERATE * _CHANNELS * 16))
     if video is not None:
         cmaf = 'video' in chunkers
         # Annex B: a decoder description would contradict the payload.
@@ -952,7 +964,8 @@ def _sample_cadence(samples, timescale: int, samplerate: Optional[int] = None):
     """(cadence, samples) of one pass [(sample, start s)]: on the track's
     timescale when every sample lasts the same and sync samples are evenly
     spaced. Audio (`samplerate` given) whose starts all lie within half a
-    frame of a regular grid is retimed onto it, in samplerate ticks.
+    frame of a regular grid, each step within one container tick plus one
+    sample of the frame, is retimed onto it, in samplerate ticks.
     Else (None, samples)."""
     if not samples:
         return None, samples
@@ -970,8 +983,10 @@ def _sample_cadence(samples, timescale: int, samplerate: Optional[int] = None):
     if samplerate and len(samples) > 1:
         sr = [t * samplerate for _, t in samples]
         spf = round((sr[-1] - sr[0]) / (len(sr) - 1))
-        if spf > 0 and all(2 * abs(x - sr[0] - n * spf) < spf
-                           for n, x in enumerate(sr)):
+        slack = Fraction(samplerate, timescale) + 1
+        if spf > 0 and all(
+                abs(b - a - spf) <= slack for a, b in zip(sr, sr[1:])) and all(
+                2 * abs(x - sr[0] - n * spf) < spf for n, x in enumerate(sr)):
             t0 = samples[0][1]
             return _Cadence(samplerate, spf, per_group), [
                 (s, t0 + Fraction(n * spf, samplerate))
@@ -1287,7 +1302,8 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
     m = _mapped(track)
     group = None
     for i, (payload, ts) in enumerate(pcm_tone_frames(
-            duration_s=args.duration, freq=args.freq,
+            duration_s=None if math.isinf(args.duration) else args.duration,
+            freq=args.freq,
             samplerate=_SAMPLERATE, channels=_CHANNELS,
             frame_ms=_FRAME_MS)):
         at = _exact(ts + offset * 1_000_000)
@@ -1467,15 +1483,17 @@ async def _redial(ep: _Endpoint, pub: FanoutPublisher, start: dict,
 
 
 async def _shutdown(pub: FanoutPublisher, sessions: list,
-                    announced: bool) -> None:
-    """Signal shutdown in about a second: refuse new SUBSCRIBEs and
-    FETCHes, End of Track and PUBLISH_DONE on every track,
-    PUBLISH_NAMESPACE_DONE for an announced namespace, then close each
-    session once its peer has acknowledged all of it."""
+                    announced: bool, ended: bool = False) -> None:
+    """End the run in about a second: refuse new SUBSCRIBEs and
+    FETCHes, End of Track and PUBLISH_DONE on every track (`ended`: the
+    feeders already ended them), PUBLISH_NAMESPACE_DONE for an announced
+    namespace, then close each session once its peer has acknowledged
+    all of it."""
     for s in sessions:
         s.drain()
-    for track in pub.tracks.values():
-        track.end()
+    if not ended:
+        for track in pub.tracks.values():
+            track.end()
     await pub.catalog_track.finish()
     catalogs = getattr(pub.catalog_track, "members", [pub.catalog_track])
     tracks = [*pub.tracks.values(), *catalogs]
@@ -1848,8 +1866,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
         if not alive:
             print("  error: no relay back when the duration ended")
             raise SystemExit(EXIT_UNAVAILABLE)
-        await pub.catalog_track.finish()
-        await asyncio.sleep(1.0)  # drain tail before teardown
+        await _shutdown(pub, alive, start['announce_namespace'], ended=True)
     print("  done")
     return 'duration'
 
