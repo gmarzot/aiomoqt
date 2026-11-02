@@ -257,7 +257,8 @@ arrival. Prefer `--ts`.
 - A source on a fixed cadence (no B-frames, a key frame every M frames)
   can say so: `--ts-cadence fps=30,gop=60` sends TIMESCALE 30000 and
   TIMESTAMP_MAPPING, OBJECT_TIMESTAMP only off schedule, and the catalog
-  framerate. `--catalog-bitrate BPS` sets the catalog bitrate; without
+  framerate. The mapping is anchored at the Unix epoch, so output starts
+  at the next group boundary: up to one GOP of added delay. `--catalog-bitrate BPS` sets the catalog bitrate; without
   it `--ts` measures one over the first seconds and republishes the
   catalog.
 - Measure: burn-in clock vs player frame (screenshot both), overlay

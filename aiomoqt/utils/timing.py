@@ -7,6 +7,7 @@ frindell Track Properties are parsed once into a TrackTiming; a
 violation of the draft's rules raises TimestampMalformed (the track is
 malformed, MOQT §12.1).
 """
+import math
 import time
 from fractions import Fraction
 from math import gcd
@@ -327,6 +328,11 @@ class TimestampWriter:
         return exts
 
 
+def round_us(t) -> int:
+    """µs `t` (int or Fraction) rounded to the nearest, half up."""
+    return t if isinstance(t, int) else math.floor(t + Fraction(1, 2))
+
+
 class MediaTimestamps:
     """Timing properties for a media track whose objects carry known
     capture times (wall-clock µs).
@@ -335,9 +341,9 @@ class MediaTimestamps:
     TIMESTAMP_MAPPING anchored at `wall0_us`, and OBJECT_TIMESTAMP only
     on an object off schedule. Otherwise Appendix A.2: TIMESCALE 1e6 and
     each object's capture time as OBJECT_TIMESTAMP. No CLOCK_ID or
-    TIMESTAMP_ORIGIN: these are wall-clock tracks. `wall0_us` times the
-    timescale should be a whole number of µs·ticks/1e6, or every mapped
-    time is off by the remainder."""
+    TIMESTAMP_ORIGIN: these are wall-clock tracks. `wall0_us` 0 anchors
+    the mapping at the Unix epoch. Capture times may be Fractions of a µs,
+    so that times on the tick grid are exact."""
 
     def __init__(self, wall0_us: int, timescale: int = 1_000_000,
                  group_multiplier: Optional[int] = None,
@@ -362,20 +368,23 @@ class MediaTimestamps:
         d = (capture_us - self.wall0_us) * self.timescale
         return (2 * d + 1_000_000) // 2_000_000
 
-    def group_for(self, capture_us: int) -> Optional[int]:
-        """The scheduled group of a group-opening object, above every
-        group returned before: an off-schedule group never reuses an ID."""
+    def group_of(self, capture_us) -> int:
+        """The group whose span holds `capture_us` (mapped only)."""
+        assert self.group_multiplier, "not mapped with groups"
+        return self._ticks(capture_us) // self.group_multiplier
+
+    def group_for(self, capture_us) -> Optional[int]:
+        """The group of a group-opening object, above every group returned
+        before: an off-schedule group never reuses an ID."""
         if not self.mapped or not self.group_multiplier:
             return None
-        g = self.group_multiplier
-        self._group = max(self._group + 1,
-                          (2 * self._ticks(capture_us) + g) // (2 * g))
+        self._group = max(self._group + 1, self.group_of(capture_us))
         return self._group
 
     def object_properties(self, group_id: int, object_id: int,
                           capture_us: int) -> Dict[int, Any]:
         if not self.mapped:
-            return {OBJECT_TIMESTAMP: capture_us}
+            return {OBJECT_TIMESTAMP: round_us(capture_us)}
         c = self._ticks(capture_us) - (group_id * self.group_multiplier
                                        + object_id * self.object_multiplier)
         return {OBJECT_TIMESTAMP: (c << 1) ^ (c >> 63)} if c else {}

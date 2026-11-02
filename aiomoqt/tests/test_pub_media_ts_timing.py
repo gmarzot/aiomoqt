@@ -114,15 +114,17 @@ def test_cadence_stamps_only_the_frame_off_schedule():
     first = [TsUnit('video', b'k', True, 0)]
     dmx = NS(to_us=clock.to_us)
     m = pub_media._ts_timestamps(NS(ts_cadence=cadence), dmx, first,
-                                 'video', 0)
+                                 'video')
     assert m.mapped and m.timescale == 30000
     pts = [i * 3000 for i in range(10)]
     pts[6] += 900                            # 10 ms late
+    group = m.group_for(clock.to_us(pts[0]))
+    assert group is not None
     stamped = [i for i, p in enumerate(pts)
-               if m.object_properties(0, i, clock.to_us(p))]
+               if m.object_properties(group, i, clock.to_us(p))]
     assert stamped == [6]
     explicit = pub_media._ts_timestamps(NS(ts_cadence=None), dmx, first,
-                                        'video', wall0)
+                                        'video')
     assert not explicit.mapped
 
 

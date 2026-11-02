@@ -2,6 +2,11 @@
 
 ## v0.14.0
 
+- pub_media `--timestamp-mapping` anchors TIMESTAMP_MAPPING at the Unix epoch (draft-marzot-moq-test-tracks): Base Group and Base Timestamp 0, Group ID = capture ticks // Group Multiplier, so a restarted publisher sends the same Track Properties; the run starts on the next video group boundary, audio on its nearest frame boundary. `--ts-cadence` holds output until then (up to one GOP).
+- pub_media `--start-at USEC` starts a `--timestamp-mapping` run (`--mp4`, `--ts`) at that instant, which must be a group boundary.
+- pub_media `--stats-json` with `--timestamp-mapping` emits an `anchor` event (start, and each track's timescale and multipliers) before the first object.
+- pub_media `--loop --timestamp-mapping` trims the loop period to a multiple of the video group and audio frame durations, with a WARNING, so loop seams need no OBJECT_TIMESTAMP.
+- pub_media LOC TIMESTAMP is the capture time rounded to the nearest µs.
 - pub_media `--mp4` honours the edit list: encoder priming (AAC, Opus pre-skip) is not sent and an empty edit delays the track; an unsupported edit list is ignored with a WARNING.
 - pub_media `--loop` runs every track of a clip on one period, the clip's presented duration, so audio and video no longer drift apart on each pass.
 - pub_media `--timestamp-mapping`: a group that opens off schedule, as at a loop seam after a short last GOP, takes a new group ID instead of the previous one.

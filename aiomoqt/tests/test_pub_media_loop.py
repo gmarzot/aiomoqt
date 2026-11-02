@@ -7,6 +7,7 @@ import random
 import struct
 from fractions import Fraction
 from types import SimpleNamespace as NS
+from typing import Any, cast
 
 import pytest
 
@@ -107,17 +108,21 @@ async def _feed(path, passes, mapping=False):
     """Loop a clip `passes` times as pub_media does: (video, audio)
     recorders and their _Mp4Pass."""
     reader = Mp4Reader(path)
-    mp4s = pub_media._mp4_passes(reader, reader.audio, True)
-    _, wall0 = pub_media._media_clock([p.timescale for p in mp4s], True)
+    mp4s = pub_media._mp4_passes(reader, reader.audio, True, mapping)
+    timings = [pub_media._frindell_for(p) for p in mp4s]
+    _, wall0 = pub_media._media_clock(
+        pub_media._grid(*timings) if mapping else None)
     period = mp4s[0].period
     args = NS(duration=float(passes * period) - 0.001, no_pace=True,
-              loop=True)
+              loop=True, timestamp_mapping=mapping)
     recs = []
-    for mp4, frames in zip(mp4s, (None, 1)):
-        rec = _Rec(pub_media._frindell_for(mp4, wall0) if mapping else None)
+    for mp4, m, frames in zip(mp4s, timings, (None, 1)):
+        off = (pub_media._audio_delay(wall0, mp4.times[0], m)
+               if mapping and frames else Fraction(0))
+        rec = _Rec(m if mapping else None)
         await pub_media._feed_mp4_track(
             rec, mp4, args, pub_media._TrackStats(), group_frames=frames,
-            clock=(0, wall0))
+            clock=(0, wall0), offset=off)
         recs.append(rec)
     return recs, mp4s
 
@@ -127,7 +132,8 @@ def _numbered(rec):
     group, obj, out = -1, 0, []
     for s in rec.sent:
         if s.key:
-            group = LocTrackPublisher._next_group(NS(group_id=s.hint), group)
+            group = LocTrackPublisher._next_group(
+                cast(Any, NS(group_id=s.hint)), group)
             obj = 0
         else:
             obj += 1
@@ -161,6 +167,7 @@ def test_other_edit_list_shapes_are_unsupported(entries):
 
 def test_clip_has_aac_priming_in_its_edit_list(tmp_path):
     audio = Mp4Reader(_clip(tmp_path / 'c.mp4', 30)).audio
+    assert audio is not None
     assert (audio.media_time, audio.edit_delay) == (1024, 0)
 
 
@@ -170,7 +177,7 @@ def test_unsupported_edit_list_is_ignored_with_a_warning(tmp_path, caplog):
     path.write_bytes(_with_audio_elst(data, [(143_360, 1024, 2, 0)]))
     with caplog.at_level(logging.WARNING, logger='aiomoqt.media.sources'):
         audio = Mp4Reader(str(path)).audio
-    assert audio.media_time == 0
+    assert audio is not None and audio.media_time == 0
     warned = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warned) == 1 and 'track 2' in warned[0].getMessage()
 
@@ -184,6 +191,7 @@ def test_empty_edit_delays_the_track(tmp_path, version):
     path.write_bytes(_with_audio_elst(
         data, [(movie // 4, -1, 1, 0), (movie, 1024, 1, 0)], version))
     audio = Mp4Reader(str(path)).audio
+    assert audio is not None
     starts = [t for _, t in audio.presented()]
     assert starts[:2] == [Fraction(1, 4), Fraction(1, 4) + Fraction(1024,
                                                                     48000)]
@@ -193,7 +201,9 @@ def test_empty_edit_delays_the_track(tmp_path, version):
 
 async def test_no_priming_packet_is_sent_on_any_pass(tmp_path):
     path = _clip(tmp_path / 'c.mp4', 90)
-    priming = next(Mp4Reader(path).audio.samples()).payload
+    audio = Mp4Reader(path).audio
+    assert audio is not None
+    priming = next(audio.samples()).payload
     (video, audio), _ = await _feed(path, 3)
     assert len(video.sent) == 3 * 90
     assert len(audio.sent) == 3 * 140
@@ -209,7 +219,9 @@ async def test_loop_passes_start_together_and_groups_increase(tmp_path):
         first = rec.sent[0].payload
         starts.append([s.ts for s in rec.sent if s.payload == first])
     assert [len(s) for s in starts] == [3, 3]
-    assert all(abs(v - a) <= 1_000_000 / 48000 for v, a in zip(*starts))
+    # Mapped audio starts on its own frame grid, within a frame.
+    assert all(abs(v - a) <= 1_000_000 * 1024 / 48000
+               for v, a in zip(*starts))
     for rec in (video, audio):
         hints = [s.hint for s in rec.sent if s.key]
         assert all(a < b for a, b in zip(hints, hints[1:]))
@@ -244,7 +256,7 @@ async def test_near_regular_audio_maps_on_its_frame_grid(starts, timescale):
                              samplerate=48000)
     assert mp4.cadence == (48000, 1024, 1)
     assert mp4.timescale == 48000
-    m = pub_media._frindell_for(mp4, 1_767_225_600_000_000)
+    m = pub_media._frindell_for(mp4)
     rec = _Rec(m)
     await pub_media._feed_mp4_track(
         rec, mp4, NS(duration=10.0, no_pace=True, loop=False),
@@ -260,7 +272,7 @@ def test_irregular_audio_falls_back_to_explicit_timestamps():
     mp4 = pub_media._Mp4Pass(_audio(starts, 48000), Fraction(0),
                              samplerate=48000)
     assert mp4.cadence is None
-    assert not pub_media._frindell_for(mp4, 0).mapped
+    assert not pub_media._frindell_for(mp4).mapped
 
 
 # -- end to end ----------------------------------------------------------
@@ -273,6 +285,7 @@ async def test_looped_clip_through_the_relay_keeps_audio_on_video(
         tmp_path, monkeypatch):
     path = _clip(tmp_path / 'c.mp4', 90)                  # 3 s, AAC + H.264
     reader = Mp4Reader(path)
+    assert reader.video is not None and reader.audio is not None
     v_first = next(reader.video.samples()).payload
     a_first = list(reader.audio.samples())[1].payload    # after the priming
     seen = []
