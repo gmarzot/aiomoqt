@@ -469,10 +469,18 @@ python -m aiomoqt.tools.load_sim "$RELAY_WT" -f rich-matrix --draft 18 -k --repo
 
 Packaged scenarios are `default`, `rich-matrix` (namespaces by tracks),
 `churn-storm` (join and leave pressure), `datagram-mix` (mixed delivery
-modes) and `viewers`. `--seed` makes the churn reproducible.
+modes), `viewers` and `av-viewers`. `--seed` makes the churn reproducible.
 `--subs-per-proc` caps subscriber slots per host process, default 100.
 The one-track case needs no scenario file at all:
 `--subs 50 -N load-$(date +%H%M%S) -r 30 -s 4096 -t 120`.
+
+`av-viewers` is the 180-viewer hold with each viewer on catalog, video
+and audio over one session, against pub_bench's standard video track:
+
+```
+python -m aiomoqt.tools.pub_bench "$RELAY_WT" --video 720p -r 30 -g 60 --audio --catalog -k --draft 18 -t 480
+python -m aiomoqt.tools.load_sim "$RELAY_WT" -f av-viewers --role sub --draft 18 -k -i 5
+```
 
 `viewers` is an audience and nothing else: `--role sub` drops the
 scenario's own publishers, so **it needs a broadcast already running or
