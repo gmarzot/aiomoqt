@@ -11,6 +11,7 @@
 - pub_media `--loop` with several mp4s loops every track on the shortest clip, with a WARNING.
 - sub_media writes `<name>.h264` per LOC video track when there are several.
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
+- moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
 
 ## v0.14.0
 
