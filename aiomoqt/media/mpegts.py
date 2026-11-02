@@ -13,7 +13,9 @@ import logging
 import statistics
 import time
 from fractions import Fraction
-from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import (
+    Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union,
+)
 
 from ..utils.timing import MediaTimestamps
 from .sources import _ADTS_FREQ, AnnexBAssembler, HevcAnnexBAssembler
@@ -72,7 +74,7 @@ class TsClock:
         self._wall0_us = wall_us
         self._held = self._exact = True
 
-    def to_us(self, pts: int) -> int:
+    def to_us(self, pts: int) -> Union[int, Fraction]:
         now_us = int(self._now() * 1_000_000)
         if self._pts0 is None or pts < self._last - self._restart:
             self._pts0 = pts
@@ -362,7 +364,7 @@ class TsDemuxer:
         """None until the PMT is seen."""
         return None if not self.pmt_seen else self.audio_pid is not None
 
-    def to_us(self, pts: int) -> int:
+    def to_us(self, pts: int) -> Union[int, Fraction]:
         return self.clock.to_us(pts)
 
     # ── packets ─────────────────────────────────────────────────────

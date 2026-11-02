@@ -8,6 +8,7 @@ import logging
 import time
 from fractions import Fraction
 from types import SimpleNamespace as NS
+from typing import Any, cast
 
 import pytest
 
@@ -126,9 +127,9 @@ async def test_ts_groups_are_epoch_ticks_over_the_group_multiplier(
          for i in range(90)]
         + [TsUnit('audio', b'a', True, 90_000 - 630 + 1920 * i)
            for i in range(140)], key=lambda u: u.pts)
-    dmx = NS(clock=TsClock(), config_changed=False, feed=lambda c: [],
-             close=lambda: [], audio_samplerate=48000,
-             audio_frame_samples=1024)
+    dmx = cast(Any, NS(clock=TsClock(), config_changed=False,
+                       feed=lambda c: [], close=lambda: [],
+                       audio_samplerate=48000, audio_frame_samples=1024))
     dmx.to_us = dmx.clock.to_us
     v_time = pub_media._ts_timestamps(NS(ts_cadence=cadence), dmx, units,
                                       'video')

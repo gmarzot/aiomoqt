@@ -65,7 +65,7 @@ import time
 import traceback
 import uuid
 from fractions import Fraction
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.delivery import DatagramTooLarge
@@ -931,7 +931,8 @@ def _media_clock(grid=None, start_at: Optional[int] = None):
     return time.monotonic() + float(wall0 - now) / 1e6, wall0
 
 
-def _audio_delay(wall0, t0: Fraction, m: MediaTimestamps) -> Fraction:
+def _audio_delay(wall0, t0: Union[int, Fraction],
+                 m: MediaTimestamps) -> Fraction:
     """s to add to audio times that start at `t0` s after `wall0`, so the
     first lands on the first frame boundary of `m`'s epoch grid at or
     after wall0 plus t0's whole frames."""
@@ -1057,10 +1058,11 @@ def _align_period(video: Optional[_Mp4Pass],
         units.append(Fraction(c.frame * c.per_group, c.timescale))
     if audio is not None and audio.cadence:
         units.append(Fraction(audio.cadence.frame, audio.cadence.timescale))
-    if not units:
+    lead = video if video is not None else audio
+    if not units or lead is None:
         return
     unit = functools.reduce(_lcm, units)
-    period = (video or audio).period
+    period = lead.period
     whole = period // unit * unit
     if not whole:
         log.warning("--loop: the clip (%.3f s) is shorter than %.3f s, the "
@@ -1068,8 +1070,9 @@ def _align_period(video: Optional[_Mp4Pass],
                     "frame durations: loop seams carry OBJECT_TIMESTAMP",
                     period, unit)
         return
-    c = (video if video is not None and video.cadence else audio).cadence
-    if period - whole > Fraction(c.frame, c.timescale):
+    timed = video if video is not None and video.cadence else audio
+    c = timed.cadence if timed is not None else None
+    if c is not None and period - whole > Fraction(c.frame, c.timescale):
         log.warning("--loop: period trimmed from %.3f to %.3f s, a multiple "
                     "of %.3f s, so every pass starts on the group and frame "
                     "grids", period, whole, unit)
@@ -1135,7 +1138,7 @@ async def _pace(start: float, ts_us: int, pace: bool):
 
 
 async def _send(track, stats, payload: bytes, key: bool,
-                timestamp: Optional[int] = None,
+                timestamp: Optional[Union[int, Fraction]] = None,
                 group_id: Optional[int] = None):
     """Send one frame, or drop it while no subscriber has started
     generation: a paced feeder stays on the clock instead of queueing a

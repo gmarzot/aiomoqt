@@ -119,6 +119,7 @@ def test_cadence_stamps_only_the_frame_off_schedule():
     pts = [i * 3000 for i in range(10)]
     pts[6] += 900                            # 10 ms late
     group = m.group_for(clock.to_us(pts[0]))
+    assert group is not None
     stamped = [i for i, p in enumerate(pts)
                if m.object_properties(group, i, clock.to_us(p))]
     assert stamped == [6]

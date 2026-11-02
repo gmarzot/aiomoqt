@@ -370,6 +370,7 @@ class MediaTimestamps:
 
     def group_of(self, capture_us) -> int:
         """The group whose span holds `capture_us` (mapped only)."""
+        assert self.group_multiplier, "not mapped with groups"
         return self._ticks(capture_us) // self.group_multiplier
 
     def group_for(self, capture_us) -> Optional[int]:
