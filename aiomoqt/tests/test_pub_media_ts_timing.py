@@ -135,6 +135,7 @@ def test_cadence_stamps_only_the_frame_off_schedule():
      'LOC packaging only'),
     (['--no-catalog', '--init-data', 'catalog'], 'needs a catalog'),
     (['--catalog-bitrate', '0'], 'must be positive'),
+    (['--catalog-audio-bitrate', '0'], 'must be positive'),
 ])
 def test_flags_refused_where_they_cannot_apply(monkeypatch, capsys, argv,
                                                why):
@@ -198,6 +199,21 @@ def test_explicit_bitrate_and_cadence_framerate(monkeypatch, tmp_path):
     assert (cat.find('video').framerate, cat.find('video').bitrate) == (
         30.0, 2_500_000)
     assert cat.find('audio').bitrate is None          # measured later
+
+
+def test_explicit_audio_bitrate_beside_video(monkeypatch, tmp_path):
+    ts = _encode(tmp_path / 'c.ts', 'mpegts', acodec='aac', seconds=1)
+    d, _ = _units(ts)
+    args = _pub_args(monkeypatch, '--ts', ts, '--catalog-bitrate', '2500000',
+                     '--catalog-audio-bitrate', '96000')
+    cat = pub_media._build_catalog(args, pub_media._LiveVideo(d.video),
+                                   pub_media._LiveAudio(d))
+    assert (cat.find('video').bitrate, cat.find('audio').bitrate) == (
+        2_500_000, 96_000)
+    tone = pub_media._build_catalog(
+        _pub_args(monkeypatch, '--catalog-audio-bitrate', '64000'),
+        None, None)
+    assert tone.find('audio').bitrate == 64_000
 
 
 @requires_certs

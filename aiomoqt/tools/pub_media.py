@@ -236,6 +236,11 @@ def parse_args():
                              'when there is no video). Default: the '
                              'mp4\'s mean; --ts measures it, and the '
                              'catalog omits it until measured.')
+    parser.add_argument('--catalog-audio-bitrate', type=int, default=None,
+                        metavar='BPS',
+                        help='Catalog bitrate of the audio track, with or '
+                             'without video. Default: as for '
+                             '--catalog-bitrate.')
     parser.add_argument('--init-data', choices=('catalog', 'track', 'object'),
                         default=None,
                         help='LOC decoder config placement: catalog = '
@@ -364,8 +369,10 @@ def parse_args():
         if not args.ts:
             parser.error('--ts-cadence applies to --ts only')
         args.timestamp_mapping = True
-    if args.catalog_bitrate is not None and args.catalog_bitrate <= 0:
-        parser.error('--catalog-bitrate must be positive')
+    for flag, bps in (('--catalog-bitrate', args.catalog_bitrate),
+                      ('--catalog-audio-bitrate', args.catalog_audio_bitrate)):
+        if bps is not None and bps <= 0:
+            parser.error(f'{flag} must be positive')
     if args.packaging != PACKAGING_LOC:
         for flag, on in (('--no-catalog', args.no_catalog),
                          ('--init-data', args.init_data not in
@@ -463,6 +470,7 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
     init = []
     live_ts = bool(getattr(args, 'ts', None))
     explicit = getattr(args, 'catalog_bitrate', None)
+    audio_bps = getattr(args, 'catalog_audio_bitrate', None)
     if audio is not None:
         # Opus over LOC needs no decoder description, so no initData.
         a_init = (chunkers['audio'].init_segment() if 'audio' in chunkers
@@ -472,7 +480,7 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=((explicit if video is None else None)
+            bitrate=(audio_bps or (explicit if video is None else None)
                      or audio.avg_bitrate or (None if live_ts else 128_000)),
             initRef='a0' if a_init else None))
         if 'audio' in chunkers:
@@ -484,7 +492,7 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             name='audio', packaging='loc', isLive=True, role='audio',
             renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
             channelConfig=str(_CHANNELS),
-            bitrate=_SAMPLERATE * _CHANNELS * 16))
+            bitrate=audio_bps or _SAMPLERATE * _CHANNELS * 16))
     if video is not None:
         cmaf = 'video' in chunkers
         # Annex B: a decoder description would contradict the payload.
