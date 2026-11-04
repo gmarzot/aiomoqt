@@ -4,16 +4,20 @@
 
 - `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
 - A new subgroup stream opens with its header and first object; over WebTransport they travel with the stream create (aiopquic `create_stream(initial=)`) and leave in one send instead of two. `MOQTSession.open_uni_stream(initial=, priority=)` sets the stream priority and writes its first bytes on either transport.
-- `aiomoqt/media/README.md`: a media publishing guide (sources, packaging, timing, delivery, recipes).
 - pub_media publishes several video tracks (`video`, `video_1`, …): `--mp4` repeats, and `--ts` takes every H.264/H.265 stream in the PMT. With `--timestamp-mapping` they must share frame duration and GOP length, and carry the same group and object IDs.
 - pub_media `--video-alt one|each` puts the video tracks in one catalog altGroup (a ladder) or one each (views); `--video-label` sets their catalog labels.
 - pub_media `--catalog-bitrate` repeats, one value per video track.
 - pub_media `--loop` with several mp4s loops every track on the shortest clip, with a WARNING.
 - sub_media writes `<name>.h264` per LOC video track when there are several.
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
-- moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
 - pub_bench `--audio` and `--catalog` publish AAC-shaped and catalog-shaped tracks beside `--video`; a load_sim subscriber group may take `tracks: [..]`, all on one session per subscriber; packaged scenario `av-viewers`.
+
+## v0.14.1
+
+- Requires aiopquic 0.7.1: a crafted version-upgrade request could hang the QUIC network thread (picoquic #2331).
+- moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
 - moq_interop_client runs moq-rs-draft-18's eight moq-test-* cases under the same names: a MoQT Test tuple each, PUBLISHed with the subscriber already waiting (draft-18 and later).
+- `aiomoqt/media/README.md`: a media publishing guide (sources, packaging, timing, delivery, recipes).
 
 ## v0.14.0
 
