@@ -114,33 +114,9 @@ so it cannot share a shell with anything below it.
   safe ones — check `has_b_frames` before substituting.
 
 ## Player URL parameters (/g5-player/)
-The publisher's `player:` line opens `$AIOMOQT_PLAYER_URL` (`--player-base`). The
-page's settings dialog edits the same parameters.
-
-| Param | Meaning | Default |
-|---|---|---|
-| `url=` | relay WT URL | probe page host |
-| `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | live |
-| `v=` | draft 14/16/18; a 16/18 pin never retries WT bare | 16 |
-| `catalogBootstrap=` | auto / joining-fetch / strict / subscribe | auto |
-| `targetLatency=` | overrides the catalog target (ms): LOC cushion cap and catch-up set point; CMAF buffer held ahead, soft-chase set point, live-edge and gap-jump landing | catalog value |
-| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT < 5 ms) / 750 |
-| `catchUp=` | LOC max playback rate chasing the target; wall-clock based | 1.0 = off |
-| `warmStart=1` | joining FETCH of the current group (LOC only; startup decode error at the seam) | off |
-| `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
-| `compat=` | `request-credit`, `empty-objects`: opt-in leniency for non-conformant relays | none |
-| `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
-| `hash=` | relay certificate hash (hex) | none |
-| `debug=1` | engine debug log, MSE tracing, media-element events in the page log | off |
-| `status=1` | playback state over the picture | off |
-
-On draft 18 the page follows the namespace with SUBSCRIBE_NAMESPACE (SUB_NS
-badge; grey on draft 16, where it is not sent): a publisher that goes away
-and returns is re-joined without a reload. The page log prints `Options: …`
-at load with exactly what reached the engine. Readouts: LATENCY p50/p95/max
-is capture → arrival; `E2E` is capture → drawn frame (`≈` on CMAF, where it
-is arrival plus the buffer ahead); QUEUED is what each track has ahead of
-the playhead against TARGET.
+The publisher's `player:` line opens `$AIOMOQT_PLAYER_URL` (`--player-base`).
+The player's URL parameters, readouts and latency settings are in the G5
+[demo runbook](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#url-parameters) in the moq-playa fork.
 
 ## Demo A — CMAF file → glass (MSE playback)
 - SHELL 1 — Big Buck Bunny, 1920x1080@30, 2.3 Mbps:
@@ -401,7 +377,7 @@ drawtext.
 - Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N $USER-demo --discover -t 30`
   → video and audio lines with N > 0 frames.
 - BROWSER: the G5 player with `url=` the relay and `ns=` the `--ns` value
-  (Player URL parameters above).
+  ([player URL parameters](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#url-parameters)).
 - Pass: ≥ 60 s of the clock with no stalls and no gaps.
 
 ## Reading a stall or a pinned cushion
@@ -441,7 +417,7 @@ drawtext.
   sync re-anchors, stalls every few seconds) while a browser-published
   g5-broadcast on the same relay plays clean → look at the WSL host before
   the code: compare its clock with Windows for 60–90 s and log scheduling
-  gaps (see the clock note in [demo-runbook-g5.md](demo-runbook-g5.md)).
+  gaps (see the clock note in the G5 [demo runbook](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#clock-note-wsl-tools)).
   A WSL publisher's timestamps and pacing inherit both.
 - A viewer of a namespace restarted under the same name gets no catalog →
   moqx answers its FETCH from the earlier run's cache (openmoq/moqx#795).
