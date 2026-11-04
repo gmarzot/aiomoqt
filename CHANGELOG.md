@@ -3,6 +3,7 @@
 ## v0.14.1 (unreleased)
 
 - moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
+- moq_interop_client runs moq-rs-draft-18's eight moq-test-* cases under the same names: a MoQT Test tuple each, PUBLISHed with the subscriber already waiting (draft-18 and later).
 
 ## v0.14.0
 
