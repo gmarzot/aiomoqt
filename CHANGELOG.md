@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.14.1
+
+- Requires aiopquic 0.7.1: a crafted version-upgrade request could hang the QUIC network thread (picoquic #2331).
+- moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
+- moq_interop_client runs moq-rs-draft-18's eight moq-test-* cases under the same names: a MoQT Test tuple each, PUBLISHed with the subscriber already waiting (draft-18 and later).
+- `aiomoqt/media/README.md`: a media publishing guide (sources, packaging, timing, delivery, recipes).
+
 ## v0.14.0
 
 - pub_media `--timestamp-mapping` anchors TIMESTAMP_MAPPING at the Unix epoch (draft-marzot-moq-test-tracks): Base Group and Base Timestamp 0, Group ID = capture ticks // Group Multiplier, so a restarted publisher sends the same Track Properties; the run starts on the next video group boundary, audio on its nearest frame boundary. `--ts-cadence` holds output until then (up to one GOP).

@@ -23,6 +23,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass, field, replace
+from typing import Any, Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
@@ -30,9 +31,12 @@ from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.tools.moqtest_origin import parse_namespace as parse_moq_test
+from aiomoqt.tools.moqtest_origin import (
+    _SERVERS as _MOQ_TEST_SENDERS, parse_namespace as parse_moq_test,
+    priority_for,
+)
 from aiomoqt.types import (
-    ParamType, FetchType, MOQTRequestError, MOQTMessageType,
+    ParamType, FetchType, MOQTRequestError, MOQTMessageType, MOQTStreamStopped,
     SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
@@ -213,6 +217,14 @@ STANDARD_TESTS = [
     "namespace-discovery",
     "publish-track-only",
     "publish-track-subscribe",
+    "moq-test-subgroup-per-group-eog",
+    "moq-test-subgroup-per-object",
+    "moq-test-two-subgroups-eog",
+    "moq-test-datagram",
+    "moq-test-datagram-eog",
+    "moq-test-extensions",
+    "moq-test-increments",
+    "moq-test-forward-zero",
 ]
 
 # Leading Track Namespace fields from --namespace-prefix.
@@ -377,7 +389,7 @@ def _session_meta(session) -> dict:
 
 def _make_client(host: str, port: int, path: str, use_quic: bool,
                  tls_disable_verify: bool, debug: bool,
-                 supported_drafts: int = None) -> MOQTClient:
+                 supported_drafts: Optional[int] = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
@@ -1090,6 +1102,8 @@ class _DataPublisher:
         # or UNSUBSCRIBE): there is no request stream left for PUBLISH_DONE.
         self.cancelled = False
         self.done_sent = False
+        # The group whose subgroup stream is being written.
+        self.group = None
         # The MoQT Test parameters the subscribed namespace selected.
         self.params = None
         self.subscribed = asyncio.Event()
@@ -1127,6 +1141,7 @@ class _DataPublisher:
         objects = range(p.start_object, p.last_object + 1, p.o_inc)
         streams = 0
         for group_id in groups:
+            self.group = group_id
             stream_id = await session.open_uni_stream()
             streams += 1
             header = SubgroupHeader(
@@ -1316,6 +1331,9 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
         return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+    except MOQTStreamStopped:
+        return result(False, f"relay stopped the subgroup stream for group "
+                             f"{pub.group}")
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
 
@@ -1716,6 +1734,326 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
 
 
 # ---------------------------------------------------------------------------
+# moq-test-* cases
+# ---------------------------------------------------------------------------
+
+# moq-rs-draft-18's moq-test-client scenarios: MoQT Test tuple fields 1-15
+# (after "moq-test-00") by case name.
+MOQ_TEST_CASES = {
+    "moq-test-subgroup-per-group-eog":
+        ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "-1", "-1", "0"),
+    "moq-test-subgroup-per-object":
+        ("1", "0", "0", "1", "3", "4", "64", "32", "2", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-two-subgroups-eog":
+        ("2", "0", "0", "2", "6", "6", "64", "32", "2", "1", "1", "1", "-1", "-1", "0"),
+    "moq-test-datagram":
+        ("3", "0", "0", "2", "4", "5", "64", "32", "20", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-datagram-eog":
+        ("3", "0", "0", "2", "5", "5", "64", "32", "20", "1", "1", "1", "-1", "-1", "0"),
+    "moq-test-extensions":
+        ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "1", "2", "0"),
+    "moq-test-increments":
+        ("0", "10", "3", "24", "7", "3", "40", "24", "2", "7", "2", "0", "-1", "-1", "0"),
+    "moq-test-forward-zero":
+        ("0", "0", "0", "1", "2", "3", "64", "32", "2", "1", "1", "0", "-1", "-1", "0"),
+}
+_MOQ_TEST_FORWARD_ZERO = "moq-test-forward-zero"
+_MOQ_TEST_RENDEZVOUS_MS = 5000
+# The subscriber's SUBSCRIBE reaches the relay this long before the PUBLISH.
+_MOQ_TEST_HEAD_START_S = 0.2
+_MOQ_TEST_PHASE_S = 8.0
+# After PUBLISH_DONE: datagrams can still trail it, and with Forward State 0
+# an object arriving here still fails the case.
+_MOQ_TEST_GRACE_S = 0.25
+
+
+def _moq_test_expected(p):
+    """What the generator sends for tuple `p`: the data objects and End of
+    Group markers as {(group, object)}, and the Stream Count."""
+    groups = range(p.start_group, p.last_group + 1, p.g_inc)
+    objects = list(range(p.start_object, p.last_object + 1, p.o_inc))
+    eog = objects[-1] if p.markers else None
+    data = {(g, o) for g in groups for o in objects if o != eog}
+    markers = {(g, eog) for g in groups} if p.markers else set()
+    if p.fp == 0:
+        streams = len(groups)
+    elif p.fp == 1:
+        streams = len(groups) * len(objects)
+    elif p.fp == 2:
+        both = p.objects_per_group > 1 and p.o_inc % 2 == 1
+        streams = len(groups) * (2 if both else 1)
+    else:
+        streams = 0
+    return data, markers, streams
+
+
+def _moq_test_subgroup(p, object_id):
+    """The subgroup the generator puts an object on; None for datagrams."""
+    return {0: 0, 1: object_id, 2: object_id % 2}.get(p.fp)
+
+
+def _moq_test_extension_ids(p) -> frozenset:
+    ids = set()
+    if p.int_ext >= 0:
+        ids.add(2 * p.int_ext)
+    if p.var_ext >= 0:
+        ids.add(2 * p.var_ext + 1)
+    return frozenset(ids)
+
+
+class _MoqTestSubscriber(_DataSubscriber):
+    """Also records each object's extension IDs and, on a datagram, the End
+    of Group type bit."""
+
+    def on_object(self, msg, size, ts, group_id, subgroup_id):
+        gid = getattr(msg, "group_id", None)
+        self.objects.append((
+            group_id if gid is None else gid, subgroup_id, msg.object_id,
+            getattr(msg, "publisher_priority", None),
+            getattr(msg, "status", None), bytes(msg.payload or b""),
+            frozenset(getattr(msg, "extensions", None) or ()),
+            subgroup_id is None and bool(getattr(msg, "end_of_group", False))))
+
+
+def _moq_test_problems(p, objects, done, streams_ended, streams_reset,
+                       forward_zero) -> list:
+    """Deviations from what tuple `p` should deliver; with Forward State 0,
+    from no objects and Stream Count 0."""
+    data, markers, streams = _moq_test_expected(p)
+    if forward_zero:
+        data, markers, streams = set(), set(), 0
+        if objects:
+            return [f"{len(objects)} object(s) delivered with Forward State 0"]
+    problems = []
+    ext_ids = _moq_test_extension_ids(p)
+    seen, seen_eog, last_on = set(), set(), {}
+    for gid, sgid, oid, prio, status, payload, exts, dgram_eog in objects:
+        loc = f"{gid}.{oid}"
+        want = _moq_test_subgroup(p, oid)
+        if sgid != want:
+            problems.append(f"object {loc} on subgroup {sgid}, expected {want}")
+        elif sgid is not None:
+            prev = last_on.get((gid, sgid))
+            if prev is not None and oid <= prev:
+                problems.append(f"object {loc} after {gid}.{prev} on "
+                                f"subgroup {sgid}")
+            last_on[(gid, sgid)] = oid
+        if prio != priority_for(gid):
+            problems.append(f"object {loc} priority {prio}, expected "
+                            f"{priority_for(gid)}")
+        if dgram_eog:
+            problems.append(f"datagram {loc} sets the End of Group type bit")
+        if status == ObjectStatus.END_OF_GROUP:
+            if (gid, oid) not in markers:
+                problems.append(f"unexpected End of Group at {loc}")
+            seen_eog.add((gid, oid))
+            continue
+        if not _is_normal(status):
+            problems.append(f"object {loc} with status {status}")
+            continue
+        if (gid, oid) in seen:
+            problems.append(f"duplicate object {loc}")
+            continue
+        seen.add((gid, oid))
+        if (gid, oid) not in data:
+            problems.append(f"unexpected object {loc}")
+            continue
+        size = p.size0 if oid == p.start_object else p.size_gt0
+        if payload != _DATA_FILL * size:
+            problems.append(f"object {loc}: {len(payload)}-byte payload, "
+                            f"expected {size} bytes of {_DATA_FILL!r}")
+        if exts != ext_ids:
+            problems.append(f"object {loc} extensions {sorted(exts)}, "
+                            f"expected {sorted(ext_ids)}")
+    missing = sorted(data - seen)
+    if missing:
+        first = ", ".join(f"{g}.{o}" for g, o in missing[:5])
+        problems.append(f"missing {len(missing)} object(s): {first}")
+    for g, o in sorted(markers - seen_eog):
+        problems.append(f"missing End of Group at {g}.{o}")
+    if done is None:
+        problems.append("no downstream PUBLISH_DONE")
+    else:
+        if done.status_code != SubscribeDoneCode.TRACK_ENDED:
+            problems.append(f"downstream PUBLISH_DONE status "
+                            f"{done.status_code}, expected TRACK_ENDED")
+        if done.stream_count != streams:
+            problems.append(f"downstream Stream Count {done.stream_count}, "
+                            f"expected {streams}")
+        elif streams_ended < streams:
+            problems.append(f"{streams_ended} of {streams} downstream "
+                            f"streams ended")
+    if streams_reset:
+        problems.append(f"{streams_reset} downstream stream(s) reset")
+    return problems
+
+
+class _MoqTestTrack(PublishedTrack):
+    """PUBLISHes one MoQT Test track. The tuple's objects go out once
+    `ready` is set, unless the Forward State is then 0."""
+
+    def __init__(self, session, namespace: str, track_name: str, params):
+        super().__init__(session, namespace=namespace, trackname=track_name)
+        self._quiet = True
+        self._stats_header_printed = True
+        self.params = params
+        self.ready = asyncio.Event()
+        self.sent = asyncio.Event()
+        self.forwarded = None
+        self.error: Optional[BaseException] = None
+
+    async def generate(self, session, track_alias: int):
+        await self.ready.wait()
+        # The PUBLISH reply's Forward State applies first.
+        await asyncio.sleep(0)
+        sub = self._sub_for(session)
+        self.forwarded = bool(sub.forward)
+        try:
+            if self.forwarded:
+                sub.stream_count = await _MOQ_TEST_SENDERS[self.params.fp](
+                    session, track_alias, self.params)
+        except (Exception, MOQTStreamStopped) as e:
+            self.error = e
+        finally:
+            self.sent.set()
+
+
+async def _run_moq_test(name: str, host: str, port: int, path: str,
+                        use_quic: bool, tls_disable_verify: bool, debug: bool,
+                        supported_drafts=None) -> TestResult:
+    """Subscriber first: SUBSCRIBE with RENDEZVOUS_TIMEOUT to the bare
+    tuple namespace, then a second session PUBLISHes the same track and
+    sends the tuple's objects; the subscriber checks what the relay
+    delivers."""
+    t0 = time.monotonic()
+    loop = asyncio.get_running_loop()
+    sessions = {}
+    fields = ("moq-test-00", *MOQ_TEST_CASES[name])
+    params = parse_moq_test(fields)
+    forward_zero = name == _MOQ_TEST_FORWARD_ZERO
+    namespace = "/".join((*_NS_PREFIX, *fields))
+    track_name = f"moq-test-{secrets.token_hex(8)}"
+    sub = _MoqTestSubscriber()
+    pub_track = reply = None
+    sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+
+    def result(passed: bool, message: str, **kw) -> TestResult:
+        return _skip_unsupported_publish(TestResult(
+            name=name, passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions, message=message, **kw), reply)
+
+    step = "subscriber SETUP"
+    try:
+        async with asyncio.timeout(_MOQ_TEST_PHASE_S):
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+                sessions["subscriber"] = _session_meta(sub_session)
+                draft = sub_session.negotiated_draft
+                if draft < 18:
+                    sub_session.close()
+                    return result(True, "", skipped=True,
+                                  skip_reason=f"RENDEZVOUS_TIMEOUT is "
+                                              f"draft-18; negotiated "
+                                              f"draft-{draft}")
+                step = "SUBSCRIBE"
+                track = SubscribedTrack(sub_session, namespace, track_name,
+                                        on_object=sub.on_object,
+                                        on_done=sub.on_done)
+                track._quiet = True
+                # None omits FORWARD and the filter on the wire.
+                omit: dict[str, Any] = {
+                    "forward": 0 if forward_zero else None,
+                    "filter_type": None}
+                subscribing = asyncio.ensure_future(track.subscribe(
+                    parameters={_RENDEZVOUS_TIMEOUT: _MOQ_TEST_RENDEZVOUS_MS},
+                    **omit))
+                await asyncio.wait({subscribing},
+                                   timeout=_MOQ_TEST_HEAD_START_S)
+                if subscribing.done():
+                    subscribing.result()
+
+                step = "publisher SETUP"
+                async with pub_client.connect() as pub_session:
+                    await pub_session.client_session_init()
+                    sessions["publisher"] = _session_meta(pub_session)
+                    step = "PUBLISH"
+                    pub_track = _MoqTestTrack(pub_session, namespace,
+                                              track_name, params)
+                    await pub_track.publish(publish_track=True, forward=1)
+                    request_id = pub_track.request_id
+                    if request_id is None:
+                        return result(False, "PUBLISH not sent")
+                    reply = _publish_reply(pub_session, request_id, pub_track)
+                    msg = await reply
+                    if _MOQTSessionMixin._is_error_response(msg):
+                        return result(False, f"PUBLISH refused: code="
+                                             f"{msg.error_code:#x} "
+                                             f"{getattr(msg, 'reason', '')}")
+                    step = "SUBSCRIBE_OK"
+                    await subscribing
+                    sub_session.register_stream_end_handler(
+                        track.track_alias, sub.on_stream_end)
+
+                    step = "object delivery"
+                    pub_track.ready.set()
+                    await pub_track.sent.wait()
+                    pub_track._send_publish_done(pub_session)
+                    await sub.drain(loop.time() + _DATA_DELIVERY_S)
+                    if forward_zero or params.fp == 3:
+                        await asyncio.sleep(_MOQ_TEST_GRACE_S)
+                    sub_session.close()
+                pub_session.close()
+    except TimeoutError:
+        return result(False, f"timed out waiting for {step}")
+    except MOQTRequestError as e:
+        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+    except Exception as e:
+        return result(False, f"{step} failed: {_format_exc(e)}")
+    finally:
+        if pub_track is not None:
+            pub_track.ready.set()
+
+    problems = _moq_test_problems(params, sub.objects, sub.done,
+                                  sub.streams_ended, sub.streams_reset,
+                                  forward_zero)
+    if pub_track.error is not None:
+        problems.insert(0, f"publisher: {_format_exc(pub_track.error)}")
+    elif pub_track.forwarded is False and not forward_zero:
+        problems.insert(0, "relay left the PUBLISH at Forward State 0")
+    data, markers, streams = _moq_test_expected(params)
+    received = sum(1 for o in sub.objects if _is_normal(o[4]))
+    eogs = sum(1 for o in sub.objects if o[4] == ObjectStatus.END_OF_GROUP)
+    count = "none" if sub.done is None else sub.done.stream_count
+    if forward_zero:
+        summary = (f"{received} objects with Forward State 0; "
+                   f"Stream Count {count}")
+        if pub_track.forwarded:
+            summary += "; relay took the PUBLISH at Forward State 1"
+    else:
+        summary = (f"objects {received}/{len(data)}, End of Group "
+                   f"{eogs}/{len(markers)}, Stream Count {count}/{streams}")
+    if problems:
+        return result(False, f"{problems[0]} ({len(problems)} problem(s)); "
+                             f"{summary}")
+    return result(True, summary)
+
+
+def _moq_test_case(name: str):
+    async def case(host, port, path, use_quic, tls_disable_verify, debug,
+                   supported_drafts=None, compat=frozenset()) -> TestResult:
+        return await _run_moq_test(name, host, port, path, use_quic,
+                                   tls_disable_verify, debug,
+                                   supported_drafts=supported_drafts)
+    case.__name__ = "test_" + name.replace("-", "_")
+    case.__doc__ = f"{name}: MoQT Test tuple {'/'.join(MOQ_TEST_CASES[name])}"
+    return case
+
+
+# ---------------------------------------------------------------------------
 # Test dispatch
 # ---------------------------------------------------------------------------
 
@@ -1734,6 +2072,7 @@ TEST_FUNCTIONS = {
     "subscribe-namespace-lifecycle": test_subscribe_namespace_lifecycle,
     "publish-track-only": test_publish_track_only,
     "publish-track-subscribe": test_publish_track_subscribe,
+    **{name: _moq_test_case(name) for name in MOQ_TEST_CASES},
 }
 
 
@@ -1892,7 +2231,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
             result = await fn(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=effective_draft,
                               compat=compat)
-        except Exception as e:
+        except (Exception, MOQTStreamStopped) as e:
             result = TestResult(name=test_name, passed=False,
                                 message=f"test raised {_format_exc(e)}")
         nc_delta = (

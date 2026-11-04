@@ -11,7 +11,7 @@ import pytest
 
 from aiomoqt.tools import moq_interop_client as client
 from aiomoqt.tools import moq_interop_relay as relay
-from aiomoqt.types import ObjectStatus, RequestErrorCode
+from aiomoqt.types import MOQTStreamStopped, ObjectStatus, RequestErrorCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -196,10 +196,39 @@ async def test_a_relay_that_withholds_publish_done_fails_the_case(monkeypatch):
     assert r.message.startswith("no downstream PUBLISH_DONE"), r.message
 
 
+@requires_certs
 @pytest.mark.asyncio
-async def test_a_test_that_raises_fails_and_the_run_continues(monkeypatch):
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_relay_that_stops_a_subgroup_stream_fails_the_case(
+        monkeypatch, use_quic):
+    on_object = relay._RelayedTrack.on_object
+    stopped = []
+
+    def stop_group_0(self, msg, size, ts, group_id, subgroup_id):
+        if not stopped:
+            session = relay._upstream_session(self)
+            for sid, state in session._data_streams.items():
+                if state.group_id == 0:
+                    session.stream_stop_sending(sid)
+                    stopped.append(sid)
+        on_object(self, msg, size, ts, group_id, subgroup_id)
+
+    monkeypatch.setattr(relay._RelayedTrack, "on_object", stop_group_0)
+    # 50 ms between objects: the STOP_SENDING lands while group 0 is open.
+    case = list(client.DATA_SUBGROUP_BASIC_CASE)
+    case[9] = "50"
+    monkeypatch.setattr(client, "DATA_SUBGROUP_BASIC_CASE", tuple(case))
+    r = await _run(_BASE_PORT + 5 + (0 if use_quic else 1), 18, use_quic)
+    assert stopped
+    assert not r.passed
+    assert r.message == "relay stopped the subgroup stream for group 0", r.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [AttributeError, MOQTStreamStopped])
+async def test_a_test_that_raises_fails_and_the_run_continues(monkeypatch, exc):
     async def _raises(*args, **kw):
-        raise AttributeError("boom")
+        raise exc()
 
     async def _passes(*args, **kw):
         return client.TestResult(name="passes", passed=True)
@@ -210,7 +239,7 @@ async def test_a_test_that_raises_fails_and_the_run_continues(monkeypatch):
                                  True, True, False, supported_drafts=18)
     assert [(r.name, r.passed) for r in rep.results] == [
         ("raises", False), ("passes", True)]
-    assert "AttributeError" in rep.results[0].message
+    assert exc.__name__ in rep.results[0].message
 
 
 def _result(name, passed=True, **kw):
