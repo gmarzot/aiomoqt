@@ -23,6 +23,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass, field, replace
+from typing import Any, Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import is_draft16_or_later, profile_for
@@ -388,7 +389,7 @@ def _session_meta(session) -> dict:
 
 def _make_client(host: str, port: int, path: str, use_quic: bool,
                  tls_disable_verify: bool, debug: bool,
-                 supported_drafts: int = None) -> MOQTClient:
+                 supported_drafts: Optional[int] = None) -> MOQTClient:
     """Create a configured MOQTClient."""
     return MOQTClient(
         host, port,
@@ -1899,7 +1900,7 @@ class _MoqTestTrack(PublishedTrack):
         self.ready = asyncio.Event()
         self.sent = asyncio.Event()
         self.forwarded = None
-        self.error = None
+        self.error: Optional[BaseException] = None
 
     async def generate(self, session, track_alias: int):
         await self.ready.wait()
@@ -1917,8 +1918,9 @@ class _MoqTestTrack(PublishedTrack):
             self.sent.set()
 
 
-async def _run_moq_test(name, host, port, path, use_quic, tls_disable_verify,
-                        debug, supported_drafts=None) -> TestResult:
+async def _run_moq_test(name: str, host: str, port: int, path: str,
+                        use_quic: bool, tls_disable_verify: bool, debug: bool,
+                        supported_drafts=None) -> TestResult:
     """Subscriber first: SUBSCRIBE with RENDEZVOUS_TIMEOUT to the bare
     tuple namespace, then a second session PUBLISHes the same track and
     sends the tuple's objects; the subscriber checks what the relay
@@ -1962,10 +1964,13 @@ async def _run_moq_test(name, host, port, path, use_quic, tls_disable_verify,
                                         on_object=sub.on_object,
                                         on_done=sub.on_done)
                 track._quiet = True
+                # None omits FORWARD and the filter on the wire.
+                omit: dict[str, Any] = {
+                    "forward": 0 if forward_zero else None,
+                    "filter_type": None}
                 subscribing = asyncio.ensure_future(track.subscribe(
-                    forward=0 if forward_zero else None, filter_type=None,
-                    parameters={_RENDEZVOUS_TIMEOUT:
-                                _MOQ_TEST_RENDEZVOUS_MS}))
+                    parameters={_RENDEZVOUS_TIMEOUT: _MOQ_TEST_RENDEZVOUS_MS},
+                    **omit))
                 await asyncio.wait({subscribing},
                                    timeout=_MOQ_TEST_HEAD_START_S)
                 if subscribing.done():
@@ -1979,8 +1984,10 @@ async def _run_moq_test(name, host, port, path, use_quic, tls_disable_verify,
                     pub_track = _MoqTestTrack(pub_session, namespace,
                                               track_name, params)
                     await pub_track.publish(publish_track=True, forward=1)
-                    reply = _publish_reply(pub_session, pub_track.request_id,
-                                           pub_track)
+                    request_id = pub_track.request_id
+                    if request_id is None:
+                        return result(False, "PUBLISH not sent")
+                    reply = _publish_reply(pub_session, request_id, pub_track)
                     msg = await reply
                     if _MOQTSessionMixin._is_error_response(msg):
                         return result(False, f"PUBLISH refused: code="
