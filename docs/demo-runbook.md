@@ -357,6 +357,29 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   `mlm/cmsf/drm-cbcs`, raw QUIC and WT, draft 18) and passes only when
   every LOCMAF track delivers frames with 0 rejected.
 
+## Demo G — moq-test-tracks streams, generated locally (no token)
+The hosted moq-test-tracks service needs a token. `mtt run` from
+[openmoq/moq-test-tracks](https://github.com/openmoq/moq-test-tracks)
+generates the same tracks on this machine with aiomoqt and publishes them
+to any relay. Needs Linux, Python 3.12+ and ffmpeg with libx264 and
+drawtext.
+- Prep (once), outside this repo:
+  ```
+  git clone https://github.com/openmoq/moq-test-tracks && cd moq-test-tracks
+  python3 -m venv .venv && . .venv/bin/activate && pip install -e . 'aiomoqt>=0.14.1'
+  ```
+- SHELL 1, in that venv:
+  `mtt run --relay "$RELAY_QUIC" --ns $USER-demo/mtt_00/clock/loc/h264/720/30/aac/2 --ttl 3600`
+  (`$RELAY_QUIC` from Other relays above). The first field is your own
+  prefix; `openmoq/…` belongs to the hosted service. The fields after
+  `mtt_00` pick the content, packaging, codecs and rates: see the repo's
+  `docs/local.md`. Multi-video tracks (`altN`, `viewN`) need aiomoqt 0.15.0.
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N $USER-demo --discover -t 30`
+  → video and audio lines with N > 0 frames.
+- BROWSER: the G5 player with `url=` the relay and `ns=` the `--ns` value
+  ([player URL parameters](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#url-parameters)).
+- Pass: ≥ 60 s of the clock with no stalls and no gaps.
+
 ## Reading a stall or a pinned cushion
 - Publisher `lag mean/max ms` per track = how late a frame was against
   its own capture stamp when the feeder sent it (source, pipe, demux).
