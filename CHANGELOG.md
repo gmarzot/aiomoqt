@@ -13,6 +13,7 @@
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
 - moq_interop_client: a subgroup stream the relay stops fails data-subgroup-basic, naming the group, instead of crashing the client and leaving the remaining cases unreported.
 - pub_bench `--audio` and `--catalog` publish AAC-shaped and catalog-shaped tracks beside `--video`; a load_sim subscriber group may take `tracks: [..]`, all on one session per subscriber; packaged scenario `av-viewers`.
+- moq_interop_client runs moq-rs-draft-18's eight moq-test-* cases under the same names: a MoQT Test tuple each, PUBLISHed with the subscriber already waiting (draft-18 and later).
 
 ## v0.14.0
 
