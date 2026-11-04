@@ -128,6 +128,8 @@ whole fields and does not apply.
 ### M2 — aiomoqt publisher → browser player
 - With `AIOMOQT_PLAYER_URL` set, `pub_media` prints a `/g5-player/` URL
   per relay: demos A–C in [demo-runbook.md](demo-runbook.md).
+- moq-test-tracks streams generated locally, no token: demo G in
+  [demo-runbook.md](demo-runbook.md).
 
 ### M3 — path canary next to a g5 pair
 - Publisher first, then subscriber, while a G1/G2 pair runs:
