@@ -43,11 +43,14 @@ Limits:
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the announcing session under the
     namespace tuple, respond with the protocol's default RequestOk
-    (d16+) / PublishNamespaceOk (d14).
+    (d16+) / PublishNamespaceOk (d14), and subscribe the announcer to
+    each live track under the namespace.
   - SUBSCRIBE: find publishers that announced the namespace or a prefix
-    of it (§2.4 Namespace Prefix Matching), subscribe upstream once per
-    Full Track Name, answer SUBSCRIBE_OK and fan the objects out to
-    every downstream subscriber of that track. With no match, send
+    of it (§2.4 Namespace Prefix Matching), subscribe each upstream once
+    per Full Track Name, answer SUBSCRIBE_OK on the first to accept and
+    fan the objects out, deduplicated by Location, to every downstream
+    subscriber of that track. When the serving publisher ends, another
+    takes over. With no match, send
     SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
     0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
     rejection. For --startup-hold seconds after start, such a SUBSCRIBE
@@ -336,7 +339,8 @@ def _track_live(track) -> bool:
         return False
     if track.pending_publish is not None:
         return _session_live(track.pending_publish[0])
-    return _session_live(_upstream_session(track))
+    return (_session_live(_upstream_session(track))
+            or any(_session_live(f.session) for f in track.standby))
 
 
 def _upstream_session(track):
@@ -358,8 +362,8 @@ def _session_live(session) -> bool:
     return not (fut is not None and fut.done())
 
 
-def _publishers_for(ns: tuple) -> list:
-    """Publisher sessions that announced `ns` or a prefix of it."""
+def _announcers(ns: tuple) -> list:
+    """Live sessions that announced `ns` or a prefix of it."""
     out, seen = [], set()
     for a in _announced_match(ns):
         # Newest announcement first: a publisher that just announced is
@@ -373,6 +377,14 @@ def _publishers_for(ns: tuple) -> list:
             if id(sess) not in seen:
                 seen.add(id(sess))
                 out.append(sess)
+    return out
+
+
+def _publishers_for(ns: tuple) -> list:
+    """Publisher sessions that announced `ns` or a prefix of it, then the
+    origins we dialled."""
+    out = _announcers(ns)
+    seen = {id(s) for s in out}
     # An origin we dialled advertises nothing to us, so ask it last:
     # _establish_upstream tries candidates in turn and moves on when one
     # does not serve the track.
@@ -750,8 +762,56 @@ class _RelayLane(SendLane):
         return False
 
 
+class _Feed:
+    """A further publisher's subscription to a relayed track (§7.6)."""
+
+    __slots__ = ("sub", "ended", "props", "bound", "at")
+
+    def __init__(self):
+        self.sub = None
+        # Accepted: the handlers under its alias are its own.
+        self.bound = False
+        # Largest Location it delivered, copies included.
+        self.at = None
+        # Its subgroup streams ended, against its PUBLISH_DONE Stream Count.
+        self.ended = 0
+        self.props: dict = {}
+
+    @property
+    def session(self):
+        return getattr(self.sub, "session", None)
+
+    def update(self, forward) -> None:
+        """REQUEST_UPDATE its Forward State, no reply awaited."""
+        session, rid = self.session, getattr(self.sub, "request_id", None)
+        if rid is None or not _session_live(session):
+            return
+        try:
+            session.request_update(rid, forward=forward)
+        except Exception:
+            logger.debug("relay: updating a standby upstream failed",
+                         exc_info=True)
+
+    def release(self, cancel=False) -> None:
+        """Drop its handlers, once; with `cancel`, its request too."""
+        session = self.session
+        alias = getattr(self.sub, "track_alias", None)
+        if not self.bound or session is None or alias is None:
+            return
+        self.bound = False
+        if cancel and _session_live(session):
+            _cancel_request(session, self.sub.request_id)
+        try:
+            session.unregister_object_handler(alias)
+            session.unregister_stream_end_handler(alias)
+        except Exception:
+            logger.debug("relay: releasing standby handlers failed",
+                         exc_info=True)
+
+
 class _RelayedTrack:
-    """One upstream subscription fanned out to N downstream subscribers.
+    """Upstream subscriptions to a track, one per publisher, fanned out
+    to N downstream subscribers.
 
     Transport §"Relays": a Full Track Name is matched exactly against
     existing upstream subscriptions, so a second downstream subscriber
@@ -766,6 +826,27 @@ class _RelayedTrack:
     def __init__(self, key):
         self.key = key
         self.upstream = None
+        # Other publishers' subscriptions (§7.6): all forward objects, and
+        # one takes over when the primary upstream ends.
+        self.standby: list[_Feed] = []
+        # The standby now serving as primary; None while the first
+        # upstream does.
+        self.feed = None
+        # A standby has been asked: objects are deduplicated by Location.
+        self._multi = False
+        # Sessions a standby SUBSCRIBE is outstanding on.
+        self._joining: set = set()
+        # (group, subgroup) -> [largest Object ID taken, feeds carrying
+        # it]; None stands for the first upstream.
+        self._subgroups: dict = {}
+        # (group, subgroup) reset downstream.
+        self._reset = set()
+        # (group, object) of datagrams taken from several publishers.
+        self._dgrams = set()
+        # Groups below this are pruned: another copy of them is dropped.
+        self._floor = 0
+        # Copies dropped as already taken from another publisher.
+        self._copies = 0
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
         # Upstream Forward State is 0: answered so in PUBLISH_OK, or
@@ -901,10 +982,107 @@ class _RelayedTrack:
                          exc_info=True)
         self.upstream_alias = None
 
+    def _release_standby(self) -> None:
+        for f in self.standby:
+            f.release(cancel=True)
+        self.standby.clear()
+
+    def feeds_from(self, session) -> bool:
+        """`session` feeds this track, or a standby SUBSCRIBE is
+        outstanding on it."""
+        return (_upstream_session(self) is session
+                or id(session) in self._joining
+                or any(f.session is session for f in self.standby))
+
+    def add_standby(self, feed) -> None:
+        self.standby.append(feed)
+        self._multi = True
+        feed.session.register_stream_end_handler(
+            feed.sub.track_alias,
+            lambda g, sg, clean=True, code=0, f=feed: self.on_stream_end(
+                g, sg, clean, code, feed=f))
+        largest = feed.sub.largest
+        if largest is not None and self._near(largest[0]):
+            self.note_largest(largest)
+
+    def _carried(self, feed) -> bool:
+        """`feed` (None: the first upstream) still feeds the track."""
+        if feed is None:
+            return self.feed is None and _session_live(_upstream_session(self))
+        return ((feed is self.feed or feed in self.standby)
+                and _session_live(feed.session))
+
+    def _uncarry(self, feed) -> None:
+        """`feed` has gone: reset downstream each open subgroup no other
+        publisher carries."""
+        for k, st in list(self._subgroups.items()):
+            if feed not in st[1]:
+                continue
+            st[1].discard(feed)
+            if st[1] or k in self._ended or k in self._reset:
+                continue
+            self._reset.add(k)
+            self.queue.put_nowait((k[0], k[1], None, None, None, None,
+                                   "RESET", StreamResetCode.CANCELLED))
+        self._ensure_drain()
+
+    def drop_feed(self, feed) -> bool:
+        """A standby's subscription ended or its session closed."""
+        if feed not in self.standby:
+            return False
+        self.standby.remove(feed)
+        feed.release()
+        self._uncarry(feed)
+        return True
+
+    def _near(self, gid) -> bool:
+        """Group `gid` is within one of Largest's, once Largest is known."""
+        return self.largest is not None and abs(gid - self.largest[0]) <= 1
+
+    def _in_step(self, feed) -> bool:
+        """`feed` is near Largest: a copy of the track, not a publisher
+        that restarted its numbering."""
+        at = feed.at or feed.sub.largest
+        return self.largest is None or (at is not None and self._near(at[0]))
+
+    def fail_over(self, key) -> bool:
+        """The primary upstream ended: a live standby takes its place.
+        False when there is none."""
+        if self._closed or self.pending_publish is not None or _is_session(
+                self.upstream):
+            return False
+        live = [f for f in self.standby if _session_live(f.session)]
+        nxt = next((f for f in live if self._in_step(f)), None)
+        if nxt is None:
+            if live:
+                logger.info(f"relay: upstream {key} ended; {len(live)} "
+                            f"standby not at Largest {self.largest}, "
+                            f"ending the track")
+            return False
+        self.standby.remove(nxt)
+        old = self.feed
+        self.release_upstream()
+        self.upstream = nxt.sub
+        self.upstream_alias = nxt.sub.track_alias
+        self.feed = nxt
+        self._upstream_ended = nxt.ended
+        self.properties = nxt.props
+        if self._done_timer is not None:
+            self._done_timer.cancel()
+            self._done_timer = None
+        self._pending_done = None
+        self._uncarry(old)
+        logger.info(f"relay: upstream {key} failed over to another "
+                    f"publisher, alias={self.upstream_alias}, "
+                    f"{len(self.standby)} standby, {self._copies} copies "
+                    f"dropped")
+        return True
+
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
         self._closed = True
         self.release_upstream()
+        self._release_standby()
         self._release_publish()
         if self.task is not None:
             self.task.cancel()
@@ -1156,14 +1334,15 @@ class _RelayedTrack:
         if self._upstream_ended >= need:
             self._enqueue_terminal(status, reason, key)
 
-    def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0):
+    def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0,
+                      feed=None):
         """Upstream ended a subgroup stream: mirror it. A FIN becomes our
         FIN (the subscriber may infer end-of-group, §11.4.2); a reset
         becomes our reset with the same code, never a FIN. A malformed
         upstream track ends every downstream subscription with
         PUBLISH_DONE MALFORMED_TRACK (§2.4.2)."""
         if not clean:
-            reset_code = self._canonical_reset(reset_code)
+            reset_code = self._canonical_reset(reset_code, feed)
         if not clean and reset_code == StreamResetCode.MALFORMED_TRACK:
             self.finish(SubscribeDoneCode.MALFORMED_TRACK,
                         reset_code=StreamResetCode.MALFORMED_TRACK,
@@ -1174,19 +1353,40 @@ class _RelayedTrack:
             _drop_track(self.key, self)
             self.close()
             return
-        self.queue.put_nowait(
-            (group_id, subgroup_id or 0, None, None, None, None,
-             "END" if clean else "RESET", reset_code))
-        if clean:
-            self._ended.add((group_id, subgroup_id or 0))
+        k = (group_id, subgroup_id or 0)
+        if self._mirrors_end(k, clean, feed):
+            self.queue.put_nowait(
+                (group_id, subgroup_id or 0, None, None, None, None,
+                 "END" if clean else "RESET", reset_code))
+            if clean:
+                self._ended.add(k)
+            elif self._multi:
+                self._reset.add(k)
         self._ensure_drain()
-        self._upstream_ended += 1
-        self._check_pending_done()
+        if feed is self.feed:
+            self._upstream_ended += 1
+            self._check_pending_done()
+        elif feed is not None:
+            feed.ended += 1
 
-    def _canonical_reset(self, wire) -> StreamResetCode:
+    def _mirrors_end(self, k, clean, feed) -> bool:
+        """One publisher's stream of subgroup `k` ended: the first FIN
+        ends it downstream; a reset does only once no other publisher
+        carries it."""
+        st = self._subgroups.get(k)
+        if st is not None:
+            st[1].discard(feed)
+        if not self._multi:
+            return True
+        if k in self._ended or k in self._reset:
+            return False
+        return clean or not any(self._carried(c)
+                                for c in (st[1] if st else ()))
+
+    def _canonical_reset(self, wire, feed=None) -> StreamResetCode:
         """An upstream reset code by meaning, so each subscriber gets it
         encoded for its own draft; unknown codes become INTERNAL_ERROR."""
-        up = _upstream_session(self)
+        up = _upstream_session(self) if feed is None else feed.session
         prof = getattr(up, "_profile", None)
         code = wire if prof is None else canonical_stream_reset(wire, prof)
         try:
@@ -1200,15 +1400,50 @@ class _RelayedTrack:
                                      or tuple(location) > self.largest):
             self.largest = tuple(location)
 
-    def on_object(self, msg, size, ts, group_id, subgroup_id):
+    def _copy(self, feed, gid, sgid, oid, dgram) -> bool:
+        """§7.3: True for an object already taken from another publisher,
+        or one of a subgroup already ended; else it is recorded."""
+        if feed is not None and (feed.at is None or (gid, oid) > feed.at):
+            feed.at = (gid, oid)
+        # A standby opens nothing far from Largest: it is numbering
+        # another track.
+        far = feed is not self.feed and not self._near(gid)
+        if dgram:
+            if not self._multi:
+                return False
+            if far or (gid, oid) in self._dgrams:
+                return True
+            self._dgrams.add((gid, oid))
+            return False
+        k = (gid, sgid)
+        if self._multi and (gid < self._floor or k in self._ended
+                            or k in self._reset):
+            return True
+        st = self._subgroups.get(k)
+        if st is None:
+            if self._multi and far:
+                return True
+            self._subgroups[k] = [oid, {feed}]
+            return False
+        st[1].add(feed)
+        if self._multi and oid <= st[0]:
+            return True
+        st[0] = oid
+        return False
+
+    def on_object(self, msg, size, ts, group_id, subgroup_id, feed=None):
         """Upstream delivery callback (sync) — hand off to the drain."""
         if self._closed:
+            return
+        gid = getattr(msg, "group_id", None)
+        gid = gid if gid is not None else group_id
+        dgram = isinstance(msg, (ObjectDatagram, ObjectDatagramStatus))
+        if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
+            self._copies += 1
             return
         self._objects_in += 1
         payload = bytes(msg.payload)
         self._bytes_in += len(payload)
-        gid = getattr(msg, "group_id", None)
-        gid = gid if gid is not None else group_id
         if gid != self._last_gid:
             self._groups_in += 1
             self._last_gid = gid
@@ -1233,7 +1468,7 @@ class _RelayedTrack:
         # the publisher sent as a datagram goes out as one, with its
         # end-of-group bit, not re-framed onto a subgroup stream.
         shape = getattr(msg, "stream_flags", None)
-        if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
+        if dgram:
             shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
             self._datagrams = True
         elif isinstance(shape, tuple) and shape:
@@ -1324,6 +1559,7 @@ class _RelayedTrack:
                         self._replay(d)
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
+                self._release_standby()
                 self._release_publish()
                 self._release_downstream()
                 self._drop_cache()
@@ -1464,6 +1700,11 @@ class _RelayedTrack:
             _budget.forget(self)
         else:
             first = self._cache[0][0]
+            self._floor = first
+            self._subgroups = {k: v for k, v in self._subgroups.items()
+                               if k[0] >= first}
+            self._reset = {k for k in self._reset if k[0] >= first}
+            self._dgrams = {k for k in self._dgrams if k[0] >= first}
             self._ended = {k for k in self._ended if k[0] >= first}
             self._opened = {k for k in self._opened if k[0] >= first}
             self._heads = {g for g in self._heads if g >= first}
@@ -1817,9 +2058,13 @@ def _forget_session(session) -> None:
         lane.track.drop_session(session)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
+        for f in [f for f in track.standby if f.session is session]:
+            track.drop_feed(f)
         if _upstream_session(track) is session or (
                 track.pending_publish is not None
                 and track.pending_publish[0] is session):
+            if track.fail_over(key):
+                continue
             # Upstream is gone: give each subscriber a clean terminal
             # before dropping the fan-out.
             track.finish()
@@ -1901,6 +2146,7 @@ async def _on_publish_namespace(session, msg):
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namespace_ok(msg)
+    _join_live_tracks(ns, session)
     if _catalog_probe and _probe_wanted(ns):
         _spawn(_probe_catalog(ns))
 
@@ -2260,7 +2506,9 @@ async def _subscribe_publishers(entry):
     key = entry.key
     ns, track_name = key
     refusal = None
+    tried = []
     for pub in _publishers_for(ns):
+        tried.append(pub)
         if entry.fut.done():
             break
         track = _RelayedTrack(key)
@@ -2342,8 +2590,67 @@ async def _subscribe_publishers(entry):
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
+        for other in _announcers(ns):
+            if all(other is not p for p in tried):
+                _spawn(_subscribe_standby(track, other))
         return track, None
     return None, refusal
+
+
+def _standby_wanted(track, pub) -> bool:
+    """`pub` is live and not yet feeding `track`, a live track the relay
+    subscribed to; a PUBLISHed track keeps its one publisher."""
+    return (_session_live(pub) and not track._closed and not track.finished
+            and track.pending_publish is None and track.upstream is not None
+            and not _is_session(track.upstream) and not track.feeds_from(pub))
+
+
+def _join_live_tracks(ns, session) -> None:
+    """§7.6: the publisher of a newly announced namespace is subscribed
+    to each live track under it."""
+    for key, track in list(_tracks.items()):
+        if key[0][:len(ns)] == ns and _standby_wanted(track, session):
+            _spawn(_subscribe_standby(track, session))
+
+
+async def _subscribe_standby(track, pub) -> None:
+    """§7.6: subscribe `pub`, a further publisher of the track's
+    namespace, from the live edge. Its objects join the fan-out,
+    deduplicated by Location (§7.3)."""
+    if not _standby_wanted(track, pub):
+        return
+    key = track.key
+    ns, track_name = key
+    name = (track_name.decode() if isinstance(track_name, bytes)
+            else track_name)
+    feed = _Feed()
+    feed.sub = SubscribedTrack(
+        pub, ns, name,
+        on_object=lambda m, n, ts, g, sg, f=feed: track.on_object(
+            m, n, ts, g, sg, feed=f),
+        on_done=lambda done, f=feed: _upstream_done(track, key, done, f))
+    # Its objects may land before the SUBSCRIBE_OK is handled here.
+    track._multi = True
+    track._joining.add(id(pub))
+    try:
+        await feed.sub.subscribe(timeout=10.0,
+                                 forward=0 if track.paused else 1)
+    except Exception as e:
+        logger.info(f"relay: standby subscribe {key} failed: {e}")
+        return
+    finally:
+        track._joining.discard(id(pub))
+    feed.bound = True
+    rid = getattr(feed.sub, "request_id", None)
+    feed.props = _track_properties(pub, _subscribe_ok_for(pub, rid))
+    if (track._closed or track.finished or not _session_live(pub)
+            or _mandatory(pub, feed.props)):
+        feed.release(cancel=True)
+        return
+    track.add_standby(feed)
+    logger.info(f"relay: standby upstream established ns={ns} "
+                f"track={name} alias={feed.sub.track_alias} -> "
+                f"{1 + len(track.standby)} publisher(s)")
 
 
 def _joined_subscription(session, request_id):
@@ -2389,10 +2696,17 @@ async def _await_joined(session, request_id):
     return None
 
 
-def _upstream_done(track, key, done) -> None:
-    """Upstream ended the track: FIN downstream streams, PUBLISH_DONE
-    each subscriber, and drop the fan-out so a later SUBSCRIBE starts a
-    fresh upstream subscription."""
+def _upstream_done(track, key, done, feed=None) -> None:
+    """Upstream ended the track: a standby takes over, else FIN
+    downstream streams, PUBLISH_DONE each subscriber, and drop the
+    fan-out so a later SUBSCRIBE starts a fresh upstream subscription.
+    A standby's own end only removes it."""
+    if feed is not track.feed:
+        if feed is not None and track.drop_feed(feed):
+            logger.info(f"relay: standby upstream PUBLISH_DONE {key} "
+                        f"status={getattr(done, 'status_code', None)} -> "
+                        f"{1 + len(track.standby)} publisher(s)")
+        return
     status = getattr(done, "status_code", SubscribeDoneCode.TRACK_ENDED)
     reason = getattr(done, "reason", "") or "track ended"
     logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
@@ -2400,6 +2714,8 @@ def _upstream_done(track, key, done) -> None:
                 f"-> {len(track.downstream)} subscriber(s), objects "
                 f"in={track._objects_in} out={track._objects_out}, "
                 f"upstream streams ended={track._upstream_ended}")
+    if track.fail_over(key):
+        return
     if track.task is None and not track.attaching:
         # Nothing queued and no subscriber attached.
         track.finish(status_code=status, reason=reason)
@@ -2682,6 +2998,8 @@ def _resume_paused(track, wanted=False):
                                        **location)
         logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
                     f"forward=1 request {rid}")
+        for f in track.standby:
+            f.update(1)
     except Exception:
         logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
@@ -2792,6 +3110,8 @@ def _pause_upstream(track) -> None:
         return
     track.paused = True
     track.lowered = True
+    for f in track.standby:
+        f.update(0)
     track.open_gap()
     track.pause_largest = None
     track.pause_reply = (asyncio.ensure_future(

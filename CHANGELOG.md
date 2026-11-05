@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay subscribes to every publisher of a track's namespace, including one that announces once the track is live, and merges their objects without repeating a Location; when the serving publisher ends the track or disconnects, another takes over and subscribers see no PUBLISH_DONE.
 - `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
 - A new subgroup stream opens with its header and first object; over WebTransport they travel with the stream create (aiopquic `create_stream(initial=)`) and leave in one send instead of two. `MOQTSession.open_uni_stream(initial=, priority=)` sets the stream priority and writes its first bytes on either transport.
 - pub_media publishes several video tracks (`video`, `video_1`, …): `--mp4` repeats, and `--ts` takes every H.264/H.265 stream in the PMT. With `--timestamp-mapping` they must share frame duration and GOP length, and carry the same group and object IDs.
