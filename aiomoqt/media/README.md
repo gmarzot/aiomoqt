@@ -62,7 +62,6 @@ LOC options for receivers that need something different:
 | `--loc-codecstring` | Every object carries its codec string and, on video, frame marking: players without a catalog |
 | `--loc-timescale TICKS` | Timestamps as media time with TIMESCALE, instead of wall-clock µs |
 | `--loc01-compat` | Timestamps also under loc-01's property ID |
-| `--loc-bare` | No empty Private Properties block, for receivers predating loc-04 §2.2 |
 
 ## Groups, objects and streams
 

@@ -360,11 +360,8 @@ def _server(port, chunkers, feeds):
         if pub is None:
             pub = pubs[id(session)] = MediaPublisher(
                 session, _NS, _catalog(chunkers))
-            bare = chunkers is not None     # cmaf objects are not LOC
-            pub.add_track(LocTrackPublisher(session, _NS, 'video',
-                                            loc_bare=bare))
-            pub.add_track(LocTrackPublisher(session, _NS, 'audio',
-                                            loc_bare=bare))
+            pub.add_track(LocTrackPublisher(session, _NS, 'video'))
+            pub.add_track(LocTrackPublisher(session, _NS, 'audio'))
             await pub.catalog_track.finish()
             feeds.append(asyncio.ensure_future(_feed(pub, chunkers)))
         await pub._demux_subscribe(session, msg)
