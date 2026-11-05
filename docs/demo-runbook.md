@@ -366,14 +366,17 @@ drawtext.
 - Prep (once), outside this repo:
   ```
   git clone https://github.com/openmoq/moq-test-tracks && cd moq-test-tracks
-  python3 -m venv .venv && . .venv/bin/activate && pip install -e . 'aiomoqt>=0.14.1'
+  python3 -m venv .venv && . .venv/bin/activate
+  pip install -e . "aiomoqt @ git+https://github.com/gmarzot/aiomoqt@22fb07187fa8bcf5571d41936782bd3df0261bb3"
   ```
+  That is 0.15.0's development build: it sends LOC as the bare frame, which
+  the G5 player reads; 0.14.x prepends a block G5 no longer strips.
 - SHELL 1, in that venv:
   `mtt run --relay "$RELAY_QUIC" --ns $USER-demo/mtt_00/clock/loc/h264/720/30/aac/2 --ttl 3600`
   (`$RELAY_QUIC` from Other relays above). The first field is your own
   prefix; `openmoq/…` belongs to the hosted service. The fields after
   `mtt_00` pick the content, packaging, codecs and rates: see the repo's
-  `docs/local.md`. Multi-video tracks (`altN`, `viewN`) need aiomoqt 0.15.0.
+  `docs/local.md`.
 - Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N $USER-demo --discover -t 30`
   → video and audio lines with N > 0 frames.
 - BROWSER: the G5 player with `url=` the relay and `ns=` the `--ns` value
