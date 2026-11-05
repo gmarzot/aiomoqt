@@ -1,5 +1,7 @@
 """moq_interop_client moq-test-* cases: through aiomoqt-relay in one
 process, and the verifier against hand-built deliveries."""
+import asyncio
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -7,7 +9,7 @@ import pytest
 from aiomoqt.tools import moq_interop_client as client
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools.moqtest_origin import priority_for
-from aiomoqt.types import ObjectStatus, SubscribeDoneCode
+from aiomoqt.types import ObjectStatus, RequestErrorCode, SubscribeDoneCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -97,6 +99,86 @@ async def test_forward_zero_notes_a_relay_that_takes_the_track(monkeypatch):
     assert r.passed, r.message
     assert r.message == ("0 objects with Forward State 0; Stream Count 0; "
                          "relay took the PUBLISH at Forward State 1")
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_publisher_waits_for_a_late_forward_state_raise(monkeypatch):
+    # PUBLISH_OK at Forward State 0, raised after SUBSCRIBE_OK reaches the
+    # subscriber.
+    answer = relay._answer_publish
+    monkeypatch.setattr(relay, "_answer_publish",
+                        lambda track, forward=None: answer(track, forward=0))
+    set_forward = client._MoqTestTrack._set_forward
+
+    def late(self, sub, forward):
+        if forward:
+            asyncio.get_running_loop().call_later(
+                0.1, set_forward, self, sub, forward)
+        else:
+            set_forward(self, sub, forward)
+
+    monkeypatch.setattr(client._MoqTestTrack, "_set_forward", late)
+    r = await _run_case("moq-test-subgroup-per-group-eog", _BASE_PORT + 52,
+                        18, True)
+    assert r.passed, r.message
+
+
+def _count_streams(monkeypatch, count):
+    """The relay reports count(sent) streams in each downstream
+    PUBLISH_DONE."""
+    end = relay._RelayedTrack._end
+
+    def _end(self, d, *args, **kw):
+        key = id(d.session)
+        self._sent_streams[key] = count(self._sent_streams.get(key, 0))
+        end(self, d, *args, **kw)
+
+    monkeypatch.setattr(relay._RelayedTrack, "_end", _end)
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_forward_zero_fails_at_publish_done_with_streams(monkeypatch):
+    # The relay takes the track and passes the upstream Stream Count down.
+    monkeypatch.setattr(relay, "_forwarding", lambda track: True)
+    _count_streams(monkeypatch, lambda sent: 2)
+    r = await _run_case("moq-test-forward-zero", _BASE_PORT + 53, 18, True)
+    assert not r.passed
+    assert r.message.startswith(
+        "downstream Stream Count 2, expected 0 (1 problem(s))"), r.message
+    assert r.duration_ms < 4000
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_stream_count_never_met_fails_inside_the_phase(monkeypatch):
+    monkeypatch.setattr(client, "_MOQ_TEST_PHASE_S", 3.0)
+    _count_streams(monkeypatch, lambda sent: sent + 1)
+    r = await _run_case("moq-test-subgroup-per-group-eog", _BASE_PORT + 54,
+                        18, True)
+    assert not r.passed
+    assert r.message.startswith(
+        "downstream Stream Count 4, expected 3 (1 problem(s))"), r.message
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_refused_subscribe_leads_a_publish_timeout(monkeypatch,
+                                                           caplog):
+    async def _unanswered(session, msg):
+        pass
+
+    monkeypatch.setattr(relay, "_on_publish", _unanswered)
+    monkeypatch.setattr(client, "_MOQ_TEST_RENDEZVOUS_MS", 300)
+    monkeypatch.setattr(client, "_MOQ_TEST_PHASE_S", 2.0)
+    r = await _run_case("moq-test-datagram", _BASE_PORT + 55, 18, True)
+    gc.collect()
+    assert r.message == (
+        f"SUBSCRIBE refused: code={int(RequestErrorCode.TIMEOUT)} no "
+        f"publisher within the rendezvous timeout; timed out waiting for "
+        f"PUBLISH")
+    assert "never retrieved" not in caplog.text
 
 
 def _params(name):
