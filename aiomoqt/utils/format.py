@@ -6,25 +6,32 @@ Convention ("2-place" style):
 
 Adaptive units for bitrate and time: scale up/down to keep the numeric
 part within [0.1, 500) so it stays readable across 6+ orders of magnitude.
+Both choices go by the value as shown: 9.96 is "10", 999.6 us is "1.0ms".
 """
 
 
 def _num2(x: float) -> str:
     """Render x as 'N.M' below 10, integer above."""
-    if x < 10:
-        return f"{x:.1f}"
+    s = f"{x:.1f}"
+    if float(s) < 10:
+        return s
     return f"{x:.0f}"
+
+
+def _below(x: float, limit: float) -> bool:
+    """x stays below limit as _num2 shows it."""
+    return float(_num2(x)) < limit
 
 
 def fmt_bps(bps: float) -> str:
     """Format a bitrate in bits/sec with adaptive SI units (Kbps/Mbps/Gbps)."""
     if bps != bps or bps < 0:  # NaN or negative
         return "--"
-    if bps < 500:
+    if _below(bps, 500):
         return _num2(bps) + "bps"
-    if bps < 500_000:
+    if _below(bps / 1_000, 500):
         return _num2(bps / 1_000) + "Kbps"
-    if bps < 1_000_000_000:
+    if _below(bps / 1_000_000, 1000):
         return _num2(bps / 1_000_000) + "Mbps"
     return _num2(bps / 1_000_000_000) + "Gbps"
 
@@ -33,9 +40,9 @@ def fmt_ms(ms: float) -> str:
     """Format a time in ms with adaptive units (us/ms/s)."""
     if ms != ms or ms < 0:
         return "--"
-    if ms < 1:
+    if _below(ms * 1000, 1000):
         return _num2(ms * 1000) + "us"
-    if ms < 1000:
+    if _below(ms, 1000):
         return _num2(ms) + "ms"
     return _num2(ms / 1000) + "s"
 

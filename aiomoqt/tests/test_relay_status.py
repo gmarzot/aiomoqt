@@ -786,6 +786,21 @@ def test_live_tracks_keep_their_slots(tmp_path):
     assert "late" not in status.track_history
 
 
+def test_subscribed_tracks_take_slots_from_idle_ones(tmp_path):
+    # Present tracks without subscribers hold every slot: a subscribed
+    # newcomer takes the slot of the one idle longest, an idle one waits.
+    status = relay._Status(str(tmp_path / "status.json"), {"started": time.time()})
+    cap = relay.TRACK_HISTORY_MAX
+    _tick(status, [_row(f"idle\x1f{i}", subs=int(i > 0)) for i in range(cap)])
+    idle = [_row(f"idle\x1f{i}", subs=0) for i in range(cap)]
+    _tick(status, idle)
+    _tick(status, idle + [_row("quiet", subs=0), _row("bench", subs=70)])
+    hist = status.track_history
+    assert len(hist) == cap
+    assert "idle\x1f0" not in hist and "quiet" not in hist
+    assert list(hist["bench"]["subscribers"])[-1] == 70
+
+
 # -- --trace-subscribers and GET /sessions ---------------------------------
 
 class _ThreeGroups(PublishedTrack):

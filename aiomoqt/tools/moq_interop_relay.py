@@ -5175,7 +5175,8 @@ class _Status:
         """One point per tracked track, None for one absent this tick; a
         track absent for the whole window is dropped. With every slot
         taken, a present track (subscribed ones first) takes the slot of
-        the track absent longest."""
+        the track absent longest; a subscribed one may instead take the
+        slot of a present track without subscribers."""
         length = self.history.length
         filled = len(self.history.series["t"])
         now = {row["id"]: row for _, row in tracks}
@@ -5183,7 +5184,7 @@ class _Status:
             if tid in self.track_history:
                 continue
             if len(self.track_history) >= TRACK_HISTORY_MAX:
-                gone = self._longest_gone(now)
+                gone = self._free_slot(now, bool(now[tid]["subscribers"]))
                 if gone is None:
                     continue
                 del self.track_history[gone]
@@ -5197,18 +5198,20 @@ class _Status:
             if row is None and all(v is None for v in series["subscribers"]):
                 del self.track_history[tid]
 
-    def _longest_gone(self, now):
-        """The tracked track absent from `now` for the most ticks, or None."""
-        def absent(tid):
-            col = self.track_history[tid]["subscribers"]
+    def _free_slot(self, now, subscribed):
+        """The tracked track to drop for a new one, or None: one absent
+        from `now`, else, for a `subscribed` newcomer, one present without
+        subscribers; the one without subscribers longest first."""
+        def idle(tid):
             ticks = 0
-            for v in reversed(col):
-                if v is not None:
+            for v in reversed(self.track_history[tid]["subscribers"]):
+                if v:
                     break
                 ticks += 1
             return ticks
-        gone = [tid for tid in self.track_history if tid not in now]
-        return max(gone, key=absent, default=None)
+        free = [tid for tid in self.track_history if tid not in now
+                or (subscribed and not now[tid]["subscribers"])]
+        return max(free, key=lambda t: (t not in now, idle(t)), default=None)
 
     def _platform(self, wall: float, host: dict, totals: dict,
                   lag: dict) -> dict:

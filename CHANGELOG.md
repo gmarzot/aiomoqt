@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay status: a subscribed track takes the chart history slot of a track without subscribers when all 24 are held, so the dashboard charts show it.
 - aiomoqt-relay subscribes to every publisher of a track's namespace, including one that announces once the track is live, and merges their objects without repeating a Location; when the serving publisher ends the track or disconnects, another takes over and subscribers see no PUBLISH_DONE.
 - `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
 - A new subgroup stream opens with its header and first object; over WebTransport they travel with the stream create (aiopquic `create_stream(initial=)`) and leave in one send instead of two. `MOQTSession.open_uni_stream(initial=, priority=)` sets the stream priority and writes its first bytes on either transport.
@@ -13,6 +14,7 @@
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
 - pub_bench `--audio` and `--catalog` publish AAC-shaped and catalog-shaped tracks beside `--video`; a load_sim subscriber group may take `tracks: [..]`, all on one session per subscriber; packaged scenario `av-viewers`.
 - moq_interop_client moq-test-* cases: the publisher waits up to 1 s for a relay to raise Forward State 0 with REQUEST_UPDATE; a downstream Stream Count that delivery never meets fails the case by name instead of timing out; a refused SUBSCRIBE leads a later timeout's message.
+- Bench output: a value that rounds up to a unit's limit shows in the next unit (`10Gbps`, not `10.0Gbps`; `1.0ms`, not `1000us`); loopback_bench prints its table header after the subscriber line.
 
 ## v0.14.1
 
