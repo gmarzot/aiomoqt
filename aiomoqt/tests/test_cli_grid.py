@@ -311,12 +311,12 @@ def test_packaging_flag_agrees_across_media_tools():
         assert tuple(acts[0].choices) == MEDIA_PACKAGINGS, tool
 
 
-def test_loc_bare_flag_agrees_across_media_tools():
-    """--loc-bare is long-only and the same switch on both media tools."""
+def test_loc_prefixed_flag_agrees_across_media_tools():
+    """--loc-prefixed is long-only and the same switch on both media tools."""
     for tool in ("pub_media", "sub_media"):
-        acts = [a for a in _parser_actions(tool) if a.dest == "loc_bare"]
+        acts = [a for a in _parser_actions(tool) if a.dest == "loc_prefixed"]
         assert len(acts) == 1, tool
-        assert acts[0].option_strings == ["--loc-bare"], tool
+        assert acts[0].option_strings == ["--loc-prefixed"], tool
         assert isinstance(acts[0], argparse._StoreTrueAction), tool
 
 

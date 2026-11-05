@@ -12,6 +12,7 @@
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
 - pub_bench `--audio` and `--catalog` publish AAC-shaped and catalog-shaped tracks beside `--video`; a load_sim subscriber group may take `tracks: [..]`, all on one session per subscriber; packaged scenario `av-viewers`.
 - moq_interop_client moq-test-* cases: the publisher waits up to 1 s for a relay to raise Forward State 0 with REQUEST_UPDATE; a downstream Stream Count that delivery never meets fails the case by name instead of timing out; a refused SUBSCRIBE leads a later timeout's message.
+- LOC payloads in the clear are the bare frame (loc-04 §3.1.3, Secure Objects -01 §3.3): `LocTrackPublisher` and `LocTrackSubscriber` no longer send or expect the `0x0A 0x00` block. `loc_prefixed=` / `--loc-prefixed` restores it and replaces `loc_bare=` / `--loc-bare`.
 
 ## v0.14.1
 

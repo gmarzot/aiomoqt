@@ -1,9 +1,10 @@
 """LOC packaging over MoQT — draft-ietf-moq-loc-04.
 
-A LOC object payload is the LOC Private Properties block (§2.2: type
-0x0A, varint length, contents) followed by the raw encoded-media chunk
-(WebCodecs EncodedAudio/VideoChunk bytes). We send the block empty and
-skip its contents on receive. Public metadata rides MOQ object properties
+A LOC object payload in the clear is the raw encoded-media chunk
+(WebCodecs EncodedAudio/VideoChunk bytes): Private Properties exist only
+inside a Secure Object's plaintext (§3.1.3; Secure Objects -01 §3.3).
+`loc_prefixed` sends and expects a leading block instead (type 0x0A,
+varint length, contents). Public metadata rides MOQ object properties
 (even ID = bare vi64 value, odd ID = length-prefixed bytes — the
 codec in messages/base.py already implements this rule).
 
@@ -66,7 +67,7 @@ _CONFIG_IDS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 _CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,
                                          LOC_PROP_CODECSTRING))
 
-# Private Properties block type (SecureObjects), opening every payload.
+# Private Properties block type (Secure Objects), for `loc_prefixed`.
 LOC_PRIVATE_PROPERTIES = 0x0A
 _EMPTY_PRIVATE_PROPERTIES = bytes([LOC_PRIVATE_PROPERTIES, 0x00])
 
@@ -113,8 +114,8 @@ class LocTrackPublisher(PublishedTrack):
     TIMESCALE the timestamps are wall-clock µs, LOC's default; with it,
     LOC reads them as media time.
 
-    `loc_bare` sends the media without the Private Properties block, for
-    receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
+    `loc_prefixed` puts an empty Private Properties block (0x0A 0x00)
+    ahead of each payload, for receivers that require one.
 
     `annexb` ('h264' or 'h265') sends length-prefixed video payloads as
     Annex B (loc-04 §2.1.4) with the parameter sets from `config` ahead of
@@ -138,7 +139,7 @@ class LocTrackPublisher(PublishedTrack):
                  queue_size: int = 256,
                  loc01_compat: bool = False,
                  codec_string: Optional[str] = None,
-                 loc_bare: bool = False,
+                 loc_prefixed: bool = False,
                  config_property: Optional[str] = 'object',
                  annexb: Optional[str] = None,
                  fetch_history_bytes: int = 0):
@@ -154,7 +155,7 @@ class LocTrackPublisher(PublishedTrack):
         self._param_sets: tuple = (None, b'')
         if annexb is not None:
             config_property = None
-        self.loc_bare = loc_bare
+        self.loc_prefixed = loc_prefixed
         self.config = config
         self.config_property = config_property
         self.mapping = mapping
@@ -225,9 +226,9 @@ class LocTrackPublisher(PublishedTrack):
         without using its object id."""
         if self.annexb is not None:
             payload = self._annexb(payload, object_id == 0)
-        if self.loc_bare:
-            return payload
-        return _EMPTY_PRIVATE_PROPERTIES + payload
+        if self.loc_prefixed:
+            return _EMPTY_PRIVATE_PROPERTIES + payload
+        return payload
 
     def _annexb(self, payload: bytes, key_frame: bool) -> bytes:
         """Length-prefixed NAL units as Annex B; a key frame without
@@ -382,22 +383,23 @@ class LocTrackSubscriber(SubscribedTrack):
     object first, status markers and rejected objects included
     (frame=None), with its receive wall-clock µs.
 
-    An object without a well-formed Private Properties block is rejected
-    and counted in `objects_rejected`; `loc_bare` expects none.
+    `loc_prefixed` expects a Private Properties block ahead of each
+    payload and skips it; an object without a well-formed one is rejected
+    and counted in `objects_rejected`.
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_frame: Optional[Callable] = None,
                  auth_token: Optional[bytes] = None,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False,
+                 loc_prefixed: bool = False,
                  timestamp_errors: str = 'cancel'):
         super().__init__(session, namespace, trackname,
                          on_object=self._on_object, auth_token=auth_token,
                          timestamp_errors=timestamp_errors)
         self.on_frame = on_frame
         self.on_arrival = on_arrival
-        self.loc_bare = loc_bare
+        self.loc_prefixed = loc_prefixed
         self.config: Optional[bytes] = None
         self.timescale: Optional[int] = None
         self.codec_string: Optional[str] = None
@@ -421,9 +423,9 @@ class LocTrackSubscriber(SubscribedTrack):
         """Frame payload of a received object; None rejects it (no
         on_frame)."""
         payload = bytes(msg.payload)
-        if self.loc_bare or not payload:
+        if not self.loc_prefixed or not payload:
             return payload
-        # The block is required, never inferred: media may open with 0x0A.
+        # Configured, never inferred: media may open with 0x0A.
         buf = Buffer(data=payload)
         try:
             ptype = buf.pull_uint_var()
