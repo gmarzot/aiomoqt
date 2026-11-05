@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- relay_probe probes drafts 20 and 22 by default, after 14, 16 and 18.
 - aiomoqt-relay status: a subscribed track takes the chart history slot of a track without subscribers when all 24 are held, so the dashboard charts show it.
 - aiomoqt-relay subscribes to every publisher of a track's namespace, including one that announces once the track is live, and merges their objects without repeating a Location; when the serving publisher ends the track or disconnects, another takes over and subscribers see no PUBLISH_DONE.
 - `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
