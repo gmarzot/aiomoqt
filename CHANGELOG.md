@@ -13,6 +13,7 @@
 - `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
 - pub_bench `--audio` and `--catalog` publish AAC-shaped and catalog-shaped tracks beside `--video`; a load_sim subscriber group may take `tracks: [..]`, all on one session per subscriber; packaged scenario `av-viewers`.
 - moq_interop_client moq-test-* cases: the publisher waits up to 1 s for a relay to raise Forward State 0 with REQUEST_UPDATE; a downstream Stream Count that delivery never meets fails the case by name instead of timing out; a refused SUBSCRIBE leads a later timeout's message.
+- Bench output: a value that rounds up to a unit's limit shows in the next unit (`10Gbps`, not `10.0Gbps`; `1.0ms`, not `1000us`); loopback_bench prints its table header after the subscriber line.
 
 ## v0.14.1
 
