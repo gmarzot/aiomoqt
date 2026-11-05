@@ -373,8 +373,7 @@ class MediaSubscriber:
     on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
-    delta. `loc_prefixed` expects a Private Properties block ahead of
-    each LOC payload. `timestamp_errors` is each media track's
+    delta. `timestamp_errors` is each media track's
     SubscribedTrack policy. A media track's Track Properties are its
     subscriber's (`tracks[name]`); `properties(name)` is the merged view.
     """
@@ -385,11 +384,9 @@ class MediaSubscriber:
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
                  on_arrival: Optional[Callable] = None,
-                 loc_prefixed: bool = False,
                  timestamp_errors: str = 'cancel'):
         self.session = session
         self.namespace = namespace
-        self.loc_prefixed = loc_prefixed
         self.timestamp_errors = timestamp_errors
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
@@ -551,11 +548,8 @@ class MediaSubscriber:
                 sub = LocmafTrackSubscriber(self.session, namespace, name,
                                             init=init, **callbacks)
             else:
-                # CMAF objects are not LOC: no Private Properties block.
-                prefixed = (self.loc_prefixed
-                            and entry.packaging == PACKAGING_LOC)
                 sub = LocTrackSubscriber(self.session, namespace, name,
-                                         loc_prefixed=prefixed, **callbacks)
+                                         **callbacks)
             if entry.packaging == PACKAGING_LOC:
                 # cmaf init is a CMAF header consumed by the sink, not
                 # decoder extradata — leave config unset there.

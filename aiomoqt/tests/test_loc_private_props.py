@@ -1,6 +1,5 @@
 """LOC payloads in the clear are the media alone (loc-04 §3.1.3, Secure
-Objects -01 §3.3). `loc_prefixed` sends and expects a leading Private
-Properties block (type 0x0A, varint length, contents)."""
+Objects -01 §3.3): nothing is prepended on send or stripped on receive."""
 import asyncio
 import io
 import re
@@ -61,57 +60,11 @@ def test_payload_is_the_frame_whatever_it_opens_with():
     assert sub.objects_rejected == 0
 
 
-def test_prefixed_package_prepends_an_empty_block():
-    pub = _pub(loc_prefixed=True)
-    assert pub._package(b"idr", 0, 0) == b"\x0a\x00idr"
-    assert pub._package(_AV1_SEQ, 0, 0) == b"\x0a\x00" + _AV1_SEQ
-
-
-def test_prefixed_frame_opening_with_0x0a_is_not_mistaken_for_the_block():
-    sub = LocTrackSubscriber(None, "loc/ns", "track", loc_prefixed=True)
-    got, _ = _receive(sub, _pub(loc_prefixed=True)._package(_AV1_SEQ, 0, 0))
-    assert got == [_AV1_SEQ]
-    # Unprefixed, the frame's 0x0B reads as a block length past the end.
-    got, seen = _receive(sub, _AV1_SEQ)
-    assert got == [] and seen == [None]
-    assert sub.objects_rejected == 1
-
-
-def test_prefixed_block_contents_are_skipped():
-    sub = LocTrackSubscriber(None, "loc/ns", "track", loc_prefixed=True)
-    assert _receive(sub, b"\x0a\x03abcframe")[0] == [b"frame"]
-    # Two-byte varint length (70).
-    assert _receive(sub, b"\x0a\x40\x46" + bytes(70) + b"f")[0] == [b"f"]
-    assert sub.objects_rejected == 0
-
-
-@pytest.mark.parametrize("payload", [b"frame", b"\x0b\x00frame"],
-                         ids=["media", "other-type"])
-def test_prefixed_missing_block_is_rejected(payload):
-    sub = LocTrackSubscriber(None, "loc/ns", "track", loc_prefixed=True)
-    got, seen = _receive(sub, payload)
-    assert got == [] and seen == [None]
-    assert sub.objects_rejected == 1 and sub.frames_received == 0
-
-
-@pytest.mark.parametrize("payload", [b"\x0a\x05ab", b"\x0a", b"\x0a\x40"],
-                         ids=["contents", "no-length", "short-varint"])
-def test_prefixed_overrunning_block_is_rejected(payload):
-    sub = LocTrackSubscriber(None, "loc/ns", "track", loc_prefixed=True)
-    got, seen = _receive(sub, payload)
-    assert got == [] and seen == [None]
-    assert sub.objects_rejected == 1
-
-
 def test_zero_length_payload_passes_through():
     assert _pub()._package(b"", 0, 0) == b""
-    assert _pub(loc_prefixed=True)._package(b"", 0, 0) == b"\x0a\x00"
-    for prefixed in (False, True):
-        sub = LocTrackSubscriber(None, "loc/ns", "track",
-                                 loc_prefixed=prefixed)
-        assert _receive(sub, b"")[0] == [b""]
-        assert sub.objects_rejected == 0
-    assert _receive(sub, b"\x0a\x00")[0] == [b""]
+    sub = LocTrackSubscriber(None, "loc/ns", "track")
+    assert _receive(sub, b"")[0] == [b""]
+    assert sub.objects_rejected == 0
 
 
 def test_locmaf_objects_carry_no_block():
@@ -123,24 +76,19 @@ def test_locmaf_objects_carry_no_block():
         chunk, GroupState(), 0)
     rebuilt = LocmafDecoder(init).push(0, 0, want)
 
-    assert _pub(loc_prefixed=True)._package(chunk, 0, 0) == b"\x0a\x00" + chunk
-    for prefixed in (False, True):
-        pub = LocmafTrackPublisher(_D18, "loc/ns", "v", init=init,
-                                   loc_prefixed=prefixed)
-        assert pub._package(chunk, 0, 0) == want
-        sub = LocmafTrackSubscriber(None, "loc/ns", "v", init=init,
-                                    loc_prefixed=prefixed)
-        assert _receive(sub, want)[0] == [rebuilt]
-        assert sub.objects_rejected == 0
+    assert _pub()._package(chunk, 0, 0) == chunk
+    pub = LocmafTrackPublisher(_D18, "loc/ns", "v", init=init)
+    assert pub._package(chunk, 0, 0) == want
+    sub = LocmafTrackSubscriber(None, "loc/ns", "v", init=init)
+    assert _receive(sub, want)[0] == [rebuilt]
+    assert sub.objects_rejected == 0
 
 
 # -- over the wire ------------------------------------------------------
 
 _FRAMES = [(_AV1_SEQ, True), (b"p-1", False), (b"\x0a", False),
            (b"idr-1", True)]
-# Track name: (publisher prefixed, subscriber prefixed).
-_TRACKS = {"loc": (False, False), "prefixed": (True, True),
-           "prefixed-raw": (True, False), "bare-strict": (False, True)}
+_TRACKS = ("video", "audio")
 
 
 def _server(port, use_quic, gens):
@@ -153,8 +101,7 @@ def _server(port, use_quic, gens):
         ok = session.subscribe_ok(request_msg=msg, content_exists=0)
         await asyncio.sleep(0.05)
         pub = LocTrackPublisher(session, "loc/ns", name,
-                                mapping=StreamMapping.PER_GROUP,
-                                loc_prefixed=_TRACKS[name][0])
+                                mapping=StreamMapping.PER_GROUP)
         for i, (payload, key) in enumerate(_FRAMES):
             await pub.send_frame(payload, key_frame=key, timestamp=1000 + i)
         await pub.finish()
@@ -168,7 +115,7 @@ def _server(port, use_quic, gens):
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_tracks_on_one_session_keep_their_own_framing(use_quic):
+async def test_tracks_on_one_session_deliver_payloads_verbatim(use_quic):
     port = _BASE_PORT + (0 if use_quic else 1)
     gens = []
     server = await _server(port, use_quic, gens).serve()
@@ -179,9 +126,9 @@ async def test_tracks_on_one_session_keep_their_own_framing(use_quic):
         async with client.connect() as session:
             await session.client_session_init()
             subs = {}
-            for name, (_, prefixed) in _TRACKS.items():
+            for name in _TRACKS:
                 subs[name] = LocTrackSubscriber(
-                    session, "loc/ns", name, loc_prefixed=prefixed,
+                    session, "loc/ns", name,
                     on_frame=(lambda f, g, o, _n=name:
                               got[_n].append(f.payload)))
                 await subs[name].subscribe()
@@ -198,12 +145,9 @@ async def test_tracks_on_one_session_keep_their_own_framing(use_quic):
             g.cancel()
         server.close()
     frames = [p for p, _ in _FRAMES]
-    assert got["loc"] == frames
-    assert got["prefixed"] == frames
-    assert got["prefixed-raw"] == [b"\x0a\x00" + p for p in frames]
-    assert got["bare-strict"] == []
-    assert subs["bare-strict"].objects_rejected == len(_FRAMES)
-    assert sum(subs[n].objects_rejected for n in _TRACKS) == len(_FRAMES)
+    for name in _TRACKS:
+        assert got[name] == frames, name
+        assert subs[name].objects_rejected == 0, name
 
 
 # -- pub_media → relay → sub_media ---------------------------------------
@@ -219,17 +163,12 @@ def _argv(monkeypatch, tool, *argv):
 
 
 @requires_certs
-@pytest.mark.parametrize('use_quic, pub_prefixed, sub_prefixed', [
-    (True, False, False), (False, False, False), (True, True, True),
-    (True, False, True),
-], ids=['quic', 'wt', 'quic-prefixed', 'quic-prefixed-sub-only'])
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
 async def test_pub_media_loc_through_a_relay(clip, tmp_path,  # noqa: F811
-                                             monkeypatch, capsys, use_quic,
-                                             pub_prefixed, sub_prefixed):
+                                             monkeypatch, capsys, use_quic):
     av = pytest.importorskip('av')
     ns = 'loc/e2e'
-    port = (_BASE_PORT + 2 + (0 if use_quic else 1) + 2 * sub_prefixed
-            + pub_prefixed)
+    port = _BASE_PORT + 2 + (0 if use_quic else 1)
     url = f"{'moqt' if use_quic else 'https'}://localhost:{port}/"
     published = []
 
@@ -245,11 +184,9 @@ async def test_pub_media_loc_through_a_relay(clip, tmp_path,  # noqa: F811
                                        use_quic=use_quic, draft=18).serve()
     pub_args = _argv(monkeypatch, 'pub_media', url, '-N', ns, '--mp4', clip,
                      '--pub-ns', '-k', '--draft', '18', '-t', '4',
-                     '--stats', '0', '--catalog-interval', '0.5',
-                     *(['--loc-prefixed'] if pub_prefixed else []))
+                     '--stats', '0', '--catalog-interval', '0.5')
     sub_args = _argv(monkeypatch, 'sub_media', url, '-N', ns, '--out',
-                     str(tmp_path), '-k', '--draft', '18', '-t', '2',
-                     *(['--loc-prefixed'] if sub_prefixed else []))
+                     str(tmp_path), '-k', '--draft', '18', '-t', '2')
     pub = asyncio.create_task(pub_media.run(pub_args))
     try:
         for _ in range(200):
@@ -269,11 +206,6 @@ async def test_pub_media_loc_through_a_relay(clip, tmp_path,  # noqa: F811
     summary = _summary(capsys.readouterr().err)
     assert set(summary) == {'video', 'audio'}
     assert {t.trackname for t in published} == {'video', 'audio'}
-    assert all(t.loc_prefixed == pub_prefixed for t in published)
-    if pub_prefixed != sub_prefixed:
-        for name, (frames, rejected) in summary.items():
-            assert frames == 0 and rejected > 0, (name, frames, rejected)
-        return
     for name, (frames, rejected) in summary.items():
         assert frames > 0 and rejected == 0, (name, frames, rejected)
     data = (tmp_path / 'video.h264').read_bytes()

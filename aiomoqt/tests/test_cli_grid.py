@@ -311,15 +311,6 @@ def test_packaging_flag_agrees_across_media_tools():
         assert tuple(acts[0].choices) == MEDIA_PACKAGINGS, tool
 
 
-def test_loc_prefixed_flag_agrees_across_media_tools():
-    """--loc-prefixed is long-only and the same switch on both media tools."""
-    for tool in ("pub_media", "sub_media"):
-        acts = [a for a in _parser_actions(tool) if a.dest == "loc_prefixed"]
-        assert len(acts) == 1, tool
-        assert acts[0].option_strings == ["--loc-prefixed"], tool
-        assert isinstance(acts[0], argparse._StoreTrueAction), tool
-
-
 def test_load_sim_draft_takes_a_draft_list():
     acts = [a for a in _parser_actions("load_sim") if a.dest == "draft"]
     assert acts[0].type("22,20") == [22, 20]

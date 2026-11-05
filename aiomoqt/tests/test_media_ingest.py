@@ -514,7 +514,6 @@ async def test_pub_media_input_through_a_relay(ladders, monkeypatch, source,
     assert [t.altGroup for t in videos] == [1, 1]
     assert {t.packaging for t in catalog.tracks} == {packaging}
     assert all(t.objects_rejected == 0 for t in sub.tracks.values())
-    assert not any(t.loc_prefixed for t in sub.tracks.values())
     assert len(published) == (3 if packaging == 'locmaf' else 0)
     assert all(t.raw_fallbacks == 0 for t in published)
     groups = {}

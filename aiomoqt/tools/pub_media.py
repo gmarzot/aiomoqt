@@ -216,10 +216,6 @@ def parse_args():
                              'of each group, and on every object with '
                              '--loc-codecstring. Default: wall-clock µs, '
                              'no TIMESCALE. 1000000 keeps µs values.')
-    parser.add_argument('--loc-prefixed', action='store_true',
-                        help='LOC payloads open with an empty Private '
-                             'Properties block 0x0A 0x00, for receivers '
-                             'that require one')
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='PUBLISH_NAMESPACE only; the relay forwards '
@@ -371,7 +367,6 @@ def parse_args():
         parser.error('--loc-timescale must be positive')
     for flag, on in (('--loc-codecstring', args.loc_codecstring),
                      ('--annexb', args.annexb),
-                     ('--loc-prefixed', args.loc_prefixed),
                      ('--loc-timescale', args.loc_timescale)):
         if on and args.packaging != PACKAGING_LOC:
             parser.error(f'{flag} applies to LOC packaging only')
@@ -1769,8 +1764,6 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                  if args.audio_subgroups == 'object'
                  else StreamMapping.PER_GROUP)
         session = sessions[0]
-        # CMAF objects are not LOC: no Private Properties block.
-        loc_prefixed = args.loc_prefixed and args.packaging == PACKAGING_LOC
         cfg_at = _INIT_DATA[args.init_data][1]
 
         def _track(name, **kwargs):
@@ -1780,7 +1773,6 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 return LocmafTrackPublisher(session, args.namespace, name,
                                             init=init, **kwargs)
             return LocTrackPublisher(session, args.namespace, name,
-                                     loc_prefixed=loc_prefixed,
                                      timescale=args.loc_timescale,
                                      config_property=cfg_at, **kwargs)
         # One start for every paced feeder.
@@ -1817,7 +1809,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 name = _video_name(i)
                 tracks[name] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, name, config=v.config,
-                    mapping=v_map, loc01_compat=args.loc01_compat, loc_prefixed=loc_prefixed,
+                    mapping=v_map, loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(v_codecs[i]), annexb=annexbs[i],
                     fetch_history_bytes=args.fetch_history),
@@ -1827,7 +1819,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
                     config=ts_audio.config, mapping=a_map,
-                    loc01_compat=args.loc01_compat, loc_prefixed=loc_prefixed,
+                    loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(ts_audio.codec_string),
                     fetch_history_bytes=args.fetch_history),
@@ -1863,7 +1855,7 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             feeders.append(_feed_h264_live(
                 pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    mapping=v_map, loc01_compat=args.loc01_compat, loc_prefixed=loc_prefixed,
+                    mapping=v_map, loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(v_codecs[0]), annexb=annexbs[0],
                     fetch_history_bytes=args.fetch_history),
