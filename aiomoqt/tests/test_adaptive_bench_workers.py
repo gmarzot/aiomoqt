@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from aiomoqt.tools import adaptive_bench as ab
+from aiomoqt.types import MOQTRequestError
 from aiomoqt.utils import workers
 
 
@@ -327,3 +328,137 @@ async def test_report_csv_keeps_its_columns(monkeypatch, tmp_path, mode, has_tic
         assert None not in row and None not in row.values()
         assert ('tick_p90_ms' in row) is has_tick
         assert ('worst_p90_ms' if has_tick else 'win_p90_ms') in row
+
+
+class _Session:
+    async def client_session_init(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _Client:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def connect(self):
+        return self
+
+    async def __aenter__(self):
+        return _Session()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _slot_state():
+    return {'active': False, 'since': 0.0, 'hist': None, 'refused': 0,
+            'refusing': False, 'refused_reason': None}
+
+
+async def test_slot_counts_a_refusal_until_it_subscribes(monkeypatch):
+    stop = asyncio.Event()
+    state = _slot_state()
+    seen = []
+
+    class Track:
+        calls = 0
+        state = workers.TrackState.CLOSED
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def subscribe(self, **kwargs):
+            Track.calls += 1
+            if Track.calls == 1:
+                raise MOQTRequestError(9, 'relay overloaded', retry_interval=5001)
+            seen.append(dict(state))
+            stop.set()
+
+    monkeypatch.setattr(workers, 'MOQTClient', _Client)
+    monkeypatch.setattr(workers, 'SubscribedTrack', Track)
+    monkeypatch.setattr(workers, 'SELF_HEAL_BACKOFF_S', 0.0)
+    relay = SimpleNamespace(host='127.0.0.1', port=4433, path='', use_quic=True)
+    await workers._slot_supervisor(dict(namespace='ns', trackname='t'), relay,
+                                   stop, None, state, 0)
+    assert seen[0]['refusing'] and seen[0]['refused'] == 1
+    assert seen[0]['refused_reason'] == 'relay overloaded'
+    assert state['refused'] == 1 and not state['refusing']
+
+
+async def test_a_track_not_yet_published_is_not_a_refusal(monkeypatch):
+    stop = asyncio.Event()
+    state = _slot_state()
+
+    class Track:
+        calls = 0
+        state = workers.TrackState.CLOSED
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def subscribe(self, **kwargs):
+            Track.calls += 1
+            if Track.calls == 1:
+                raise MOQTRequestError(4, 'does not exist')
+            stop.set()
+
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(workers, 'MOQTClient', _Client)
+    monkeypatch.setattr(workers, 'SubscribedTrack', Track)
+    monkeypatch.setattr(workers.asyncio, 'sleep', lambda _s: real_sleep(0))
+    relay = SimpleNamespace(host='127.0.0.1', port=4433, path='', use_quic=True)
+    await workers._slot_supervisor(dict(namespace='ns', trackname='t'), relay,
+                                   stop, None, state, 0)
+    assert state['refused'] == 0 and not state['refusing']
+
+
+async def test_actuator_totals_refusals_past_a_reaped_worker(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    events.put(_report(refused=5, refusing=3, refused_reason='relay overloaded'))
+    sig = await act.observe()
+    assert sig.refusing_subs == 3
+    act._kill_worker(0)
+    sig = await act.observe()
+    assert sig.refusing_subs == 0
+    assert act.refused_total == 5 and act.refused_reason == 'relay overloaded'
+    await act.shutdown()
+
+
+@pytest.mark.parametrize('refusing, onset, sustained', [
+    (3, 'hold (relay refusing)', 'hold (relay refusing)'),
+    (0, 'hold (watch)', 'hold (shortfall)'),
+])
+async def test_a_refused_shortfall_says_so(monkeypatch, capsys, refusing, onset, sustained):
+    state = ab.BenchState()
+    ticks = [0]
+
+    async def observe():
+        ticks[0] += 1
+        if ticks[0] >= 8:
+            state.stop.set()
+        return ab.Signal(t=time.monotonic(), level=10, latency_mean_ms=1.0,
+                         latency_p90_ms=1.0, loss_pct=0, shortfall=True,
+                         target_mbps=10, tx_mbps=10, rx_mbps=10,
+                         refusing_subs=refusing)
+
+    actuator = SimpleNamespace(initial_level=10, unit='subs', min_level=1,
+                               max_level=20, initial_step=1, step_floor=1,
+                               apply=AsyncMock(), observe=observe)
+    controller = ab.AIMDController(actuator, state, interval_s=0.001)
+    await controller.run()
+    out = capsys.readouterr().out
+    assert onset in out and sustained in out
+    assert ('hold (shortfall)' in out) is (not refusing)
+
+
+def test_summary_names_the_refusals(capsys):
+    state = ab.BenchState()
+    actuator = SimpleNamespace(unit='subs', max_level=20, refused_total=7,
+                               refused_reason='relay overloaded')
+    controller = SimpleNamespace(actuator=actuator, high_water=10.0, pivots=[],
+                                 held_at_max=False, eq_level=0.0)
+    ab._print_summary(state, controller, 1, None)
+    assert '7 subscribes by the relay (relay overloaded)' in capsys.readouterr().out

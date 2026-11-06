@@ -32,7 +32,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import FilterType
+from aiomoqt.types import FilterType, MOQTRequestError
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_handler, set_log_level
 from aiomoqt.utils.stats import TrackStats
@@ -370,11 +370,16 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                                 or 'no such namespace' in m):
                             await asyncio.sleep(0.3)
                             continue
+                        if isinstance(e, MOQTRequestError):
+                            state['refused'] += 1
+                            state['refusing'] = True
+                            state['refused_reason'] = e.reason
                         # Other subscribe error: drop the connection and
                         # let the outer loop reopen the whole slot.
                         break
                 if subscribed:
                     state['active'] = True
+                    state['refusing'] = False
                     state['since'] = time.monotonic()
                     while not stop_ev.is_set():
                         if getattr(track, 'state', None) == TrackState.CLOSED:
@@ -425,7 +430,9 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
        "active": <subscribed slots>, "delivering": <slots at rate>,
        "t", "dt", "rx_bytes", "rx_objs" (deltas over dt),
        "lat_n", "lat_p90_ms", "lat_mean_ms" (worst slot with samples),
-       "jitter_ms", "loss", "total_bytes", "total_objs"}
+       "jitter_ms", "loss", "total_bytes", "total_objs",
+       "refused" (subscribes the relay refused so far), "refusing" (slots
+       whose last subscribe it refused), "refused_reason"}
 
     A slot is delivering per slot_delivering() against config
     'per_sub_mbps' over config 'keep_window' seconds; without
@@ -444,7 +451,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
 
     # (stats, state) per slot; stats persist across a slot's reopens.
     slots = [(TrackStats(), {'active': False, 'since': 0.0,
-                             'hist': deque()})
+                             'hist': deque(), 'refused': 0,
+                             'refusing': False, 'refused_reason': None})
              for _ in range(K)]
 
     async def _batch_stats_loop():
@@ -459,7 +467,12 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             jitter_sum = 0.0
             jitter_n = 0
             active = delivering = 0
+            refused = refusing = 0
+            refused_reason = None
             for stats, state in slots:
+                refused += state['refused']
+                refusing += state['refusing']
+                refused_reason = state['refused_reason'] or refused_reason
                 snap = stats.snapshot()
                 agg_bytes += snap['rx_bytes']
                 agg_objs += snap['rx_objs']
@@ -497,6 +510,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'lat_mean_ms': 0.0 if worst_mean is None else worst_mean,
                 'jitter_ms': jitter_sum / jitter_n if jitter_n else 0.0,
                 'total_bytes': total_bytes, 'total_objs': total_objs,
+                'refused': refused, 'refusing': refusing,
+                'refused_reason': refused_reason,
             })
             last_t = now
 
