@@ -98,6 +98,14 @@ async def test_zero_duration_holds_until_stopped():
         assert actions.count('hold (max)') >= 15, actions
 
 
+async def test_negative_duration_exits_at_max():
+    ctl, state, actions, _ = _at_max(-1)
+    await ctl.run()
+    assert state.ceiling_reason == 'reached max 10 Mbps'
+    assert actions[-1] == 'max' and not ctl.held_at_max
+    assert ctl.high_water == 10
+
+
 async def test_back_off_still_applies_at_max():
     ctl, state, actions, actuator = _at_max(None, p90s=[500, 500, 500], stop_after=10)
     await ctl.run()

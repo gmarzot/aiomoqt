@@ -884,7 +884,8 @@ class AIMDController:
     Keeps probing: it backs off on a signal and resumes ramping from the
     lower level, never locking in a ceiling. Holds at the actuator's max
     level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
-    or rx=0 for 3 intervals (a failure).
+    or rx=0 for 3 intervals (a failure). A negative duration ends the run
+    on reaching max, with no time limit.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -935,7 +936,8 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
-        self.duration_s = duration_s or None
+        self.duration_s = duration_s if duration_s and duration_s > 0 else None
+        self.exit_at_max = duration_s is not None and duration_s < 0
         self.held_at_max = False
         # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
@@ -1096,6 +1098,12 @@ class AIMDController:
                     and not sig.shortfall):
                 self.high_water = observed
             if level >= a.max_level:
+                if self.exit_at_max:
+                    state.ceiling_reason = (
+                        f"reached max {a.max_level:g} {a.unit}")
+                    self._emit(sig, "max", force=True)
+                    state.stop.set()
+                    return
                 self.held_at_max = True
                 self._emit(sig, "hold (max)")
                 await a.apply(level)
@@ -1553,11 +1561,12 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-t", "--duration", type=float, default=None,
+    p.add_argument("-t", "--duration", type=float, default=0,
                    metavar="SECONDS",
                    help="run time; the run ends after this many seconds, "
                         "holding at --max-mbps / --max-subs once there. "
-                        "0 or unset: until Ctrl-C.")
+                        "0 (default): until Ctrl-C. -1: exit on reaching "
+                        "max, no time limit.")
     p.add_argument("--keylogfile", default=None,
                    help="TLS secrets log path (NSS Key Log Format) for "
                         "Wireshark decryption of pcap captures. Each MP "
@@ -1775,7 +1784,7 @@ async def _run_fixed_publisher(args) -> int:
 
     try:
         deadline = (time.monotonic() + args.duration
-                    if args.duration else None)
+                    if args.duration > 0 else None)
         while proc.is_alive():
             drain_health()
             if failed:

@@ -2,7 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
-- adaptive_bench holds at `--max-mbps` / `--max-subs` until `-t` is up instead of exiting there; `-t 0` or no `-t` runs until Ctrl-C.
+- adaptive_bench holds at `--max-mbps` / `--max-subs` until `-t` is up instead of exiting there; `-t 0` or no `-t` runs until Ctrl-C, and `-t -1` exits on reaching max.
 - relay_probe probes drafts 20 and 22 by default, after 14, 16 and 18.
 - aiomoqt-relay status: a subscribed track takes the chart history slot of a track without subscribers when all 24 are held, so the dashboard charts show it.
 - aiomoqt-relay subscribes to every publisher of a track's namespace, including one that announces once the track is live, and merges their objects without repeating a Location; when the serving publisher ends the track or disconnects, another takes over and subscribers see no PUBLISH_DONE.
