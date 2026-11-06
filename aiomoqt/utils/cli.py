@@ -70,7 +70,7 @@ SETUP_TIMEOUT = 30
 DGRAM_MAX_OBJECT = 1152
 
 VIDEO_PROFILES = ('240p', '270p', '360p', '480p',
-                  '720p', '1080p', '1440p', '4k')
+                  '720p', '1080p', '1440p', '4k', '4kuhd')
 VIDEO_FPS = 30
 
 

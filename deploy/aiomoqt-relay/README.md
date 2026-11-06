@@ -16,8 +16,10 @@ comes from apt certbot with dns-cloudflare (`/etc/cloudflare/credentials.ini`, 0
 hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart `aiomoqt-relay` and reload `relay-web` by
 name.
 
-The host is also the perf and release-gate box. UDP 4443 belongs to the public relay; test relays
-use 5443 and up. Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
+The host is also the perf and release-gate box. UDP 4443 belongs to the public relay. A test relay
+on 5443 or up is reachable only from the host. One that takes load from another host needs a port
+in the security list's range, such as 4442, plus its own INPUT ACCEPT and the NOTRACK rules under
+"Host tuning". Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
 again after.
 
 ## Layout on the host
@@ -100,7 +102,8 @@ the host keeps other per-packet work off its cores:
 
 - **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
   queue interrupts to CPU 0, and `host/relay-irq-affinity.service` runs it at boot (irqbalance is
-  off). The relay service has `cpuset: "1,2"`.
+  off). The relay service has `cpuset: "1,2"`. GoAccess runs on CPU 0 at a low CPU share, so its
+  report runs don't take the relay's CPUs.
 
   ```sh
   sudo install -m 755 host/relay-irq-affinity.sh /usr/local/sbin/

@@ -76,6 +76,9 @@ services:
     container_name: relay-goaccess
     restart: unless-stopped
     network_mode: none
+    # Off the relay's CPUs; yields to the NIC's softirq work on CPU 0.
+    cpuset: "0"
+    cpu_shares: 64
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     read_only: true

@@ -35,8 +35,7 @@ from typing import Optional
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import SubscribedTrack
-from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
-                           parse_draft_spec)
+from aiomoqt.types import FilterType, MOQTMessageType, ObjectStatus
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.certs import (REPO_CERTS_DIR, ensure_self_signed,
                                  find_cert, find_key)
@@ -1469,8 +1468,8 @@ def parse_args():
                         "(default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
-    p.add_argument("--draft", type=parse_draft_spec, default=None,
-                   help="MoQT draft version: 14, 16, or 18")
+    _cli.add_session(p)
+    _cli.add_keepalive(p)
     p.add_argument("-N", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")
     p.add_argument("-T", "--trackname", default=None,
@@ -1503,8 +1502,6 @@ def parse_args():
                         "Splitting across hosts is subs-mode only: there "
                         "the publisher is fixed-rate and the whole "
                         "control loop lives on the subscriber side.")
-    p.add_argument("-k", "--insecure", action="store_true",
-                   help="skip TLS verification")
     p.add_argument("--cert", default=CERT)
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
@@ -1572,33 +1569,6 @@ def parse_args():
                    help="also end the run on COND; -t still applies. max: "
                         "on reaching --max-mbps / --max-subs, without "
                         "holding there.")
-    p.add_argument("--keylogfile", default=None,
-                   help="TLS secrets log path (NSS Key Log Format) for "
-                        "Wireshark decryption of pcap captures. Each MP "
-                        "worker (publisher / subscriber) gets a "
-                        "process-suffixed file: PATH.pub.<pid>, "
-                        "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--cc-algo", type=str, default="bbr",
-                   help="Congestion control (bbr | bbr1 | c4 | cubic | "
-                        "dcubic | fast | newreno | prague). Default: bbr")
-    p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
-                   help="QUIC keep-alive interval in seconds (PING) so a "
-                        "flow-controlled, consumer-stalled connection "
-                        "isn't dropped on the idle timeout. Default: off.")
-    p.add_argument("--max-queued-bytes", type=int, default=None,
-                   help="Aggregate publisher byte budget across ALL "
-                        "streams (QuicConfiguration.tx_max_queued_bytes): "
-                        "producer parks at stream rollover while total "
-                        "un-transmitted TX bytes exceed this. "
-                        "Steady-state latency ~ value / throughput. "
-                        "Default: aiopquic default (4 MiB). "
-                        "Pass 0 to disable.")
-    p.add_argument("--max-inflight-bytes", type=int, default=None,
-                   help="Per-stream TX budget (aiomoqt "
-                        "tx_max_inflight_bytes): producer pauses while "
-                        "one stream's un-transmitted bytes exceed this. "
-                        "Default: aiomoqt default (1 MiB). "
-                        "Pass 0 to disable.")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()

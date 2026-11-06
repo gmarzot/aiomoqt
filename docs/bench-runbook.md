@@ -247,6 +247,10 @@ one-second GOP is 1 I-frame, 20 B and 9 P under the `ibp` pattern:
 | 1080p | 200,000 | 25,000 | 10,000 | 20,833 | 5.00 |
 | 1440p | 350,000 | 40,000 | 18,000 | 35,666 | 8.56 |
 | 4k | 600,000 | 60,000 | 30,000 | 58,000 | 13.92 |
+| 4kuhd | 744,000 | 93,000 | 37,200 | 77,500 | 18.60 |
+
+`4kuhd` is the 1080p shape scaled to 16.0 Mbps at a two-second GOP (`-g 60`), as 1080p
+is 4.30 Mbps there.
 
 **Rate does not scale with frame rate.** `-r` sets fps; at 60 fps the
 same single I-frame amortises over twice as many frames, so the average
