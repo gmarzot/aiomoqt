@@ -18,6 +18,9 @@ Limits:
     (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
     --max-subscriptions-per-session SUBSCRIBEs held; past either, a
     request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
+  * Near overload (--admission-cpu) or at --max-subscribers, a session's
+    first SUBSCRIBE is refused the same way, with a randomized Retry
+    Interval. Sessions already subscribed may add tracks.
   * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
     oldest group dropped) under a relay-wide budget (--cache-bytes),
     which drops the oldest group of the least recently used track, never
@@ -91,6 +94,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import random
 import signal
 import sys
 import time
@@ -419,6 +423,14 @@ MAX_NAMESPACES_PER_SESSION = 256
 MAX_SUBSCRIPTIONS_PER_SESSION = 1024
 # Retry Interval of a cap refusal: milliseconds before a retry, plus one.
 CAP_RETRY_MS = 1000
+# Admission: --admission-cpu's gate, sampled every ADMISSION_TICK_S over
+# ADMISSION_WINDOW_S; a refusal's Retry Interval spans ADMISSION_RETRY_MS.
+ADMISSION_TICK_S = 1.0
+ADMISSION_WINDOW_S = 8
+ADMISSION_RETRY_MS = (5000, 15000)
+MAX_SUBSCRIBERS = 0
+_admission: relay_status.AdmissionGate | None = None
+_admission_refused = 0
 # id(session) -> its SUBSCRIBE handlers still running.
 _subscribing: Counter = Counter()
 # (id(session), cap) already warned about.
@@ -2100,6 +2112,53 @@ def _session_subscriptions(session) -> int:
         if d.session is session)
 
 
+def _subscriber_sessions() -> int:
+    """Sessions with a SUBSCRIBE in flight or attached to a track, the
+    watchdog's aside."""
+    ids = set(_subscribing)
+    for key, t in _tracks.items():
+        if not _internal_ns(key[0]):
+            ids.update(id(d.session) for d in t.downstream)
+    return len(ids)
+
+
+def _refused_by_load(session, msg) -> bool:
+    """Refuse a session's first SUBSCRIBE near overload or at
+    --max-subscribers. The watchdog's probe is exempt: refusing it would
+    exit the relay."""
+    closed = _admission is not None and not _admission.open
+    if not closed and not MAX_SUBSCRIBERS:
+        return False
+    if (_internal_ns(_ns_tuple(msg.track_namespace))
+            or _session_subscriptions(session)):
+        return False
+    if not closed and _subscriber_sessions() < MAX_SUBSCRIBERS:
+        return False
+    global _admission_refused
+    _admission_refused += 1
+    session._refuse_peer_request(
+        msg, RequestErrorCode.EXCESSIVE_LOAD, "relay overloaded",
+        retry_interval=random.randint(*ADMISSION_RETRY_MS) + 1)
+    return True
+
+
+async def _admission_watch(gate, load) -> None:
+    """Sample the busiest thread into the gate; WARNING on each change."""
+    while True:
+        await asyncio.sleep(ADMISSION_TICK_S)
+        if gate.update(load.sample()):
+            if gate.open:
+                logger.warning(f"relay: admission open: busiest thread "
+                               f"{gate.mean:.0f}%; {_admission_refused} "
+                               f"refused so far")
+            else:
+                logger.warning(f"relay: admission closed: busiest thread "
+                               f"{gate.mean:.0f}% over "
+                               f"{len(gate.samples)} samples (limit "
+                               f"{gate.close_pct:g}%): refusing new "
+                               f"subscribers with EXCESSIVE_LOAD")
+
+
 def _refused_over_cap(session, msg, what: str, cap: int, held: int) -> bool:
     """Refuse `msg` with EXCESSIVE_LOAD when the session holds `cap`
     of `what`; one WARNING per session and cap."""
@@ -3533,6 +3592,8 @@ async def _on_subscribe(session, msg):
                          MAX_SUBSCRIPTIONS_PER_SESSION,
                          _session_subscriptions(session)):
         return
+    if _refused_by_load(session, msg):
+        return
     _subscribing[id(session)] += 1
     try:
         await _relay_subscribe(session, msg)
@@ -3807,6 +3868,19 @@ def parse_args(argv=None):
                         help="SUBSCRIBEs one session may hold; more are "
                              "refused with EXCESSIVE_LOAD. Default: "
                              f"{MAX_SUBSCRIPTIONS_PER_SESSION}")
+    parser.add_argument("--admission-cpu", type=float, default=0.0,
+                        metavar="PCT",
+                        help="Refuse new subscribers with EXCESSIVE_LOAD "
+                             "while the busiest thread's "
+                             f"{ADMISSION_WINDOW_S} s mean is at PCT, until "
+                             "it falls 15 points lower. Sessions already "
+                             "subscribed may add tracks. Linux only. "
+                             "Default: 0, off")
+    parser.add_argument("--max-subscribers", type=int, default=0,
+                        metavar="N",
+                        help="Sessions the relay serves SUBSCRIBEs for; new "
+                             "ones are refused with EXCESSIVE_LOAD. "
+                             "Default: 0, no limit")
     parser.add_argument("--stream-scheduling", choices=SCHEDULING,
                         default=STREAM_SCHEDULING,
                         help="Order among data streams of one priority: "
@@ -4852,6 +4926,11 @@ def _cache_efficiency():
     return round(cache / total, 4) if total else None
 
 
+def _lane_delay_ms(lane, in_bps: float) -> float:
+    """What a lane and its streams hold, in time at the track's input rate."""
+    return round((lane.bytes + lane.tx_bytes) * 8000 / in_bps, 1)
+
+
 class _Status:
     """The dashboard's status.json, rewritten every STATUS_INTERVAL_S, and
     platform.json, every PLATFORM_INTERVAL_S."""
@@ -4925,6 +5004,7 @@ class _Status:
         pubs, subs = set(), set()
         ns_viewers: dict[tuple, set] = {}
         tracks, prev = [], {}
+        queue_ms: list[float] = []
         for key, t in list(_tracks.items()):
             if _internal_ns(key[0]):
                 continue
@@ -4965,6 +5045,11 @@ class _Status:
                     "lane_stalls": lane.stalls if lane else 0,
                     "since": info["since"] if info else None,
                     **(_sent_fields(d) if _trace_subscribers else {})})
+            in_bps = bps(t._bytes_in - p_in)
+            if in_bps:
+                queue_ms.extend(_lane_delay_ms(d.lane, in_bps)
+                                for d in t.downstream
+                                if d.lane is not None and d.forward)
             tracks.append((key, {
                 "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
                 "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
@@ -5131,6 +5216,15 @@ class _Status:
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
+            "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
+                         "p90": relay_status.percentile(queue_ms, 90),
+                         "max": max(queue_ms, default=None)},
+            "admission": {
+                "open": _admission is None or _admission.open,
+                "thread_pct": (None if _admission is None
+                               or _admission.mean is None
+                               else round(_admission.mean, 1)),
+                "refused": _admission_refused},
         }
         self._subs_peak = max(self._subs_peak, totals["subscribers"])
         totals["subscribers_peak"] = self._subs_peak
@@ -5627,6 +5721,12 @@ async def main():
               "--max-subscriptions-per-session must be above 0",
               file=sys.stderr)
         sys.exit(2)
+    if not 0 <= args.admission_cpu <= 100 or args.max_subscribers < 0:
+        print("Error: --admission-cpu must be 0-100 and --max-subscribers "
+              "0 or more", file=sys.stderr)
+        sys.exit(2)
+    global MAX_SUBSCRIBERS
+    MAX_SUBSCRIBERS = args.max_subscribers
     global MAX_NAMESPACES_PER_SESSION, MAX_SUBSCRIPTIONS_PER_SESSION
     MAX_NAMESPACES_PER_SESSION = args.max_namespaces_per_session
     MAX_SUBSCRIPTIONS_PER_SESSION = args.max_subscriptions_per_session
@@ -5666,6 +5766,12 @@ async def main():
         print(f"  upstream origin: {url}")
 
     _background.add(asyncio.create_task(_watch_lanes()))
+    if args.admission_cpu:
+        global _admission
+        _admission = relay_status.AdmissionGate(args.admission_cpu,
+                                                window=ADMISSION_WINDOW_S)
+        _background.add(asyncio.create_task(_admission_watch(
+            _admission, relay_status.ThreadLoad())))
 
     watchdog = None
     if args.watchdog > 0:
@@ -5692,6 +5798,8 @@ async def main():
                       "budget": CACHE_BUDGET_BYTES},
             "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
                             "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},
+            "admission": {"cpu_pct": args.admission_cpu,
+                          "max_subscribers": MAX_SUBSCRIBERS},
         }, handles)
         _background.add(asyncio.create_task(status.run()))
 

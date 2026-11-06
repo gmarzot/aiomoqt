@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import re
+import time
 from collections import deque
 from typing import Any, Iterable, Optional
 
@@ -449,6 +450,68 @@ class LoopLag:
         ms = [round(s * 1000, 2) for s in self.samples]
         return {"p50": percentile(ms, 50), "p99": percentile(ms, 99),
                 "max": max(ms) if ms else None}
+
+
+class ThreadLoad:
+    """The busiest thread's share of one CPU between samples, in percent,
+    from /proc. Where the kernel counts hypervisor steal in thread time,
+    the share includes it. Off Linux every sample is None."""
+
+    def __init__(self, proc: str = "/proc", clock=time.monotonic) -> None:
+        self.task_dir = os.path.join(proc, "self", "task")
+        self.clock = clock
+        self.hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        self._last: Optional[tuple[float, dict[str, int]]] = None
+
+    def _ticks(self) -> dict[str, int]:
+        try:
+            tids = os.listdir(self.task_dir)
+        except OSError:
+            return {}
+        ticks = {}
+        for tid in tids:
+            text = _read(os.path.join(self.task_dir, tid, "stat"))
+            if text:
+                ticks[tid] = parse_proc_self_stat(text)[0]
+        return ticks
+
+    def sample(self) -> Optional[float]:
+        now, ticks = self.clock(), self._ticks()
+        last, self._last = self._last, (now, ticks)
+        if not ticks or last is None or now <= last[0]:
+            return None
+        dt = now - last[0]
+        return max((100.0 * (n - last[1][tid]) / self.hz / dt
+                    for tid, n in ticks.items() if tid in last[1]),
+                   default=None)
+
+
+class AdmissionGate:
+    """Closes when the mean of the last `window` samples reaches `close_pct`;
+    reopens once that mean falls `margin` points below it."""
+
+    def __init__(self, close_pct: float, window: int = 8,
+                 margin: float = 15.0) -> None:
+        self.close_pct = close_pct
+        self.open_pct = close_pct - margin
+        self.samples: deque[float] = deque(maxlen=window)
+        self.open = True
+        self.mean: Optional[float] = None
+
+    def update(self, pct: Optional[float]) -> bool:
+        """Take a sample; True when the gate changed state."""
+        if pct is None:
+            return False
+        self.samples.append(pct)
+        if len(self.samples) < self.samples.maxlen:
+            return False
+        self.mean = sum(self.samples) / len(self.samples)
+        was_open = self.open
+        if self.open:
+            self.open = self.mean < self.close_pct
+        else:
+            self.open = self.mean < self.open_pct
+        return self.open != was_open
 
 
 class History:

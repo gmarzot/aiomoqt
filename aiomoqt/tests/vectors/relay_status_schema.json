@@ -792,6 +792,16 @@
   ".totals": [
    "object"
   ],
+  ".totals.admission": [
+   "object"
+  ],
+  ".totals.admission.open": [
+   "bool"
+  ],
+  ".totals.admission.refused": [
+   "int"
+  ],
+  ".totals.admission.thread_pct": [],
   ".totals.by_draft": [
    "object"
   ],
@@ -873,6 +883,18 @@
   ],
   ".totals.publishers": [
    "int"
+  ],
+  ".totals.queue_ms": [
+   "object"
+  ],
+  ".totals.queue_ms.max": [
+   "float"
+  ],
+  ".totals.queue_ms.p50": [
+   "float"
+  ],
+  ".totals.queue_ms.p90": [
+   "float"
   ],
   ".totals.rtt_p50_ms": [
    "float"
