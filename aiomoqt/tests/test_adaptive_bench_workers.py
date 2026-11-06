@@ -1,5 +1,6 @@
 """CLI outcomes and transport settings survive the worker boundary."""
 import asyncio
+import csv
 import queue
 import sys
 import threading
@@ -198,3 +199,131 @@ async def test_worker_applies_transport_settings(monkeypatch, kind, budget):
     assert captured['tx_max_queued_bytes'] == 0
     assert captured['tx_max_inflight_bytes'] is budget
     assert captured['keep_alive_interval'] == 2.5
+
+
+class _DryingQueue(_Queue):
+    """Reads Empty between bursts, as mp.Queue does when its pipe runs dry."""
+
+    def __init__(self, burst):
+        super().__init__()
+        self.burst = burst
+        self.left = burst
+
+    def get_nowait(self):
+        if self.left == 0:
+            self.left = self.burst
+            raise queue.Empty
+        self.left -= 1
+        return super().get_nowait()
+
+
+def _subs_actuator(monkeypatch, mbps=16.0):
+    _processes(monkeypatch, receive=False)
+    return ab.SubsActuator('moqt://127.0.0.1:4433', 'ns', 'track', None, True,
+                           force_quic=False, min_subs=1, max_subs=4, start_subs=1,
+                           step_subs=1, object_size=1000, per_sub_mbps=mbps,
+                           interval_s=1.0, stagger=0.0)
+
+
+def _report(rx_mbps=16.0, p90=None, **extra):
+    return {'kind': 'batch_stats', 'worker_id': 0, 'batch_size': 1, 'active': 1,
+            'delivering': 1, 't': time.monotonic(), 'dt': 1.0,
+            'rx_bytes': int(rx_mbps * 1e6 / 8), 'rx_objs': 30, 'loss': 0,
+            'lat_n': 0 if p90 is None else 30, 'lat_p90_ms': p90 or 0.0,
+            'lat_mean_ms': p90 or 0.0, 'jitter_ms': 0.0, 'total_objs': 30, **extra}
+
+
+async def _mature_worker(act):
+    await act.apply(1)
+    act._spawned_t[0] -= 100.0
+    return act._events_q
+
+
+async def test_reports_are_read_between_ticks_past_a_dry_pipe(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    act._events_q = _DryingQueue(burst=5)
+    await _mature_worker(act)
+    for i in range(20):
+        act._events_q.put(_report(seq=i))
+    deadline = time.monotonic() + 5.0
+    while act._events_q.qsize() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert act._events_q.qsize() == 0
+    assert act._latest_batch[0]['seq'] == 19
+    await act.shutdown()
+
+
+async def test_rx_covers_the_tick_on_a_two_second_gop(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    for _ in range(3):
+        # The second without the I-frame last: under the shortfall ratio alone.
+        events.put(_report(rx_mbps=18.6))
+        events.put(_report(rx_mbps=13.4))
+        sig = await act.observe()
+        assert sig.rx_mbps == pytest.approx(16.0, abs=0.01)
+        assert not sig.shortfall
+    await act.shutdown()
+
+
+async def test_controller_acts_on_the_worst_p90_of_the_tick(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    events.put(_report(p90=900.0))
+    events.put(_report(p90=100.0))
+    sig = await act.observe()
+    assert (sig.latency_p90_ms, sig.latest_p90_ms) == (900.0, 100.0)
+    events.put(_report(p90=100.0))
+    sig = await act.observe()
+    assert (sig.latency_p90_ms, sig.latest_p90_ms) == (100.0, 100.0)
+    await act.shutdown()
+
+
+async def test_a_young_workers_latency_is_not_counted(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    await act.apply(1)
+    act._events_q.put(_report(p90=5000.0))
+    act._drain_events()
+    act._spawned_t[0] -= 100.0
+    act._events_q.put(_report(p90=100.0))
+    sig = await act.observe()
+    assert sig.latency_p90_ms == 100.0
+    await act.shutdown()
+
+
+async def test_a_tick_without_a_report_keeps_the_last_figures(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    events.put(_report(rx_mbps=16.0, p90=100.0))
+    await act.observe()
+    sig = await act.observe()
+    assert sig.rx_mbps == pytest.approx(16.0, abs=0.01)
+    assert sig.latency_p90_ms == 100.0 and sig.latency_known
+    await act.shutdown()
+
+
+async def test_a_stale_report_warns_once(monkeypatch, capsys):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    events.put(_report(t=time.monotonic() - 30.0))
+    await act.observe()
+    assert 'worker report 30s old' in capsys.readouterr().out
+    events.put(_report())
+    await act.observe()
+    assert 'worker report' not in capsys.readouterr().out
+    await act.shutdown()
+
+
+@pytest.mark.parametrize('mode, has_tick', [('subs', True), ('bw', False)])
+async def test_report_csv_keeps_its_columns(monkeypatch, tmp_path, mode, has_tick):
+    _processes(monkeypatch)
+    path = tmp_path / 'report.csv'
+    _argv(monkeypatch, '--mode', mode, '--report', str(path))
+    assert await ab.main() == 0
+    with path.open(newline='') as f:
+        rows = list(csv.DictReader(f))
+    assert rows
+    for row in rows:
+        assert None not in row and None not in row.values()
+        assert ('tick_p90_ms' in row) is has_tick
+        assert ('worst_p90_ms' if has_tick else 'win_p90_ms') in row
