@@ -1,6 +1,10 @@
 """adaptive_bench's multi-process rate divides by the time measured so far,
-capped at the window, and missing latency prints as n/a."""
+capped at the window, and missing latency prints as n/a. The controller holds
+at max until -t."""
 import queue
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from aiomoqt.tools import adaptive_bench as ab
 
@@ -50,3 +54,59 @@ async def test_no_latency_samples_print_as_na(monkeypatch, capsys):
     ctl._print_row(sig, "ramp")
     row = capsys.readouterr().out
     assert "n/a" in row and "0.0us" not in row, row
+
+
+def _at_max(duration_s, p90s=(), stop_after=None):
+    """A controller already at max_level; p90s feed the first ticks, then 0."""
+    state = ab.BenchState()
+    p90s = list(p90s)
+    ticks = [0]
+
+    async def observe():
+        ticks[0] += 1
+        if stop_after and ticks[0] >= stop_after:
+            state.stop.set()
+        p90 = p90s.pop(0) if p90s else 0.0
+        return ab.Signal(t=time.monotonic(), level=10, latency_mean_ms=p90,
+                         latency_p90_ms=p90, loss_pct=0, shortfall=False,
+                         target_mbps=10, tx_mbps=10, rx_mbps=10)
+
+    actuator = SimpleNamespace(initial_level=10, unit='Mbps', min_level=1,
+                               max_level=10, initial_step=1, step_floor=1,
+                               apply=AsyncMock(), observe=observe)
+    ctl = ab.AIMDController(actuator, state, interval_s=0.001,
+                            latency_threshold_ms=100, duration_s=duration_s)
+    actions = []
+    ctl._emit = lambda sig, action, force=False: actions.append(action)
+    return ctl, state, actions, actuator
+
+
+async def test_holds_at_max_until_duration():
+    ctl, state, actions, actuator = _at_max(0.05)
+    await ctl.run()
+    assert 'duration cap reached' in state.ceiling_reason
+    assert actions.count('hold (max)') > 1, actions
+    assert ctl.held_at_max and ctl.high_water == 10
+    actuator.apply.assert_awaited_with(10)
+
+
+async def test_zero_duration_holds_until_stopped():
+    for duration_s in (0, None):
+        ctl, state, actions, _ = _at_max(duration_s, stop_after=20)
+        await ctl.run()
+        assert state.ceiling_reason is None
+        assert actions.count('hold (max)') >= 15, actions
+
+
+async def test_back_off_still_applies_at_max():
+    ctl, state, actions, actuator = _at_max(None, p90s=[500, 500, 500], stop_after=10)
+    await ctl.run()
+    assert 'back-off (p90 over)' in actions
+    assert any(call.args[0] < 10 for call in actuator.apply.await_args_list)
+
+
+def test_summary_says_it_held_at_max(capsys):
+    ctl, state, _, _ = _at_max(1)
+    ctl.held_at_max = True
+    ab._print_summary(state, ctl, 5, None)
+    assert 'held at max 10 Mbps' in capsys.readouterr().out

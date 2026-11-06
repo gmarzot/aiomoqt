@@ -274,7 +274,7 @@ nothing external to blame; this is the number that says the machine and
 the build are healthy before anything else means much.
 
 ```
-python -m aiomoqt.tools.adaptive_bench
+python -m aiomoqt.tools.adaptive_bench -t 60
 ```
 
 No URL selects the loopback self-test. `-P 4 --step-mbps 20` for
@@ -368,7 +368,7 @@ The publisher's rate is nudged up every interval until the subscriber's
 samples say stop.
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 --report bw-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 -t 300 --report bw-ramp.csv
 ```
 
 Against a relay the publisher and subscriber always run in separate
@@ -380,7 +380,8 @@ off when it stays over `--latency-threshold` (default 100 ms) for two
 intervals. A shortfall, achieved below `--shortfall-ratio` (0.85) of
 commanded, holds the ramp and backs off once it lasts three intervals.
 Back-off multiplies by `--backoff-factor` (0.9; closer to 1.0 for gentler
-steps). Hard caps are `--max-mbps` and `-t` seconds. A run that receives
+steps). At `--max-mbps` the run holds, still backing off, until `-t`
+seconds are up; `-t 0` or no `-t` runs until Ctrl-C. A run that receives
 nothing exits nonzero.
 
 **Set the threshold relative to the path RTT.** Absolute latency
@@ -410,7 +411,7 @@ python -m aiomoqt.tools.adaptive_bench moqt://127.0.0.1:4433 -k --draft 18 --mod
 On the **load host**:
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -j 10 -S 0.1 --sub-filter next-group-start --report subs-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -j 10 -S 0.1 --sub-filter next-group-start -t 300 --report subs-ramp.csv
 ```
 
 It prints what it is waiting for:
@@ -438,8 +439,9 @@ shortfall; a lossy or starved subscriber is not counted as capacity. The
 latency threshold works as in flow C, so set it from the path RTT here
 too.
 
-The ramp ends at `--max-subs`; it cannot hold a fixed count. For a fixed
-audience use `load_sim --subs N` (flow E).
+The ramp holds at `--max-subs`, still backing off, until `-t` seconds are
+up; `-t 0` or no `-t` runs until Ctrl-C. For a fixed audience with no ramp
+use `load_sim --subs N` (flow E).
 
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
