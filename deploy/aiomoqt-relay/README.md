@@ -133,8 +133,8 @@ RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/aiopquic-*.whl &
 
 To run on our own Python build, make it once, then pass it as the base image and layer the wheel
 for that Python. `Dockerfile.python` builds CPython with clang 19 (tail-call interpreter, PGO, thin
-LTO, no shared libpython), tuned for this host's Neoverse N1 cores. It takes all three cores, so
-build it with the relay idle.
+LTO, no shared libpython), tuned for this host's Neoverse N1 cores. It takes all three cores for
+about 12 minutes, so build it with the relay idle.
 
 ```sh
 ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build -t aiomoqt-python:3.14.10 -' < deploy/aiomoqt-relay/Dockerfile.python
