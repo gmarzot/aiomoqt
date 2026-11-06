@@ -131,6 +131,16 @@ COPY aiopquic-*.whl /tmp/
 RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/aiopquic-*.whl && rm /tmp/aiopquic-*.whl
 ```
 
+To run on our own Python build, make it once, then pass it as the base image and layer the wheel
+for that Python. `Dockerfile.python` builds CPython with clang 19 (tail-call interpreter, PGO, thin
+LTO, no shared libpython), tuned for this host's Neoverse N1 cores. It takes all three cores, so
+build it with the relay idle.
+
+```sh
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build -t aiomoqt-python:3.14.10 -' < deploy/aiomoqt-relay/Dockerfile.python
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build --build-arg PYTHON_IMAGE=aiomoqt-python:3.14.10 --build-arg VERSION=<pep440> -t aiomoqt:<sha>-py314 ~/aiomoqt-relay/build'
+```
+
 Then, in `~/aiomoqt-relay`, `./relay-swap.sh aiomoqt:<sha> [HHMMSS]` makes it the relay, at that
 UTC time if one is given. It checks the image starts, records the live image, `relay.toml` and
 `compose.yml` in `rollback/`, re-tags `aiomoqt:dev`, restarts the relay, and probes raw QUIC and

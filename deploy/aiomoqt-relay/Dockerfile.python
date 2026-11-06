@@ -1,0 +1,50 @@
+# CPython for the relay image: clang with the tail-call interpreter, PGO, thin LTO and no shared
+# libpython. Keeps symbols and frame pointers for perf. Build on the CPU family that runs it.
+FROM debian:trixie-slim AS build
+
+ARG PYTHON_VERSION=3.14.10
+ARG PYTHON_SHA256=de414a57119abef52784d8993e341d53aed635fc2b05c2607d9f98a2c5b72032
+ARG TUNE=-mcpu=neoverse-n1
+
+ENV PATH=/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates clang-19 curl libbz2-dev libffi-dev libgdbm-dev liblzma-dev \
+        libncurses-dev libreadline-dev libsqlite3-dev libssl-dev libzstd-dev lld-19 llvm-19 \
+        make pkg-config uuid-dev xz-utils zlib1g-dev
+
+RUN curl -fsSL -o /python.tar.xz \
+        "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tar.xz" \
+    && echo "$PYTHON_SHA256  /python.tar.xz" | sha256sum -c - \
+    && mkdir /src && tar -xf /python.tar.xz -C /src --strip-components=1
+
+WORKDIR /src
+RUN ./configure CC=clang LDFLAGS=-fuse-ld=lld \
+        --enable-option-checking=fatal --enable-optimizations --with-lto=thin \
+        --with-tail-call-interp --with-ensurepip \
+    && make -j"$(nproc)" \
+        EXTRA_CFLAGS="$TUNE -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer" \
+    && make install \
+    && find /usr/local -depth -type d \( -name test -o -name tests -o -name idle_test \) \
+        -exec rm -rf {} + \
+    && find /usr/local -name 'libpython*.a' -delete \
+    && ln -s python3 /usr/local/bin/python \
+    && ln -s pip3 /usr/local/bin/pip
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libbz2-1.0 libffi8 libgdbm6t64 liblzma5 libncursesw6 libreadline8t64 \
+        libsqlite3-0 libssl3t64 libuuid1 libzstd1 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local /usr/local
+
+RUN python -c "import sys, sysconfig; \
+import bz2, compression.zstd, ctypes, dbm.gnu, lzma, readline, sqlite3, ssl, uuid, zlib; \
+get = sysconfig.get_config_var; \
+assert get('Py_TAIL_CALL_INTERP') == 1, 'no tail-call interpreter'; \
+assert not get('Py_ENABLE_SHARED'), 'shared libpython'; \
+print(sys.version)"
+
+CMD ["python3"]
