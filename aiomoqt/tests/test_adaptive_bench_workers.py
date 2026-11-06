@@ -138,7 +138,8 @@ async def test_fixed_publisher_requires_confirmation(monkeypatch, published, exp
 async def test_cli_passes_transport_settings_to_every_worker(monkeypatch, mode, role, budget):
     configs = _processes(monkeypatch, fixed=role == 'pub')
     _argv(monkeypatch, '--mode', 'bw' if mode == 'mp' else mode,
-          '--role', role, '--cc-algo', 'cubic',
+          '--role', role, '--cc-algo', 'cubic', '--cc-options', 'Q0.02',
+          '--pacing-trains', '--fc-window', '33554432',
           '--max-queued-bytes', str(budget), '--max-inflight-bytes', str(budget),
           '--keepalive', '2.5')
     if mode == 'mp':
@@ -148,6 +149,9 @@ async def test_cli_passes_transport_settings_to_every_worker(monkeypatch, mode, 
     assert configs
     for _, cfg in configs:
         assert cfg['congestion_control_algorithm'] == 'cubic'
+        assert cfg['congestion_control_options'] == 'Q0.02'
+        assert cfg['packet_train_mode'] is True
+        assert cfg['flow_control_window'] == 33554432
         assert cfg['tx_max_queued_bytes'] == budget
         assert cfg['tx_max_inflight_bytes'] == (budget or None)
         assert cfg['keep_alive_interval'] == 2.5
@@ -173,7 +177,9 @@ async def test_worker_applies_transport_settings(monkeypatch, kind, budget):
     cfg = dict(relay_url='moqt://127.0.0.1:4433', sub_id=0,
                namespace='ns', trackname='track', port=4433,
                cert='test-cert', key='test-key',
-               congestion_control_algorithm='cubic', tx_max_queued_bytes=0,
+               congestion_control_algorithm='cubic',
+               congestion_control_options='Q0.02', packet_train_mode=True,
+               flow_control_window=33554432, tx_max_queued_bytes=0,
                tx_max_inflight_bytes=budget, keep_alive_interval=2.5)
     with pytest.raises(_Constructed):
         if kind == 'publisher':
@@ -186,6 +192,9 @@ async def test_worker_applies_transport_settings(monkeypatch, kind, budget):
         else:
             await workers._loopback_server_task(cfg, None, None, None)
     assert captured['congestion_control_algorithm'] == 'cubic'
+    assert captured['congestion_control_options'] == 'Q0.02'
+    assert captured['packet_train_mode'] is True
+    assert captured['flow_control_window'] == 33554432
     assert captured['tx_max_queued_bytes'] == 0
     assert captured['tx_max_inflight_bytes'] is budget
     assert captured['keep_alive_interval'] == 2.5
