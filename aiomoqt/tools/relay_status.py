@@ -488,21 +488,31 @@ class ThreadLoad:
 
 class AdmissionGate:
     """Closes when the mean of the last `window` samples reaches `close_pct`;
-    reopens once that mean falls `margin` points below it."""
+    reopens once that mean falls `margin` points below it.
+
+    A low reading is not headroom where hypervisor steal comes and goes, so
+    the subscriber count at closing stays a ceiling. While open it rises by
+    `growth` of itself per sample, at least `min_step`; closing resets it."""
 
     def __init__(self, close_pct: float, window: int = 8,
-                 margin: float = 15.0) -> None:
+                 margin: float = 15.0, growth: float = 0.05 / 60,
+                 min_step: float = 0.1) -> None:
         self.close_pct = close_pct
         self.open_pct = close_pct - margin
         self.samples: deque[float] = deque(maxlen=window)
+        self.growth = growth
+        self.min_step = min_step
         self.open = True
         self.mean: Optional[float] = None
+        self.ceiling: Optional[float] = None
 
-    def update(self, pct: Optional[float]) -> bool:
+    def update(self, pct: Optional[float], subscribers: int) -> bool:
         """Take a sample; True when the gate changed state."""
         if pct is None:
             return False
         self.samples.append(pct)
+        if self.open and self.ceiling is not None:
+            self.ceiling += max(self.ceiling * self.growth, self.min_step)
         if len(self.samples) < self.samples.maxlen:
             return False
         self.mean = sum(self.samples) / len(self.samples)
@@ -511,7 +521,18 @@ class AdmissionGate:
             self.open = self.mean < self.close_pct
         else:
             self.open = self.mean < self.open_pct
+        if was_open and not self.open:
+            self.ceiling = float(subscribers)
         return self.open != was_open
+
+    @property
+    def unlimited(self) -> bool:
+        return self.open and self.ceiling is None
+
+    def admits(self, subscribers: int) -> bool:
+        """One more subscriber fits."""
+        return self.open and (self.ceiling is None
+                              or subscribers < self.ceiling)
 
 
 class History:

@@ -18,9 +18,10 @@ Limits:
     (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
     --max-subscriptions-per-session SUBSCRIBEs held; past either, a
     request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
-  * Near overload (--admission-cpu) or at --max-subscribers, a session's
-    first SUBSCRIBE is refused the same way, with a randomized Retry
-    Interval. Sessions already subscribed may add tracks.
+  * Near overload (--admission-cpu), past the subscriber count the relay
+    last closed at, or at --max-subscribers, a session's first SUBSCRIBE is
+    refused the same way, with a randomized Retry Interval. Sessions already
+    subscribed may add tracks.
   * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
     oldest group dropped) under a relay-wide budget (--cache-bytes),
     which drops the oldest group of the least recently used track, never
@@ -2126,13 +2127,15 @@ def _refused_by_load(session, msg) -> bool:
     """Refuse a session's first SUBSCRIBE near overload or at
     --max-subscribers. The watchdog's probe is exempt: refusing it would
     exit the relay."""
-    closed = _admission is not None and not _admission.open
-    if not closed and not MAX_SUBSCRIBERS:
+    gate = _admission
+    if (gate is None or gate.unlimited) and not MAX_SUBSCRIBERS:
         return False
     if (_internal_ns(_ns_tuple(msg.track_namespace))
             or _session_subscriptions(session)):
         return False
-    if not closed and _subscriber_sessions() < MAX_SUBSCRIBERS:
+    held = _subscriber_sessions()
+    if ((gate is None or gate.admits(held))
+            and (not MAX_SUBSCRIBERS or held < MAX_SUBSCRIBERS)):
         return False
     global _admission_refused
     _admission_refused += 1
@@ -2146,14 +2149,16 @@ async def _admission_watch(gate, load) -> None:
     """Sample the busiest thread into the gate; WARNING on each change."""
     while True:
         await asyncio.sleep(ADMISSION_TICK_S)
-        if gate.update(load.sample()):
+        if gate.update(load.sample(), _subscriber_sessions()):
             if gate.open:
-                logger.warning(f"relay: admission open: busiest thread "
-                               f"{gate.mean:.0f}%; {_admission_refused} "
-                               f"refused so far")
+                logger.warning(f"relay: admission open up to "
+                               f"{gate.ceiling:.0f} subscribers: busiest "
+                               f"thread {gate.mean:.0f}%; "
+                               f"{_admission_refused} refused so far")
             else:
-                logger.warning(f"relay: admission closed: busiest thread "
-                               f"{gate.mean:.0f}% over "
+                logger.warning(f"relay: admission closed at "
+                               f"{gate.ceiling:.0f} subscribers: busiest "
+                               f"thread {gate.mean:.0f}% over "
                                f"{len(gate.samples)} samples (limit "
                                f"{gate.close_pct:g}%): refusing new "
                                f"subscribers with EXCESSIVE_LOAD")
@@ -3873,9 +3878,10 @@ def parse_args(argv=None):
                         help="Refuse new subscribers with EXCESSIVE_LOAD "
                              "while the busiest thread's "
                              f"{ADMISSION_WINDOW_S} s mean is at PCT, until "
-                             "it falls 15 points lower. Sessions already "
-                             "subscribed may add tracks. Linux only. "
-                             "Default: 0, off")
+                             "it falls 15 points lower, and past the count "
+                             "it closed at, which then rises 5%% a minute. "
+                             "Sessions already subscribed may add tracks. "
+                             "Linux only. Default: 0, off")
     parser.add_argument("--max-subscribers", type=int, default=0,
                         metavar="N",
                         help="Sessions the relay serves SUBSCRIBEs for; new "
@@ -5224,6 +5230,9 @@ class _Status:
                 "thread_pct": (None if _admission is None
                                or _admission.mean is None
                                else round(_admission.mean, 1)),
+                "ceiling": (None if _admission is None
+                            or _admission.ceiling is None
+                            else round(_admission.ceiling)),
                 "refused": _admission_refused},
         }
         self._subs_peak = max(self._subs_peak, totals["subscribers"])

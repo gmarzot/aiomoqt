@@ -157,10 +157,11 @@ compose `command:` override the file. Port, certificate and transports stay in t
 environment. After copying an edited file over, run `docker compose restart relay`.
 
 `admission-cpu = 80` refuses new subscribers with `EXCESSIVE_LOAD` and a 5-15 s Retry Interval while
-the relay's busiest thread averages 80% or more over 8 s, until it falls below 65%. Viewers already
-attached keep their service and may add tracks. On this kind of VM thread time includes hypervisor
-steal, which is why it tracks real headroom. On a kernel that leaves steal out of thread time it reads
-low. `max-subscribers = N` adds a fixed limit. `status.json` reports `totals.admission` and
+the relay's busiest thread averages 80% or more over 8 s, until it falls below 65%. The subscriber
+count at closing stays a ceiling, rising 5% a minute while the gate is open: steal comes and goes on
+this VM, and a lull is not headroom. Viewers already attached keep their service and may add tracks.
+Thread time here includes hypervisor steal, which is why it tracks real headroom. On a kernel that
+leaves steal out of thread time it reads low. `max-subscribers = N` adds a fixed limit. `status.json` reports `totals.admission` and
 `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
 
 ## nginx config

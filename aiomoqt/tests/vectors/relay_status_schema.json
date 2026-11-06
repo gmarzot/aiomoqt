@@ -795,6 +795,7 @@
   ".totals.admission": [
    "object"
   ],
+  ".totals.admission.ceiling": [],
   ".totals.admission.open": [
    "bool"
   ],

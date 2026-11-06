@@ -39,7 +39,7 @@ def _port(case: int, draft: int, use_quic: bool) -> int:
 
 def _closed_gate() -> AdmissionGate:
     gate = AdmissionGate(80, window=1)
-    gate.update(100)
+    gate.update(100, 0)
     assert not gate.open
     return gate
 
@@ -118,30 +118,79 @@ def _assert_refused(exc, draft):
 def test_gate_needs_a_full_window():
     gate = AdmissionGate(80, window=4)
     for _ in range(3):
-        assert not gate.update(100)
+        assert not gate.update(100, 0)
     assert gate.open
-    assert gate.update(100) and not gate.open
+    assert gate.update(100, 0) and not gate.open
 
 
 def test_one_spike_does_not_close_the_gate():
     gate = AdmissionGate(80, window=4)
     for pct in (50, 50, 50, 100):
-        gate.update(pct)
+        gate.update(pct, 0)
     assert gate.open and gate.mean == 62.5
 
 
 def test_gate_stays_closed_until_the_margin():
     gate = AdmissionGate(80, window=1, margin=15)
-    assert gate.update(80) and not gate.open
+    assert gate.update(80, 0) and not gate.open
     for pct in (79, 70, 65):
-        assert not gate.update(pct) and not gate.open
-    assert gate.update(64.9) and gate.open
-    assert not gate.update(79) and gate.open
+        assert not gate.update(pct, 0) and not gate.open
+    assert gate.update(64.9, 0) and gate.open
+    assert not gate.update(79, 0) and gate.open
 
 
 def test_gate_ignores_missing_samples():
     gate = AdmissionGate(80, window=1)
-    assert not gate.update(None) and gate.open and gate.mean is None
+    assert not gate.update(None, 0) and gate.open and gate.mean is None
+
+
+def test_no_ceiling_until_the_gate_first_closes():
+    gate = AdmissionGate(80, window=1)
+    gate.update(50, 500)
+    assert gate.unlimited and gate.admits(10_000)
+
+
+def test_a_lull_does_not_admit_past_the_closing_count():
+    # 11-06: steal vanished for 15 s, the gate reopened, 50 viewers joined,
+    # steal returned and the relay collapsed.
+    gate = AdmissionGate(80, window=1)
+    gate.update(88, 270)
+    assert gate.ceiling == 270 and not gate.admits(10)
+    for _ in range(15):
+        gate.update(50, 270)
+    assert gate.open and not gate.unlimited
+    assert gate.admits(272) and not gate.admits(275)
+
+
+def test_viewers_who_leave_can_be_replaced():
+    gate = AdmissionGate(80, window=1)
+    gate.update(88, 270)
+    gate.update(40, 200)
+    assert gate.open and gate.admits(200) and gate.admits(269)
+
+
+def test_ceiling_recovers_slowly_while_open():
+    gate = AdmissionGate(80, window=1)
+    gate.update(88, 270)
+    for _ in range(60):
+        gate.update(50, 270)
+    assert 280 < gate.ceiling < 290
+    # Few subscribers: a small percentage would never get anywhere.
+    gate = AdmissionGate(80, window=1)
+    gate.update(88, 2)
+    for _ in range(60):
+        gate.update(50, 2)
+    assert 7 < gate.ceiling < 9
+
+
+def test_closing_again_resets_the_ceiling():
+    gate = AdmissionGate(80, window=1)
+    gate.update(88, 270)
+    for _ in range(600):
+        gate.update(50, 270)
+    assert gate.ceiling > 350
+    gate.update(90, 300)
+    assert gate.ceiling == 300
 
 
 # -- the sampler -----------------------------------------------------
@@ -270,9 +319,36 @@ async def test_reopening_admits_the_same_session(monkeypatch, use_quic):
         sub = await connect()
         with pytest.raises(MOQTRequestError):
             await sub.subscribe(_NS, "a", wait_response=True)
-        assert gate.update(10) and gate.open
+        assert gate.update(10, 0) and gate.open
+        # Closed with no subscribers: the ceiling rises from the next sample.
+        gate.update(10, 0)
         _, got = await _counted(sub, "a")
         await _grows(got)
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_ceiling_refuses_past_the_closing_count(monkeypatch, use_quic):
+    draft = 22
+    gate = AdmissionGate(80, window=1, growth=0, min_step=0)
+    monkeypatch.setattr(relay, "_admission", gate)
+    async with _relay(_port(5, draft, use_quic), draft, use_quic) as connect:
+        await _publisher(connect, ["a"])
+        first = await connect()
+        await first.subscribe(_NS, "a", wait_response=True)
+        gate.update(90, relay._subscriber_sessions())
+        assert gate.ceiling == 1
+        gate.update(10, relay._subscriber_sessions())
+        assert gate.open
+        other = await connect()
+        with pytest.raises(MOQTRequestError) as refused:
+            await other.subscribe(_NS, "a", wait_response=True)
+        _assert_refused(refused.value, draft)
+        first.close()
+        async with asyncio.timeout(10):
+            while relay._subscriber_sessions():
+                await asyncio.sleep(0.05)
+        await other.subscribe(_NS, "a", wait_response=True)
 
 
 @requires_certs
