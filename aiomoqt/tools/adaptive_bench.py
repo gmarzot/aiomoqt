@@ -122,6 +122,9 @@ class Signal:
     tx_ring_streams: int = 0
     # False when no latency sample arrived: shown as n/a, not 0.
     latency_known: bool = True
+    # subs-mode: worst p90 of each worker's last report. latency_p90_ms is
+    # the worst across the tick, the figure the controller acts on.
+    latest_p90_ms: Optional[float] = None
 
 
 @dataclass
@@ -503,11 +506,11 @@ class SubsActuator:
     BATCHES: each worker process runs K = --step-subs subscriptions and
     self-heals individual drops internally, so the relay still sees one
     QUIC connection per sub without one OS process per sub. apply(level)
-    spawns/terminates whole workers to reach ceil(level / K). observe()
-    drains batch_stats events and aggregates:
+    spawns/terminates whole workers to reach ceil(level / K). A task
+    reads batch_stats events as they arrive; observe() aggregates:
 
-      rx_mbps         = sum of per-worker batch rates (rx_bytes / dt)
-      latency         = worst slot p90 across mature workers
+      rx_mbps         = sum of per-worker rates over the tick (rx_bytes / dt)
+      latency         = worst slot p90 across mature workers and the tick
       loss_pct        = max per-batch loss_pct
       active_subs     = subscribed slots
       delivering_subs = subscribed slots receiving >= half their rate
@@ -524,6 +527,8 @@ class SubsActuator:
     starved by the controller's batch-stats drain.
     """
     unit = "subs"
+    DRAIN_INTERVAL_S = 0.1
+    STALE_REPORT_S = 5.0
 
     def __init__(self, relay_url: str,
                  namespace: str, trackname: str,
@@ -572,6 +577,12 @@ class SubsActuator:
         # the batch size K: one worker == one group of K subs, so the
         # controller adding a group per --join-rate spawns one worker.
         self.batch_size = max(1, int(step_subs))
+        # Startup grace is a FIXED floor, not interval-scaled: QUIC
+        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
+        # of them staggered), so a small --interval must not reap a
+        # worker before it can come online.
+        self._startup_grace = max(8.0, self.keep_window
+                                  + self.batch_size * max(0.0, self.stagger))
 
         from aiomoqt.utils.workers import MP_CTX as mp
         self._mp = mp
@@ -586,6 +597,10 @@ class SubsActuator:
         self._targeted = float(start_subs)
         # Per-worker latest batch_stats event:
         self._latest_batch: dict = {}
+        # Per-worker totals since the last observe(): rx_bytes, dt, p90.
+        self._tick: dict = {}
+        self._drain_task: Optional[asyncio.Task] = None
+        self._oldest_report_s = 0.0
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
@@ -615,7 +630,51 @@ class SubsActuator:
             self._kill_worker(wid)
         return len(dead)
 
+    def _drain_events(self) -> None:
+        """Read the reports queued now. mp.Queue reads Empty whenever its
+        pipe is momentarily dry, so one pass takes about a pipe-full however
+        many wait; _drain_loop repeats it to keep up with many workers."""
+        from queue import Empty
+        while True:
+            try:
+                msg = self._events_q.get_nowait()
+            except Empty:
+                return
+            if msg.get('kind') != 'batch_stats':
+                continue
+            wid = msg.get('worker_id')
+            now = time.monotonic()
+            self._latest_batch[wid] = msg
+            self._last_batch_t[wid] = now
+            if msg.get('rx_bytes', 0) > 0:
+                self._last_bytes_t[wid] = now
+            if msg.get('active', 0) > 0:
+                self._subscribed_ever.add(wid)
+            self._oldest_report_s = max(self._oldest_report_s,
+                                        now - msg.get('t', now))
+            tick = self._tick.setdefault(
+                wid, {'rx_bytes': 0, 'dt': 0.0, 'p90': None})
+            tick['rx_bytes'] += msg.get('rx_bytes', 0)
+            tick['dt'] += msg.get('dt', 1.0)
+            if (msg.get('lat_n', 0) > 0 and now - self._spawned_t.get(wid, now)
+                    >= self._startup_grace):
+                p90 = msg['lat_p90_ms']
+                tick['p90'] = p90 if tick['p90'] is None else max(tick['p90'], p90)
+
+    async def _drain_loop(self) -> None:
+        while True:
+            self._drain_events()
+            await asyncio.sleep(self.DRAIN_INTERVAL_S)
+
+    def _ensure_draining(self) -> None:
+        """Start the drain task; a failure in it surfaces here."""
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain_loop())
+        elif self._drain_task.done():
+            self._drain_task.result()
+
     async def apply(self, level: float) -> None:
+        self._ensure_draining()
         self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
@@ -681,23 +740,13 @@ class SubsActuator:
         self._spawned_t.pop(wid, None)
 
     async def observe(self) -> Signal:
-        # Drain all pending batch_stats events from workers.
-        from queue import Empty
+        self._ensure_draining()
+        self._drain_events()
+        if self._oldest_report_s > self.STALE_REPORT_S:
+            print(f"  warning: read a worker report "
+                  f"{self._oldest_report_s:.0f}s old; figures are late")
+        self._oldest_report_s = 0.0
         failed_this_window = 0
-        while True:
-            try:
-                msg = self._events_q.get_nowait()
-            except Empty:
-                break
-            if msg.get('kind') != 'batch_stats':
-                continue
-            wid = msg.get('worker_id')
-            self._latest_batch[wid] = msg
-            self._last_batch_t[wid] = time.monotonic()
-            if msg.get('rx_bytes', 0) > 0:
-                self._last_bytes_t[wid] = self._last_batch_t[wid]
-            if msg.get('active', 0) > 0:
-                self._subscribed_ever.add(wid)
 
         # A worker reports how many of its K slots are subscribed
         # ('active') and how many of those receive their rate
@@ -708,12 +757,7 @@ class SubsActuator:
         live_ids = [wid for wid, t in self._last_bytes_t.items()
                     if t >= bytes_cutoff and wid in self._workers]
 
-        # Startup grace is a FIXED floor, not interval-scaled: QUIC
-        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
-        # of them staggered), so a small --interval must not reap a
-        # worker before it can come online.
-        startup_grace = max(8.0, keep_window
-                            + self.batch_size * max(0.0, self.stagger))
+        startup_grace = self._startup_grace
         starve_cutoff = now - keep_window
         starved = []
         for wid, (proc, stop_ev) in list(self._workers.items()):
@@ -741,6 +785,7 @@ class SubsActuator:
 
         rx_bps_total = 0.0
         worst_p90 = 0.0
+        tick_p90 = None
         worst_mean = 0.0
         lat_known = False
         max_loss_pct = 0.0
@@ -754,8 +799,12 @@ class SubsActuator:
             s = self._latest_batch.get(wid, {})
             active_subs += int(s.get('active', 0))
             delivering_subs += _delivering(s)
-            # rx_bytes is the batch's delta over its dt.
-            rx_bps_total += s.get('rx_bytes', 0) * 8 / max(s.get('dt', 1.0), 1e-3)
+            # A tick shorter than the report interval may have no report.
+            tick = self._tick.get(wid) or s
+            rx_bps_total += tick.get('rx_bytes', 0) * 8 / max(tick.get('dt', 1.0), 1e-3)
+            p90 = self._tick.get(wid, {}).get('p90')
+            if p90 is not None:
+                tick_p90 = p90 if tick_p90 is None else max(tick_p90, p90)
             # Latency drives the back-off, so only MATURE workers feed it:
             # a worker still in its startup grace is catching up (old
             # send-timestamps -> seconds-scale p90) and would trip the SLA
@@ -775,6 +824,9 @@ class SubsActuator:
             if jit is not None:
                 jitter_sum += jit
                 jitter_n += 1
+
+        self._tick.clear()
+        acted_p90 = max(worst_p90, tick_p90 or 0.0)
 
         # Setpoint is the TARGETED count, not live capacity — reaping a
         # worker must not silently lower the target the controller ramps
@@ -827,7 +879,8 @@ class SubsActuator:
             t=now,
             level=float(target_subs),
             latency_mean_ms=worst_mean,
-            latency_p90_ms=worst_p90,
+            latency_p90_ms=acted_p90,
+            latest_p90_ms=worst_p90,
             loss_pct=max_loss_pct,
             shortfall=shortfall,
             target_mbps=target_mbps,
@@ -839,10 +892,15 @@ class SubsActuator:
             delivering_subs=delivering_subs,
             failed_subs=failed_this_window,
             health=health,
-            latency_known=lat_known,
+            latency_known=lat_known or tick_p90 is not None,
         )
 
     async def shutdown(self) -> None:
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+            self._drain_task = None
+        self._tick.clear()
         # Parallel shutdown: signal all stops at once, join with one
         # shared deadline, terminate stragglers, then a final short
         # join. Serial _kill_worker at 1s each would block ~Nworkers s
@@ -1202,9 +1260,10 @@ class AIMDController:
                 f"{sig.tx_mbps:.2f}",
                 f"{sig.rx_mbps:.2f}",
                 f"{sig.latency_mean_ms:.2f}",
-                f"{sig.latency_p90_ms:.2f}",
+                f"{(sig.latency_p90_ms if sig.latest_p90_ms is None else sig.latest_p90_ms):.2f}",
                 f"{sig.loss_pct:.3f}",
                 *self._cpu,
+                *([] if sig.latest_p90_ms is None else [f"{sig.latency_p90_ms:.2f}"]),
             ])
         self._print_row(sig, action)
 
@@ -1816,12 +1875,14 @@ async def main():
     if args.report:
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
-        # bw: the subscriber's windowed latency; subs: the worst slot's.
+        # bw: the subscriber's windowed latency; subs: the worst slot's in
+        # the last reports, and tick_p90_ms across the tick (acted on).
         lat_cols = (["win_mean_ms", "win_p90_ms"] if args.mode == "bw"
                     else ["worst_mean_ms", "worst_p90_ms"])
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
             *lat_cols, "loss_pct", *CPU_FIELDS,
+            *([] if args.mode == "bw" else ["tick_p90_ms"]),
         ])
 
     mp_cleanup_queues: list = []
