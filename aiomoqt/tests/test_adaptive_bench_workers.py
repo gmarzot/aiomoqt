@@ -70,20 +70,38 @@ def _argv(monkeypatch, *extra):
     monkeypatch.setattr(sys, 'argv', [
         'moq-adaptive-bench', 'moqt://127.0.0.1:4433',
         '--interval', '0.001', '--start-mbps', '1', '--max-mbps', '1',
-        '--max-subs', '1', *extra,
+        '--max-subs', '1', '-j', '0.001', '--duration', '1', *extra,
     ])
 
 
 @pytest.mark.parametrize('receive, expected', [(False, 1), (True, 0)])
 async def test_main_exit_status_requires_received_data(monkeypatch, capsys, receive, expected):
     _processes(monkeypatch, receive=receive)
-    _argv(monkeypatch)
+    _argv(monkeypatch, *([] if receive else ['--duration', '30']))
     assert await ab.main() == expected
     output = capsys.readouterr().out
     if not receive:
         assert 'ABORT: rx=0' in output
     else:
-        assert 'reached max' in output
+        assert 'duration cap reached' in output
+
+
+async def test_exit_max_ends_the_run(monkeypatch, capsys):
+    _processes(monkeypatch)
+    _argv(monkeypatch, '--exit', 'max', '--duration', '30')
+    assert await ab.main() == 0
+    assert 'reached max' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('extra, why', [
+    (['--exit', 'max', '--mode', 'subs', '--role', 'pub'], 'no max to reach'),
+    (['-t', '-1'], 'seconds, or 0'),
+])
+def test_refuses(monkeypatch, capsys, extra, why):
+    _argv(monkeypatch, *extra)
+    with pytest.raises(SystemExit):
+        ab.parse_args()
+    assert why in capsys.readouterr().err
 
 
 async def test_duration_cap_without_measurements_fails(monkeypatch):

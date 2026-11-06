@@ -141,7 +141,6 @@ class BenchState:
     history: deque = field(default_factory=lambda: deque(maxlen=64))
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ceiling_reason: Optional[str] = None
-    ceiling_mbps: Optional[float] = None
     received_data: bool = False
     failed: bool = False
 
@@ -883,8 +882,10 @@ class AIMDController:
     """Additive-increase / multiplicative-decrease over a LoadActuator.
 
     Keeps probing: it backs off on a signal and resumes ramping from the
-    lower level, never locking in a ceiling. Ends at the actuator's max
-    level, -t/--duration, Ctrl-C, or rx=0 for 3 intervals (a failure).
+    lower level, never locking in a ceiling. Holds at the actuator's max
+    level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
+    or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
+    reaching max.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -912,6 +913,7 @@ class AIMDController:
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
+                 exit_at_max: bool = False,
                  tick_s: float | None = None,
                  skew_safe: bool = False):
         self.actuator = actuator
@@ -935,7 +937,9 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
-        self.duration_s = duration_s
+        self.duration_s = duration_s or None
+        self.exit_at_max = exit_at_max
+        self.held_at_max = False
         # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
         self._p90_seen: deque = deque(maxlen=self.BASELINE_SAMPLES)
@@ -1081,12 +1085,6 @@ class AIMDController:
                     await a.apply(level)
                 continue
 
-            if level >= a.max_level:
-                state.ceiling_mbps = self.high_water
-                state.ceiling_reason = f"reached max {a.max_level} {a.unit}"
-                self._emit(sig, "max", force=True)
-                state.stop.set()
-                return
             # High-water tracks the *delivered* metric (bw: rx_mbps;
             # subs: active sub count), not the commanded target —
             # a target the system can't sustain shouldn't pollute the
@@ -1100,6 +1098,17 @@ class AIMDController:
                     and headroom >= 0.2
                     and not sig.shortfall):
                 self.high_water = observed
+            if level >= a.max_level:
+                if self.exit_at_max:
+                    state.ceiling_reason = (
+                        f"reached max {a.max_level:g} {a.unit}")
+                    self._emit(sig, "max", force=True)
+                    state.stop.set()
+                    return
+                self.held_at_max = True
+                self._emit(sig, "hold (max)")
+                await a.apply(level)
+                continue
             # Gain curve: full step when headroom > 0.5, linearly taper
             # to zero at headroom = 0.05. Below that → hold.
             if headroom >= 0.5:
@@ -1456,7 +1465,7 @@ def parse_args():
     p.add_argument("--step-mbps", type=float, default=10.0,
                    help="ramp step size (default: 10)")
     p.add_argument("--max-mbps", type=float, default=10000.0,
-                   help="bw-mode cap; the run ends on reaching it "
+                   help="bw-mode cap; the run holds there until -t "
                         "(default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
@@ -1521,7 +1530,7 @@ def parse_args():
                         "Also the batch size: one worker process hosts a "
                         "group of this many self-healing subscriptions.")
     p.add_argument("--max-subs", type=int, default=200,
-                   help="subs-mode: cap; the run ends on reaching it "
+                   help="subs-mode: cap; the run holds there until -t "
                         "(default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    action=_cli.StoreGiven,
@@ -1553,12 +1562,16 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-t", "--duration", type=float, default=None,
+    p.add_argument("-t", "--duration", type=float, default=0,
                    metavar="SECONDS",
-                   help="hard wall-clock cap; controller exits after "
-                        "this many seconds even if --max-mbps / --max-subs "
-                        "hasn't been reached. Useful for fixed-budget "
-                        "regression runs.")
+                   help="run time; the run ends after this many seconds, "
+                        "holding at --max-mbps / --max-subs once there. "
+                        "0 (default): until Ctrl-C.")
+    p.add_argument("--exit", dest="exit_on", choices=("max",), default=None,
+                   metavar="COND",
+                   help="also end the run on COND; -t still applies. max: "
+                        "on reaching --max-mbps / --max-subs, without "
+                        "holding there.")
     p.add_argument("--keylogfile", default=None,
                    help="TLS secrets log path (NSS Key Log Format) for "
                         "Wireshark decryption of pcap captures. Each MP "
@@ -1597,6 +1610,11 @@ def parse_args():
                 "cannot be "
                 "combined with a URL — a URL says where to dial, "
                 "loopback options say what to bind")
+
+    if args.duration < 0:
+        p.error("-t/--duration: seconds, or 0 for no limit")
+    if args.exit_on == "max" and args.role == "pub":
+        p.error("--exit max: --role pub has no max to reach")
 
     # Splitting the run across hosts is subs-mode only. In subs mode the
     # publisher is fixed-rate and the controller's only actuator is the
@@ -1713,6 +1731,9 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     if controller.pivots:
         print(f"  Equilibrium: {controller.eq_level:.1f} {unit} "
               f"({len(controller.pivots)} pivots)")
+    elif controller.held_at_max:
+        print(f"  Equilibrium: not reached — held at max "
+              f"{controller.actuator.max_level:g} {unit} with no back-off")
     else:
         print("  Equilibrium: not reached — no ramp/back-off pivot "
               "(ended while still climbing)")
@@ -1988,6 +2009,7 @@ async def main():
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
+        exit_at_max=args.exit_on == "max",
         tick_s=(args.join_rate if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
     )
