@@ -239,6 +239,19 @@ def test_short_flag_has_one_meaning_across_tools():
     assert not clashes
 
 
+def test_setup_timeout_follows_duration():
+    assert cli.setup_timeout(argparse.Namespace(duration=0)) == cli.SETUP_TIMEOUT
+    assert cli.setup_timeout(argparse.Namespace(duration=300)) == 300
+
+
+@pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
+def test_duration_defaults_to_no_limit(tool):
+    package = "aiomoqt.examples" if tool in EXAMPLES else "aiomoqt.tools"
+    for action in _parser_actions(tool, package):
+        if "--duration" in action.option_strings:
+            assert action.default == 0, tool
+
+
 @pytest.mark.parametrize("tool", sorted(EXTERNAL_CONTRACT))
 def test_external_contract_matches_its_interface(tool):
     contract = EXTERNAL_CONTRACT[tool]

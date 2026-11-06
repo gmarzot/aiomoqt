@@ -61,8 +61,8 @@ from aiomoqt.utils.url import parse_relay_url
 # Defaults, one place. Powers of two, same on every tool.
 DEFAULT_OBJECT_SIZE = 4096
 DEFAULT_GROUP_SIZE = 4096
-DEFAULT_DURATION = 30
 DEFAULT_INTERVAL = 5.0
+SETUP_TIMEOUT = 30
 
 # Conservative universal datagram payload cap: the 1200 B frame ceiling
 # picoquic admits without consulting live path MTU, minus MoQT header
@@ -240,15 +240,25 @@ def add_payload_check(p):
 
 # -- run / session ---------------------------------------------------
 
-def add_run(p, duration=DEFAULT_DURATION):
-    p.add_argument('-t', '--duration', type=int, default=duration,
-                   help=f'Duration seconds (default: {duration})')
+def add_run(p):
+    p.add_argument('-t', '--duration', type=int, default=0,
+                   help='Run time in seconds; 0 (default): no limit')
     p.add_argument('-d', '--debug', action='store_true',
                    help='Verbose logging')
     p.add_argument('--no-stats', action='store_true',
                    help='Count objects and bytes only — no latency, '
                         'jitter, loss or group accounting. Measures the '
                         'delivery ceiling without the measurement in it.')
+
+
+def setup_timeout(args):
+    """Seconds to wait for a session or catalog: -t, or SETUP_TIMEOUT."""
+    return args.duration or SETUP_TIMEOUT
+
+
+def duration_label(seconds):
+    """-t for a banner."""
+    return f"{seconds}s" if seconds else "no limit"
 
 
 def log_spec(value):

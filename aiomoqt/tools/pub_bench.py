@@ -273,7 +273,7 @@ def print_banner(relay, args):
     side = [n for n in ('catalog', 'audio') if getattr(args, n, False)]
     if side:
         print(f"  with:        {', '.join(side)}")
-    print(f"  duration:    {args.duration}s")
+    print(f"  duration:    {_cli.duration_label(args.duration)}")
     print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
 
@@ -320,10 +320,11 @@ async def run(args):
     side = []
     async with contextlib.AsyncExitStack() as stack:
         try:
-            async with asyncio.timeout(args.duration or None):
+            async with asyncio.timeout(_cli.setup_timeout(args)):
                 session = await stack.enter_async_context(client.connect())
         except TimeoutError:
-            print(f"  Connection failed: no session within {args.duration}s")
+            print("  Connection failed: no session within "
+                  f"{_cli.setup_timeout(args)}s")
             return 1
         except Exception as e:
             print(f"  Connection failed: {e}")
