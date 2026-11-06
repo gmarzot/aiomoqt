@@ -339,10 +339,13 @@ class _Session:
 
 
 class _Client:
+    connects = 0
+
     def __init__(self, *args, **kwargs):
         pass
 
     def connect(self):
+        _Client.connects += 1
         return self
 
     async def __aenter__(self):
@@ -372,16 +375,20 @@ async def test_slot_counts_a_refusal_until_it_subscribes(monkeypatch):
         async def subscribe(self, **kwargs):
             Track.calls += 1
             if Track.calls == 1:
-                raise MOQTRequestError(9, 'relay overloaded', retry_interval=5001)
+                raise MOQTRequestError(9, 'relay overloaded', retry_interval=201)
             seen.append(dict(state))
             stop.set()
 
     monkeypatch.setattr(workers, 'MOQTClient', _Client)
     monkeypatch.setattr(workers, 'SubscribedTrack', Track)
     monkeypatch.setattr(workers, 'SELF_HEAL_BACKOFF_S', 0.0)
+    monkeypatch.setattr(_Client, 'connects', 0)
     relay = SimpleNamespace(host='127.0.0.1', port=4433, path='', use_quic=True)
+    t0 = time.monotonic()
     await workers._slot_supervisor(dict(namespace='ns', trackname='t'), relay,
                                    stop, None, state, 0)
+    assert time.monotonic() - t0 >= 0.19
+    assert _Client.connects == 1
     assert seen[0]['refusing'] and seen[0]['refused'] == 1
     assert seen[0]['refused_reason'] == 'relay overloaded'
     assert state['refused'] == 1 and not state['refusing']
@@ -452,6 +459,39 @@ async def test_a_refused_shortfall_says_so(monkeypatch, capsys, refusing, onset,
     out = capsys.readouterr().out
     assert onset in out and sustained in out
     assert ('hold (shortfall)' in out) is (not refusing)
+
+
+async def test_retry_wait_honours_the_interval():
+    stop = threading.Event()
+    assert not await workers.retry_wait(MOQTRequestError(9, 'x', retry_interval=0), stop)
+    assert not await workers.retry_wait(ValueError('x'), stop)
+    t0 = time.monotonic()
+    assert await workers.retry_wait(MOQTRequestError(9, 'x', retry_interval=1), stop)
+    assert time.monotonic() - t0 < 0.05
+    t0 = time.monotonic()
+    assert await workers.retry_wait(MOQTRequestError(9, 'x', retry_interval=201), stop)
+    assert time.monotonic() - t0 >= 0.19
+
+
+async def test_retry_wait_stops_early():
+    stop = threading.Event()
+    asyncio.get_running_loop().call_later(0.05, stop.set)
+    t0 = time.monotonic()
+    assert await workers.retry_wait(MOQTRequestError(9, 'x', retry_interval=30000), stop)
+    assert time.monotonic() - t0 < 2.0
+
+
+@pytest.mark.parametrize('refusing, reaped', [(2, False), (0, True)])
+async def test_only_a_silent_worker_is_reaped_as_starved(monkeypatch, refusing, reaped):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    events.put(_report(rx_mbps=0, active=0, refused=refusing, refusing=refusing,
+                       refused_reason='relay overloaded' if refusing else None))
+    sig = await act.observe()
+    assert (0 not in act._workers) is reaped
+    assert (sig.failed_subs > 0) is reaped
+    assert sig.refusing_subs == (0 if reaped else refusing)
+    await act.shutdown()
 
 
 def test_summary_names_the_refusals(capsys):
