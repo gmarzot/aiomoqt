@@ -125,6 +125,8 @@ class Signal:
     # subs-mode: worst p90 of each worker's last report. latency_p90_ms is
     # the worst across the tick, the figure the controller acts on.
     latest_p90_ms: Optional[float] = None
+    # subs-mode: slots whose last subscribe the relay refused.
+    refusing_subs: int = 0
 
 
 @dataclass
@@ -601,6 +603,9 @@ class SubsActuator:
         self._tick: dict = {}
         self._drain_task: Optional[asyncio.Task] = None
         self._oldest_report_s = 0.0
+        # Per-worker refused subscribes, kept after a worker is reaped.
+        self._refused: dict = {}
+        self.refused_reason = None
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
@@ -650,6 +655,9 @@ class SubsActuator:
                 self._last_bytes_t[wid] = now
             if msg.get('active', 0) > 0:
                 self._subscribed_ever.add(wid)
+            if msg.get('refused', 0) > 0:
+                self._refused[wid] = msg['refused']
+                self.refused_reason = msg.get('refused_reason')
             self._oldest_report_s = max(self._oldest_report_s,
                                         now - msg.get('t', now))
             tick = self._tick.setdefault(
@@ -660,6 +668,10 @@ class SubsActuator:
                     >= self._startup_grace):
                 p90 = msg['lat_p90_ms']
                 tick['p90'] = p90 if tick['p90'] is None else max(tick['p90'], p90)
+
+    @property
+    def refused_total(self) -> int:
+        return sum(self._refused.values())
 
     async def _drain_loop(self) -> None:
         while True:
@@ -893,6 +905,8 @@ class SubsActuator:
             failed_subs=failed_this_window,
             health=health,
             latency_known=lat_known or tick_p90 is not None,
+            refusing_subs=sum(self._latest_batch.get(wid, {}).get('refusing', 0)
+                              for wid in self._workers),
         )
 
     async def shutdown(self) -> None:
@@ -1114,7 +1128,8 @@ class AIMDController:
                 if self.shortfall_streak < 3 * self._tpr:
                     # Onset: hold and watch. apply(level) is a reconcile
                     # (subs respawns lost workers); BW it's a no-op.
-                    self._emit(sig, "hold (watch)")
+                    self._emit(sig, "hold (relay refusing)" if sig.refusing_subs
+                               else "hold (watch)")
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
@@ -1138,7 +1153,8 @@ class AIMDController:
                     # reconcile (apply at the SAME target respawns it).
                     # Backing off here would kill more subs and
                     # re-introduce the setpoint-decay-on-loss bug.
-                    self._emit(sig, "hold (shortfall)")
+                    self._emit(sig, "hold (relay refusing)" if sig.refusing_subs
+                               else "hold (shortfall)")
                     await a.apply(level)
                 continue
 
@@ -1768,6 +1784,10 @@ def _print_summary(state: BenchState, controller, samples: int, args):
               "(ended while still climbing)")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
+    refused = getattr(controller.actuator, 'refused_total', 0)
+    if refused:
+        print(f"  Refused:     {refused} subscribes by the relay "
+              f"({controller.actuator.refused_reason})")
     print(f"  Samples:     {samples}")
     print(f"  Host:        {cpu_summary()}")
     print("═" * 68)
