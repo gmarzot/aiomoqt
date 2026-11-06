@@ -334,7 +334,7 @@ def parse_args():
              'is up, anchor with --timestamp-mapping, stats every '
              '--stats interval, endpoint_lost, '
              'endpoint_up, done); human output goes to stderr')
-    _cli.add_run(parser, duration=30)
+    _cli.add_run(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
     _cli.add_fetch_history(parser)

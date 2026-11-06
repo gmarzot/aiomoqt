@@ -37,7 +37,7 @@ aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--input` ingest needs the `m
 
 Most tools share one flag grid from `aiomoqt.utils.cli` (listed in its module docstring):
 `-N` namespace, `-T` trackname, `-s` object size, `-g` group size, `-P` streams, `-r` rate,
-`-t` duration, `-i` interval, `-k` insecure, `-d` debug, `-D` datagram, `-p` port, `--draft`.
+`-t` duration (0 or absent: no limit), `-i` interval, `-k` insecure, `-d` debug, `-D` datagram, `-p` port, `--draft`.
 A dialed URL's scheme selects the transport: `moqt://host:port/path` is raw QUIC,
 `https://host:port/path` or bare `host:port` is WebTransport. Listeners take `-Q` (raw QUIC),
 `-W` (WebTransport), or both on one port. `moq-interop-client` follows the interop runner's

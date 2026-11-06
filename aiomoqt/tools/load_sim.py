@@ -736,8 +736,9 @@ def parse_args(argv=None):
                             "'viewers') at a live broadcast.")
     quick.add_argument("-T", "--trackname", type=str, default="track",
                        help="quick mode: track name (default: track)")
-    quick.add_argument("-t", "--duration", type=int, default=30,
-                       help="quick mode: seconds (default: 30)")
+    quick.add_argument("-t", "--duration", type=int, default=0,
+                       help="quick mode: run time in seconds; 0 (default): "
+                            "no limit")
     quick.add_argument("--subs", type=int, default=None,
                        help="Subscriber count (enables quick mode)")
     quick.add_argument("-s", "--object-size", type=int, default=1024,
@@ -780,6 +781,17 @@ def parse_args(argv=None):
     return p, args
 
 
+def _no_data_forever(groups, horizon, t) -> bool:
+    """With no time limit, nothing else ends a run against a dead relay."""
+    return (math.isinf(horizon) and t >= _cli.SETUP_TIMEOUT
+            and not any(s.stats.get("total_objs", 0)
+                        for g in groups.values() for s in g.shards))
+
+
+def _secs(t):
+    return "no limit" if math.isinf(t) else f"{t:.0f}s"
+
+
 def main():
     p, args = parse_args()
     _cli.apply_logging(args, default=logging.INFO)
@@ -797,7 +809,7 @@ def main():
                 "bitrate_kbps": int(args.object_size * fps * 8 / 1000),
                 "fps": fps, "object_size": args.object_size,
                 "gop_s": (args.group_size / fps) if args.group_size else 1.0,
-                "start_delay": 0, "duration": args.duration,
+                "start_delay": 0, "duration": args.duration or math.inf,
             }],
             "subscribers": [{
                 "namespace": ns, "track": args.trackname,
@@ -852,7 +864,7 @@ def main():
           f"{len({ps.namespace for ps in pub_specs})} namespaces")
     print(f"  subscribers: {peak_subs} peak target across "
           f"{len(group_specs)} groups")
-    print(f"  timeline:    {horizon:.0f}s "
+    print(f"  timeline:    {_secs(horizon)} "
           f"(duration-scale {args.duration_scale:g})")
     print(f"  worst-case egress if all peaks align: "
           f"{fmt_bps(total_bps)}")
@@ -861,7 +873,7 @@ def main():
     for ps in pub_specs:
         subs = per_track_subs.get(ps.key, 0)
         print(f"    {ps.key:<28} {fmt_bps(ps.bps):>10} x {subs:>4} subs"
-              f"  T+{ps.start_delay:.0f}s..{ps.start_delay + ps.duration:.0f}s"
+              f"  T+{ps.start_delay:.0f}s..{_secs(ps.start_delay + ps.duration)}"
               f"  obj={ps.object_size}B @ {ps.fps:g}/s"
               + ("  [datagram]" if ps.delivery == "datagram" else ""))
     print("─" * 72)
@@ -873,7 +885,7 @@ def main():
         **_cli.transport_kwargs(args),
     )
 
-    stopping = False
+    stopping = no_data = False
 
     def _on_sigint(_sig, _frm):
         nonlocal stopping
@@ -1021,6 +1033,9 @@ def main():
                     csv_f.flush()
 
             # --- end conditions ---
+            if _no_data_forever(groups, horizon, t):
+                print(f"  no objects within {_cli.SETUP_TIMEOUT}s; stopping.")
+                no_data = stopping = True
             pubs_done = all(prt.ended for prt in pubs.values()) if pubs \
                 else t >= horizon
             # Subscribers do NOT self-terminate when a publisher stops:
@@ -1075,7 +1090,7 @@ def main():
     print("─" * 72)
     for line in lines:
         print(line)
-    if stopping:
+    if stopping and not no_data:
         return 130     # interrupted: the verdict covers a partial run
     return 1 if failed else 0
 

@@ -1,5 +1,6 @@
 """load_sim's verdict: a group that subscribed but received nothing, or only a
 trickle of what its subscribers should have seen, fails."""
+import math
 import os
 import re
 import socket
@@ -11,8 +12,19 @@ from pathlib import Path
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tools.load_sim import (
-    GroupRT, GroupSpec, PubRT, PubSpec, ShardRT, _accrue_expected, _verdict,
+    GroupRT, GroupSpec, PubRT, PubSpec, ShardRT, _accrue_expected,
+    _no_data_forever, _verdict,
 )
+from aiomoqt.utils.cli import SETUP_TIMEOUT
+
+
+def test_no_time_limit_ends_when_no_data_arrives():
+    empty, _ = _group(0, 0, 0)
+    busy, _ = _group(3, 10, 1000)
+    assert _no_data_forever(empty, math.inf, SETUP_TIMEOUT)
+    assert not _no_data_forever(empty, math.inf, SETUP_TIMEOUT - 1)
+    assert not _no_data_forever(empty, 300, SETUP_TIMEOUT)
+    assert not _no_data_forever(busy, math.inf, SETUP_TIMEOUT)
 
 
 def _group(peak, objs, nbytes, subs=3, expected=0.0):

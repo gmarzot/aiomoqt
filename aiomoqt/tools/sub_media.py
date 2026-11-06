@@ -40,6 +40,7 @@ skew are built from differences and do not.
 import asyncio
 import csv
 import functools
+import math
 import os
 import sys
 import time
@@ -115,7 +116,7 @@ def parse_args():
     parser.add_argument('--report', type=str, default=None, metavar='PATH',
                         help='With --analyze: write interval and summary '
                              'rows as CSV to PATH (- = stdout)')
-    _cli.add_run(parser, duration=30)
+    _cli.add_run(parser)
     _cli.add_interval(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser)
@@ -366,7 +367,7 @@ async def _analyze(args, analysis: MediaAnalysis, closed, report) -> None:
     session closes."""
     _table(report, [interval_header(analysis.tracks)])
     start = time.monotonic()
-    end = start + args.duration
+    end = start + args.duration if args.duration else math.inf
     k = 0
     while not closed.done() and time.monotonic() < end:
         k += 1
@@ -466,14 +467,15 @@ async def run(args):
         sub.on_arrival = _fan(inspector and inspector.on_arrival,
                               analysis and analysis.on_arrival)
         try:
-            catalog = await sub.start(timeout=args.duration)
+            catalog = await sub.start(timeout=_cli.setup_timeout(args))
         except MOQTRequestError as e:
             _status(f"  error: {e} — no publisher on "
                     f"'{args.namespace}'?")
             sys.exit(2)
         except asyncio.TimeoutError:
             _status(f"  error: no catalog received on "
-                    f"'{args.namespace}' within {args.duration}s")
+                    f"'{args.namespace}' within "
+                    f"{_cli.setup_timeout(args)}s")
             sys.exit(2)
         _status(f"  catalog: {[t.name for t in catalog.tracks]}")
         if not sub.tracks:
@@ -509,9 +511,14 @@ async def run(args):
                     rc = _finish_analysis(analysis, start_us, _now_us(),
                                           report)
             else:
-                async with asyncio.timeout(args.duration + 5):
-                    while not writers.pipe_closed and not closed.done():
-                        await asyncio.sleep(0.1)
+                try:
+                    async with asyncio.timeout(
+                            args.duration + 5 if args.duration else None):
+                        while not writers.pipe_closed and not closed.done():
+                            await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    # Ctrl-C: frame counts below still print.
+                    asyncio.current_task().uncancel()
         except asyncio.TimeoutError:
             pass
         finally:

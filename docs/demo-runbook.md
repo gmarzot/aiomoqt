@@ -409,7 +409,7 @@ drawtext.
   audioUnderruns, avSkewMs, stallDurationMs, gapCount).
 - `debug=1`: `[video] waiting/seeking/ratechange …` lines with
   `t= rs= rate= buffered=` sit next to the stall lines for correlation.
-- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --inspect 5 --show-catalog`
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --inspect 5 --show-catalog -t 60`
   (`--discover` treats `-N` as a prefix and finds the run's
   `aiomoqt/demo-<rand4>`, so nothing is typed or pasted)
   (ts_skew_ms = wire latency). QUIC: `AIOPQUIC_QLOG_DIR=/tmp/qlog` on the publisher.

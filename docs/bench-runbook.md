@@ -302,8 +302,8 @@ python -m aiomoqt.tools.loopback_bench -Q --draft 18 --rtt-ms 50 -r 200 -t 10
 - `-Q` raw QUIC, else H3/WebTransport. `--draft` applies to both ends
   (default 14, deprecated: pass 18, 20 or 22).
 - `-s` object size, `-r` aggregate objects/s (0 = as fast as it goes),
-  `-P` parallel subgroup streams, `-g` objects per group, `-t` seconds,
-  `-i` report interval.
+  `-P` parallel subgroup streams, `-g` objects per group, `-t` seconds
+  (0 or absent: no limit), `-i` report interval.
 - `-D` sends ObjectDatagrams instead of streams (object at most ~1150 B);
   run it at the same `-s` and `-r` as a stream run to compare the two.
 - `--fanout` publishes through `produce()` and the per-subscriber send
