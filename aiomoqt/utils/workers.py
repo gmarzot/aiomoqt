@@ -137,7 +137,8 @@ def _post(q, msg):
 def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
     """Forward explicit transport settings, retaining None to disable a budget."""
     return {key: config[key] for key in (
-        'congestion_control_algorithm', 'tx_max_queued_bytes',
+        'congestion_control_algorithm', 'congestion_control_options',
+        'packet_train_mode', 'flow_control_window', 'tx_max_queued_bytes',
         'tx_max_inflight_bytes', 'keep_alive_interval',
     ) if key in config}
 

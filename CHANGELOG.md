@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- adaptive_bench takes the shared session flags: `--cc-options`, `--pacing-trains` and `--fc-window` now reach its publisher and subscriber workers.
 - `--video 4kuhd`: a video profile of 16 Mbps at 30 fps and `-g 60` (the 1080p shape scaled up); `--video 4k` is unchanged.
 - Every tool and example runs with no time limit by default: no `-t` is `-t 0`, ending at Ctrl-C or when the media or session ends. Waiting for a session or catalog is still bounded: by `-t`, or 30 s without one. sub_media `-t 0` now means no limit.
 - adaptive_bench holds at `--max-mbps` / `--max-subs` until `-t` is up instead of exiting there; `-t 0` or no `-t` runs until Ctrl-C, and `--exit max` ends the run on reaching max.
