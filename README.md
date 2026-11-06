@@ -178,6 +178,8 @@ The [media guide](aiomoqt/media/README.md) covers every source, packaging, timin
 
 ### Command line
 
+Tools run until Ctrl-C or until the media or session ends; `-t SECONDS` sets a limit.
+
 ```bash
 # Publish an mp4 as an MSF broadcast — LOC packaging, catalog + video + audio
 python -m aiomoqt.tools.pub_media $RELAY -N demo/live --mp4 clip.mp4 --loop \

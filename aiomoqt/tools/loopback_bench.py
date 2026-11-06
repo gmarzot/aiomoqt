@@ -62,8 +62,8 @@ def parse_args():
              'default: max). Per-stream emit rate is rate/streams. '
              '-P only changes parallelism, not offered load.')
     parser.add_argument(
-        '-t', '--duration', type=int, default=20,
-        help='Duration seconds (default: 20)')
+        '-t', '--duration', type=int, default=0,
+        help='Run time in seconds; 0 (default): no limit')
     parser.add_argument(
         '-i', '--interval', type=float, default=5.0,
         help='Report interval seconds (default: 5)')
@@ -292,7 +292,7 @@ def print_banner(args):
         row("payload", f"checked (every {args.verify_payload})")
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
-    row("duration", f"{args.duration}s")
+    row("duration", _cli.duration_label(args.duration))
     row("cpu", cpu_summary())
     print("─" * 56)
 

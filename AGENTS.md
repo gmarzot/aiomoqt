@@ -135,6 +135,7 @@ exceptions; `moq_interop_client`'s `-r/-t/-l/-v` are the interop runner's interf
 defaults, never which flags exist (also tested). A dialed URL's
 scheme selects the transport (`moqt://` raw QUIC, `https://` or bare `host:port`
 WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALPN dispatch.
+`-t` defaults to 0, no limit, on every tool and example (also tested); a tool may add an exit condition with `--exit COND`.
 `-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
 all three). Write `-h` in docs: `-?` is a shell glob.
 
