@@ -134,6 +134,21 @@ def _post(q, msg):
         pass
 
 
+async def retry_wait(exc, stop_ev) -> bool:
+    """Wait out a refused request's Retry Interval, less if stopping; False
+    when it carries none. The value is milliseconds plus one."""
+    interval = getattr(exc, 'retry_interval', 0)
+    if not interval:
+        return False
+    end = time.monotonic() + (interval - 1) / 1000
+    while not stop_ev.is_set():
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        await asyncio.sleep(min(STOP_POLL_S, left))
+    return True
+
+
 def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
     """Forward explicit transport settings, retaining None to disable a budget."""
     return {key: config[key] for key in (
@@ -191,6 +206,9 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                     )
                     break
                 except Exception as e:
+                    if await retry_wait(e, stop_ev):
+                        deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
+                        continue
                     m = str(e)
                     if ('code=4' in m or 'does not exist' in m
                             or 'no such namespace' in m):
@@ -366,14 +384,19 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                         break
                     except Exception as e:
                         m = str(e)
-                        if ('code=4' in m or 'does not exist' in m
-                                or 'no such namespace' in m):
-                            await asyncio.sleep(0.3)
-                            continue
-                        if isinstance(e, MOQTRequestError):
+                        unpublished = ('code=4' in m or 'does not exist' in m
+                                       or 'no such namespace' in m)
+                        if isinstance(e, MOQTRequestError) and not unpublished:
                             state['refused'] += 1
                             state['refusing'] = True
                             state['refused_reason'] = e.reason
+                        if await retry_wait(e, stop_ev):
+                            deadline = (time.monotonic()
+                                        + SUBSCRIBE_RETRY_WINDOW_S)
+                            continue
+                        if unpublished:
+                            await asyncio.sleep(0.3)
+                            continue
                         # Other subscribe error: drop the connection and
                         # let the outer loop reopen the whole slot.
                         break

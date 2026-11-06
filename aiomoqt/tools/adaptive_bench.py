@@ -780,6 +780,9 @@ class SubsActuator:
             spawned = self._spawned_t.get(wid, now)
             if last_bytes is None and (now - spawned) < startup_grace:
                 continue
+            # Refused by the relay, not stuck: reaping would only redial.
+            if self._latest_batch.get(wid, {}).get('refusing', 0) > 0:
+                continue
             if last_bytes is None or last_bytes <= starve_cutoff:
                 starved.append(wid)
         for wid in starved:

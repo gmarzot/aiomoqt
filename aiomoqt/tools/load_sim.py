@@ -91,6 +91,7 @@ from aiomoqt.utils.workers import (
     pub_worker_entry,
     MP_CTX,
     SUBSCRIBE_RETRY_WINDOW_S,
+    retry_wait,
     SUBSCRIBE_EACH_TIMEOUT_S,
     STATS_INTERVAL_S,
     STOP_POLL_S,
@@ -234,6 +235,8 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
                         subscribed = True
                         break
                     except Exception as e:
+                        if await retry_wait(e, stop_ev):
+                            continue
                         m = str(e)
                         last_err = m
                         # Transient: the track is not up yet, or two joins
