@@ -151,8 +151,6 @@ def test_no_ceiling_until_the_gate_first_closes():
 
 
 def test_a_lull_does_not_admit_past_the_closing_count():
-    # 11-06: steal vanished for 15 s, the gate reopened, 50 viewers joined,
-    # steal returned and the relay collapsed.
     gate = AdmissionGate(80, window=1)
     gate.update(88, 270)
     assert gate.ceiling == 270 and not gate.admits(10)
