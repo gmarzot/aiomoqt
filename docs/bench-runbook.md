@@ -523,7 +523,7 @@ namespace at the same time.
 | Surface | What it shows |
 |---|---|
 | relay stats | Whatever the relay under test exposes. For moqx that is a Grafana overview: sessions, ingress and egress bandwidth, fan-out ratio, subscribers, drops, loss, latency, and QUIC connections, streams, goodput and RTT. The relay's own account of the run. |
-| `--report PATH` | Per-sample CSV from adaptive_bench, per-interval per-track CSV from load_sim. The artifact to keep and diff across builds. |
+| `--report PATH` | Per-sample CSV from adaptive_bench (in subs mode, `worst_p90_ms` is the worst sub in the last reports and `tick_p90_ms` the worst across the tick, which the controller acts on), per-interval per-track CSV from load_sim. The artifact to keep and diff across builds. |
 | `AIOPQUIC_QLOG_DIR=<dir>` | Standard qlog traces of the QUIC layer: congestion control, RTT, loss. Free to the run. |
 | `--keylogfile PATH` | TLS secrets for Wireshark. Under `--mp` each worker writes `PATH.pub.<pid>` and `PATH.sub.<pid>`, combined when decrypting. |
 

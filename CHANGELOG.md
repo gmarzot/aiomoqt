@@ -3,6 +3,8 @@
 ## v0.15.0 (unreleased)
 
 - aiomoqt-relay `--admission-cpu PCT` and `--max-subscribers N`: near overload, past the count the relay last closed at (which then rises 5% a minute), or at the limit, a session's first SUBSCRIBE is refused with EXCESSIVE_LOAD and a randomized Retry Interval; sessions already subscribed may add tracks. Off by default. `status.json` gains `totals.admission` and `totals.queue_ms`. adaptive_bench and load_sim subscribers wait out a Retry Interval instead of reconnecting.
+- adaptive_bench subs mode shows a relay's refusals: `hold (relay refusing)` in place of a bare shortfall, and a summary line with the count and reason.
+- adaptive_bench subs mode reads worker reports as they arrive, so above about 25 workers per host the controller no longer acts on reports a minute old. It acts on the worst p90 across each tick, so climbs stop earlier than before; `--report` adds `tick_p90_ms`, and `worst_p90_ms` keeps its meaning. Rx covers the whole tick.
 - adaptive_bench takes the shared session flags: `--cc-options`, `--pacing-trains` and `--fc-window` now reach its publisher and subscriber workers.
 - `--video 4kuhd`: a video profile of 16 Mbps at 30 fps and `-g 60` (the 1080p shape scaled up); `--video 4k` is unchanged.
 - Every tool and example runs with no time limit by default: no `-t` is `-t 0`, ending at Ctrl-C or when the media or session ends. Waiting for a session or catalog is still bounded: by `-t`, or 30 s without one. sub_media `-t 0` now means no limit.
