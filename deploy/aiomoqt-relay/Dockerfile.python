@@ -9,9 +9,9 @@ ARG TUNE=-mcpu=neoverse-n1
 ENV PATH=/usr/lib/llvm-19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates clang-19 curl libbz2-dev libffi-dev libgdbm-dev liblzma-dev \
-        libncurses-dev libreadline-dev libsqlite3-dev libssl-dev libzstd-dev lld-19 llvm-19 \
-        make pkg-config uuid-dev xz-utils zlib1g-dev
+        ca-certificates clang-19 curl libbz2-dev libclang-rt-19-dev libffi-dev libgdbm-dev \
+        liblzma-dev libncurses-dev libreadline-dev libsqlite3-dev libssl-dev libzstd-dev \
+        lld-19 llvm-19 make pkg-config uuid-dev xz-utils zlib1g-dev
 
 RUN curl -fsSL -o /python.tar.xz \
         "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tar.xz" \
