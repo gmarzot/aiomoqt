@@ -884,8 +884,8 @@ class AIMDController:
     Keeps probing: it backs off on a signal and resumes ramping from the
     lower level, never locking in a ceiling. Holds at the actuator's max
     level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
-    or rx=0 for 3 intervals (a failure). A negative duration ends the run
-    on reaching max, with no time limit.
+    or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
+    reaching max.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -913,6 +913,7 @@ class AIMDController:
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
+                 exit_at_max: bool = False,
                  tick_s: float | None = None,
                  skew_safe: bool = False):
         self.actuator = actuator
@@ -936,8 +937,8 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
-        self.duration_s = duration_s if duration_s and duration_s > 0 else None
-        self.exit_at_max = duration_s is not None and duration_s < 0
+        self.duration_s = duration_s or None
+        self.exit_at_max = exit_at_max
         self.held_at_max = False
         # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
@@ -1565,8 +1566,12 @@ def parse_args():
                    metavar="SECONDS",
                    help="run time; the run ends after this many seconds, "
                         "holding at --max-mbps / --max-subs once there. "
-                        "0 (default): until Ctrl-C. -1: exit on reaching "
-                        "max, no time limit.")
+                        "0 (default): until Ctrl-C.")
+    p.add_argument("--exit", dest="exit_on", choices=("max",), default=None,
+                   metavar="COND",
+                   help="also end the run on COND; -t still applies. max: "
+                        "on reaching --max-mbps / --max-subs, without "
+                        "holding there.")
     p.add_argument("--keylogfile", default=None,
                    help="TLS secrets log path (NSS Key Log Format) for "
                         "Wireshark decryption of pcap captures. Each MP "
@@ -1605,6 +1610,11 @@ def parse_args():
                 "cannot be "
                 "combined with a URL — a URL says where to dial, "
                 "loopback options say what to bind")
+
+    if args.duration < 0:
+        p.error("-t/--duration: seconds, or 0 for no limit")
+    if args.exit_on == "max" and args.role == "pub":
+        p.error("--exit max: --role pub has no max to reach")
 
     # Splitting the run across hosts is subs-mode only. In subs mode the
     # publisher is fixed-rate and the controller's only actuator is the
@@ -1784,7 +1794,7 @@ async def _run_fixed_publisher(args) -> int:
 
     try:
         deadline = (time.monotonic() + args.duration
-                    if args.duration > 0 else None)
+                    if args.duration else None)
         while proc.is_alive():
             drain_health()
             if failed:
@@ -1999,6 +2009,7 @@ async def main():
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
+        exit_at_max=args.exit_on == "max",
         tick_s=(args.join_rate if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
     )

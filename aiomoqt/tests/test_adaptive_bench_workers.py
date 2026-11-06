@@ -86,17 +86,22 @@ async def test_main_exit_status_requires_received_data(monkeypatch, capsys, rece
         assert 'duration cap reached' in output
 
 
-async def test_minus_one_exits_at_max(monkeypatch, capsys):
+async def test_exit_max_ends_the_run(monkeypatch, capsys):
     _processes(monkeypatch)
-    _argv(monkeypatch, '-t', '-1')
+    _argv(monkeypatch, '--exit', 'max', '--duration', '30')
     assert await ab.main() == 0
     assert 'reached max' in capsys.readouterr().out
 
 
-async def test_minus_one_publisher_keeps_publishing(monkeypatch):
-    _processes(monkeypatch)
-    _argv(monkeypatch, '--mode', 'subs', '--role', 'pub', '-t', '-1')
-    assert await asyncio.wait_for(ab.main(), 0.3) == 130
+@pytest.mark.parametrize('extra, why', [
+    (['--exit', 'max', '--mode', 'subs', '--role', 'pub'], 'no max to reach'),
+    (['-t', '-1'], 'seconds, or 0'),
+])
+def test_refuses(monkeypatch, capsys, extra, why):
+    _argv(monkeypatch, *extra)
+    with pytest.raises(SystemExit):
+        ab.parse_args()
+    assert why in capsys.readouterr().err
 
 
 async def test_duration_cap_without_measurements_fails(monkeypatch):

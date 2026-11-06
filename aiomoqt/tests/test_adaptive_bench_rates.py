@@ -56,8 +56,8 @@ async def test_no_latency_samples_print_as_na(monkeypatch, capsys):
     assert "n/a" in row and "0.0us" not in row, row
 
 
-def _at_max(duration_s, p90s=(), stop_after=None):
-    """A controller already at max_level; p90s feed the first ticks, then 0."""
+def _at_max(duration_s, p90s=(), stop_after=None, max_level=10, exit_at_max=False):
+    """A controller at level 10; p90s feed the first ticks, then 0."""
     state = ab.BenchState()
     p90s = list(p90s)
     ticks = [0]
@@ -72,10 +72,11 @@ def _at_max(duration_s, p90s=(), stop_after=None):
                          target_mbps=10, tx_mbps=10, rx_mbps=10)
 
     actuator = SimpleNamespace(initial_level=10, unit='Mbps', min_level=1,
-                               max_level=10, initial_step=1, step_floor=1,
+                               max_level=max_level, initial_step=1, step_floor=1,
                                apply=AsyncMock(), observe=observe)
     ctl = ab.AIMDController(actuator, state, interval_s=0.001,
-                            latency_threshold_ms=100, duration_s=duration_s)
+                            latency_threshold_ms=100, duration_s=duration_s,
+                            exit_at_max=exit_at_max)
     actions = []
     ctl._emit = lambda sig, action, force=False: actions.append(action)
     return ctl, state, actions, actuator
@@ -98,8 +99,14 @@ async def test_zero_duration_holds_until_stopped():
         assert actions.count('hold (max)') >= 15, actions
 
 
-async def test_negative_duration_exits_at_max():
-    ctl, state, actions, _ = _at_max(-1)
+async def test_exit_max_still_respects_duration():
+    ctl, state, _, _ = _at_max(0.05, max_level=100, exit_at_max=True)
+    await ctl.run()
+    assert 'duration cap reached' in state.ceiling_reason
+
+
+async def test_exit_max_ends_at_max():
+    ctl, state, actions, _ = _at_max(30, exit_at_max=True)
     await ctl.run()
     assert state.ceiling_reason == 'reached max 10 Mbps'
     assert actions[-1] == 'max' and not ctl.held_at_max

@@ -381,8 +381,9 @@ intervals. A shortfall, achieved below `--shortfall-ratio` (0.85) of
 commanded, holds the ramp and backs off once it lasts three intervals.
 Back-off multiplies by `--backoff-factor` (0.9; closer to 1.0 for gentler
 steps). At `--max-mbps` the run holds, still backing off, until `-t`
-seconds are up; `-t 0` or no `-t` runs until Ctrl-C, and `-t -1` exits on
-reaching max, with no time limit. A run that receives nothing exits nonzero.
+seconds are up; `-t 0` or no `-t` runs until Ctrl-C. `--exit max` ends the
+run on reaching max instead, and `-t` still applies. A run that receives
+nothing exits nonzero.
 
 **Set the threshold relative to the path RTT.** Absolute latency
 includes the path, and the ramp takes full steps only while p90 is under
@@ -440,9 +441,9 @@ latency threshold works as in flow C, so set it from the path RTT here
 too.
 
 The ramp holds at `--max-subs`, still backing off, until `-t` seconds are
-up; `-t 0` or no `-t` runs until Ctrl-C, and `-t -1` exits on reaching max,
-with no time limit. For a fixed audience with no ramp use `load_sim --subs N`
-(flow E).
+up; `-t 0` or no `-t` runs until Ctrl-C. `--exit max` ends the run on
+reaching max instead, and `-t` still applies. For a fixed audience with no
+ramp use `load_sim --subs N` (flow E).
 
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
