@@ -383,19 +383,20 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                         subscribed = True
                         break
                     except Exception as e:
+                        m = str(e)
+                        unpublished = ('code=4' in m or 'does not exist' in m
+                                       or 'no such namespace' in m)
+                        if isinstance(e, MOQTRequestError) and not unpublished:
+                            state['refused'] += 1
+                            state['refusing'] = True
+                            state['refused_reason'] = e.reason
                         if await retry_wait(e, stop_ev):
                             deadline = (time.monotonic()
                                         + SUBSCRIBE_RETRY_WINDOW_S)
                             continue
-                        m = str(e)
-                        if ('code=4' in m or 'does not exist' in m
-                                or 'no such namespace' in m):
+                        if unpublished:
                             await asyncio.sleep(0.3)
                             continue
-                        if isinstance(e, MOQTRequestError):
-                            state['refused'] += 1
-                            state['refusing'] = True
-                            state['refused_reason'] = e.reason
                         # Other subscribe error: drop the connection and
                         # let the outer loop reopen the whole slot.
                         break
