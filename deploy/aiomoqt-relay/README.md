@@ -102,7 +102,8 @@ the host keeps other per-packet work off its cores:
 
 - **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
   queue interrupts to CPU 0, and `host/relay-irq-affinity.service` runs it at boot (irqbalance is
-  off). The relay service has `cpuset: "1,2"`.
+  off). The relay service has `cpuset: "1,2"`. GoAccess runs on CPU 0 at a low CPU share, so its
+  report runs don't take the relay's CPUs.
 
   ```sh
   sudo install -m 755 host/relay-irq-affinity.sh /usr/local/sbin/
