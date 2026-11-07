@@ -116,9 +116,17 @@ def test_an_inactive_or_silent_slot_is_not_behind(p90):
     assert state['behind_since'] is None
 
 
+def test_the_flag_parses_in_subs_mode(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["adaptive_bench", "moqt://h:1", "--mode", "subs",
+                                      "--sub-mbps", "1", "--too-far-behind", "2"])
+    assert ab.parse_args().too_far_behind == 2.0
+
+
 @pytest.mark.parametrize("argv,expected", [
     (["--mode", "bw", "--too-far-behind", "2"], "subs-mode only"),
     (["--mode", "subs", "--sub-mbps", "1", "--too-far-behind", "-1"], "seconds"),
+    (["--mode", "subs", "--sub-mbps", "1", "--role", "sub", "--too-far-behind", "2"],
+     "--role both"),
 ])
 def test_bad_flags_are_refused(argv, expected, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["adaptive_bench", "moqt://h:1"] + argv)

@@ -1709,9 +1709,6 @@ def parse_args():
         p.error("--too-far-behind: seconds, or 0 for off")
     if args.too_far_behind and args.mode != "subs":
         p.error("--too-far-behind is subs-mode only")
-    if args.too_far_behind and args.skew_safe_signals:
-        p.error("--too-far-behind reads absolute latency: drop the skew-safe "
-                "signals")
     if args.exit_on == "max" and args.role == "pub":
         p.error("--exit max: --role pub has no max to reach")
 
@@ -1733,6 +1730,8 @@ def parse_args():
     # carries their clock offset, so the controller acts on p90 over a
     # running baseline instead (AIMDController skew_safe).
     args.skew_safe_signals = args.role != "both"
+    if args.too_far_behind and args.skew_safe_signals:
+        p.error("--too-far-behind reads absolute latency, so it needs --role both")
 
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
