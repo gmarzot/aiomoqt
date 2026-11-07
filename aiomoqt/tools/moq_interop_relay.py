@@ -4777,7 +4777,7 @@ TRANSPORT_COUNTERS = (
     "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
     "rx_event_drops", "tx_event_ring_count_now", "tx_event_ring_pops",
     "tx_worker_idle_now", "tx_wake_lost", "loop_callbacks",
-    "wake_calls", "wake_skipped_coalesced")
+    "wake_calls", "wake_skipped_coalesced", "loop_late_checks", "loop_late_us")
 
 
 def _transport_of(handle):
@@ -4941,6 +4941,7 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
+                 "send_late_ms",
                  "drops", "shed_objects")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
@@ -4997,6 +4998,7 @@ class _Status:
         self._delivered = 0
         self._drops = 0
         self._shed = 0
+        self._late_seen = (0, 0)
         self._last = None
 
     async def run(self) -> None:
@@ -5016,6 +5018,18 @@ class _Status:
             except Exception:
                 logger.warning("relay: status write failed", exc_info=True)
             await asyncio.sleep(STATUS_INTERVAL_S)
+
+    def _send_late_ms(self):
+        """How overdue the network threads' next wakes were on average since
+        the last call, None without the counters or a pass to judge."""
+        rows = transport_counters(self.handles)
+        checks = sum(r["loop_late_checks"] or 0 for r in rows)
+        late = sum(r["loop_late_us"] or 0 for r in rows)
+        seen_checks, seen_late = self._late_seen
+        self._late_seen = (checks, late)
+        if checks <= seen_checks:
+            return None
+        return round((late - seen_late) / (checks - seen_checks) / 1000, 2)
 
     def snapshot(self, now: float, wall: float) -> dict:
         """Relay, totals, namespace, track and session tables, host
@@ -5258,6 +5272,7 @@ class _Status:
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
+            "send_late_ms": self._send_late_ms(),
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -5288,6 +5303,7 @@ class _Status:
             "objects_out_per_s": totals["objects_out_per_s"],
             "groups_per_s": totals["groups_per_s"],
             "groups_out_per_s": totals["groups_out_per_s"],
+            "send_late_ms": totals["send_late_ms"],
             "drops": totals["drops"],
             "shed_objects": totals["shed_objects"],
         })

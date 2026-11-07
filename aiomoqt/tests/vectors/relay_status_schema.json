@@ -470,6 +470,8 @@
   ".transport[].loop_callbacks": [
    "int"
   ],
+  ".transport[].loop_late_checks": [],
+  ".transport[].loop_late_us": [],
   ".transport[].rx_event_drops": [
    "int"
   ],
@@ -599,6 +601,10 @@
   ".history.rtt_p50_ms[]": [
    "float"
   ],
+  ".history.send_late_ms": [
+   "array"
+  ],
+  ".history.send_late_ms[]": [],
   ".history.sessions": [
    "array"
   ],
@@ -909,6 +915,7 @@
   ".totals.rtt_p99_ms": [
    "float"
   ],
+  ".totals.send_late_ms": [],
   ".totals.sessions": [
    "int"
   ],

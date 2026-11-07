@@ -176,7 +176,8 @@ function renderTiles(s) {
   setTile('tracks', fmt.num(T.tracks), `${fmt.num(live)} live`);
   setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
   const lag = T.loop_lag_ms || {};
-  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
+  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)} · send late ${fmt.ms(T.send_late_ms)}`,
+          'Python loop lag; send late = how overdue the network thread\'s next wake was');
   setTile('loss', fmt.pct(T.loss_pct, 2),
           none(T.spurious_pct) ? 'delivery sessions' : `spurious ${fmt.pct(T.spurious_pct, 2)}`,
           'Packets lost toward viewers; spurious = declared lost, acknowledged later');
