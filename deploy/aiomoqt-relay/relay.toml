@@ -8,5 +8,6 @@ log-dir = "/logs"
 control = "/status/control.sock"
 catalog-probe = true
 cache-bytes = 268435456
-admission-cpu = 87
+admission-cpu = 80
 cc-algo = "bbr"
+cc-options = "Q0.02"
