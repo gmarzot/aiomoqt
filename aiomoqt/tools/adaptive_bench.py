@@ -962,7 +962,7 @@ class AIMDController:
     lower level, never locking in a ceiling. Holds at the actuator's max
     level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
     or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
-    reaching max.
+    reaching max, or at the first back-off if that comes sooner.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -991,7 +991,6 @@ class AIMDController:
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
                  exit_at_max: bool = False,
-                 exit_at_ceiling: bool = False,
                  tick_s: float | None = None,
                  skew_safe: bool = False):
         self.actuator = actuator
@@ -1017,7 +1016,6 @@ class AIMDController:
         self.loss_threshold_pct = loss_threshold_pct
         self.duration_s = duration_s or None
         self.exit_at_max = exit_at_max
-        self.exit_at_ceiling = exit_at_ceiling
         self.held_at_max = False
         # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
@@ -1108,7 +1106,7 @@ class AIMDController:
                 if self.pressure_streak < 2 * self._tpr:
                     self._emit(sig, "watch (p90 over)")
                     continue
-                if self.exit_at_ceiling:
+                if self.exit_at_max:
                     self._end_at_ceiling(sig, "p90 over threshold")
                     return
                 retreat = max(self.backoff_factor, 1.0 + headroom)
@@ -1144,6 +1142,9 @@ class AIMDController:
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "delivery short of target")
+                    return
                 if a.unit == "Mbps":
                     # BW: back off the target toward what's actually
                     # delivered, so Target settles at the real ceiling
@@ -1158,9 +1159,6 @@ class AIMDController:
                     await self._apply(new_level, sig,
                                       "back-off (shortfall)", force=True)
                     self.draining = True
-                elif self.exit_at_ceiling:
-                    self._end_at_ceiling(sig, "delivery short of target")
-                    return
                 else:
                     # Subs: a sustained shortfall is usually a lost
                     # subscriber the reaper will replace — hold +
@@ -1658,12 +1656,12 @@ def parse_args():
                    help="run time; the run ends after this many seconds, "
                         "holding at --max-mbps / --max-subs once there. "
                         "0 (default): until Ctrl-C.")
-    p.add_argument("--exit", dest="exit_on", choices=("max", "ceiling"),
-                   default=None, metavar="COND",
+    p.add_argument("--exit", dest="exit_on", choices=("max",), default=None,
+                   metavar="COND",
                    help="also end the run on COND; -t still applies. max: "
                         "on reaching --max-mbps / --max-subs, without "
-                        "holding there. ceiling: at the first back-off, "
-                        "instead of backing off.")
+                        "holding there, or at the first back-off if that "
+                        "comes sooner.")
     p.add_argument("--worker-per-sub", action="store_true",
                    help="subs mode: one picoquic worker per subscriber "
                         "instead of one per process, to compare layouts")
@@ -1683,8 +1681,6 @@ def parse_args():
         p.error("-t/--duration: seconds, or 0 for no limit")
     if args.exit_on == "max" and args.role == "pub":
         p.error("--exit max: --role pub has no max to reach")
-    if args.exit_on == "ceiling" and args.role == "pub":
-        p.error("--exit ceiling: --role pub has no ceiling to reach")
 
     # Splitting the run across hosts is subs-mode only. In subs mode the
     # publisher is fixed-rate and the controller's only actuator is the
@@ -2090,7 +2086,6 @@ async def main():
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
         exit_at_max=args.exit_on == "max",
-        exit_at_ceiling=args.exit_on == "ceiling",
         tick_s=(args.join_rate if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
     )
