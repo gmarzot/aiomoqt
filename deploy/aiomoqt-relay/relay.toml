@@ -10,3 +10,4 @@ catalog-probe = true
 cache-bytes = 268435456
 admission-cpu = 87
 cc-algo = "bbr"
+cc-options = "Q0.02"
