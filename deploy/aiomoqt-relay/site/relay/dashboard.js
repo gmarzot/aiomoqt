@@ -120,9 +120,9 @@ function setPair(key, rateIn, rateOut, title) {
            el('span', {}, el('i', {class: 'key-area s0'}), 'out')], title);
 }
 
-// Objects skipped over the 10-minute history.
+// Bytes skipped over the 10-minute history.
 function skipped(h) {
-  const d = (h.shed_objects || []).filter(v => !none(v));
+  const d = (h.shed_bytes || []).filter(v => !none(v));
   return d.length ? Math.max(d[d.length - 1] - d[0], 0) : 0;
 }
 
@@ -176,13 +176,14 @@ function renderTiles(s) {
   setTile('tracks', fmt.num(T.tracks), `${fmt.num(live)} live`);
   setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
   const lag = T.loop_lag_ms || {};
-  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
+  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)} · send late ${fmt.ms(T.send_late_ms)}`,
+          'Python loop lag; send late = how overdue the network thread\'s next wake was');
   setTile('loss', fmt.pct(T.loss_pct, 2),
           none(T.spurious_pct) ? 'delivery sessions' : `spurious ${fmt.pct(T.spurious_pct, 2)}`,
           'Packets lost toward viewers; spurious = declared lost, acknowledged later');
   setTile('drops', drops ? fmt.num(drops.reduce((a, b) => a + b, 0)) : '—',
-          `${fmt.num(T.drops)} since start · ${fmt.num(skipped(s.history))} objects skipped`,
-          'Subscribers dropped, bars per minute; objects skipped for viewers too far behind, 10 min');
+          `${fmt.num(T.drops)} since start · ${fmt.bytes(skipped(s.history))} skipped`,
+          'Subscribers dropped, bars per minute; data skipped for viewers too far behind, 10 min');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
   const out = (k, rate) => (none(T[k]) ? fanout(rate) : T[k]);
   setPair('groups', groupsIn, out('groups_out_per_s', 'groups_per_s'),

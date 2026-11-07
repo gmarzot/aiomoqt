@@ -900,3 +900,20 @@ async def test_untraced_relay_counts_nothing_per_object(relay_tables):
                          for lane in lanes), lanes
     assert report["trace_subscribers"] is False
     assert all("subscriptions" not in row for row in report["sessions"])
+
+
+def test_send_lateness_is_the_mean_since_the_last_read(tmp_path, monkeypatch):
+    status = relay._Status(str(tmp_path / "status.json"), {"started": 0}, [])
+    rows = [{"loop_late_checks": 100, "loop_late_us": 200_000}]
+    monkeypatch.setattr(relay, "transport_counters", lambda handles: rows)
+    assert status._send_late_ms() == 2.0   # 2 ms a pass since the start
+    rows[0] = {"loop_late_checks": 300, "loop_late_us": 1_400_000}
+    assert status._send_late_ms() == 6.0   # the last interval only
+    assert status._send_late_ms() is None  # no pass since
+
+
+def test_send_lateness_is_null_on_an_aiopquic_without_it(tmp_path, monkeypatch):
+    status = relay._Status(str(tmp_path / "status.json"), {"started": 0}, [])
+    monkeypatch.setattr(relay, "transport_counters", lambda handles: [
+        {"loop_late_checks": None, "loop_late_us": None}])
+    assert status._send_late_ms() is None
