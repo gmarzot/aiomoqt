@@ -22,6 +22,7 @@ import asyncio
 import logging
 import multiprocessing
 import os
+import random
 import signal
 import sys
 import time
@@ -56,6 +57,10 @@ SUBSCRIBE_EACH_TIMEOUT_S = 5.0
 STATS_INTERVAL_S = 1.0
 STOP_POLL_S = 0.1
 SELF_HEAL_BACKOFF_S = 0.5
+# --too-far-behind: seconds a slot stays past it before resubscribing, and
+# the randomized wait between its resubscribes.
+RESUBSCRIBE_AFTER_S = 5.0
+RESUBSCRIBE_EVERY_S = (10.0, 20.0)
 # A slot's delivery is judged this long after its (re)subscribe, and
 # counts while it receives at least DELIVERING_FLOOR of its expected rate.
 SLOT_GRACE_S = 3.0
@@ -364,51 +369,67 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
             )
             async with client.connect() as session:
                 await session.client_session_init()
-                deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
-                track = None
-                subscribed = False
-                while time.monotonic() < deadline and not stop_ev.is_set():
-                    track = SubscribedTrack(
-                        session, config['namespace'],
-                        trackname=config['trackname'],
-                        on_object=_on_object,
-                    )
-                    try:
-                        ft = FilterType(config.get('sub_filter',
-                                                   FilterType.LATEST_OBJECT))
-                        await track.subscribe(
-                            timeout=SUBSCRIBE_EACH_TIMEOUT_S,
-                            filter_type=ft,
+                resubscribe = True
+                while resubscribe and not stop_ev.is_set():
+                    resubscribe = False
+                    deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
+                    track = None
+                    subscribed = False
+                    while time.monotonic() < deadline and not stop_ev.is_set():
+                        track = SubscribedTrack(
+                            session, config['namespace'],
+                            trackname=config['trackname'],
+                            on_object=_on_object,
                         )
-                        subscribed = True
-                        break
-                    except Exception as e:
-                        m = str(e)
-                        unpublished = ('code=4' in m or 'does not exist' in m
-                                       or 'no such namespace' in m)
-                        if isinstance(e, MOQTRequestError) and not unpublished:
-                            state['refused'] += 1
-                            state['refusing'] = True
-                            state['refused_reason'] = e.reason
-                        if await retry_wait(e, stop_ev):
-                            deadline = (time.monotonic()
-                                        + SUBSCRIBE_RETRY_WINDOW_S)
-                            continue
-                        if unpublished:
-                            await asyncio.sleep(0.3)
-                            continue
-                        # Other subscribe error: drop the connection and
-                        # let the outer loop reopen the whole slot.
-                        break
-                if subscribed:
-                    state['active'] = True
-                    state['refusing'] = False
-                    state['since'] = time.monotonic()
-                    while not stop_ev.is_set():
-                        if getattr(track, 'state', None) == TrackState.CLOSED:
+                        try:
+                            ft = FilterType(config.get('sub_filter',
+                                                       FilterType.LATEST_OBJECT))
+                            await track.subscribe(
+                                timeout=SUBSCRIBE_EACH_TIMEOUT_S,
+                                filter_type=ft,
+                            )
+                            subscribed = True
                             break
-                        await asyncio.sleep(STOP_POLL_S)
-                    state['active'] = False
+                        except Exception as e:
+                            m = str(e)
+                            unpublished = ('code=4' in m or 'does not exist' in m
+                                           or 'no such namespace' in m)
+                            # A resubscribe can reach the relay ahead of its
+                            # unsubscribe.
+                            if 'already subscribed' in m:
+                                await asyncio.sleep(0.3)
+                                continue
+                            if isinstance(e, MOQTRequestError) and not unpublished:
+                                state['refused'] += 1
+                                state['refusing'] = True
+                                state['refused_reason'] = e.reason
+                            if await retry_wait(e, stop_ev):
+                                deadline = (time.monotonic()
+                                            + SUBSCRIBE_RETRY_WINDOW_S)
+                                continue
+                            if unpublished:
+                                await asyncio.sleep(0.3)
+                                continue
+                            # Other subscribe error: drop the connection and
+                            # let the outer loop reopen the whole slot.
+                            break
+                    if subscribed:
+                        state['active'] = True
+                        state['refusing'] = False
+                        state['since'] = time.monotonic()
+                        while not stop_ev.is_set():
+                            if getattr(track, 'state', None) == TrackState.CLOSED:
+                                break
+                            if state['resubscribe']:
+                                # On this session, as a player would: its
+                                # congestion state carries over.
+                                state['resubscribe'] = False
+                                state['resubscribed'] += 1
+                                track.unsubscribe()
+                                resubscribe = True
+                                break
+                            await asyncio.sleep(STOP_POLL_S)
+                        state['active'] = False
                 session.close()
         except Exception:
             pass
@@ -422,6 +443,23 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
         except asyncio.TimeoutError:
             pass
     state['active'] = False
+
+
+def slot_too_far_behind(state, p90_ms, now: float, limit_ms: float) -> bool:
+    """Whether an active slot's p90 is past `limit_ms`; after
+    RESUBSCRIBE_AFTER_S of that, and no sooner than its next allowed time,
+    asks it to resubscribe."""
+    if not state['active'] or p90_ms is None or p90_ms <= limit_ms:
+        state['behind_since'] = None
+        return False
+    if state['behind_since'] is None:
+        state['behind_since'] = now
+    elif (now - state['behind_since'] >= RESUBSCRIBE_AFTER_S
+            and now >= state['resubscribe_at']):
+        state['resubscribe'] = True
+        state['behind_since'] = None
+        state['resubscribe_at'] = now + random.uniform(*RESUBSCRIBE_EVERY_S)
+    return True
 
 
 def slot_delivering(hist, since: float, now: float, window_s: float,
@@ -471,11 +509,14 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     per_sub_mbps = config.get('per_sub_mbps') or 0.0
     expected_bps = per_sub_mbps * 1e6 / 8
     window_s = float(config.get('keep_window', 3.0))
+    behind_ms = float(config.get('too_far_behind') or 0.0) * 1000
 
     # (stats, state) per slot; stats persist across a slot's reopens.
     slots = [(TrackStats(), {'active': False, 'since': 0.0,
                              'hist': deque(), 'refused': 0,
-                             'refusing': False, 'refused_reason': None})
+                             'refusing': False, 'refused_reason': None,
+                             'behind_since': None, 'resubscribe_at': 0.0,
+                             'resubscribe': False, 'resubscribed': 0})
              for _ in range(K)]
 
     async def _batch_stats_loop():
@@ -492,11 +533,17 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             active = delivering = 0
             refused = refusing = 0
             refused_reason = None
+            behind = resubscribed = 0
             for stats, state in slots:
                 refused += state['refused']
                 refusing += state['refusing']
                 refused_reason = state['refused_reason'] or refused_reason
+                resubscribed += state['resubscribed']
                 snap = stats.snapshot()
+                if behind_ms and slot_too_far_behind(
+                        state, snap['lat_p90_ms'] if snap['lat_n'] else None,
+                        now, behind_ms):
+                    behind += 1
                 agg_bytes += snap['rx_bytes']
                 agg_objs += snap['rx_objs']
                 agg_iv_lost += snap['iv_lost']
@@ -535,6 +582,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'total_bytes': total_bytes, 'total_objs': total_objs,
                 'refused': refused, 'refusing': refusing,
                 'refused_reason': refused_reason,
+                'behind': behind, 'resubscribed': resubscribed,
             })
             last_t = now
 

@@ -499,6 +499,7 @@ def test_summary_names_the_refusals(capsys):
     actuator = SimpleNamespace(unit='subs', max_level=20, refused_total=7,
                                refused_reason='relay overloaded')
     controller = SimpleNamespace(actuator=actuator, high_water=10.0, pivots=[],
-                                 held_at_max=False, eq_level=0.0)
+                                 held_at_max=False, eq_level=0.0, wanted_mbps=0.0,
+                                 too_far_behind=False)
     ab._print_summary(state, controller, 1, None)
     assert '7 subscribes by the relay (relay overloaded)' in capsys.readouterr().out
