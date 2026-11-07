@@ -519,4 +519,4 @@ def test_the_deployed_relay_config_parses():
     if not path.exists():
         pytest.skip("source tree only")
     args = relay.parse_args(["--config", str(path)])
-    assert args.lag_limit == 2.0
+    assert args.lag_limit == relay.LAG_LIMIT_S
