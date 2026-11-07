@@ -28,7 +28,7 @@ import time
 from collections import deque
 from typing import Any, Dict
 
-from aiomoqt.client import MOQTClient
+from aiomoqt.client import MOQTClient, SharedTransport
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import SubscribedTrack, TrackState
@@ -51,6 +51,9 @@ def apply_compat(compat) -> bool:
     return "all" in keys or "libquicr" in keys
 
 
+# RX event ring of a batch's shared transport: the size each sub gets alone.
+SHARED_RING_PER_SUB = 1 << 14
+SHARED_RING_MAX = 1 << 20
 SUBSCRIBE_RETRY_WINDOW_S = 30.0
 SUBSCRIBE_EACH_TIMEOUT_S = 5.0
 STATS_INTERVAL_S = 1.0
@@ -327,7 +330,7 @@ def sub_worker_entry(config: Dict[str, Any], mp_stop_event, events_queue):
 # ---------------------------------------------------------------------------
 
 async def _slot_supervisor(config, relay, stop_ev, stats, state,
-                           initial_delay):
+                           initial_delay, shared=None):
     """Maintain ONE subscription for the batch's lifetime: connect,
     subscribe, receive until the track closes/resets, then reopen after
     a short backoff. Runs until stop_ev. The per-slot TrackStats is
@@ -360,6 +363,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                 verify_tls=not insecure,
                 supported_drafts=config.get('draft'),
                 libquicr_compat=apply_compat(config.get('compat')),
+                shared_transport=shared,
                 **_transport_options(config),
             )
             async with client.connect() as session:
@@ -538,10 +542,12 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             })
             last_t = now
 
+    shared = (SharedTransport(ring_capacity=min(SHARED_RING_MAX, SHARED_RING_PER_SUB * K))
+              if config.get('shared_transport') else None)
     supervisors = [
         asyncio.create_task(
             _slot_supervisor(config, relay, stop_ev, stats, state,
-                             i * stagger))
+                             i * stagger, shared))
         for i, (stats, state) in enumerate(slots)
     ]
     stats_task = asyncio.create_task(_batch_stats_loop())
@@ -556,6 +562,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        if shared is not None:
+            shared.close()
 
 
 def sub_batch_worker_entry(config: Dict[str, Any], mp_stop_event,

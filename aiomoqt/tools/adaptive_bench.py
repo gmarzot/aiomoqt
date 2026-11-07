@@ -542,7 +542,8 @@ class SubsActuator:
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
                  shortfall_ratio: float = 0.85,
-                 transport_options: Optional[dict] = None):
+                 transport_options: Optional[dict] = None,
+                 shared_transport: bool = True):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -574,6 +575,7 @@ class SubsActuator:
         # and "kept" (not reaped); floored so jitter doesn't reap.
         self.keep_window = max(3.0, 1.5 * interval_s)
         self.transport_options = dict(transport_options or {})
+        self.shared_transport = shared_transport
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
@@ -720,6 +722,7 @@ class SubsActuator:
                 sub_filter=int(self.sub_filter),
                 per_sub_mbps=self.per_sub_mbps,
                 keep_window=self.keep_window,
+                shared_transport=self.shared_transport,
                 **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -959,7 +962,7 @@ class AIMDController:
     lower level, never locking in a ceiling. Holds at the actuator's max
     level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
     or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
-    reaching max.
+    reaching max, or at the first back-off if that comes sooner.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -1103,6 +1106,9 @@ class AIMDController:
                 if self.pressure_streak < 2 * self._tpr:
                     self._emit(sig, "watch (p90 over)")
                     continue
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "p90 over threshold")
+                    return
                 retreat = max(self.backoff_factor, 1.0 + headroom)
                 new_level = level * retreat
                 new_level = max(a.min_level, new_level)
@@ -1136,6 +1142,9 @@ class AIMDController:
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "delivery short of target")
+                    return
                 if a.unit == "Mbps":
                     # BW: back off the target toward what's actually
                     # delivered, so Target settles at the real ceiling
@@ -1262,6 +1271,11 @@ class AIMDController:
             ordered = sorted(seen)
             baseline = ordered[len(ordered) // 100]
         return sig.latency_p90_ms - baseline
+
+    def _end_at_ceiling(self, sig: Signal, reason: str) -> None:
+        self.state.ceiling_reason = reason
+        self._emit(sig, f"ceiling ({reason})", force=True)
+        self.state.stop.set()
 
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
@@ -1646,7 +1660,11 @@ def parse_args():
                    metavar="COND",
                    help="also end the run on COND; -t still applies. max: "
                         "on reaching --max-mbps / --max-subs, without "
-                        "holding there.")
+                        "holding there, or at the first back-off if that "
+                        "comes sooner.")
+    p.add_argument("--worker-per-sub", action="store_true",
+                   help="subs mode: one picoquic worker per subscriber "
+                        "instead of one per process, to compare layouts")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -1761,6 +1779,9 @@ def _print_banner(args):
           + (" over baseline (split hosts)" if args.skew_safe_signals
              else ""))
     print(f"  transport:          {_cli.describe_transport(args)}")
+    if args.mode == "subs" and args.role != "pub":
+        print("  picoquic workers:   "
+              + ("one per subscriber" if args.worker_per_sub else "one per process"))
     print("─" * 68)
     print()
     print()
@@ -1937,6 +1958,7 @@ async def main():
             stagger=args.stagger,
             shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
+            shared_transport=not args.worker_per_sub,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process

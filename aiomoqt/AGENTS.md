@@ -5,7 +5,7 @@ Guide for agents using the installed `aiomoqt` package: an asyncio implementatio
 
 ## API boundary
 
-Import from `aiomoqt.client` (`MOQTClient`), `aiomoqt.server` (`MOQTServer`), `aiomoqt.track`
+Import from `aiomoqt.client` (`MOQTClient`, `SharedTransport`), `aiomoqt.server` (`MOQTServer`), `aiomoqt.track`
 (`PublishedTrack`, `SubscribedTrack`), `aiomoqt.delivery` (`StreamMapping`), `aiomoqt.media`
 (its `__all__`), `aiomoqt.types` (`MOQTMessageType`, `ParamType`, `SetupParamType`,
 `MOQTRequestError`), and `aiomoqt.messages` when building frames explicitly.
@@ -76,6 +76,9 @@ SIGUSR1.
   receiver buffers that much per stream.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
+- Many sessions in one process: `MOQTClient(shared_transport=SharedTransport())` puts them on one
+  picoquic worker and socket, far cheaper than one each. All its connections share a source port, so a
+  relay that hashes it to a worker thread (mvfst) serves them all from one thread.
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
   refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
 - Ending a track: a `produce()` track sends End of Track after its last object, then
