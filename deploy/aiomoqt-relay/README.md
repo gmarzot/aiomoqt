@@ -169,13 +169,18 @@ an unknown key or a wrong type stops the relay with an error naming it. Flags ad
 compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
 environment. After copying an edited file over, run `docker compose restart relay`.
 
-`admission-cpu = 87` refuses new subscribers with `EXCESSIVE_LOAD` and a 5-15 s Retry Interval while
-the relay's busiest thread averages 87% or more over 8 s, until it falls below 72%. The subscriber
+`admission-cpu = 80` refuses new subscribers with `EXCESSIVE_LOAD` and a 5-15 s Retry Interval while
+the relay's busiest thread averages 80% or more over 8 s, until it falls below 65%. The subscriber
 count at closing stays a ceiling, rising 5% a minute while the gate is open: steal comes and goes on
 this VM, and a lull is not headroom. Viewers already attached keep their service and may add tracks.
 Thread time here includes hypervisor steal, which is why it tracks real headroom. On a kernel that
 leaves steal out of thread time it reads low. `max-subscribers = N` adds a fixed limit. `status.json` reports `totals.admission` and
 `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
+
+`lag-limit = 2` keeps a viewer within about 2 s of live: past that, counting what its queue and its
+QUIC streams hold at the track's input rate, it skips to a newer group. It sees a freeze of up to one
+group instead of falling further behind. A subscriber's own delivery timeout replaces the limit.
+`status.json` reports skipped objects as `shed_objects`; the dashboard shows them on the Drops tile.
 
 ## nginx config
 
