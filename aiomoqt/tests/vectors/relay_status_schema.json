@@ -605,6 +605,12 @@
   ".history.sessions[]": [
    "int"
   ],
+  ".history.shed_objects": [
+   "array"
+  ],
+  ".history.shed_objects[]": [
+   "int"
+  ],
   ".history.subscribers": [
    "array"
   ],
@@ -906,6 +912,9 @@
   ".totals.sessions": [
    "int"
   ],
+  ".totals.shed_objects": [
+   "int"
+  ],
   ".totals.spurious_pct": [
    "float"
   ],
@@ -1031,6 +1040,9 @@
   ],
   ".tracks[].rtt_up_ms": [
    "float"
+  ],
+  ".tracks[].shed_objects": [
+   "int"
   ],
   ".tracks[].since": [
    "float"

@@ -5,12 +5,14 @@ import asyncio
 import contextlib
 import logging
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import canonical_stream_reset, profile_for
+from aiomoqt.delivery import LANE_MIN_BYTES, SendLane
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import StreamResetCode, SubscribeDoneCode
@@ -342,3 +344,161 @@ async def test_a_closed_session_stops_its_draining_lane(monkeypatch):
     await _settle()
     assert lane.stopped and lane.task.done() and lane not in relay._lanes
     assert not slow.kinds("done")
+
+
+# -- the lane's time bound -------------------------------------------------
+class _Writer:
+    """Holds `tx` bytes in the transport, and every send waits on `gate`."""
+
+    def __init__(self):
+        self.session = SimpleNamespace()
+        self.tx = 0
+        self.resets = []
+        self.gate = asyncio.Event()
+
+    async def send(self, item):
+        await self.gate.wait()
+        return True
+
+    def tx_queued(self, floor=None):
+        return self.tx
+
+    def reset_below(self, floor):
+        self.resets.append(floor)
+
+    def reset_group(self, code=StreamResetCode.CANCELLED):
+        self.resets.append(code)
+
+    def end_group(self):
+        pass
+
+    def close_streams(self):
+        pass
+
+    def expire(self, gid):
+        return True
+
+    def final(self, *args):
+        pass
+
+
+def _item(gid, cost=1000):
+    return (gid, cost, True, None)
+
+
+@pytest.mark.parametrize("deadline,rate,expected", [
+    (None, 100_000, 4_000_000),  # no deadline: bytes alone
+    (2.0, 0.0, 4_000_000),       # rate unknown
+    (2.0, 125_000, 250_000),     # 1 Mbps for 2 s
+    (2.0, 1_000, LANE_MIN_BYTES),   # a slow track keeps the floor
+    (60.0, 125_000, 4_000_000),  # never past max_bytes
+])
+async def test_the_bound_is_the_deadline_at_the_input_rate(deadline, rate, expected):
+    lane = SendLane(_Writer(), max_bytes=4_000_000)
+    lane.deadline, lane.rate = deadline, rate
+    assert lane.bound == expected
+    lane.stop()
+    await _settle()
+
+
+async def test_transport_backlog_counts_against_the_time_bound():
+    writer = _Writer()
+    lane = SendLane(writer, max_bytes=4_000_000)
+    lane.deadline, lane.rate = 1.0, 100_000
+    writer.tx = 90_000
+    lane.offer(_item(1, 5_000))   # read tx_bytes; under the bound with this
+    assert lane.sheds == 0
+    lane.offer(_item(2, 8_000))   # a new group reads it again: 103 KB held
+    assert lane.sheds == 1 and lane.shedding
+    assert lane.floor is not None and lane.floor >= 2
+    lane.stop()
+    await _settle()
+
+
+async def test_no_rate_leaves_the_byte_bound_alone():
+    writer = _Writer()
+    lane = SendLane(writer, max_bytes=4_000_000)
+    lane.deadline = 1.0
+    writer.tx = 2_000_000
+    lane.offer(_item(1))
+    lane.offer(_item(2))
+    assert lane.sheds == 0
+    lane.stop()
+    await _settle()
+
+
+def test_the_input_rate_decays_from_a_peak_and_reaches_the_lanes():
+    lane = SimpleNamespace(rate=0.0)
+    track = SimpleNamespace(_rate_mark=(0.0, 0), _bytes_in=0, _in_rate=0.0,
+                            _lanes=[lane])
+    update = relay._RelayedTrack.update_in_rate
+    track._bytes_in = 1000
+    update(track, 1.0)
+    assert track._in_rate == 1000 and lane.rate == 1000
+    update(track, 2.0)            # nothing arrived: held near the peak
+    assert lane.rate == pytest.approx(1000 * relay.IN_RATE_DECAY)
+    track._bytes_in = 3000
+    update(track, 3.0)
+    assert lane.rate == 2000
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_viewer_past_the_lag_limit_sheds_under_the_byte_bound(
+        use_quic, draft, relay_tables, monkeypatch):
+    monkeypatch.setattr(relay, "_lag_limit", 0.5)
+    port = _BASE_PORT + 8 + 4 * (draft == 22) + 2 * (not use_quic)
+    fast, slow, slow_audio = _Sub(), _Sub(), _Sub()
+    async with _relay(port, use_quic, draft) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video", object_size=_OBJ,
+                       group_size=_GROUP, rate=_RATE).attach()
+        PublishedTrack(pub, namespace=_NS, trackname="audio", object_size=200,
+                       group_size=50, rate=50).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+
+        s_fast, s_slow = await connect(), await connect()
+        await fast.subscribe(s_fast, "video")
+        track = relay._tracks[(relay._ns_tuple(_NS), b"video")]
+        before = set(map(id, (d.session for d in track.downstream)))
+        await slow.subscribe(s_slow, "video")
+        (d_slow,) = [d for d in track.downstream if id(d.session) not in before]
+        _slow_down(d_slow.session)
+        await slow_audio.subscribe(s_slow, "audio")
+        audio = relay._tracks[(relay._ns_tuple(_NS), b"audio")]
+        (d_audio,) = list(audio.downstream)
+
+        async def tick():
+            while True:
+                await asyncio.sleep(0.2)
+                relay._check_lanes()
+        ticker = asyncio.create_task(tick())
+        try:
+            await asyncio.sleep(3.0)
+        finally:
+            ticker.cancel()
+        lane = d_slow.lane
+        sent, sheds, bound = track._objects_in, lane.sheds, lane.bound
+        shed_total = track.shed_objects()
+        audio_sheds = d_audio.lane.sheds
+
+    assert relay.LANE_BYTES > bound > 0, bound
+    assert sheds >= 1 and shed_total > 0, (sheds, shed_total)
+    assert audio_sheds == 0
+    assert slow_audio.count
+    assert fast.count >= sent - _RATE, (fast.count, sent)
+    assert slow.count
+    resets = {k: code for k, (clean, code) in slow.ends.items() if not clean}
+    assert resets and all(c is not None for c in resets.values()), slow.ends
+    for k, (clean, _code) in slow.ends.items():
+        if clean:
+            assert slow.objects[k] == set(range(_GROUP)), (k, slow.objects[k])
+
+
+def test_the_deployed_relay_config_parses():
+    path = Path(relay.__file__).parents[2] / "deploy/aiomoqt-relay/relay.toml"
+    if not path.exists():
+        pytest.skip("source tree only")
+    args = relay.parse_args(["--config", str(path)])
+    assert args.lag_limit == 2.0
