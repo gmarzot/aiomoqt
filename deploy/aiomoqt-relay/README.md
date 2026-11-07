@@ -180,7 +180,7 @@ leaves steal out of thread time it reads low. `max-subscribers = N` adds a fixed
 `lag-limit = 2` keeps a viewer within about 2 s of live: past that, counting what its queue and its
 QUIC streams hold at the track's input rate, it skips to a newer group. It sees a freeze of up to one
 group instead of falling further behind. A subscriber's own delivery timeout replaces the limit.
-`status.json` reports skipped objects as `shed_objects`; the dashboard shows them on the Drops tile.
+`status.json` reports skipped data as `shed_bytes`; the dashboard shows it on the Drops tile.
 
 ## nginx config
 

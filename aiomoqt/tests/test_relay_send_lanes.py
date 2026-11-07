@@ -415,6 +415,24 @@ async def test_transport_backlog_counts_against_the_time_bound():
     await _settle()
 
 
+async def test_shed_bytes_count_what_the_transport_held():
+    writer = _Writer()
+    lane = SendLane(writer, max_bytes=4_000_000)
+    lane.deadline, lane.rate = 1.0, 100_000
+    writer.tx_queued = lambda floor=None: 95_000 if floor is None else 0
+    writer.gate.set()
+    lane.offer(_item(1, 1_000))
+    lane._probe_gid = None
+    lane.tx_bytes = 95_000
+    lane.items.clear()
+    lane.bytes = 0
+    lane.offer(_item(2, 10_000))
+    assert lane.sheds == 1 and lane.shed == 0
+    assert lane.shed_bytes == 95_000, lane.shed_bytes
+    lane.stop()
+    await _settle()
+
+
 async def test_no_rate_leaves_the_byte_bound_alone():
     writer = _Writer()
     lane = SendLane(writer, max_bytes=4_000_000)
@@ -480,7 +498,7 @@ async def test_a_viewer_past_the_lag_limit_sheds_under_the_byte_bound(
             ticker.cancel()
         lane = d_slow.lane
         sent, sheds, bound = track._objects_in, lane.sheds, lane.bound
-        shed_total = track.shed_objects()
+        shed_total = track.shed_bytes()
         audio_sheds = d_audio.lane.sheds
 
     assert relay.LANE_BYTES > bound > 0, bound
