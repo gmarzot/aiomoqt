@@ -394,6 +394,11 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                             m = str(e)
                             unpublished = ('code=4' in m or 'does not exist' in m
                                            or 'no such namespace' in m)
+                            # A resubscribe can reach the relay ahead of its
+                            # unsubscribe.
+                            if 'already subscribed' in m:
+                                await asyncio.sleep(0.3)
+                                continue
                             if isinstance(e, MOQTRequestError) and not unpublished:
                                 state['refused'] += 1
                                 state['refusing'] = True

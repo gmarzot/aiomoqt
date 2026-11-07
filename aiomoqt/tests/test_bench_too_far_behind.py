@@ -174,6 +174,7 @@ async def test_a_slot_resubscribes_on_its_session(use_quic):
             await _until(lambda: track.downstream and
                          not before & {id(d) for d in track.downstream})
             assert state['resubscribed'] == 1 and state['active']
+            assert state['refused'] == 0
             assert not before & {id(d) for d in track.downstream}
             assert len(relay._sessions) == sessions
             stats.snapshot()
