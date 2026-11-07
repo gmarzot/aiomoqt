@@ -95,6 +95,30 @@ async def test_exit_max_ends_the_run(monkeypatch, capsys):
     assert 'reached max' in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('signal, reason', [
+    (dict(latency_mean_ms=900.0, latency_p90_ms=900.0, shortfall=False), 'p90 over threshold'),
+    (dict(latency_mean_ms=1.0, latency_p90_ms=1.0, shortfall=True), 'delivery short of target'),
+])
+async def test_exit_max_ends_the_run_at_the_first_back_off(capsys, signal, reason):
+    state = ab.BenchState()
+    ticks = [0]
+
+    async def observe():
+        ticks[0] += 1
+        if ticks[0] >= 50:
+            state.stop.set()
+        return ab.Signal(t=time.monotonic(), level=10, loss_pct=0, target_mbps=10,
+                         tx_mbps=10, rx_mbps=10, **signal)
+
+    actuator = SimpleNamespace(initial_level=10, unit='subs', min_level=1, max_level=20,
+                               initial_step=1, step_floor=1, apply=AsyncMock(), observe=observe)
+    controller = ab.AIMDController(actuator, state, interval_s=0.001,
+                                   latency_threshold_ms=500.0, exit_at_max=True)
+    await controller.run()
+    assert state.ceiling_reason == reason and ticks[0] < 50
+    assert f'ceiling ({reason})' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('extra, why', [
     (['--exit', 'max', '--mode', 'subs', '--role', 'pub'], 'no max to reach'),
     (['-t', '-1'], 'seconds, or 0'),

@@ -978,7 +978,7 @@ class AIMDController:
     lower level, never locking in a ceiling. Holds at the actuator's max
     level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
     or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
-    reaching max.
+    reaching max, or at the first back-off if that comes sooner.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -1133,6 +1133,9 @@ class AIMDController:
                 if self.pressure_streak < 2 * self._tpr:
                     self._emit(sig, f"watch ({over})")
                     continue
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "p90 over threshold")
+                    return
                 retreat = max(self.backoff_factor, 1.0 + headroom)
                 new_level = level * retreat
                 new_level = max(a.min_level, new_level)
@@ -1166,6 +1169,9 @@ class AIMDController:
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "delivery short of target")
+                    return
                 if a.unit == "Mbps":
                     # BW: back off the target toward what's actually
                     # delivered, so Target settles at the real ceiling
@@ -1301,6 +1307,11 @@ class AIMDController:
             ordered = sorted(seen)
             baseline = ordered[len(ordered) // 100]
         return sig.latency_p90_ms - baseline
+
+    def _end_at_ceiling(self, sig: Signal, reason: str) -> None:
+        self.state.ceiling_reason = reason
+        self._emit(sig, f"ceiling ({reason})", force=True)
+        self.state.stop.set()
 
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
@@ -1647,7 +1658,8 @@ def parse_args():
     p.add_argument("--step-subs", type=int, default=1,
                    help="subs-mode: subscribers per group (default: 1). "
                         "Also the batch size: one worker process hosts a "
-                        "group of this many self-healing subscriptions.")
+                        "group of this many self-healing subscriptions on one "
+                        "picoquic thread, each with its own source port.")
     p.add_argument("--max-subs", type=int, default=200,
                    help="subs-mode: cap; the run holds there until -t "
                         "(default: 200)")
@@ -1690,7 +1702,8 @@ def parse_args():
                    metavar="COND",
                    help="also end the run on COND; -t still applies. max: "
                         "on reaching --max-mbps / --max-subs, without "
-                        "holding there.")
+                        "holding there, or at the first back-off if that "
+                        "comes sooner.")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()

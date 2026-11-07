@@ -2,6 +2,8 @@
 
 ## v0.15.0 (unreleased)
 
+- adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`, with one source port per subscriber. Needs aiopquic 0.8.0 on raw QUIC.
+- adaptive_bench `--exit max` also ends a run at its first back-off, if that comes before the max.
 - aiomoqt-relay `status.json` gains `totals.send_late_ms`, how overdue the network thread's next wake was on average, and its history, shown on the dashboard's loop lag tile. It needs aiopquic's `loop_late_us` counter, and reads null without it.
 - adaptive_bench `--too-far-behind SEC` (subs mode, off by default): back off on the share of viewers more than SEC behind, over 5%, instead of on the worst viewer's p90, and a viewer past it resubscribes on its session. The summary gains `Delivered`, the share of the subscribed viewers' rate that arrived.
 - aiomoqt-relay `--lag-limit` also bounds what a subscriber's queue and streams hold, at the track's input rate, shedding whole groups past it, so transport backlog no longer lets a viewer fall seconds beyond the limit. `status.json` gains `shed_bytes`, shown on the dashboard's Drops tile.
