@@ -127,6 +127,8 @@ class Signal:
     latest_p90_ms: Optional[float] = None
     # subs-mode: slots whose last subscribe the relay refused.
     refusing_subs: int = 0
+    # subs-mode, --too-far-behind: slots past it.
+    behind_subs: int = 0
 
 
 @dataclass
@@ -542,7 +544,9 @@ class SubsActuator:
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
                  shortfall_ratio: float = 0.85,
-                 transport_options: Optional[dict] = None):
+                 transport_options: Optional[dict] = None,
+                 too_far_behind: float = 0.0):
+        self.too_far_behind = too_far_behind
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -606,6 +610,8 @@ class SubsActuator:
         # Per-worker refused subscribes, kept after a worker is reaped.
         self._refused: dict = {}
         self.refused_reason = None
+        # Per-worker resubscribes under --too-far-behind, kept the same way.
+        self._resubscribed: dict = {}
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
@@ -658,6 +664,8 @@ class SubsActuator:
             if msg.get('refused', 0) > 0:
                 self._refused[wid] = msg['refused']
                 self.refused_reason = msg.get('refused_reason')
+            if msg.get('resubscribed', 0) > 0:
+                self._resubscribed[wid] = msg['resubscribed']
             self._oldest_report_s = max(self._oldest_report_s,
                                         now - msg.get('t', now))
             tick = self._tick.setdefault(
@@ -672,6 +680,10 @@ class SubsActuator:
     @property
     def refused_total(self) -> int:
         return sum(self._refused.values())
+
+    @property
+    def resubscribed_total(self) -> int:
+        return sum(self._resubscribed.values())
 
     async def _drain_loop(self) -> None:
         while True:
@@ -720,6 +732,7 @@ class SubsActuator:
                 sub_filter=int(self.sub_filter),
                 per_sub_mbps=self.per_sub_mbps,
                 keep_window=self.keep_window,
+                too_far_behind=self.too_far_behind,
                 **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -910,6 +923,8 @@ class SubsActuator:
             latency_known=lat_known or tick_p90 is not None,
             refusing_subs=sum(self._latest_batch.get(wid, {}).get('refusing', 0)
                               for wid in self._workers),
+            behind_subs=sum(self._latest_batch.get(wid, {}).get('behind', 0)
+                            for wid in self._workers),
         )
 
     async def shutdown(self) -> None:
@@ -952,6 +967,10 @@ class SubsActuator:
 # Controller: scalar P-control over a LoadActuator
 # ---------------------------------------------------------------------------
 
+# --too-far-behind: back off once this share of viewers is past the limit.
+BEHIND_SHARE = 0.05
+
+
 class AIMDController:
     """Additive-increase / multiplicative-decrease over a LoadActuator.
 
@@ -989,7 +1008,11 @@ class AIMDController:
                  duration_s: float | None = None,
                  exit_at_max: bool = False,
                  tick_s: float | None = None,
-                 skew_safe: bool = False):
+                 skew_safe: bool = False,
+                 too_far_behind: bool = False):
+        self.too_far_behind = too_far_behind
+        self.peak_behind = (0, 0)  # most viewers past it, of how many
+        self.delivered_mbps = self.wanted_mbps = 0.0
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
@@ -1086,8 +1109,15 @@ class AIMDController:
             #   1.0 = idle (p90 = 0), 0.0 = at SLA, <0 = overshoot.
             # p90 is more sensitive than p50 — catches queue build-up
             # sooner while being less noisy than p99.
-            headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
-                / self.latency_threshold_ms
+            self._tally(sig)
+            if self.too_far_behind:
+                # The same control over the share of viewers past the limit.
+                share = sig.behind_subs / max(sig.active_subs, 1)
+                headroom = (BEHIND_SHARE - share) / BEHIND_SHARE
+            else:
+                headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
+                    / self.latency_threshold_ms
+            over = "too far behind" if self.too_far_behind else "p90 over"
 
             # Back off on sustained p90 overshoot; the first bad interval
             # only watches, so a transient RTT spike is not a cliff. Loss
@@ -1101,7 +1131,7 @@ class AIMDController:
             if over_p90:
                 self.pressure_streak += 1
                 if self.pressure_streak < 2 * self._tpr:
-                    self._emit(sig, "watch (p90 over)")
+                    self._emit(sig, f"watch ({over})")
                     continue
                 retreat = max(self.backoff_factor, 1.0 + headroom)
                 new_level = level * retreat
@@ -1109,7 +1139,7 @@ class AIMDController:
                 # Symmetric clamp with ramp: drop at most initial_step.
                 new_level = max(new_level, level - a.initial_step)
                 self.pressure_streak = 0
-                await self._apply(new_level, sig, "back-off (p90 over)",
+                await self._apply(new_level, sig, f"back-off ({over})",
                                   force=True)
                 self.draining = True
                 continue
@@ -1245,6 +1275,15 @@ class AIMDController:
                 continue
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
+
+    def _tally(self, sig: Signal) -> None:
+        """Totals for the summary."""
+        if sig.behind_subs > self.peak_behind[0]:
+            self.peak_behind = (sig.behind_subs, sig.active_subs)
+        per_sub = getattr(self.actuator, 'per_sub_mbps', None)
+        if per_sub:
+            self.delivered_mbps += sig.rx_mbps
+            self.wanted_mbps += sig.active_subs * per_sub
 
     def _control_p90(self, sig: Signal) -> float:
         """The p90 the controller acts on: absolute, or when skew-safe
@@ -1588,6 +1627,11 @@ def parse_args():
                    metavar="MS", dest="latency_threshold",
                    help="p90 latency SLA in ms; back off after 2 intervals "
                         "over (default: 100)")
+    p.add_argument("--too-far-behind", type=float, default=0.0, metavar="SEC",
+                   dest="too_far_behind",
+                   help="subs mode: back off on the share of viewers more than "
+                        "SEC behind, over 5%%, instead of on the worst viewer's "
+                        "p90; a viewer past it resubscribes (default: off)")
     p.add_argument("--backoff-factor", type=float, default=0.9,
                    dest="backoff_factor", metavar="F",
                    help="multiplicative back-off factor on ceiling signal "
@@ -1661,6 +1705,13 @@ def parse_args():
 
     if args.duration < 0:
         p.error("-t/--duration: seconds, or 0 for no limit")
+    if args.too_far_behind < 0:
+        p.error("--too-far-behind: seconds, or 0 for off")
+    if args.too_far_behind and args.mode != "subs":
+        p.error("--too-far-behind is subs-mode only")
+    if args.too_far_behind and args.skew_safe_signals:
+        p.error("--too-far-behind reads absolute latency: drop the skew-safe "
+                "signals")
     if args.exit_on == "max" and args.role == "pub":
         p.error("--exit max: --role pub has no max to reach")
 
@@ -1757,6 +1808,9 @@ def _print_banner(args):
     if args.mode == "subs":
         cli_name = args.sub_filter.name.lower().replace("_", "-")
         print(f"  subscribe filter:   {cli_name}")
+    if args.too_far_behind:
+        print(f"  too far behind:     {args.too_far_behind:g} s, back off over "
+              f"{BEHIND_SHARE:.0%} of viewers")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
           + (" over baseline (split hosts)" if args.skew_safe_signals
              else ""))
@@ -1791,6 +1845,15 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     if refused:
         print(f"  Refused:     {refused} subscribes by the relay "
               f"({controller.actuator.refused_reason})")
+    if controller.wanted_mbps:
+        print(f"  Delivered:   "
+              f"{100 * controller.delivered_mbps / controller.wanted_mbps:.1f}% "
+              f"of the subscribed viewers' rate")
+    if controller.too_far_behind:
+        behind, of = controller.peak_behind
+        print(f"  Too far behind: peak {behind} of {of} viewers, "
+              f"{getattr(controller.actuator, 'resubscribed_total', 0)} "
+              f"resubscribes")
     print(f"  Samples:     {samples}")
     print(f"  Host:        {cpu_summary()}")
     print("═" * 68)
@@ -1937,6 +2000,7 @@ async def main():
             stagger=args.stagger,
             shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
+            too_far_behind=args.too_far_behind,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
@@ -2066,6 +2130,7 @@ async def main():
         exit_at_max=args.exit_on == "max",
         tick_s=(args.join_rate if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
+        too_far_behind=bool(args.too_far_behind),
     )
 
     server = None

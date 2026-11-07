@@ -381,7 +381,11 @@ one Python process is GIL-bound and can be what you measure.
 
 Latency is the subscriber's p90 over its last 5 s. The controller backs
 off when it stays over `--latency-threshold` (default 100 ms) for two
-intervals. A shortfall, achieved below `--shortfall-ratio` (0.85) of
+intervals. In subs mode, `--too-far-behind SEC` replaces that with the share
+of viewers more than SEC behind: over 5% for two intervals backs off, and a
+viewer past SEC for 5 s resubscribes on its session. Numbers taken this way
+don't compare with worst-viewer runs; report `Delivered` with them. A
+shortfall, achieved below `--shortfall-ratio` (0.85) of
 commanded, holds the ramp and backs off once it lasts three intervals.
 Back-off multiplies by `--backoff-factor` (0.9; closer to 1.0 for gentler
 steps). At `--max-mbps` the run holds, still backing off, until `-t`
