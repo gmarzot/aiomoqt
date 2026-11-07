@@ -848,6 +848,7 @@ class SendLane:
         self.floor = None        # objects of groups below it are not sent
         self._lost = None        # newest group shed, expired or failed
         self.shed = 0            # objects shed
+        self.shed_bytes = 0      # bytes shed, the transport's included
         self.sheds = 0           # shed episodes
         self.expired = 0         # objects past the delivery timeout (§8)
         # False while the peer's Forward State is 0 (§5.1): nothing is
@@ -1040,6 +1041,7 @@ class SendLane:
             self._uncount(item)
             if count and item[1]:
                 self.shed += 1
+                self.shed_bytes += item[1]
         self.items = kept
 
     def _skip(self, gid, count: bool = True) -> None:
@@ -1054,12 +1056,14 @@ class SendLane:
         is over the bound; their open streams are reset first."""
         writer = self.writer
         floor = gid
+        held = writer.tx_queued(self.floor)
         self._drop_below(floor)
         self.tx_bytes = writer.tx_queued(floor)
         if self.bytes + self.tx_bytes > self.bound:
             floor = gid + 1
             self._drop_below(floor)
             self.tx_bytes = writer.tx_queued(floor)
+        self.shed_bytes += max(held - self.tx_bytes, 0)
         self.floor = floor if self.floor is None else max(self.floor, floor)
         self._lost = self.floor - 1
         if self.busy and self.opening:
@@ -1254,6 +1258,7 @@ class SendLane:
                         and time.monotonic() - item[3] > deadline):
                     # §8: not sent; on a stream the group is not resumed.
                     self.expired += 1
+                    self.shed_bytes += item[1]
                     if writer.expire(gid):
                         self._skip(gid)
                         self._lost = gid

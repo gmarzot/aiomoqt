@@ -3,7 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - adaptive_bench `--too-far-behind SEC` (subs mode, off by default): back off on the share of viewers more than SEC behind, over 5%, instead of on the worst viewer's p90, and a viewer past it resubscribes on its session. The summary gains `Delivered`, the share of the subscribed viewers' rate that arrived.
-- aiomoqt-relay `--lag-limit` also bounds what a subscriber's queue and streams hold, at the track's input rate, shedding whole groups past it, so transport backlog no longer lets a viewer fall seconds beyond the limit. `status.json` gains `shed_objects`, shown on the dashboard's Drops tile.
+- aiomoqt-relay `--lag-limit` also bounds what a subscriber's queue and streams hold, at the track's input rate, shedding whole groups past it, so transport backlog no longer lets a viewer fall seconds beyond the limit. `status.json` gains `shed_bytes`, shown on the dashboard's Drops tile.
 - aiomoqt-relay `--admission-cpu PCT` and `--max-subscribers N`: near overload, past the count the relay last closed at (which then rises 5% a minute), or at the limit, a session's first SUBSCRIBE is refused with EXCESSIVE_LOAD and a randomized Retry Interval; sessions already subscribed may add tracks. Off by default. `status.json` gains `totals.admission` and `totals.queue_ms`.
 - adaptive_bench and load_sim subscribers wait out a refused subscribe's Retry Interval on the same connection instead of reconnecting at once, and adaptive_bench no longer reaps a worker whose subscribers are all refused.
 - adaptive_bench subs mode shows a relay's refusals: `hold (relay refusing)` in place of a bare shortfall, and a summary line with the count and reason.
