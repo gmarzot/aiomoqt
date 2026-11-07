@@ -95,15 +95,6 @@ async def test_exit_max_ends_the_run(monkeypatch, capsys):
     assert 'reached max' in capsys.readouterr().out
 
 
-@pytest.mark.parametrize('extra, shared', [([], True), (['--worker-per-sub'], False)])
-async def test_subs_share_one_worker_per_process_by_default(monkeypatch, extra, shared):
-    configs = _processes(monkeypatch)
-    _argv(monkeypatch, '--mode', 'subs', '--role', 'sub', *extra)
-    await ab.main()
-    batches = [cfg for name, cfg in configs if name == 'sub_batch_worker_entry']
-    assert batches and all(cfg['shared_transport'] is shared for cfg in batches)
-
-
 @pytest.mark.parametrize('signal, reason', [
     (dict(latency_mean_ms=900.0, latency_p90_ms=900.0, shortfall=False), 'p90 over threshold'),
     (dict(latency_mean_ms=1.0, latency_p90_ms=1.0, shortfall=True), 'delivery short of target'),

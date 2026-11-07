@@ -542,10 +542,10 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             })
             last_t = now
 
-    # One source port per sub, so a relay hashing them spreads them like viewers.
-    shared = (SharedTransport(ring_capacity=min(SHARED_RING_MAX, SHARED_RING_PER_SUB * K),
-                              sockets=config.get('worker_sockets') or K)
-              if config.get('shared_transport') else None)
+    # One picoquic thread; one source port per sub, so a relay hashing them
+    # spreads them like viewers.
+    shared = SharedTransport(ring_capacity=min(SHARED_RING_MAX, SHARED_RING_PER_SUB * K),
+                             sockets=K)
     supervisors = [
         asyncio.create_task(
             _slot_supervisor(config, relay, stop_ev, stats, state,
@@ -564,8 +564,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        if shared is not None:
-            shared.close()
+        shared.close()
 
 
 def sub_batch_worker_entry(config: Dict[str, Any], mp_stop_event,

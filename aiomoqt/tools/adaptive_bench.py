@@ -542,9 +542,7 @@ class SubsActuator:
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
                  shortfall_ratio: float = 0.85,
-                 transport_options: Optional[dict] = None,
-                 shared_transport: bool = True,
-                 worker_sockets: int = 0):
+                 transport_options: Optional[dict] = None):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -576,8 +574,6 @@ class SubsActuator:
         # and "kept" (not reaped); floored so jitter doesn't reap.
         self.keep_window = max(3.0, 1.5 * interval_s)
         self.transport_options = dict(transport_options or {})
-        self.shared_transport = shared_transport
-        self.worker_sockets = worker_sockets
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
@@ -724,8 +720,6 @@ class SubsActuator:
                 sub_filter=int(self.sub_filter),
                 per_sub_mbps=self.per_sub_mbps,
                 keep_window=self.keep_window,
-                shared_transport=self.shared_transport,
-                worker_sockets=self.worker_sockets,
                 **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -1620,7 +1614,8 @@ def parse_args():
     p.add_argument("--step-subs", type=int, default=1,
                    help="subs-mode: subscribers per group (default: 1). "
                         "Also the batch size: one worker process hosts a "
-                        "group of this many self-healing subscriptions.")
+                        "group of this many self-healing subscriptions on one "
+                        "picoquic thread, each with its own source port.")
     p.add_argument("--max-subs", type=int, default=200,
                    help="subs-mode: cap; the run holds there until -t "
                         "(default: 200)")
@@ -1665,12 +1660,6 @@ def parse_args():
                         "on reaching --max-mbps / --max-subs, without "
                         "holding there, or at the first back-off if that "
                         "comes sooner.")
-    p.add_argument("--worker-per-sub", action="store_true",
-                   help="subs mode: one picoquic worker per subscriber "
-                        "instead of one per process, to compare layouts")
-    p.add_argument("--worker-sockets", type=int, default=0, metavar="N",
-                   help="subs mode: source ports per worker process, to compare "
-                        "(default: one per subscriber)")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -1785,9 +1774,6 @@ def _print_banner(args):
           + (" over baseline (split hosts)" if args.skew_safe_signals
              else ""))
     print(f"  transport:          {_cli.describe_transport(args)}")
-    if args.mode == "subs" and args.role != "pub":
-        print("  picoquic workers:   "
-              + ("one per subscriber" if args.worker_per_sub else "one per process"))
     print("─" * 68)
     print()
     print()
@@ -1964,8 +1950,6 @@ async def main():
             stagger=args.stagger,
             shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
-            shared_transport=not args.worker_per_sub,
-            worker_sockets=args.worker_sockets,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process

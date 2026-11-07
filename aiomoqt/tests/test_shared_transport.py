@@ -137,7 +137,7 @@ async def _batch_report(port, use_quic, want):
     task = asyncio.create_task(workers._subscriber_batch_task(dict(
         worker_id=0, batch_size=3, stagger=0.01, relay_url=f"{scheme}://{_HOST}:{port}/",
         namespace=_NS, trackname="a", draft=_DRAFT, insecure=True, force_quic=False,
-        sub_filter=int(FilterType.LATEST_OBJECT), keep_window=3.0, shared_transport=True,
+        sub_filter=int(FilterType.LATEST_OBJECT), keep_window=3.0,
     ), stop, events))
     try:
         async with asyncio.timeout(20):
