@@ -200,11 +200,19 @@ class _Fake:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None):
         sid = self._next
         self._next += 4
         self.log.append(("open", sid))
         self._unwritten.add(sid)
+        if initial:
+            # The header write carries the stream's first object.
+            try:
+                await self.stream_write_drain(sid, initial)
+            except BaseException:
+                self.stream_reset(sid, StreamResetCode.CANCELLED)
+                raise
+            self.log.append(("data", sid))
         return sid
 
     def stream_write(self, sid, data, end_stream=False):

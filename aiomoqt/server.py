@@ -90,6 +90,7 @@ class MOQTServer(MOQTPeer):
         tx_max_queued_bytes: Optional[int] = None,
         congestion_control_algorithm: Optional[str] = "bbr",
         congestion_control_options: Optional[str] = None,
+        packet_train_mode: bool = False,
         flow_control_window: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
@@ -125,6 +126,8 @@ class MOQTServer(MOQTPeer):
         self.congestion_control_algorithm = congestion_control_algorithm
         # Algorithm option string, e.g. "Q0.02" for bbr.
         self.congestion_control_options = congestion_control_options
+        # Paced sends release up to 10 packets at once (picoquic train mode).
+        self.packet_train_mode = packet_train_mode
         # QUIC flow-control window, per stream and per connection; None = 16 MiB.
         self.flow_control_window = flow_control_window
         # QUIC keep-alive interval (seconds). None = disabled. PING
@@ -181,6 +184,8 @@ class MOQTServer(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.congestion_control_options is not None:
                 cfg.congestion_control_options = self.congestion_control_options
+            if self.packet_train_mode:
+                cfg.packet_train_mode = True
             if self.flow_control_window is not None:
                 cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
@@ -230,6 +235,8 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             wt_cfg.congestion_control_options = self.congestion_control_options
+        if self.packet_train_mode:
+            wt_cfg.packet_train_mode = True
         if self.flow_control_window is not None:
             wt_cfg.max_data = wt_cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
@@ -283,6 +290,8 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             cfg.congestion_control_options = self.congestion_control_options
+        if self.packet_train_mode:
+            cfg.packet_train_mode = True
         if self.flow_control_window is not None:
             cfg.max_data = cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:

@@ -1762,6 +1762,11 @@ _MOQ_TEST_RENDEZVOUS_MS = 5000
 # The subscriber's SUBSCRIBE reaches the relay this long before the PUBLISH.
 _MOQ_TEST_HEAD_START_S = 0.2
 _MOQ_TEST_PHASE_S = 8.0
+# Phase time kept after delivery for the grace period and the closes.
+_MOQ_TEST_CLOSE_S = 1.0
+# A relay can answer the PUBLISH at Forward State 0 and raise it with
+# REQUEST_UPDATE once the subscription links.
+_MOQ_TEST_FORWARD_WAIT_S = 1.0
 # After PUBLISH_DONE: datagrams can still trail it, and with Forward State 0
 # an object arriving here still fails the case.
 _MOQ_TEST_GRACE_S = 0.25
@@ -1803,7 +1808,16 @@ def _moq_test_extension_ids(p) -> frozenset:
 
 class _MoqTestSubscriber(_DataSubscriber):
     """Also records each object's extension IDs and, on a datagram, the End
-    of Group type bit."""
+    of Group type bit. With Forward State 0, PUBLISH_DONE ends delivery."""
+
+    def __init__(self, forward_zero: bool = False):
+        super().__init__()
+        self.forward_zero = forward_zero
+
+    def _drained(self) -> bool:
+        if self.forward_zero:
+            return self.done is not None
+        return super()._drained()
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         gid = getattr(msg, "group_id", None)
@@ -1890,7 +1904,7 @@ def _moq_test_problems(p, objects, done, streams_ended, streams_reset,
 
 class _MoqTestTrack(PublishedTrack):
     """PUBLISHes one MoQT Test track. The tuple's objects go out once
-    `ready` is set, unless the Forward State is then 0."""
+    `ready` is set, unless the Forward State stays 0."""
 
     def __init__(self, session, namespace: str, track_name: str, params):
         super().__init__(session, namespace=namespace, trackname=track_name)
@@ -1907,6 +1921,10 @@ class _MoqTestTrack(PublishedTrack):
         # The PUBLISH reply's Forward State applies first.
         await asyncio.sleep(0)
         sub = self._sub_for(session)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _MOQ_TEST_FORWARD_WAIT_S
+        while not sub.forward and loop.time() < deadline:
+            await asyncio.sleep(0.01)
         self.forwarded = bool(sub.forward)
         try:
             if self.forwarded:
@@ -1916,6 +1934,22 @@ class _MoqTestTrack(PublishedTrack):
             self.error = e
         finally:
             self.sent.set()
+
+
+def _retrieved(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _subscribe_refusal(task) -> Optional[str]:
+    """The relay's refusal of the SUBSCRIBE `task` sent, if it ended so;
+    not a failure from our own session close."""
+    if task is None or not task.done() or task.cancelled():
+        return None
+    e = task.exception()
+    if not isinstance(e, MOQTRequestError) or e.response is None:
+        return None
+    return f"SUBSCRIBE refused: code={e.error_code} {e.reason}"
 
 
 async def _run_moq_test(name: str, host: str, port: int, path: str,
@@ -1933,8 +1967,8 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
     forward_zero = name == _MOQ_TEST_FORWARD_ZERO
     namespace = "/".join((*_NS_PREFIX, *fields))
     track_name = f"moq-test-{secrets.token_hex(8)}"
-    sub = _MoqTestSubscriber()
-    pub_track = reply = None
+    sub = _MoqTestSubscriber(forward_zero)
+    pub_track = reply = subscribing = None
     sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=supported_drafts)
     pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
@@ -1947,8 +1981,9 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
             sessions=sessions, message=message, **kw), reply)
 
     step = "subscriber SETUP"
+    phase_end = loop.time() + _MOQ_TEST_PHASE_S
     try:
-        async with asyncio.timeout(_MOQ_TEST_PHASE_S):
+        async with asyncio.timeout_at(phase_end):
             async with sub_client.connect() as sub_session:
                 await sub_session.client_session_init()
                 sessions["subscriber"] = _session_meta(sub_session)
@@ -1971,6 +2006,7 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
                 subscribing = asyncio.ensure_future(track.subscribe(
                     parameters={_RENDEZVOUS_TIMEOUT: _MOQ_TEST_RENDEZVOUS_MS},
                     **omit))
+                subscribing.add_done_callback(_retrieved)
                 await asyncio.wait({subscribing},
                                    timeout=_MOQ_TEST_HEAD_START_S)
                 if subscribing.done():
@@ -2002,13 +2038,16 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
                     pub_track.ready.set()
                     await pub_track.sent.wait()
                     pub_track._send_publish_done(pub_session)
-                    await sub.drain(loop.time() + _DATA_DELIVERY_S)
+                    await sub.drain(phase_end - _MOQ_TEST_CLOSE_S)
                     if forward_zero or params.fp == 3:
                         await asyncio.sleep(_MOQ_TEST_GRACE_S)
                     sub_session.close()
                 pub_session.close()
     except TimeoutError:
-        return result(False, f"timed out waiting for {step}")
+        timed_out = f"timed out waiting for {step}"
+        refusal = _subscribe_refusal(subscribing)
+        return result(False, f"{refusal}; {timed_out}" if refusal
+                      else timed_out)
     except MOQTRequestError as e:
         return result(False, f"{step} refused: code={e.error_code} {e.reason}")
     except Exception as e:

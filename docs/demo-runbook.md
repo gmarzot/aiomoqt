@@ -114,33 +114,9 @@ so it cannot share a shell with anything below it.
   safe ones — check `has_b_frames` before substituting.
 
 ## Player URL parameters (/g5-player/)
-The publisher's `player:` line opens `$AIOMOQT_PLAYER_URL` (`--player-base`). The
-page's settings dialog edits the same parameters.
-
-| Param | Meaning | Default |
-|---|---|---|
-| `url=` | relay WT URL | probe page host |
-| `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | live |
-| `v=` | draft 14/16/18; a 16/18 pin never retries WT bare | 16 |
-| `catalogBootstrap=` | auto / joining-fetch / strict / subscribe | auto |
-| `targetLatency=` | overrides the catalog target (ms): LOC cushion cap and catch-up set point; CMAF buffer held ahead, soft-chase set point, live-edge and gap-jump landing | catalog value |
-| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 if RTT < 5 ms) / 750 |
-| `catchUp=` | LOC max playback rate chasing the target; wall-clock based | 1.0 = off |
-| `warmStart=1` | joining FETCH of the current group (LOC only; startup decode error at the seam) | off |
-| `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
-| `compat=` | `request-credit`, `empty-objects`: opt-in leniency for non-conformant relays | none |
-| `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
-| `hash=` | relay certificate hash (hex) | none |
-| `debug=1` | engine debug log, MSE tracing, media-element events in the page log | off |
-| `status=1` | playback state over the picture | off |
-
-On draft 18 the page follows the namespace with SUBSCRIBE_NAMESPACE (SUB_NS
-badge; grey on draft 16, where it is not sent): a publisher that goes away
-and returns is re-joined without a reload. The page log prints `Options: …`
-at load with exactly what reached the engine. Readouts: LATENCY p50/p95/max
-is capture → arrival; `E2E` is capture → drawn frame (`≈` on CMAF, where it
-is arrival plus the buffer ahead); QUEUED is what each track has ahead of
-the playhead against TARGET.
+The publisher's `player:` line opens `$AIOMOQT_PLAYER_URL` (`--player-base`).
+The player's URL parameters, readouts and latency settings are in the G5
+[demo runbook](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#url-parameters) in the moq-playa fork.
 
 ## Demo A — CMAF file → glass (MSE playback)
 - SHELL 1 — Big Buck Bunny, 1920x1080@30, 2.3 Mbps:
@@ -303,13 +279,12 @@ start; Eyevinn's moqlivemock endpoint is always on.
 
   Silence from the `ffmpeg … -f null -` line means a clean decode; it is
   the better check here because it needs no display.
-- **`video.h264` will throw decode errors on this source, and that is
-  the tool, not the wire.** `sub_media` opens one `video.h264` for every
-  non-AV1 video track, so all six AVC and HEVC tracks land in one file
-  interleaved — `PPS changed between slices`, `Could not find ref with
-  POC 1`. `-T` does not narrow a catalog-driven broadcast. `video.ivf`
-  survives because IVF frames its samples. On a single-video-track
-  broadcast (demos A and B) both files are clean.
+- **Each AVC and HEVC track gets its own `<name>.h264`.** With several
+  LOC video tracks `sub_media` writes one Annex-B file per track rather
+  than one `video.h264`; `-T` does not narrow a catalog-driven broadcast.
+  AV1 tracks share `video.ivf`, which survives because IVF frames its
+  samples. On a single-video-track broadcast (demos A and B) the files
+  are `video.h264` and `video.ivf`.
 - Reverse direction unavailable: the pinned `mlmsub` is a d16-era build
   and dies on ALPN at draft 18; no Go toolchain here to build a current
   one. They also host a warp-player and an MSF/CMSF validator.
@@ -382,6 +357,32 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   `mlm/cmsf/drm-cbcs`, raw QUIC and WT, draft 18) and passes only when
   every LOCMAF track delivers frames with 0 rejected.
 
+## Demo G — moq-test-tracks streams, generated locally (no token)
+The hosted moq-test-tracks service needs a token. `mtt run` from
+[openmoq/moq-test-tracks](https://github.com/openmoq/moq-test-tracks)
+generates the same tracks on this machine with aiomoqt and publishes them
+to any relay. Needs Linux, Python 3.12+ and ffmpeg with libx264 and
+drawtext.
+- Prep (once), outside this repo:
+  ```
+  git clone https://github.com/openmoq/moq-test-tracks && cd moq-test-tracks
+  python3 -m venv .venv && . .venv/bin/activate
+  pip install -e . "aiomoqt @ git+https://github.com/gmarzot/aiomoqt@22fb07187fa8bcf5571d41936782bd3df0261bb3"
+  ```
+  That is 0.15.0's development build: it sends LOC as the bare frame, which
+  the G5 player reads; 0.14.x prepends a block G5 no longer strips.
+- SHELL 1, in that venv:
+  `mtt run --relay "$RELAY_QUIC" --ns $USER-demo/mtt_00/clock/loc/h264/720/30/aac/2 --ttl 3600`
+  (`$RELAY_QUIC` from Other relays above). The first field is your own
+  prefix; `openmoq/…` belongs to the hosted service. The fields after
+  `mtt_00` pick the content, packaging, codecs and rates: see the repo's
+  `docs/local.md`.
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N $USER-demo --discover -t 30`
+  → video and audio lines with N > 0 frames.
+- BROWSER: the G5 player with `url=` the relay and `ns=` the `--ns` value
+  ([player URL parameters](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#url-parameters)).
+- Pass: ≥ 60 s of the clock with no stalls and no gaps.
+
 ## Reading a stall or a pinned cushion
 - Publisher `lag mean/max ms` per track = how late a frame was against
   its own capture stamp when the feeder sent it (source, pipe, demux).
@@ -408,7 +409,7 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   audioUnderruns, avSkewMs, stallDurationMs, gapCount).
 - `debug=1`: `[video] waiting/seeking/ratechange …` lines with
   `t= rs= rate= buffered=` sit next to the stall lines for correlation.
-- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --inspect 5 --show-catalog`
+- Wire: `python -m aiomoqt.tools.sub_media "$RELAY_WT" -N aiomoqt --discover --draft 18 --inspect 5 --show-catalog -t 60`
   (`--discover` treats `-N` as a prefix and finds the run's
   `aiomoqt/demo-<rand4>`, so nothing is typed or pasted)
   (ts_skew_ms = wire latency). QUIC: `AIOPQUIC_QLOG_DIR=/tmp/qlog` on the publisher.
@@ -419,7 +420,7 @@ previous one inside a group; the player rebuilds the chunks. Audio from
   sync re-anchors, stalls every few seconds) while a browser-published
   g5-broadcast on the same relay plays clean → look at the WSL host before
   the code: compare its clock with Windows for 60–90 s and log scheduling
-  gaps (see the clock note in [demo-runbook-g5.md](demo-runbook-g5.md)).
+  gaps (see the clock note in the G5 [demo runbook](https://github.com/gmarzot/moq-playa/blob/gmarzot-g5-dev/examples/g5-player/demo-runbook.md#clock-note-wsl-tools)).
   A WSL publisher's timestamps and pacing inherit both.
 - A viewer of a namespace restarted under the same name gets no catalog →
   moqx answers its FETCH from the earlier run's cache (openmoq/moqx#795).

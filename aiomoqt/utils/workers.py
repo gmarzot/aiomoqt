@@ -32,7 +32,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import SubscribedTrack, TrackState
-from aiomoqt.types import FilterType
+from aiomoqt.types import FilterType, MOQTRequestError
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_handler, set_log_level
 from aiomoqt.utils.stats import TrackStats
@@ -134,10 +134,26 @@ def _post(q, msg):
         pass
 
 
+async def retry_wait(exc, stop_ev) -> bool:
+    """Wait out a refused request's Retry Interval, less if stopping; False
+    when it carries none. The value is milliseconds plus one."""
+    interval = getattr(exc, 'retry_interval', 0)
+    if not interval:
+        return False
+    end = time.monotonic() + (interval - 1) / 1000
+    while not stop_ev.is_set():
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        await asyncio.sleep(min(STOP_POLL_S, left))
+    return True
+
+
 def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
     """Forward explicit transport settings, retaining None to disable a budget."""
     return {key: config[key] for key in (
-        'congestion_control_algorithm', 'tx_max_queued_bytes',
+        'congestion_control_algorithm', 'congestion_control_options',
+        'packet_train_mode', 'flow_control_window', 'tx_max_queued_bytes',
         'tx_max_inflight_bytes', 'keep_alive_interval',
     ) if key in config}
 
@@ -190,6 +206,9 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                     )
                     break
                 except Exception as e:
+                    if await retry_wait(e, stop_ev):
+                        deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
+                        continue
                     m = str(e)
                     if ('code=4' in m or 'does not exist' in m
                             or 'no such namespace' in m):
@@ -365,8 +384,17 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                         break
                     except Exception as e:
                         m = str(e)
-                        if ('code=4' in m or 'does not exist' in m
-                                or 'no such namespace' in m):
+                        unpublished = ('code=4' in m or 'does not exist' in m
+                                       or 'no such namespace' in m)
+                        if isinstance(e, MOQTRequestError) and not unpublished:
+                            state['refused'] += 1
+                            state['refusing'] = True
+                            state['refused_reason'] = e.reason
+                        if await retry_wait(e, stop_ev):
+                            deadline = (time.monotonic()
+                                        + SUBSCRIBE_RETRY_WINDOW_S)
+                            continue
+                        if unpublished:
                             await asyncio.sleep(0.3)
                             continue
                         # Other subscribe error: drop the connection and
@@ -374,6 +402,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                         break
                 if subscribed:
                     state['active'] = True
+                    state['refusing'] = False
                     state['since'] = time.monotonic()
                     while not stop_ev.is_set():
                         if getattr(track, 'state', None) == TrackState.CLOSED:
@@ -424,7 +453,9 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
        "active": <subscribed slots>, "delivering": <slots at rate>,
        "t", "dt", "rx_bytes", "rx_objs" (deltas over dt),
        "lat_n", "lat_p90_ms", "lat_mean_ms" (worst slot with samples),
-       "jitter_ms", "loss", "total_bytes", "total_objs"}
+       "jitter_ms", "loss", "total_bytes", "total_objs",
+       "refused" (subscribes the relay refused so far), "refusing" (slots
+       whose last subscribe it refused), "refused_reason"}
 
     A slot is delivering per slot_delivering() against config
     'per_sub_mbps' over config 'keep_window' seconds; without
@@ -443,7 +474,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
 
     # (stats, state) per slot; stats persist across a slot's reopens.
     slots = [(TrackStats(), {'active': False, 'since': 0.0,
-                             'hist': deque()})
+                             'hist': deque(), 'refused': 0,
+                             'refusing': False, 'refused_reason': None})
              for _ in range(K)]
 
     async def _batch_stats_loop():
@@ -458,7 +490,12 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             jitter_sum = 0.0
             jitter_n = 0
             active = delivering = 0
+            refused = refusing = 0
+            refused_reason = None
             for stats, state in slots:
+                refused += state['refused']
+                refusing += state['refusing']
+                refused_reason = state['refused_reason'] or refused_reason
                 snap = stats.snapshot()
                 agg_bytes += snap['rx_bytes']
                 agg_objs += snap['rx_objs']
@@ -496,6 +533,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'lat_mean_ms': 0.0 if worst_mean is None else worst_mean,
                 'jitter_ms': jitter_sum / jitter_n if jitter_n else 0.0,
                 'total_bytes': total_bytes, 'total_objs': total_objs,
+                'refused': refused, 'refusing': refusing,
+                'refused_reason': refused_reason,
             })
             last_t = now
 

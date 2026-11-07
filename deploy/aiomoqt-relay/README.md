@@ -16,8 +16,10 @@ comes from apt certbot with dns-cloudflare (`/etc/cloudflare/credentials.ini`, 0
 hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart `aiomoqt-relay` and reload `relay-web` by
 name.
 
-The host is also the perf and release-gate box. UDP 4443 belongs to the public relay; test relays
-use 5443 and up. Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
+The host is also the perf and release-gate box. UDP 4443 belongs to the public relay. A test relay
+on 5443 or up is reachable only from the host. One that takes load from another host needs a port
+in the security list's range, such as 4442, plus its own INPUT ACCEPT and the NOTRACK rules under
+"Host tuning". Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
 again after.
 
 ## Layout on the host
@@ -100,7 +102,8 @@ the host keeps other per-packet work off its cores:
 
 - **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
   queue interrupts to CPU 0, and `host/relay-irq-affinity.service` runs it at boot (irqbalance is
-  off). The relay service has `cpuset: "1,2"`.
+  off). The relay service has `cpuset: "1,2"`. GoAccess runs on CPU 0 at a low CPU share, so its
+  report runs don't take the relay's CPUs.
 
   ```sh
   sudo install -m 755 host/relay-irq-affinity.sh /usr/local/sbin/
@@ -129,6 +132,16 @@ COPY aiopquic-*.whl /tmp/
 RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/aiopquic-*.whl && rm /tmp/aiopquic-*.whl
 ```
 
+To run on our own Python build, make it once, then pass it as the base image and layer the wheel
+for that Python. `Dockerfile.python` builds CPython with clang 19 (tail-call interpreter, PGO, thin
+LTO, no shared libpython), tuned for this host's Neoverse N1 cores. It takes all three cores for
+about 12 minutes, so build it with the relay idle.
+
+```sh
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build -t aiomoqt-python:3.14.10 -' < deploy/aiomoqt-relay/Dockerfile.python
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build --build-arg PYTHON_IMAGE=aiomoqt-python:3.14.10 --build-arg VERSION=<pep440> -t aiomoqt:<sha>-py314 ~/aiomoqt-relay/build'
+```
+
 Then, in `~/aiomoqt-relay`, `./relay-swap.sh aiomoqt:<sha> [HHMMSS]` makes it the relay, at that
 UTC time if one is given. It checks the image starts, records the live image, `relay.toml` and
 `compose.yml` in `rollback/`, re-tags `aiomoqt:dev`, restarts the relay, and probes raw QUIC and
@@ -155,6 +168,14 @@ long flag names (`cache-bytes = 268435456`, `catalog-probe = true`, lists for re
 an unknown key or a wrong type stops the relay with an error naming it. Flags added to the
 compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
 environment. After copying an edited file over, run `docker compose restart relay`.
+
+`admission-cpu = 80` refuses new subscribers with `EXCESSIVE_LOAD` and a 5-15 s Retry Interval while
+the relay's busiest thread averages 80% or more over 8 s, until it falls below 65%. The subscriber
+count at closing stays a ceiling, rising 5% a minute while the gate is open: steal comes and goes on
+this VM, and a lull is not headroom. Viewers already attached keep their service and may add tracks.
+Thread time here includes hypervisor steal, which is why it tracks real headroom. On a kernel that
+leaves steal out of thread time it reads low. `max-subscribers = N` adds a fixed limit. `status.json` reports `totals.admission` and
+`totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
 
 ## nginx config
 

@@ -27,7 +27,6 @@ _HISTORY = 1 << 20
 # Video opens a group every _GOP frames; every audio frame is a group.
 _GOP = {"video": 8, "audio": 1}
 _DRAFTS = [16, 18, 20, 22]
-_PRIVATE = b"\x0a\x00"   # empty Private Properties block ahead of a payload
 
 
 async def _until(cond, timeout=5.0):
@@ -111,7 +110,7 @@ async def test_paused_history_holds_one_open_group(name, history):
         held = track._history.fetch((head, 0), (head, 1 << 62))
         assert [(o.group_id, o.object_id) for o in held] == [
             loc for loc in _expected(name, 0, paused_end) if loc[0] == head]
-        assert held[0].payload == _PRIVATE + _frame(name, head * gop)
+        assert held[0].payload == _frame(name, head * gop)
     track.live = True
     await _feed(tracks, paused_end + 1, paused_end + 2 * gop)
     await track.finish()
@@ -220,7 +219,7 @@ async def test_direct_resume_mid_group(history, use_quic, draft):
         if history:
             assert [(o.group_id, o.object_id) for o in fetched["video"]] == [
                 (5, i) for i in range(4)]
-            assert fetched["video"][0].payload == _PRIVATE + b"video-40"
+            assert fetched["video"][0].payload == b"video-40"
             assert [(o.group_id, o.object_id) for o in fetched["audio"]] == [
                 (43, 0)]
             assert live["video"] == _expected("video", 44, 58)
@@ -393,7 +392,7 @@ async def test_relay_joining_fetch_after_resume(use_quic):
 
             video = [(g, o) for g, o, _ in fetched["video"]]
             assert video == [(3, i) for i in range(5)], fetched["video"]
-            assert fetched["video"][0][2] == _PRIVATE + b"video-24"
+            assert fetched["video"][0][2] == b"video-24"
             assert [(g, o) for g, o, _ in fetched["audio"]] == [(28, 0)]
             # Live continues the open group: no gap, no duplicate.
             assert live["video"] == _expected("video", 29, 44), live

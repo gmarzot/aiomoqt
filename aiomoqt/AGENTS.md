@@ -37,7 +37,7 @@ aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--input` ingest needs the `m
 
 Most tools share one flag grid from `aiomoqt.utils.cli` (listed in its module docstring):
 `-N` namespace, `-T` trackname, `-s` object size, `-g` group size, `-P` streams, `-r` rate,
-`-t` duration, `-i` interval, `-k` insecure, `-d` debug, `-D` datagram, `-p` port, `--draft`.
+`-t` duration (0 or absent: no limit), `-i` interval, `-k` insecure, `-d` debug, `-D` datagram, `-p` port, `--draft`.
 A dialed URL's scheme selects the transport: `moqt://host:port/path` is raw QUIC,
 `https://host:port/path` or bare `host:port` is WebTransport. Listeners take `-Q` (raw QUIC),
 `-W` (WebTransport), or both on one port. `moq-interop-client` follows the interop runner's
@@ -69,6 +69,8 @@ SIGUSR1.
   default. moqx defaults to BBR2. `--cc-algo` takes `bbr`, `bbr1`, `c4`, `cubic`, `dcubic`,
   `fast`, `newreno`, `prague` and `reno`. `--cc-options` / `congestion_control_options=`
   passes an option string to that algorithm, e.g. `Q0.02` for bbr's send quantum.
+  `--pacing-trains` / `packet_train_mode=True` lets paced sends release up to 10 packets
+  at once (off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`).
 - Flow-control window: 16 MiB per stream and per connection, so one stream carries at most
   16 MiB per RTT (2.7 Gbps at 50 ms). `--fc-window` / `flow_control_window=` raises it; the
   receiver buffers that much per stream.

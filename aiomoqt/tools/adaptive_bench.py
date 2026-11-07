@@ -35,8 +35,7 @@ from typing import Optional
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import SubscribedTrack
-from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
-                           parse_draft_spec)
+from aiomoqt.types import FilterType, MOQTMessageType, ObjectStatus
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.certs import (REPO_CERTS_DIR, ensure_self_signed,
                                  find_cert, find_key)
@@ -123,6 +122,11 @@ class Signal:
     tx_ring_streams: int = 0
     # False when no latency sample arrived: shown as n/a, not 0.
     latency_known: bool = True
+    # subs-mode: worst p90 of each worker's last report. latency_p90_ms is
+    # the worst across the tick, the figure the controller acts on.
+    latest_p90_ms: Optional[float] = None
+    # subs-mode: slots whose last subscribe the relay refused.
+    refusing_subs: int = 0
 
 
 @dataclass
@@ -141,7 +145,6 @@ class BenchState:
     history: deque = field(default_factory=lambda: deque(maxlen=64))
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ceiling_reason: Optional[str] = None
-    ceiling_mbps: Optional[float] = None
     received_data: bool = False
     failed: bool = False
 
@@ -505,11 +508,11 @@ class SubsActuator:
     BATCHES: each worker process runs K = --step-subs subscriptions and
     self-heals individual drops internally, so the relay still sees one
     QUIC connection per sub without one OS process per sub. apply(level)
-    spawns/terminates whole workers to reach ceil(level / K). observe()
-    drains batch_stats events and aggregates:
+    spawns/terminates whole workers to reach ceil(level / K). A task
+    reads batch_stats events as they arrive; observe() aggregates:
 
-      rx_mbps         = sum of per-worker batch rates (rx_bytes / dt)
-      latency         = worst slot p90 across mature workers
+      rx_mbps         = sum of per-worker rates over the tick (rx_bytes / dt)
+      latency         = worst slot p90 across mature workers and the tick
       loss_pct        = max per-batch loss_pct
       active_subs     = subscribed slots
       delivering_subs = subscribed slots receiving >= half their rate
@@ -526,6 +529,8 @@ class SubsActuator:
     starved by the controller's batch-stats drain.
     """
     unit = "subs"
+    DRAIN_INTERVAL_S = 0.1
+    STALE_REPORT_S = 5.0
 
     def __init__(self, relay_url: str,
                  namespace: str, trackname: str,
@@ -574,6 +579,12 @@ class SubsActuator:
         # the batch size K: one worker == one group of K subs, so the
         # controller adding a group per --join-rate spawns one worker.
         self.batch_size = max(1, int(step_subs))
+        # Startup grace is a FIXED floor, not interval-scaled: QUIC
+        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
+        # of them staggered), so a small --interval must not reap a
+        # worker before it can come online.
+        self._startup_grace = max(8.0, self.keep_window
+                                  + self.batch_size * max(0.0, self.stagger))
 
         from aiomoqt.utils.workers import MP_CTX as mp
         self._mp = mp
@@ -588,6 +599,13 @@ class SubsActuator:
         self._targeted = float(start_subs)
         # Per-worker latest batch_stats event:
         self._latest_batch: dict = {}
+        # Per-worker totals since the last observe(): rx_bytes, dt, p90.
+        self._tick: dict = {}
+        self._drain_task: Optional[asyncio.Task] = None
+        self._oldest_report_s = 0.0
+        # Per-worker refused subscribes, kept after a worker is reaped.
+        self._refused: dict = {}
+        self.refused_reason = None
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
@@ -617,7 +635,58 @@ class SubsActuator:
             self._kill_worker(wid)
         return len(dead)
 
+    def _drain_events(self) -> None:
+        """Read the reports queued now. mp.Queue reads Empty whenever its
+        pipe is momentarily dry, so one pass takes about a pipe-full however
+        many wait; _drain_loop repeats it to keep up with many workers."""
+        from queue import Empty
+        while True:
+            try:
+                msg = self._events_q.get_nowait()
+            except Empty:
+                return
+            if msg.get('kind') != 'batch_stats':
+                continue
+            wid = msg.get('worker_id')
+            now = time.monotonic()
+            self._latest_batch[wid] = msg
+            self._last_batch_t[wid] = now
+            if msg.get('rx_bytes', 0) > 0:
+                self._last_bytes_t[wid] = now
+            if msg.get('active', 0) > 0:
+                self._subscribed_ever.add(wid)
+            if msg.get('refused', 0) > 0:
+                self._refused[wid] = msg['refused']
+                self.refused_reason = msg.get('refused_reason')
+            self._oldest_report_s = max(self._oldest_report_s,
+                                        now - msg.get('t', now))
+            tick = self._tick.setdefault(
+                wid, {'rx_bytes': 0, 'dt': 0.0, 'p90': None})
+            tick['rx_bytes'] += msg.get('rx_bytes', 0)
+            tick['dt'] += msg.get('dt', 1.0)
+            if (msg.get('lat_n', 0) > 0 and now - self._spawned_t.get(wid, now)
+                    >= self._startup_grace):
+                p90 = msg['lat_p90_ms']
+                tick['p90'] = p90 if tick['p90'] is None else max(tick['p90'], p90)
+
+    @property
+    def refused_total(self) -> int:
+        return sum(self._refused.values())
+
+    async def _drain_loop(self) -> None:
+        while True:
+            self._drain_events()
+            await asyncio.sleep(self.DRAIN_INTERVAL_S)
+
+    def _ensure_draining(self) -> None:
+        """Start the drain task; a failure in it surfaces here."""
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain_loop())
+        elif self._drain_task.done():
+            self._drain_task.result()
+
     async def apply(self, level: float) -> None:
+        self._ensure_draining()
         self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
@@ -683,23 +752,13 @@ class SubsActuator:
         self._spawned_t.pop(wid, None)
 
     async def observe(self) -> Signal:
-        # Drain all pending batch_stats events from workers.
-        from queue import Empty
+        self._ensure_draining()
+        self._drain_events()
+        if self._oldest_report_s > self.STALE_REPORT_S:
+            print(f"  warning: read a worker report "
+                  f"{self._oldest_report_s:.0f}s old; figures are late")
+        self._oldest_report_s = 0.0
         failed_this_window = 0
-        while True:
-            try:
-                msg = self._events_q.get_nowait()
-            except Empty:
-                break
-            if msg.get('kind') != 'batch_stats':
-                continue
-            wid = msg.get('worker_id')
-            self._latest_batch[wid] = msg
-            self._last_batch_t[wid] = time.monotonic()
-            if msg.get('rx_bytes', 0) > 0:
-                self._last_bytes_t[wid] = self._last_batch_t[wid]
-            if msg.get('active', 0) > 0:
-                self._subscribed_ever.add(wid)
 
         # A worker reports how many of its K slots are subscribed
         # ('active') and how many of those receive their rate
@@ -710,12 +769,7 @@ class SubsActuator:
         live_ids = [wid for wid, t in self._last_bytes_t.items()
                     if t >= bytes_cutoff and wid in self._workers]
 
-        # Startup grace is a FIXED floor, not interval-scaled: QUIC
-        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
-        # of them staggered), so a small --interval must not reap a
-        # worker before it can come online.
-        startup_grace = max(8.0, keep_window
-                            + self.batch_size * max(0.0, self.stagger))
+        startup_grace = self._startup_grace
         starve_cutoff = now - keep_window
         starved = []
         for wid, (proc, stop_ev) in list(self._workers.items()):
@@ -725,6 +779,9 @@ class SubsActuator:
             # posting zero-byte batches.
             spawned = self._spawned_t.get(wid, now)
             if last_bytes is None and (now - spawned) < startup_grace:
+                continue
+            # Refused by the relay, not stuck: reaping would only redial.
+            if self._latest_batch.get(wid, {}).get('refusing', 0) > 0:
                 continue
             if last_bytes is None or last_bytes <= starve_cutoff:
                 starved.append(wid)
@@ -743,6 +800,7 @@ class SubsActuator:
 
         rx_bps_total = 0.0
         worst_p90 = 0.0
+        tick_p90 = None
         worst_mean = 0.0
         lat_known = False
         max_loss_pct = 0.0
@@ -756,8 +814,12 @@ class SubsActuator:
             s = self._latest_batch.get(wid, {})
             active_subs += int(s.get('active', 0))
             delivering_subs += _delivering(s)
-            # rx_bytes is the batch's delta over its dt.
-            rx_bps_total += s.get('rx_bytes', 0) * 8 / max(s.get('dt', 1.0), 1e-3)
+            # A tick shorter than the report interval may have no report.
+            tick = self._tick.get(wid) or s
+            rx_bps_total += tick.get('rx_bytes', 0) * 8 / max(tick.get('dt', 1.0), 1e-3)
+            p90 = self._tick.get(wid, {}).get('p90')
+            if p90 is not None:
+                tick_p90 = p90 if tick_p90 is None else max(tick_p90, p90)
             # Latency drives the back-off, so only MATURE workers feed it:
             # a worker still in its startup grace is catching up (old
             # send-timestamps -> seconds-scale p90) and would trip the SLA
@@ -777,6 +839,9 @@ class SubsActuator:
             if jit is not None:
                 jitter_sum += jit
                 jitter_n += 1
+
+        self._tick.clear()
+        acted_p90 = max(worst_p90, tick_p90 or 0.0)
 
         # Setpoint is the TARGETED count, not live capacity — reaping a
         # worker must not silently lower the target the controller ramps
@@ -829,7 +894,8 @@ class SubsActuator:
             t=now,
             level=float(target_subs),
             latency_mean_ms=worst_mean,
-            latency_p90_ms=worst_p90,
+            latency_p90_ms=acted_p90,
+            latest_p90_ms=worst_p90,
             loss_pct=max_loss_pct,
             shortfall=shortfall,
             target_mbps=target_mbps,
@@ -841,10 +907,17 @@ class SubsActuator:
             delivering_subs=delivering_subs,
             failed_subs=failed_this_window,
             health=health,
-            latency_known=lat_known,
+            latency_known=lat_known or tick_p90 is not None,
+            refusing_subs=sum(self._latest_batch.get(wid, {}).get('refusing', 0)
+                              for wid in self._workers),
         )
 
     async def shutdown(self) -> None:
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+            self._drain_task = None
+        self._tick.clear()
         # Parallel shutdown: signal all stops at once, join with one
         # shared deadline, terminate stragglers, then a final short
         # join. Serial _kill_worker at 1s each would block ~Nworkers s
@@ -883,8 +956,10 @@ class AIMDController:
     """Additive-increase / multiplicative-decrease over a LoadActuator.
 
     Keeps probing: it backs off on a signal and resumes ramping from the
-    lower level, never locking in a ceiling. Ends at the actuator's max
-    level, -t/--duration, Ctrl-C, or rx=0 for 3 intervals (a failure).
+    lower level, never locking in a ceiling. Holds at the actuator's max
+    level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
+    or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
+    reaching max.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -912,6 +987,7 @@ class AIMDController:
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
+                 exit_at_max: bool = False,
                  tick_s: float | None = None,
                  skew_safe: bool = False):
         self.actuator = actuator
@@ -935,7 +1011,9 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
-        self.duration_s = duration_s
+        self.duration_s = duration_s or None
+        self.exit_at_max = exit_at_max
+        self.held_at_max = False
         # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
         self._p90_seen: deque = deque(maxlen=self.BASELINE_SAMPLES)
@@ -1053,7 +1131,8 @@ class AIMDController:
                 if self.shortfall_streak < 3 * self._tpr:
                     # Onset: hold and watch. apply(level) is a reconcile
                     # (subs respawns lost workers); BW it's a no-op.
-                    self._emit(sig, "hold (watch)")
+                    self._emit(sig, "hold (relay refusing)" if sig.refusing_subs
+                               else "hold (watch)")
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
@@ -1077,16 +1156,11 @@ class AIMDController:
                     # reconcile (apply at the SAME target respawns it).
                     # Backing off here would kill more subs and
                     # re-introduce the setpoint-decay-on-loss bug.
-                    self._emit(sig, "hold (shortfall)")
+                    self._emit(sig, "hold (relay refusing)" if sig.refusing_subs
+                               else "hold (shortfall)")
                     await a.apply(level)
                 continue
 
-            if level >= a.max_level:
-                state.ceiling_mbps = self.high_water
-                state.ceiling_reason = f"reached max {a.max_level} {a.unit}"
-                self._emit(sig, "max", force=True)
-                state.stop.set()
-                return
             # High-water tracks the *delivered* metric (bw: rx_mbps;
             # subs: active sub count), not the commanded target —
             # a target the system can't sustain shouldn't pollute the
@@ -1100,6 +1174,17 @@ class AIMDController:
                     and headroom >= 0.2
                     and not sig.shortfall):
                 self.high_water = observed
+            if level >= a.max_level:
+                if self.exit_at_max:
+                    state.ceiling_reason = (
+                        f"reached max {a.max_level:g} {a.unit}")
+                    self._emit(sig, "max", force=True)
+                    state.stop.set()
+                    return
+                self.held_at_max = True
+                self._emit(sig, "hold (max)")
+                await a.apply(level)
+                continue
             # Gain curve: full step when headroom > 0.5, linearly taper
             # to zero at headroom = 0.05. Below that → hold.
             if headroom >= 0.5:
@@ -1194,9 +1279,10 @@ class AIMDController:
                 f"{sig.tx_mbps:.2f}",
                 f"{sig.rx_mbps:.2f}",
                 f"{sig.latency_mean_ms:.2f}",
-                f"{sig.latency_p90_ms:.2f}",
+                f"{(sig.latency_p90_ms if sig.latest_p90_ms is None else sig.latest_p90_ms):.2f}",
                 f"{sig.loss_pct:.3f}",
                 *self._cpu,
+                *([] if sig.latest_p90_ms is None else [f"{sig.latency_p90_ms:.2f}"]),
             ])
         self._print_row(sig, action)
 
@@ -1456,12 +1542,12 @@ def parse_args():
     p.add_argument("--step-mbps", type=float, default=10.0,
                    help="ramp step size (default: 10)")
     p.add_argument("--max-mbps", type=float, default=10000.0,
-                   help="bw-mode cap; the run ends on reaching it "
+                   help="bw-mode cap; the run holds there until -t "
                         "(default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
-    p.add_argument("--draft", type=parse_draft_spec, default=None,
-                   help="MoQT draft version: 14, 16, or 18")
+    _cli.add_session(p)
+    _cli.add_keepalive(p)
     p.add_argument("-N", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")
     p.add_argument("-T", "--trackname", default=None,
@@ -1494,8 +1580,6 @@ def parse_args():
                         "Splitting across hosts is subs-mode only: there "
                         "the publisher is fixed-rate and the whole "
                         "control loop lives on the subscriber side.")
-    p.add_argument("-k", "--insecure", action="store_true",
-                   help="skip TLS verification")
     p.add_argument("--cert", default=CERT)
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
@@ -1521,7 +1605,7 @@ def parse_args():
                         "Also the batch size: one worker process hosts a "
                         "group of this many self-healing subscriptions.")
     p.add_argument("--max-subs", type=int, default=200,
-                   help="subs-mode: cap; the run ends on reaching it "
+                   help="subs-mode: cap; the run holds there until -t "
                         "(default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    action=_cli.StoreGiven,
@@ -1553,39 +1637,16 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-t", "--duration", type=float, default=None,
+    p.add_argument("-t", "--duration", type=float, default=0,
                    metavar="SECONDS",
-                   help="hard wall-clock cap; controller exits after "
-                        "this many seconds even if --max-mbps / --max-subs "
-                        "hasn't been reached. Useful for fixed-budget "
-                        "regression runs.")
-    p.add_argument("--keylogfile", default=None,
-                   help="TLS secrets log path (NSS Key Log Format) for "
-                        "Wireshark decryption of pcap captures. Each MP "
-                        "worker (publisher / subscriber) gets a "
-                        "process-suffixed file: PATH.pub.<pid>, "
-                        "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--cc-algo", type=str, default="bbr",
-                   help="Congestion control (bbr | bbr1 | c4 | cubic | "
-                        "dcubic | fast | newreno | prague). Default: bbr")
-    p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
-                   help="QUIC keep-alive interval in seconds (PING) so a "
-                        "flow-controlled, consumer-stalled connection "
-                        "isn't dropped on the idle timeout. Default: off.")
-    p.add_argument("--max-queued-bytes", type=int, default=None,
-                   help="Aggregate publisher byte budget across ALL "
-                        "streams (QuicConfiguration.tx_max_queued_bytes): "
-                        "producer parks at stream rollover while total "
-                        "un-transmitted TX bytes exceed this. "
-                        "Steady-state latency ~ value / throughput. "
-                        "Default: aiopquic default (4 MiB). "
-                        "Pass 0 to disable.")
-    p.add_argument("--max-inflight-bytes", type=int, default=None,
-                   help="Per-stream TX budget (aiomoqt "
-                        "tx_max_inflight_bytes): producer pauses while "
-                        "one stream's un-transmitted bytes exceed this. "
-                        "Default: aiomoqt default (1 MiB). "
-                        "Pass 0 to disable.")
+                   help="run time; the run ends after this many seconds, "
+                        "holding at --max-mbps / --max-subs once there. "
+                        "0 (default): until Ctrl-C.")
+    p.add_argument("--exit", dest="exit_on", choices=("max",), default=None,
+                   metavar="COND",
+                   help="also end the run on COND; -t still applies. max: "
+                        "on reaching --max-mbps / --max-subs, without "
+                        "holding there.")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -1597,6 +1658,11 @@ def parse_args():
                 "cannot be "
                 "combined with a URL — a URL says where to dial, "
                 "loopback options say what to bind")
+
+    if args.duration < 0:
+        p.error("-t/--duration: seconds, or 0 for no limit")
+    if args.exit_on == "max" and args.role == "pub":
+        p.error("--exit max: --role pub has no max to reach")
 
     # Splitting the run across hosts is subs-mode only. In subs mode the
     # publisher is fixed-rate and the controller's only actuator is the
@@ -1713,11 +1779,18 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     if controller.pivots:
         print(f"  Equilibrium: {controller.eq_level:.1f} {unit} "
               f"({len(controller.pivots)} pivots)")
+    elif controller.held_at_max:
+        print(f"  Equilibrium: not reached — held at max "
+              f"{controller.actuator.max_level:g} {unit} with no back-off")
     else:
         print("  Equilibrium: not reached — no ramp/back-off pivot "
               "(ended while still climbing)")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
+    refused = getattr(controller.actuator, 'refused_total', 0)
+    if refused:
+        print(f"  Refused:     {refused} subscribes by the relay "
+              f"({controller.actuator.refused_reason})")
     print(f"  Samples:     {samples}")
     print(f"  Host:        {cpu_summary()}")
     print("═" * 68)
@@ -1825,12 +1898,14 @@ async def main():
     if args.report:
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
-        # bw: the subscriber's windowed latency; subs: the worst slot's.
+        # bw: the subscriber's windowed latency; subs: the worst slot's in
+        # the last reports, and tick_p90_ms across the tick (acted on).
         lat_cols = (["win_mean_ms", "win_p90_ms"] if args.mode == "bw"
                     else ["worst_mean_ms", "worst_p90_ms"])
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
             *lat_cols, "loss_pct", *CPU_FIELDS,
+            *([] if args.mode == "bw" else ["tick_p90_ms"]),
         ])
 
     mp_cleanup_queues: list = []
@@ -1988,6 +2063,7 @@ async def main():
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
+        exit_at_max=args.exit_on == "max",
         tick_s=(args.join_rate if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
     )

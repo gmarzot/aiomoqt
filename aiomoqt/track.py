@@ -2562,6 +2562,7 @@ class VideoTrack(PublishedTrack):
         "1080p": {"i_frame": 200_000, "p_frame": 25_000, "b_frame": 10_000},
         "1440p": {"i_frame": 350_000, "p_frame": 40_000, "b_frame": 18_000},
         "4k":    {"i_frame": 600_000, "p_frame": 60_000, "b_frame": 30_000},
+        "4kuhd": {"i_frame": 744_000, "p_frame": 93_000, "b_frame": 37_200},
     }
 
     def __init__(self, session, namespace: str, trackname: str = 'video',

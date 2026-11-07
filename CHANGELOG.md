@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15.0 (unreleased)
+
+- aiomoqt-relay `--admission-cpu PCT` and `--max-subscribers N`: near overload, past the count the relay last closed at (which then rises 5% a minute), or at the limit, a session's first SUBSCRIBE is refused with EXCESSIVE_LOAD and a randomized Retry Interval; sessions already subscribed may add tracks. Off by default. `status.json` gains `totals.admission` and `totals.queue_ms`.
+- adaptive_bench and load_sim subscribers wait out a refused subscribe's Retry Interval on the same connection instead of reconnecting at once, and adaptive_bench no longer reaps a worker whose subscribers are all refused.
+- adaptive_bench subs mode shows a relay's refusals: `hold (relay refusing)` in place of a bare shortfall, and a summary line with the count and reason.
+- adaptive_bench subs mode reads worker reports as they arrive, so above about 25 workers per host the controller no longer acts on reports a minute old. It acts on the worst p90 across each tick, so climbs stop earlier than before; `--report` adds `tick_p90_ms`, and `worst_p90_ms` keeps its meaning. Rx covers the whole tick.
+- adaptive_bench takes the shared session flags: `--cc-options`, `--pacing-trains` and `--fc-window` now reach its publisher and subscriber workers.
+- `--video 4kuhd`: a video profile of 16 Mbps at 30 fps and `-g 60` (the 1080p shape scaled up); `--video 4k` is unchanged.
+- Every tool and example runs with no time limit by default: no `-t` is `-t 0`, ending at Ctrl-C or when the media or session ends. Waiting for a session or catalog is still bounded: by `-t`, or 30 s without one. sub_media `-t 0` now means no limit.
+- adaptive_bench holds at `--max-mbps` / `--max-subs` until `-t` is up instead of exiting there; `-t 0` or no `-t` runs until Ctrl-C, and `--exit max` ends the run on reaching max.
+- relay_probe probes drafts 20 and 22 by default, after 14, 16 and 18.
+- aiomoqt-relay status: a subscribed track takes the chart history slot of a track without subscribers when all 24 are held, so the dashboard charts show it.
+- aiomoqt-relay subscribes to every publisher of a track's namespace, including one that announces once the track is live, and merges their objects without repeating a Location; when the serving publisher ends the track or disconnects, another takes over and subscribers see no PUBLISH_DONE.
+- `--pacing-trains` (session grid, aiomoqt-relay, loopback_bench; relay.toml `pacing-trains`) and `packet_train_mode=` on `MOQTClient` / `MOQTServer`: when pacing holds a connection back, picoquic sends up to 10 packets at once instead of one or two. Off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`.
+- A new subgroup stream opens with its header and first object; over WebTransport they travel with the stream create (aiopquic `create_stream(initial=)`) and leave in one send instead of two. `MOQTSession.open_uni_stream(initial=, priority=)` sets the stream priority and writes its first bytes on either transport.
+- pub_media publishes several video tracks (`video`, `video_1`, …): `--mp4` repeats, and `--ts` takes every H.264/H.265 stream in the PMT. With `--timestamp-mapping` they must share frame duration and GOP length, and carry the same group and object IDs.
+- pub_media `--video-alt one|each` puts the video tracks in one catalog altGroup (a ladder) or one each (views); `--video-label` sets their catalog labels.
+- pub_media `--catalog-bitrate` repeats, one value per video track.
+- pub_media `--loop` with several mp4s loops every track on the shortest clip, with a WARNING.
+- sub_media writes `<name>.h264` per LOC video track when there are several.
+- `TsDemuxer` keeps every video stream (`videos`, `video_pids`); `TsUnit.index` and `TsUnit.track` name the stream, and `TsRates` measures per track.
+- pub_bench `--audio` and `--catalog` publish AAC-shaped and catalog-shaped tracks beside `--video`; a load_sim subscriber group may take `tracks: [..]`, all on one session per subscriber; packaged scenario `av-viewers`.
+- moq_interop_client moq-test-* cases: the publisher waits up to 1 s for a relay to raise Forward State 0 with REQUEST_UPDATE; a downstream Stream Count that delivery never meets fails the case by name instead of timing out; a refused SUBSCRIBE leads a later timeout's message.
+- Bench output: a value that rounds up to a unit's limit shows in the next unit (`10Gbps`, not `10.0Gbps`; `1.0ms`, not `1000us`); loopback_bench prints its table header after the subscriber line.
+- LOC payloads in the clear are the bare frame (loc-04 §3.1.3, Secure Objects -01 §3.3): `LocTrackPublisher` and `LocTrackSubscriber` no longer send or expect the `0x0A 0x00` block; `loc_bare=` and `--loc-bare` are removed.
+
 ## v0.14.1
 
 - Requires aiopquic 0.7.1: a crafted version-upgrade request could hang the QUIC network thread (picoquic #2331).

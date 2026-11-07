@@ -52,7 +52,7 @@ def parse_args():
         help='Object payload size bytes (default: 4096)')
     parser.add_argument(
         '-g', '--group-size', type=int, default=4096,
-        help='Objects per group (default: 10000)')
+        help='Objects per group (default: 4096)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
         help='Parallel subgroup streams (default: 1)')
@@ -62,8 +62,8 @@ def parse_args():
              'default: max). Per-stream emit rate is rate/streams. '
              '-P only changes parallelism, not offered load.')
     parser.add_argument(
-        '-t', '--duration', type=int, default=20,
-        help='Duration seconds (default: 20)')
+        '-t', '--duration', type=int, default=0,
+        help='Run time in seconds; 0 (default): no limit')
     parser.add_argument(
         '-i', '--interval', type=float, default=5.0,
         help='Report interval seconds (default: 5)')
@@ -130,6 +130,10 @@ def parse_args():
         '--cc-options', type=str, default=None, metavar='OPTS',
         help='Option string for the congestion controller, e.g. Q0.02: '
              'bbr sends bursts of 20 ms of pacing rate')
+    parser.add_argument(
+        '--pacing-trains', action='store_true',
+        help='When pacing holds a connection back, send up to 10 packets '
+             'at once instead of one or two')
     parser.add_argument(
         '--fc-window', type=int, default=None, metavar='BYTES',
         help='QUIC flow-control window, per stream and per connection; the '
@@ -271,7 +275,8 @@ def print_banner(args):
         + (", fanout lane" if args.fanout else "")
         + (", per-peer props" if args.per_peer_props else ""))
     row("cc algorithm", args.cc_algo
-        + (f" {args.cc_options}" if args.cc_options else ""))
+        + (f" {args.cc_options}" if args.cc_options else "")
+        + (" trains" if args.pacing_trains else ""))
     if args.fc_window:
         row("fc window", f"{args.fc_window} B")
     if _emulated(args):
@@ -287,7 +292,7 @@ def print_banner(args):
         row("payload", f"checked (every {args.verify_payload})")
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
-    row("duration", f"{args.duration}s")
+    row("duration", _cli.duration_label(args.duration))
     row("cpu", cpu_summary())
     print("─" * 56)
 
@@ -420,8 +425,9 @@ async def run_server(args, tracks):
         supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
-        # None = honor protocol default (16 MB); 0 = opt out.
+        # Unset keeps the 1 MiB default; 0 removes the budget.
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
              else args.max_inflight_bytes)}
@@ -448,6 +454,7 @@ async def run_subscriber(args, stats, tracks):
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
     )
 
@@ -463,11 +470,11 @@ async def run_subscriber(args, stats, tracks):
                 timestamp_errors=args.timestamp_errors,
             )
             stats.stats.timing = track.timing
+            # Objects can arrive before subscribe() returns.
+            print("  Subscriber connected, receiving...\n")
             # Loopback server does not send PUBLISH; use direct SUBSCRIBE.
             # Loopback passes explicit trackname → auto-routes to direct.
             await track.subscribe()
-
-            print("  Subscriber connected, receiving...\n")
             stats.start()
 
             if not await wait_cond_timeout(

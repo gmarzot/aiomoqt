@@ -1,5 +1,6 @@
 """load_sim's verdict: a group that subscribed but received nothing, or only a
 trickle of what its subscribers should have seen, fails."""
+import math
 import os
 import re
 import socket
@@ -11,8 +12,19 @@ from pathlib import Path
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tools.load_sim import (
-    GroupRT, GroupSpec, PubRT, PubSpec, ShardRT, _accrue_expected, _verdict,
+    GroupRT, GroupSpec, PubRT, PubSpec, ShardRT, _accrue_expected,
+    _no_data_forever, _verdict,
 )
+from aiomoqt.utils.cli import SETUP_TIMEOUT
+
+
+def test_no_time_limit_ends_when_no_data_arrives():
+    empty, _ = _group(0, 0, 0)
+    busy, _ = _group(3, 10, 1000)
+    assert _no_data_forever(empty, math.inf, SETUP_TIMEOUT)
+    assert not _no_data_forever(empty, math.inf, SETUP_TIMEOUT - 1)
+    assert not _no_data_forever(empty, 300, SETUP_TIMEOUT)
+    assert not _no_data_forever(busy, math.inf, SETUP_TIMEOUT)
 
 
 def _group(peak, objs, nbytes, subs=3, expected=0.0):
@@ -96,6 +108,71 @@ def test_expected_accrues_per_live_subscriber_second():
     # Audience role: no local publisher, the timeline alone decides.
     _accrue_expected(groups, {}, t=4.0, dt=0.5)
     assert g.expected_objs == 3 * fps + 1.5 * fps
+
+
+
+def _av_group(video, audio, expected=(0.0, 0.0), peak=3):
+    """A group on video and audio; `video` and `audio` are object counts."""
+    vid = PubSpec({"namespace": "ns", "track": "video", "bitrate_kbps": 2190,
+                   "rate": 30}, 1.0)
+    aud = PubSpec({"namespace": "ns", "track": "audio", "bitrate_kbps": 128,
+                   "rate": 46.875, "object_size": 341}, 1.0)
+    g = GroupRT(GroupSpec(0, {"subs": 3}, vid, aud))
+    shard = ShardRT(0, 3, None, None, None)
+    shard.stats = {"total_objs": video + audio,
+                   "total_bytes": (video + audio) * 1000,
+                   "track_objs": {"video": video, "audio": audio}}
+    g.shards.append(shard)
+    g.max_live = peak
+    g.expected_track = {"video": expected[0], "audio": expected[1]}
+    g.expected_objs = sum(expected)
+    pubs = {}
+    for ps in (vid, aud):
+        pubs[ps.key] = PubRT(ps)
+        pubs[ps.key].published = True
+    return {0: g}, pubs
+
+
+def test_single_track_group_prints_no_track_lines():
+    lines, _ = _verdict(*_group(peak=3, objs=293, nbytes=300032))
+    assert not any(line.startswith("    ") for line in lines), lines
+
+
+def test_multi_track_group_counts_each_track():
+    lines, failed = _verdict(*_av_group(90, 140, expected=(90, 140)))
+    text = "\n".join(lines)
+    assert not failed
+    assert "ns/video+audio" in text
+    assert "    video" in text and "objs=90 expected=90" in text
+    assert "    audio" in text and "objs=140 expected=140" in text
+    assert "Total objects: 230" in text
+    assert "Expected objects: 230" in text
+
+
+def test_a_track_with_zero_objects_fails_the_group():
+    lines, failed = _verdict(*_av_group(900, 0, expected=(900, 140)))
+    text = "\n".join(lines)
+    assert failed
+    assert "<< audio: NO OBJECTS" in text
+    assert "objs=0 expected=140  << NO OBJECTS" in text
+    assert "RESULT: FAIL" in text
+
+
+def test_a_track_below_the_floor_fails_though_the_sum_passes():
+    lines, failed = _verdict(*_av_group(900, 20, expected=(900, 140)))
+    text = "\n".join(lines)
+    assert failed
+    assert "objs=20 expected=140  << BELOW 50% OF EXPECTED" in text
+    assert "RESULT: FAIL" in text
+
+
+def test_expected_sums_the_tracks_rates():
+    groups, pubs = _av_group(0, 0)
+    g = groups[0]
+    g.shards[0].live = 2
+    _accrue_expected(groups, pubs, t=1.0, dt=1.0)
+    assert g.expected_track == {"video": 60, "audio": 93.75}
+    assert g.expected_objs == 60 + 93.75
 
 
 def _free_udp_port():

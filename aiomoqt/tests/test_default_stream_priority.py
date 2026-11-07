@@ -48,6 +48,20 @@ def _spy(monkeypatch, name):
     return calls
 
 
+def _spy_open(monkeypatch):
+    """Priorities that ride a WT stream create, which calls no setter."""
+    calls = []
+    orig = _MOQTSessionMixin.open_uni_stream
+
+    async def spy(self, initial=b"", priority=None):
+        sid = await orig(self, initial=initial, priority=priority)
+        if self._is_wt and priority is not None:
+            calls.append((self, sid, priority, True))
+        return sid
+    monkeypatch.setattr(_MOQTSessionMixin, "open_uni_stream", spy)
+    return calls
+
+
 async def _run(port, use_quic, scheduling, monkeypatch):
     """Two tracks through the relay; objects received per track."""
     _reset_relay_state()
@@ -111,13 +125,14 @@ async def test_sessions_default_to_the_neutral_band(
 async def test_data_streams_take_their_track_band(
         use_quic, scheduling, monkeypatch):
     bands = _spy(monkeypatch, "set_stream_priority")
+    opens = _spy_open(monkeypatch)
     port = _BASE_PORT + 4 + 2 * (not use_quic) + (scheduling != "fifo")
     pub, server = await _run(port, use_quic, scheduling, monkeypatch)
 
     want = {to_stream_priority(p, discipline=scheduling)
             for p in _TRACKS.values()}
     assert {p % 2 for p in want} == {1 if scheduling == "fifo" else 0}
-    data = [(s, p, ok) for s, _sid, p, ok in bands
+    data = [(s, p, ok) for s, _sid, p, ok in bands + opens
             if p != STREAM_BAND_CONTROL]
     assert all(ok for _s, _p, ok in data), data
     pub_bands = [p for s, p, _ok in data if s is pub]
