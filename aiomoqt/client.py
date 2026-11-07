@@ -20,15 +20,17 @@ logger = get_logger(__name__)
 
 
 class SharedTransport:
-    """One picoquic worker, socket and RX ring for many MOQTClient connections.
+    """One picoquic worker and RX ring for many MOQTClient connections.
 
     Pass it as MOQTClient(shared_transport=), from one event loop. The first
     connection's settings apply to all, so give every client the same ones.
-    close() after the last connection ends.
+    close() after the last connection ends. With `sockets` above 1, on Linux,
+    connections take that many source ports in turn; otherwise they share one.
     """
 
-    def __init__(self, ring_capacity: Optional[int] = None) -> None:
+    def __init__(self, ring_capacity: Optional[int] = None, sockets: int = 0) -> None:
         self.ring_capacity = ring_capacity
+        self.sockets = sockets
         self._engine: Any = None
         self._wt_transport: Optional[TransportContext] = None
 
@@ -37,7 +39,8 @@ class SharedTransport:
         """The raw QUIC side, created on first use."""
         if self._engine is None:
             from aiopquic.asyncio.client import QuicClientEngine
-            self._engine = QuicClientEngine(ring_capacity=self.ring_capacity)
+            self._engine = QuicClientEngine(ring_capacity=self.ring_capacity,
+                                            sockets=self.sockets)
         return self._engine
 
     def close(self) -> None:
@@ -296,6 +299,8 @@ class MOQTClient(MOQTPeer):
                     (self.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(self.socket_buffer_size or 0),
                 qlog_dir=wt_cfg.qlog_dir,
+                **({"client_sockets": shared.sockets}
+                   if shared is not None and shared.sockets else {}),
             )
             if shared is not None:
                 shared._wt_transport = transport

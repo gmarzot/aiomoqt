@@ -542,7 +542,9 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             })
             last_t = now
 
-    shared = (SharedTransport(ring_capacity=min(SHARED_RING_MAX, SHARED_RING_PER_SUB * K))
+    # One source port per sub, so a relay hashing them spreads them like viewers.
+    shared = (SharedTransport(ring_capacity=min(SHARED_RING_MAX, SHARED_RING_PER_SUB * K),
+                              sockets=config.get('worker_sockets') or K)
               if config.get('shared_transport') else None)
     supervisors = [
         asyncio.create_task(

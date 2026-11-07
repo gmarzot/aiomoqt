@@ -2,7 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
-- adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`; `--worker-per-sub` keeps the old layout for comparison. Needs aiopquic 0.8.0 on raw QUIC.
+- adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`; with one source port per subscriber. `--worker-per-sub` and `--worker-sockets` compare layouts. Needs aiopquic 0.8.0 on raw QUIC.
 - adaptive_bench `--exit max` also ends a run at its first back-off, if that comes before the max.
 - aiomoqt-relay `--admission-cpu PCT` and `--max-subscribers N`: near overload, past the count the relay last closed at (which then rises 5% a minute), or at the limit, a session's first SUBSCRIBE is refused with EXCESSIVE_LOAD and a randomized Retry Interval; sessions already subscribed may add tracks. Off by default. `status.json` gains `totals.admission` and `totals.queue_ms`.
 - adaptive_bench and load_sim subscribers wait out a refused subscribe's Retry Interval on the same connection instead of reconnecting at once, and adaptive_bench no longer reaps a worker whose subscribers are all refused.

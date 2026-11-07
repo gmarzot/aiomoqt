@@ -76,9 +76,9 @@ SIGUSR1.
   receiver buffers that much per stream.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
-- Many sessions in one process: `MOQTClient(shared_transport=SharedTransport())` puts them on one
-  picoquic worker and socket, far cheaper than one each. All its connections share a source port, so a
-  relay that hashes it to a worker thread (mvfst) serves them all from one thread.
+- Many sessions in one process: `MOQTClient(shared_transport=SharedTransport(sockets=N))` puts them on
+  one picoquic worker, far cheaper than one each. Give it one socket per session on Linux: sessions sharing
+  a source port all land on one worker thread of a relay that hashes ports to threads (mvfst).
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
   refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
 - Ending a track: a `produce()` track sends End of Track after its last object, then

@@ -543,7 +543,8 @@ class SubsActuator:
                  stagger: float = 0.1,
                  shortfall_ratio: float = 0.85,
                  transport_options: Optional[dict] = None,
-                 shared_transport: bool = True):
+                 shared_transport: bool = True,
+                 worker_sockets: int = 0):
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -576,6 +577,7 @@ class SubsActuator:
         self.keep_window = max(3.0, 1.5 * interval_s)
         self.transport_options = dict(transport_options or {})
         self.shared_transport = shared_transport
+        self.worker_sockets = worker_sockets
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
@@ -723,6 +725,7 @@ class SubsActuator:
                 per_sub_mbps=self.per_sub_mbps,
                 keep_window=self.keep_window,
                 shared_transport=self.shared_transport,
+                worker_sockets=self.worker_sockets,
                 **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -1665,6 +1668,9 @@ def parse_args():
     p.add_argument("--worker-per-sub", action="store_true",
                    help="subs mode: one picoquic worker per subscriber "
                         "instead of one per process, to compare layouts")
+    p.add_argument("--worker-sockets", type=int, default=0, metavar="N",
+                   help="subs mode: source ports per worker process, to compare "
+                        "(default: one per subscriber)")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -1959,6 +1965,7 @@ async def main():
             shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
             shared_transport=not args.worker_per_sub,
+            worker_sockets=args.worker_sockets,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
