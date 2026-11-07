@@ -177,6 +177,11 @@ Thread time here includes hypervisor steal, which is why it tracks real headroom
 leaves steal out of thread time it reads low. `max-subscribers = N` adds a fixed limit. `status.json` reports `totals.admission` and
 `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
 
+`lag-limit = 2` keeps a viewer within about 2 s of live: past that, counting what its queue and its
+QUIC streams hold at the track's input rate, it skips to a newer group. It sees a freeze of up to one
+group instead of falling further behind. A subscriber's own delivery timeout replaces the limit.
+`status.json` reports skipped objects as `shed_objects`; the dashboard shows them on the Drops tile.
+
 ## nginx config
 
 `nginx.conf` is bind-mounted as a single file. Replacing it gives it a new inode, and

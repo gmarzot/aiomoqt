@@ -37,6 +37,9 @@ _CLOSE = ("CLOSE",)
 # subscriber, and a publisher's per peer.
 LANE_BYTES = 4 * 1024 * 1024
 PUBLISHER_LANE_BYTES = 16 * 1024 * 1024
+# A lane's time bound never goes under this: a low-rate track's objects
+# and bursts are not shed.
+LANE_MIN_BYTES = 64 * 1024
 # Live offers between reads of a lane's transport backlog.
 LANE_TX_PROBE = 8
 # Seconds between a lane's shed log lines after its first.
@@ -802,11 +805,12 @@ class SendLane:
     """One peer's objects behind its own FIFO and writer task.
 
     The source hands each object to every lane without waiting, so a
-    peer held up by its transport holds up only itself. Past `max_bytes`
-    of live objects, counting what the peer's streams still hold in the
-    transport, the lane sheds whole groups: their streams are reset,
-    never FINed short, and delivery resumes at a newer group. Group IDs
-    are taken to ascend.
+    peer held up by its transport holds up only itself. Past `bound`
+    bytes of live objects, counting what the peer's streams still hold in
+    the transport, the lane sheds whole groups: their streams are reset,
+    never FINed short, and delivery resumes at a newer group. `bound` is
+    `max_bytes`, or less once `rate` gives the bytes `deadline` covers.
+    Group IDs are taken to ascend.
 
     An item is a tuple (group_id, cost, live, born, ...), the rest for
     the writer: `cost` is the object's retained_object_bytes, 0 for a
@@ -831,6 +835,8 @@ class SendLane:
                  name: str = ""):
         self.writer = writer
         self.max_bytes = max_bytes
+        self.bound = max_bytes   # bytes held before shedding
+        self._rate = 0.0         # the track's input bytes/s, 0 for unknown
         self.name = name         # the track's, for logs
         self.items: deque = deque()
         self.bytes = 0           # live object bytes queued
@@ -886,8 +892,25 @@ class SendLane:
     @deadline.setter
     def deadline(self, value: Optional[float]) -> None:
         self._deadline = value or None
+        self._set_bound()
         if self.on_deadline is not None:
             self.on_deadline()
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    @rate.setter
+    def rate(self, value: float) -> None:
+        self._rate = value
+        self._set_bound()
+
+    def _set_bound(self) -> None:
+        bound = self.max_bytes
+        if self._deadline is not None and self._rate > 0:
+            bound = min(bound, max(LANE_MIN_BYTES,
+                                   int(self._rate * self._deadline)))
+        self.bound = bound
 
     @property
     def idle(self) -> bool:
@@ -920,7 +943,7 @@ class SendLane:
             self._probe_n += 1
         nowait = self._nowait
         if (nowait is not None and not self.items and not self.busy
-                and self.gate and self.tx_bytes + cost <= self.max_bytes):
+                and self.gate and self.tx_bytes + cost <= self.bound):
             try:
                 sent = nowait(item)
             except Exception as e:
@@ -940,7 +963,7 @@ class SendLane:
                 self.replay_bytes += cost
         self.items.append(item)
         self._wake.set()
-        if live and self.bytes + self.tx_bytes > self.max_bytes:
+        if live and self.bytes + self.tx_bytes > self.bound:
             self._shed(gid)
         return True
 
@@ -1033,7 +1056,7 @@ class SendLane:
         floor = gid
         self._drop_below(floor)
         self.tx_bytes = writer.tx_queued(floor)
-        if self.bytes + self.tx_bytes > self.max_bytes:
+        if self.bytes + self.tx_bytes > self.bound:
             floor = gid + 1
             self._drop_below(floor)
             self.tx_bytes = writer.tx_queued(floor)
@@ -1061,7 +1084,7 @@ class SendLane:
         who = f"{self.prefix}{self._who()}"
         if self._logged_at is None:
             self.log.warning(
-                f"{who} over its {self.max_bytes}-byte send lane: resetting "
+                f"{who} over its {self.bound}-byte send lane: resetting "
                 f"groups below {self.floor}")
         else:
             self.log.info(

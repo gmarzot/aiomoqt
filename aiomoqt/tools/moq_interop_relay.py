@@ -40,7 +40,8 @@ Limits:
     OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
     and the subscriber's), else live objects past --lag-limit seconds,
     resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
-    the group. Past the track's MAX_CACHE_DURATION an object is neither
+    the group. The same deadline at the track's input rate bounds what
+    the lane and its streams hold: past it, whole groups are shed. Past the track's MAX_CACHE_DURATION an object is neither
     sent nor served from the cache: a request for it goes upstream.
   * Namespace tables are in memory and global to the process.
 
@@ -259,6 +260,8 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
+# A track's input rate falls by at most this factor per lane check.
+IN_RATE_DECAY = 0.9
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -478,6 +481,8 @@ def _kib(n) -> str:
 
 def _check_lanes() -> None:
     now = time.monotonic()
+    for track in list(_tracks.values()):
+        track.update_in_rate(now)
     for lane in list(_lanes):
         lane.check(now, LANE_STALL_S)
 
@@ -721,9 +726,9 @@ class _TracedRelayDelivery(_RelayDelivery):
 
 
 class _RelayLane(SendLane):
-    """One subscriber's SendLane, bounded by LANE_BYTES and registered
-    for the stall check and the status page. A failed write drops the
-    subscriber."""
+    """One subscriber's SendLane, bounded by LANE_BYTES or its deadline at
+    the track's input rate, and registered for the stall check and the
+    status page. A failed write drops the subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -735,12 +740,14 @@ class _RelayLane(SendLane):
         writer.lane = self
         self.track = track
         self.d = d
+        self.rate = track._in_rate
         _lanes.add(self)
         track._lanes.add(self)
 
     def _exit(self) -> None:
         _lanes.discard(self)
         self.track._lanes.discard(self)
+        self.track._shed_done += self.shed + self.expired
         super()._exit()
 
     def _who(self) -> str:
@@ -965,6 +972,11 @@ class _RelayedTrack:
         self._objects_out = 0
         # Dashboard counters: payload bytes, most subscribers at once,
         # FETCHes served, subscribers dropped on a failed write.
+        self._shed_done = 0      # objects skipped by lanes that have ended
+        # Input bytes/s, held near recent peaks so a lull doesn't tighten
+        # the lanes' time bounds before the next burst.
+        self._in_rate = 0.0
+        self._rate_mark = (time.monotonic(), 0)
         self._bytes_in = 0
         self._bytes_out = 0
         self._peak_subs = 0
@@ -1181,6 +1193,22 @@ class _RelayedTrack:
                 self._streams.pop(k, None)
                 streamed = True
         return streamed or not self._datagrams
+
+    def update_in_rate(self, now: float) -> None:
+        """Measure the input rate and hand it to the track's lanes."""
+        then, seen = self._rate_mark
+        if now <= then:
+            return
+        self._rate_mark = (now, self._bytes_in)
+        rate = max((self._bytes_in - seen) / (now - then),
+                   self._in_rate * IN_RATE_DECAY)
+        self._in_rate = rate
+        for lane in self._lanes:
+            lane.rate = rate
+
+    def shed_objects(self) -> int:
+        """Objects its lanes skipped, ended lanes included."""
+        return self._shed_done + sum(ln.shed + ln.expired for ln in self._lanes)
 
     def _queued(self, d) -> bool:
         """`d`'s lane still holds or is writing something."""
@@ -3803,7 +3831,10 @@ def parse_args(argv=None):
                         help="Drop a subscriber's live objects older than "
                              "SEC seconds when no OBJECT_DELIVERY_TIMEOUT "
                              "applies, resetting the subgroup with "
-                             "DELIVERY_TIMEOUT. Cache replays are exempt. "
+                             "DELIVERY_TIMEOUT, and shed whole groups once "
+                             "its queue and streams hold more than SEC at "
+                             "the track's input rate. Cache replays are "
+                             "exempt. "
                              f"0 = never. Default: {LAG_LIMIT_S:g}")
     parser.add_argument("--goaway-uri", type=str, default="", metavar="URL",
                         help="New Session URI sent in GOAWAY on SIGTERM or "
@@ -4910,7 +4941,7 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
-                 "drops")
+                 "drops", "shed_objects")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -4965,6 +4996,7 @@ class _Status:
         self._quic_prev: dict[int, tuple] = {}
         self._delivered = 0
         self._drops = 0
+        self._shed = 0
         self._last = None
 
     async def run(self) -> None:
@@ -5014,10 +5046,12 @@ class _Status:
         for key, t in list(_tracks.items()):
             if _internal_ns(key[0]):
                 continue
-            p_in, p_out, p_drops, p_obj, p_grp = self._track_prev.get(
-                id(t), (0, 0, 0, 0, 0))
+            p_in, p_out, p_drops, p_obj, p_grp, p_shed = self._track_prev.get(
+                id(t), (0, 0, 0, 0, 0, 0))
+            shed = t.shed_objects()
             prev[id(t)] = (t._bytes_in, t._bytes_out, t._drops, t._objects_in,
-                           t._groups_in)
+                           t._groups_in, shed)
+            self._shed += shed - p_shed
             self._delivered += t._bytes_out - p_out
             self._drops += t._drops - p_drops
             owner = _track_owner(t)
@@ -5068,6 +5102,7 @@ class _Status:
                 "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
                 "objects_in": t._objects_in, "objects_out": t._objects_out,
                 "fetches": t._fetches, "drops": t._drops,
+                "shed_objects": shed,
                 "fetch_cache_bytes": t._fetch_bytes["cache"],
                 "fetch_upstream_bytes": t._fetch_bytes["upstream"],
                 "groups_in": t._groups_in,
@@ -5209,6 +5244,7 @@ class _Status:
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
+            "shed_objects": self._shed,
             "fetches": sum(r["fetches"] for _, r in tracks),
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
@@ -5253,6 +5289,7 @@ class _Status:
             "groups_per_s": totals["groups_per_s"],
             "groups_out_per_s": totals["groups_out_per_s"],
             "drops": totals["drops"],
+            "shed_objects": totals["shed_objects"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)
