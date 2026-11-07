@@ -747,7 +747,7 @@ class _RelayLane(SendLane):
     def _exit(self) -> None:
         _lanes.discard(self)
         self.track._lanes.discard(self)
-        self.track._shed_done += self.shed + self.expired
+        self.track._shed_done += self.shed_bytes
         super()._exit()
 
     def _who(self) -> str:
@@ -972,7 +972,7 @@ class _RelayedTrack:
         self._objects_out = 0
         # Dashboard counters: payload bytes, most subscribers at once,
         # FETCHes served, subscribers dropped on a failed write.
-        self._shed_done = 0      # objects skipped by lanes that have ended
+        self._shed_done = 0      # bytes skipped by lanes that have ended
         # Input bytes/s, held near recent peaks so a lull doesn't tighten
         # the lanes' time bounds before the next burst.
         self._in_rate = 0.0
@@ -1206,9 +1206,9 @@ class _RelayedTrack:
         for lane in self._lanes:
             lane.rate = rate
 
-    def shed_objects(self) -> int:
-        """Objects its lanes skipped, ended lanes included."""
-        return self._shed_done + sum(ln.shed + ln.expired for ln in self._lanes)
+    def shed_bytes(self) -> int:
+        """Bytes its lanes skipped, ended lanes included."""
+        return self._shed_done + sum(ln.shed_bytes for ln in self._lanes)
 
     def _queued(self, d) -> bool:
         """`d`'s lane still holds or is writing something."""
@@ -4942,7 +4942,7 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
                  "send_late_ms",
-                 "drops", "shed_objects")
+                 "drops", "shed_bytes")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -5062,7 +5062,7 @@ class _Status:
                 continue
             p_in, p_out, p_drops, p_obj, p_grp, p_shed = self._track_prev.get(
                 id(t), (0, 0, 0, 0, 0, 0))
-            shed = t.shed_objects()
+            shed = t.shed_bytes()
             prev[id(t)] = (t._bytes_in, t._bytes_out, t._drops, t._objects_in,
                            t._groups_in, shed)
             self._shed += shed - p_shed
@@ -5116,7 +5116,7 @@ class _Status:
                 "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
                 "objects_in": t._objects_in, "objects_out": t._objects_out,
                 "fetches": t._fetches, "drops": t._drops,
-                "shed_objects": shed,
+                "shed_bytes": shed,
                 "fetch_cache_bytes": t._fetch_bytes["cache"],
                 "fetch_upstream_bytes": t._fetch_bytes["upstream"],
                 "groups_in": t._groups_in,
@@ -5258,7 +5258,7 @@ class _Status:
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
-            "shed_objects": self._shed,
+            "shed_bytes": self._shed,
             "fetches": sum(r["fetches"] for _, r in tracks),
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
@@ -5305,7 +5305,7 @@ class _Status:
             "groups_out_per_s": totals["groups_out_per_s"],
             "send_late_ms": totals["send_late_ms"],
             "drops": totals["drops"],
-            "shed_objects": totals["shed_objects"],
+            "shed_bytes": totals["shed_bytes"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)
