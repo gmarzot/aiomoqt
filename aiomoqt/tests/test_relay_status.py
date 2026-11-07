@@ -393,6 +393,9 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert totals["publishers"] == 1
     assert totals["ingress_bps"] > 0 and totals["egress_bps"] > 0
     assert totals["rtt_p50_ms"] is not None
+    assert totals["admission"] == {"open": True, "thread_pct": None,
+                                   "ceiling": None, "refused": 0}
+    assert totals["queue_ms"]["p50"] is not None
     assert sorted(s["role"] for s in snap["sessions"]) == [
         "pub", "sub", "sub"]
     # What each session holds against its per-session caps.
