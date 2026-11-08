@@ -457,11 +457,12 @@ ramp use `load_sim --subs N` (flow E).
 SEC seconds and passes only if every tick stays under the threshold with no
 shortfall, no lossy, late or refused subscriber and no lost object, and its
 p90 has stopped rising. Steps add 10% while p90 is under a tenth of the
-threshold, 5% under a quarter, then one group. The first failure drops
-straight back to the last passing level, which must then hold for
-`--confirm` (30 s). The level is then held, still checked, until `-t`, so
-subscriber hosts running side by side end together; a fault there steps down
-one group and confirms again. `--exit sustained` ends the run at the
+threshold, 5% under a quarter, then one group. The first failure drops every
+subscriber, waits `--trial-gap` (5 s) and rejoins at the last passing level,
+because a relay that does not shed late work cannot drain a backlog under
+load. That level must then hold for `--confirm` (30 s). It is then held, still
+checked, until `-t`, so subscriber hosts running side by side end together; a
+fault there resets one group lower and confirms again. `--exit sustained` ends the run at the
 confirmation instead. The summary's `Sustained` line is the level held to
 the end and for how long, or `not demonstrated`.
 
