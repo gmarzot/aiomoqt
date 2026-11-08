@@ -775,8 +775,12 @@ class _RelayLane(SendLane):
         return False
 
     def _failed(self, item, error) -> bool:
-        logger.debug("relay: forward failed, dropping subscriber",
-                     exc_info=error)
+        # CancelledError here is a session that ended mid-write.
+        log = (logger.debug if isinstance(error, asyncio.CancelledError)
+               else logger.warning)
+        log(f"relay: forward to {self._who()} failed, dropping the "
+            f"subscriber: {error!r}")
+        logger.debug("relay: forward failure", exc_info=error)
         self.track._drops += 1
         self.track.drop_session(self.d.session)
         return False
@@ -3882,8 +3886,8 @@ def parse_args(argv=None):
     parser.add_argument("--stream-ring-cap", type=int, default=1 << 20,
                         metavar="BYTES",
                         help="Per-stream send buffer, allocated whole for "
-                             "each open stream; must exceed the largest "
-                             "object. Default: 1 MiB")
+                             "each open stream; larger objects are written "
+                             "in pieces. Default: 1 MiB")
     parser.add_argument("--max-inflight-bytes", type=int, default=512 << 10,
                         metavar="BYTES",
                         help="Per-stream send budget, below "

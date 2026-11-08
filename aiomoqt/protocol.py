@@ -3771,6 +3771,21 @@ class _MOQTSessionMixin:
             return False
         return True
 
+    _ring_cap: Optional[int] = None
+
+    def _stream_ring_cap(self) -> int:
+        """The most one write may put on a stream: its TX ring's size,
+        or 0 when the transport doesn't say. Fixed for the session."""
+        cap = self._ring_cap
+        if cap is None:
+            if self._is_wt:
+                cap = getattr(self, "stream_ring_cap", 0) or 0
+            else:
+                cfg = getattr(self._quic, "_configuration", None)
+                cap = getattr(cfg, "stream_ring_cap", 0) or 0
+            self._ring_cap = cap
+        return cap
+
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False) -> None:
         """Write bytes with backpressure.
@@ -3794,6 +3809,16 @@ class _MOQTSessionMixin:
         if stream_id in self._stopped_streams:
             self._stopped_streams.discard(stream_id)
             raise MOQTStreamStopped()
+        cap = self._stream_ring_cap()
+        if cap and len(data) > cap:
+            # aiopquic refuses a single write larger than the stream's ring.
+            piece = cap // 2
+            view = memoryview(data)
+            for at in range(0, len(data), piece):
+                await self.stream_write_drain(
+                    stream_id, bytes(view[at:at + piece]),
+                    end_stream=end_stream and at + piece >= len(data))
+            return
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
         # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx
@@ -3840,15 +3865,18 @@ class _MOQTSessionMixin:
     def stream_write_nowait(self, stream_id: int, data: bytes) -> bool:
         """stream_write_drain() when it would not wait: True once the
         transport holds `data`. False, with nothing written, when the
-        session is closing, the stream is over its budget or the
-        transport is near full. A stopped stream raises
-        MOQTStreamStopped."""
+        session is closing, the stream is over its budget, the transport
+        is near full or `data` is larger than the stream's ring. A
+        stopped stream raises MOQTStreamStopped."""
         quic = self._quic
         if not self._session_writable() or getattr(quic, 'closed', False):
             return False
         if stream_id in self._stopped_streams:
             self._stopped_streams.discard(stream_id)
             raise MOQTStreamStopped()
+        cap = self._stream_ring_cap()
+        if cap and len(data) > cap:
+            return False
         max_bytes = self._session.tx_max_inflight_bytes
         if (max_bytes is not None
                 and quic.tx_data_ring_used(stream_id) > max_bytes):
