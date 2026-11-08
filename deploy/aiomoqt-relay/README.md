@@ -171,9 +171,8 @@ environment. After copying an edited file over, run `docker compose restart rela
 
 New subscribers are not refused for load; past saturation the relay sheds instead. `lag-limit`
 (below) keeps each viewer near live by skipping groups, and per-session caps bound its requests.
-`admission-cpu = PCT` refuses new subscribers with `EXCESSIVE_LOAD` while the busiest thread is at
-PCT, and `max-subscribers = N` sets a fixed limit; neither is set here. `status.json` reports
-`totals.admission` and `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
+`max-subscribers = N` sets a fixed limit, not set here. `status.json` reports `totals.admission`
+and `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
 
 `lag-limit`, 5 s by default, keeps a viewer that close to live: past that, counting what its queue and
 its QUIC streams hold at the track's input rate, it skips to a newer group. It sees a freeze of up to
