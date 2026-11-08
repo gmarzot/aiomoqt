@@ -33,6 +33,8 @@ publisher media   -s/--object-size -g/--group-size -P/--streams
                   -r/--rate -D/--datagram, plus video
 video             --video RES: -r = frame rate, -g = GOP frames; refuses
                   -s/-P/-D (check_video)
+side tracks       --audio --catalog beside --video; with them -D applies to
+                  --audio (check_side_tracks)
 run               -t/--duration -d/--debug --no-stats
 logging           --log-level --log (long only; -d/--debug = --log-level
                   debug)
@@ -458,6 +460,60 @@ def check_datagram(parser, args):
         parser.error(
             f'-D/--datagram: object-size {size} can never fit a DATAGRAM '
             f'frame (max ~{DGRAM_MAX_OBJECT} B; frames cannot fragment)')
+
+
+# --audio: AAC at 128 kbps, 1024-sample frames at 48 kHz.
+AUDIO_RATE = 48000 / 1024
+AUDIO_OBJECT_SIZE = 341
+CATALOG_RATE = 1.0
+CATALOG_OBJECT_SIZE = 512
+
+
+def add_side_tracks(p):
+    """--audio and --catalog: tracks beside --video, one object per group."""
+    p.add_argument('--audio', action='store_true',
+                   help="With --video: also 'audio', "
+                        f"{AUDIO_OBJECT_SIZE} B objects at {AUDIO_RATE:g}/s "
+                        "(AAC, 128 kbps), one object per group; with -D, as "
+                        "ObjectDatagrams")
+    p.add_argument('--catalog', action='store_true',
+                   help="With --video: also 'catalog', "
+                        f"{CATALOG_OBJECT_SIZE} B objects at {CATALOG_RATE:g}/s, "
+                        "one object per group. With --audio or --catalog, -T "
+                        "defaults to 'video'")
+
+
+def check_side_tracks(parser, args):
+    """--audio/--catalog validity and -T's default, before check_video.
+    With --video, -D applies to the --audio track. Sets args.side_tracks."""
+    side = [n for n in ('audio', 'catalog') if getattr(args, n)]
+    for name in side:
+        if not args.video:
+            parser.error(f'--{name} needs --video')
+    args.audio_datagram = bool(args.video and args.audio
+                               and getattr(args, 'datagram', False))
+    if args.audio_datagram:
+        args.datagram = False
+        given(args).discard('datagram')
+    if side and args.trackname is None:
+        args.trackname = 'video'
+    if args.trackname in side:
+        parser.error(f"-T {args.trackname} clashes with --{args.trackname}")
+    args.side_tracks = side_track_shapes(args)
+
+
+def side_track_shapes(args):
+    """(name, object size, objects/s, as datagrams) per side track."""
+    shapes = ([('catalog', CATALOG_OBJECT_SIZE, CATALOG_RATE, False)]
+              if args.catalog else [])
+    if args.audio:
+        shapes.append(('audio', AUDIO_OBJECT_SIZE, AUDIO_RATE,
+                       args.audio_datagram))
+    return shapes
+
+
+def side_tracks_mbps(shapes):
+    return sum(size * 8 * rate for _, size, rate, _ in shapes) / 1e6
 
 
 def check_video(parser, args):
