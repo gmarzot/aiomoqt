@@ -1,4 +1,4 @@
-"""adaptive_bench --join-search: the largest burst of joins a relay serves."""
+"""adaptive_bench --join-burst: the largest burst of joins a relay serves."""
 import asyncio
 import queue
 import random
@@ -222,19 +222,19 @@ def test_percentile_is_nearest_rank():
 
 
 @pytest.mark.parametrize('extra, why', [
-    (['--join-search', '5'], 'subs-mode only'),
-    (['--join-search', '5', '--mode', 'subs', '--hold', '30'], 'drop --hold'),
-    (['--join-search', '5', '--mode', 'subs', '--exit', 'max'], 'drop --exit'),
-    (['--join-search', '5', '--mode', 'subs', '--exit', 'sustained'], 'drop --exit'),
-    (['--join-search', '5', '--mode', 'subs', '--too-far-behind', '2'],
+    (['--join-burst', '5'], 'subs-mode only'),
+    (['--join-burst', '5', '--mode', 'subs', '--hold', '30'], 'drop --hold'),
+    (['--join-burst', '5', '--mode', 'subs', '--exit', 'max'], 'drop --exit'),
+    (['--join-burst', '5', '--mode', 'subs', '--exit', 'sustained'], 'drop --exit'),
+    (['--join-burst', '5', '--mode', 'subs', '--too-far-behind', '2'],
      'drop --too-far-behind'),
-    (['--join-search', '0', '--mode', 'subs'], 'at least 1'),
-    (['--join-search', '5', '--join-max', '4', '--mode', 'subs'], 'at least --join-search'),
-    (['--join-search', '5', '--mode', 'subs', '--trial-gap', '0'], 'positive'),
-    (['--join-search', '5', '--mode', 'subs', '--watchers', '1'], 'between 0 and 1'),
+    (['--join-burst', '0', '--mode', 'subs'], 'at least 1'),
+    (['--join-burst', '5', '--join-max', '4', '--mode', 'subs'], 'at least --join-burst'),
+    (['--join-burst', '5', '--mode', 'subs', '--trial-gap', '0'], 'positive'),
+    (['--join-burst', '5', '--mode', 'subs', '--watchers', '1'], 'between 0 and 1'),
     (['--join-steps', '5,10', '--mode', 'subs'], 'unrecognized arguments'),
 ])
-def test_join_search_refuses(monkeypatch, capsys, extra, why):
+def test_join_burst_refuses(monkeypatch, capsys, extra, why):
     monkeypatch.setattr(sys, 'argv', ['moq-adaptive-bench', 'moqt://127.0.0.1:4433', *extra])
     with pytest.raises(SystemExit):
         ab.parse_args()
@@ -243,7 +243,7 @@ def test_join_search_refuses(monkeypatch, capsys, extra, why):
 
 def test_the_banner_says_start_subs_is_ignored(monkeypatch, capsys):
     monkeypatch.setattr(sys, 'argv', ['moq-adaptive-bench', 'moqt://127.0.0.1:4433',
-                                      '--mode', 'subs', '--join-search', '5',
+                                      '--mode', 'subs', '--join-burst', '5',
                                       '--join-max', '60', '--max-subs', '80',
                                       '--start-subs', '7'])
     ab._print_banner(ab.parse_args())
@@ -293,7 +293,7 @@ def _actuator(monkeypatch, step_subs=1, max_subs=4):
     return ab.SubsActuator('moqt://127.0.0.1:4433', 'ns', 'track', None, True,
                            force_quic=False, min_subs=1, max_subs=max_subs, start_subs=1,
                            step_subs=step_subs, object_size=1000, per_sub_mbps=8.0,
-                           interval_s=1.0, stagger=0.0, join_search=True)
+                           interval_s=1.0, stagger=0.0, join_burst=True)
 
 
 def _report(wid=0, **extra):

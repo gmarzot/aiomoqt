@@ -420,7 +420,7 @@ python -m aiomoqt.tools.adaptive_bench moqt://127.0.0.1:4433 -k --draft 18 --mod
 On the **load host**:
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -j 10 -S 0.1 --sub-filter next-group-start -t 300 --report subs-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -I 10 -S 0.1 --sub-filter next-group-start -t 300 --report subs-ramp.csv
 ```
 
 It prints what it is waiting for:
@@ -436,7 +436,7 @@ Ramp knobs:
 | Flag | Meaning |
 |---|---|
 | `--step-subs` | subscribers per group, and the batch size: one worker process hosts a group |
-| `-j` / `--join-rate` | seconds between groups. The ramp cadence, independent of `--interval`, which is only reporting |
+| `-I` / `--group-interval` | seconds between groups. The ramp cadence, independent of `--interval`, which is only reporting. New subscribers per second = `--step-subs` / `-I` |
 | `-S` / `--stagger` | seconds between individual joins inside a group (default 0.1). Spaces the QUIC Initials so a group does not burst the relay; 0 opens the batch at once |
 | `--sub-filter` | `next-group-start` skips the current-group replay some relays do on `latest-object`, the default |
 
@@ -465,7 +465,7 @@ one group and confirms again. `--exit sustained` ends the run at the
 confirmation instead. The summary's `Sustained` line is the level held to
 the end and for how long, or `not demonstrated`.
 
-`--join-search B0` measures the largest burst of joins a relay serves while
+`--join-burst B0` measures the largest burst of joins a relay serves while
 an audience stays healthy. The first `--watchers` share (0.25) of each
 group's subscribers are watchers, never cycled; the rest are joiners. It
 holds `--max-subs` (`--start-subs` is ignored) for `--base-s` (30 s) under

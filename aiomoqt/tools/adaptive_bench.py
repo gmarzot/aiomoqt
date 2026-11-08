@@ -10,7 +10,7 @@ delivering subscribers) each interval and nudges one continuous
 publisher, or the subscriber count, up or down. Subs mode with --hold
 steps and holds instead, to the most subscribers it holds through a
 confirmation with no loss and p90 under the threshold, and holds them to
-the end of the run. Subs mode with --join-search holds an audience and
+the end of the run. Subs mode with --join-burst holds an audience and
 has bursts of its subscribers rejoin at once, to the largest burst served
 with that audience healthy.
 
@@ -583,12 +583,12 @@ class SubsActuator:
                  transport_options: Optional[dict] = None,
                  too_far_behind: float = 0.0,
                  slot_latency_ms: float = 0.0,
-                 join_search: bool = False,
+                 join_burst: bool = False,
                  watchers: float = 0.25):
         self.too_far_behind = too_far_behind
         # Workers get a shared trial Array (start time, joiners); see
         # start_trial(). They judge health on watchers once one starts.
-        self.join_search = join_search
+        self.join_burst = join_burst
         self.watchers = watchers
         self._trial_arrays: dict = {}
         self._trial: Optional[dict] = None
@@ -628,7 +628,7 @@ class SubsActuator:
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
-        # controller adding a group per --join-rate spawns one worker.
+        # controller adding a group per --group-interval spawns one worker.
         self.batch_size = max(1, int(step_subs))
         # Startup grace is a FIXED floor, not interval-scaled: QUIC
         # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
@@ -777,7 +777,7 @@ class SubsActuator:
         target = workers_target * self.batch_size
         self._targeted = float(target)
         # Spawn-up is BOUNDED to one worker (one group of K) per call:
-        # the controller adds a group every --join-rate, so an unbounded
+        # the controller adds a group every --group-interval, so an unbounded
         # respawn can't fire dozens of simultaneous batches at a
         # struggling relay (the death-spiral amplifier). Each worker
         # spaces its own K handshakes internally by --stagger.
@@ -802,7 +802,7 @@ class SubsActuator:
                 slot_latency_ms=self.slot_latency_ms,
                 **self.transport_options,
             )
-            if self.join_search:
+            if self.join_burst:
                 cfg['trial'] = self._trial_arrays[wid] = self._mp.Array('d', 2)
                 cfg['watchers'] = self.watchers
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -1139,14 +1139,14 @@ class AIMDController:
         self.interval_s = interval_s
         # tick_s = how often we observe / decide / add a group; report_s
         # = how often we print a row + write CSV. Subs mode passes
-        # tick_s=join_rate so a group is added every --join-rate while
+        # tick_s=group_interval so a group is added every --group-interval while
         # rows print every --interval. BW mode leaves tick_s=interval,
         # so every tick reports — byte-identical to the old behavior.
         self.report_s = interval_s
         self.tick_s = tick_s if (tick_s and tick_s > 0) else interval_s
         # Streaks are wall-clock windows; express them in ticks so the
         # dead-air / back-off / shortfall reaction times stay constant
-        # when tick_s < report_s (otherwise a fast --join-rate would
+        # when tick_s < report_s (otherwise a short --group-interval would
         # make a dead-air abort fire in ~2s instead of ~3 intervals).
         self._tpr = max(1, round(self.report_s / self.tick_s))
         self._last_report_t = 0.0
@@ -1438,7 +1438,7 @@ class AIMDController:
 
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
-        ticks at tick_s (= --join-rate in subs mode), but rows print at
+        ticks at tick_s (= --group-interval in subs mode), but rows print at
         --interval; force=True always emits (terminal + back-off rows
         the user must not miss)."""
         now = time.monotonic()
@@ -2240,12 +2240,14 @@ def parse_args():
                    action=_cli.StoreGiven,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps; with --video, the profile's)")
-    p.add_argument("-j", "--join-rate", type=float, default=None,
-                   dest="join_rate", metavar="SEC",
+    p.add_argument("-I", "--group-interval", type=float, default=None,
+                   dest="group_interval", metavar="SEC",
                    help="subs-mode: seconds between subscriber GROUPS "
-                        "(a group = --step-subs subs). The ramp cadence, "
+                        "(a group = --step-subs subs, so new subscribers per "
+                        "second = --step-subs / -I). The ramp cadence, "
                         "independent of --interval (reporting). Default: "
                         "--interval (one group per report).")
+    p.add_argument("-j", type=float, dest="group_interval", help=argparse.SUPPRESS)
     p.add_argument("-S", "--stagger", type=float, default=0.1,
                    help="subs-mode: seconds between individual joins "
                         "WITHIN a group (default: 0.1), applied inside "
@@ -2286,26 +2288,26 @@ def parse_args():
     p.add_argument("--confirm", type=float, default=30, metavar="SEC",
                    help="with --hold: seconds the final level must hold "
                         "to count (default: 30)")
-    p.add_argument("--join-search", type=int, default=None, metavar="B0",
+    p.add_argument("--join-burst", type=int, default=None, metavar="B0",
                    help="subs-mode: find the largest burst of subscribers joining "
                         "at once. Hold --max-subs for --base-s, then have B "
                         "joiners redial together, from B0 up, bisecting after "
                         "the first failure and confirming 3x; --start-subs is "
                         "ignored (default: off)")
     p.add_argument("--join-max", type=int, default=None, metavar="N",
-                   help="with --join-search: largest burst to try (default: the "
+                   help="with --join-burst: largest burst to try (default: the "
                         "eligible joiner pool)")
     p.add_argument("--join-bound", type=float, default=1000, metavar="MS",
-                   help="with --join-search: a join counts only with its first "
+                   help="with --join-burst: a join counts only with its first "
                         "object within MS of the burst (default: 1000)")
     p.add_argument("--trial-gap", type=float, default=5, metavar="SEC",
-                   help="with --join-search: seconds the watchers must run clean "
+                   help="with --join-burst: seconds the watchers must run clean "
                         "between bursts (default: 5)")
     p.add_argument("--base-s", type=float, default=30, metavar="SEC",
-                   help="with --join-search: seconds the base audience must "
+                   help="with --join-burst: seconds the base audience must "
                         "hold first (default: 30)")
     p.add_argument("--watchers", type=float, default=0.25, metavar="SHARE",
-                   help="with --join-search: share of each group's subscribers "
+                   help="with --join-burst: share of each group's subscribers "
                         "never cycled, whose health the bursts are judged on; "
                         "the rest join (default: 0.25)")
     _cli.add_logging(p)
@@ -2334,19 +2336,19 @@ def parse_args():
         p.error("--trial-gap, --base-s and --join-bound: positive")
     if not 0 < args.watchers < 1:
         p.error("--watchers: a share between 0 and 1")
-    if args.join_search is not None:
-        if args.join_search < 1:
-            p.error("--join-search: a burst of at least 1")
-        if args.join_max is not None and args.join_max < args.join_search:
-            p.error("--join-max: at least --join-search")
+    if args.join_burst is not None:
+        if args.join_burst < 1:
+            p.error("--join-burst: a burst of at least 1")
+        if args.join_max is not None and args.join_max < args.join_burst:
+            p.error("--join-max: at least --join-burst")
         if args.mode != "subs":
-            p.error("--join-search is subs-mode only")
+            p.error("--join-burst is subs-mode only")
         if args.hold:
-            p.error("--join-search runs its own trials; drop --hold")
+            p.error("--join-burst runs its own trials; drop --hold")
         if args.exit_on:
-            p.error("--join-search ends with its result; drop --exit")
+            p.error("--join-burst ends with its result; drop --exit")
         if args.too_far_behind:
-            p.error("--join-search judges each viewer's p90; drop --too-far-behind")
+            p.error("--join-burst judges each viewer's p90; drop --too-far-behind")
     if args.hold and args.mode != "subs":
         p.error("--hold is subs-mode only")
     if args.hold and args.exit_on == "max":
@@ -2457,10 +2459,10 @@ def _print_banner(args):
     if getattr(args, "hold", 0):
         print(f"  step and hold:      {args.hold:g} s per step, "
               f"{args.confirm:g} s to confirm")
-    if getattr(args, "join_search", None):
+    if getattr(args, "join_burst", None):
         top = f"B={args.join_max}" if args.join_max else "the pool"
         print(f"  join search:        {args.max_subs} subs (--start-subs ignored) held "
-              f"{args.base_s:g} s, then bursts from B={args.join_search} to {top}, "
+              f"{args.base_s:g} s, then bursts from B={args.join_burst} to {top}, "
               f"bound {args.join_bound:g} ms, gap {args.trial_gap:g} s, "
               f"{args.watchers:.0%} watchers")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
@@ -2687,7 +2689,7 @@ async def main():
             slot_latency_ms=(0.0 if args.skew_safe_signals
                              else args.too_far_behind * 1000
                              or args.latency_threshold),
-            join_search=args.join_search is not None,
+            join_burst=args.join_burst is not None,
             watchers=args.watchers,
         )
     else:
@@ -2806,15 +2808,15 @@ async def main():
             mp_rate_queue=mp_rate_q, mp_events_queue=mp_events_q,
             mp_stop_event=mp_stop_event,
         )
-    # Subs mode adds a group (--step-subs) every --join-rate while rows
+    # Subs mode adds a group (--step-subs) every --group-interval while rows
     # print every --interval; BW mode ticks at --interval (tick_s=None).
     hold = (dict(hold_s=args.hold, confirm_s=args.confirm,
                  exit_sustained=args.exit_on == "sustained")
             if args.hold else {})
     kind = HoldController if hold else AIMDController
-    if args.join_search is not None:
+    if args.join_burst is not None:
         kind, hold = JoinSearchController, dict(
-            b0=args.join_search, join_max=args.join_max, join_bound_ms=args.join_bound,
+            b0=args.join_burst, join_max=args.join_max, join_bound_ms=args.join_bound,
             trial_gap_s=args.trial_gap, base_s=args.base_s)
     controller = kind(
         actuator, state,
@@ -2825,7 +2827,7 @@ async def main():
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
         exit_at_max=args.exit_on == "max",
-        tick_s=(args.join_rate if args.mode == "subs" else None),
+        tick_s=(args.group_interval if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
         too_far_behind=bool(args.too_far_behind),
     )
