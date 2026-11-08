@@ -207,8 +207,8 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/bare --mp4 clip.mp4 --loop --no
 
 `abr_ingest` sits in front of a relay. The source publisher dials it, and it publishes the source
 unchanged plus an H.264 ladder of its video, under the same namespace with one catalog. It needs
-cymedia, which builds against the system's FFmpeg:
-`uv pip install git+https://github.com/gmarzot/cymedia`.
+[cymedia](https://github.com/gmarzot/cymedia), an optional extra that builds against the system's
+FFmpeg development files: `uv pip install 'aiomoqt[abr]'`.
 
 ```bash
 python -m aiomoqt.tools.abr_ingest -Q -p 4443 -N live/x $RELAY

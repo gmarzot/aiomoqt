@@ -5,7 +5,7 @@ group and object IDs and timestamps and opens each group on a key frame,
 so equally numbered groups line up across the ladder (msf §4.2). Nothing
 here knows about sessions or peers.
 
-AbrLadder needs cymedia: `uv pip install git+https://github.com/gmarzot/cymedia`.
+AbrLadder needs cymedia: `uv pip install 'aiomoqt[abr]'`.
 """
 from __future__ import annotations
 
@@ -170,8 +170,8 @@ class AbrLadder:
         try:
             cymedia = importlib.import_module("cymedia")
         except ImportError as e:
-            raise ImportError("the ABR ladder needs cymedia: uv pip install "
-                              "git+https://github.com/gmarzot/cymedia") from e
+            raise ImportError("the ABR ladder needs cymedia: "
+                              "uv pip install 'aiomoqt[abr]'") from e
         if not rungs:
             raise ValueError("no rungs")
         self.rungs = list(rungs)

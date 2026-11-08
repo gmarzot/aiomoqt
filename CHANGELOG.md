@@ -2,7 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
-- `abr_ingest`: an ABR ingester in front of a relay. A LOC broadcast dials in, or is subscribed from a relay, and goes out unchanged plus an H.264 ladder encoded by cymedia (NVENC or CPU) under the same namespace and catalog, each rung on the source's group and object IDs. It reports the delay from a frame's arrival to its hand-off, per track.
+- `abr_ingest`: an ABR ingester in front of a relay. A LOC broadcast dials in, or is subscribed from a relay, and goes out unchanged plus an H.264 ladder encoded by cymedia (NVENC or CPU; the `abr` extra) under the same namespace and catalog, each rung on the source's group and object IDs. It reports the delay from a frame's arrival to its hand-off, per track.
 - adaptive_bench counts the whole groups and group tails a subscriber never got as lost; before, its loss column read 0.0% while a relay shed groups. In subs mode a subscriber that lost an object in the keep window, or (with `--role both`) has p90 over the threshold, no longer counts as delivering, so it is a shortfall and stays out of high-water: `hold (subs losing objects)` and `hold (subs over threshold)` name it, and the summary gains `Lost` and the peak of each.
 - An object larger than a stream's send ring goes out in pieces instead of failing the write; through aiomoqt-relay at its 1 MiB `--stream-ring-cap`, a 4K keyframe no longer drops the subscriber. The relay logs a subscriber it drops for a failed forward at WARNING.
 - adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`, with one source port per subscriber. Needs aiopquic 0.8.0 on raw QUIC.

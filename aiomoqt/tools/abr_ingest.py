@@ -13,8 +13,8 @@ to that same relay needs another namespace (--out-ns).
 
 The video track (-T; default the catalog's first LOC video track) must be
 H.264. Every LOC track passes through unchanged. The rungs are encoded
-from the video by cymedia (uv pip install
-git+https://github.com/gmarzot/cymedia), keep its group and object IDs, open each group on a key frame and join its catalog altGroup.
+from the video by cymedia (uv pip install 'aiomoqt[abr]'), keep its group and
+object IDs, open each group on a key frame and join its catalog altGroup.
 
 Each -i interval reports, per output track, the delay from a source
 frame's arrival to its hand-off to the output track; rungs add the

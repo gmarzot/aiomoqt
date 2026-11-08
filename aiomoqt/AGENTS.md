@@ -33,7 +33,7 @@ Console scripts: `moq-pub-bench`, `moq-sub-bench`, `moq-loopback-bench`, `moq-ad
 `moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-interop-client`,
 `moq-interop-relay`, `aiomoqt-versions`. Others run as modules: `python -m
 aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--input` ingest needs the `media` extra),
-`aiomoqt.tools.abr_ingest` (ABR ladder; needs cymedia), `aiomoqt.tools.moqtest_origin`.
+`aiomoqt.tools.abr_ingest` (ABR ladder; needs the `abr` extra), `aiomoqt.tools.moqtest_origin`.
 
 Most tools share one flag grid from `aiomoqt.utils.cli` (listed in its module docstring):
 `-N` namespace, `-T` trackname, `-s` object size, `-g` group size, `-P` streams, `-r` rate,
