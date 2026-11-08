@@ -50,7 +50,8 @@ async def test_a_delivery_admitted_mid_group_does_not_claim_its_first_object():
         _profile = profile_for(18)
         streams = 0
 
-        async def open_uni_stream(self, initial=b"", priority=None):
+        async def open_uni_stream(self, initial=b"", priority=None,
+                                  end_stream=False):
             self.streams += 1
             if initial:
                 await self.stream_write_drain(self.streams, initial)

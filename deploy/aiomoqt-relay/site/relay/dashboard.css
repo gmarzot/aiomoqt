@@ -297,6 +297,7 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
 .jumps { display: inline-flex; gap: 8px; }
 .jump b { font-weight: 600; }
 .jump-error:not(:disabled) b, .jump-crash:not(:disabled) b { color: var(--red); }
+.jump-warning:not(:disabled) b { color: var(--amber); }
 .log-pane {
   height: calc(100vh - 230px); min-height: 320px; overflow: auto; background: var(--field);
   border: 1px solid var(--edge); border-radius: 6px; padding: 6px 0;

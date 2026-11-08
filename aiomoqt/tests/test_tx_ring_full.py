@@ -243,9 +243,10 @@ async def test_object_stream_header_and_fin_survive_a_full_ring(draft):
     drain = _drain_later(ring)
     await delivery.write(0, 0, b"a", group_start=True)
     await drain
-    assert await _until(lambda: len(ring.ops) == 2)
-    sids = {op[1] for op in ring.ops}
-    assert len(sids) == 1
-    sent = _data(ring, sids.pop())
-    assert [fin for _, fin in sent] == [False, True]
-    assert sent[1][0] == b""
+    # The header, the object and the FIN open the stream together.
+    assert await _until(lambda: len(ring.ops) == 1)
+    sent = _data(ring, ring.ops[0][1])
+    assert [fin for _, fin in sent] == [True]
+    assert sent[0][0].startswith(SubgroupHeader(
+        track_alias=1, group_id=0, subgroup_id=0, publisher_priority=128,
+        extensions_present=True, prof=s._profile).serialize().data)
