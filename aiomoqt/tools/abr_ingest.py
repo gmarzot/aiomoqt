@@ -12,8 +12,8 @@ dials (bump in the wire). pub_media announces with --pub-ns:
 to that same relay needs another namespace (--out-ns).
 
 The video track (-T; default the catalog's first LOC video track) must be
-H.264. Every LOC track passes through unchanged. The rungs are encoded
-from the video by cymedia (uv pip install 'aiomoqt[abr]'), keep its group and
+H.264. Every LOC track passes through unchanged. The rungs, H.264 or AV1
+(--codec), are encoded from the video by cymedia (uv pip install 'aiomoqt[abr]'), keep its group and
 object IDs, open each group on a key frame and join its catalog altGroup.
 
 Each -i interval reports, per output track, the delay from a source
@@ -32,7 +32,7 @@ from typing import Dict, List, Optional
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media.abr import (
-    DEFAULT_RUNGS, AbrLadder, DelayMeter, Rung, frame_rate, ladder_catalog,
+    CODECS, DEFAULT_RUNGS, AbrLadder, DelayMeter, Rung, frame_rate, ladder_catalog,
     quantiles_ms, rungs_below,
 )
 from aiomoqt.media.broadcast import MediaSubscriber
@@ -80,6 +80,8 @@ def parse_args(argv=None):
     parser.add_argument('--profile', choices=('nvenc', 'cpu'),
                         default='nvenc',
                         help='cymedia encoder profile (default: nvenc)')
+    parser.add_argument('--codec', choices=CODECS, default='h264',
+                        help='Rung codec (default: h264)')
     default_rungs = ', '.join(f'{r.width}x{r.height}:{r.bit_rate / 1e6:g}M'
                               for r in DEFAULT_RUNGS)
     parser.add_argument('--rung', metavar='WxH:BPS', type=_rung,
@@ -276,8 +278,8 @@ class _Ingest:
         src = self.sub.tracks[self.video_name]
         ladder = self.ladder = AbrLadder(
             self.rungs, config=src.config, fps=self.fps,
-            profile=self.args.profile, timescale=src.timescale,
-            on_frame=self._on_rung)
+            profile=self.args.profile, codec=self.args.codec,
+            timescale=src.timescale, on_frame=self._on_rung)
         ladder.start()
 
     def _on_rung(self, i: int, frame: LocFrame, group_id: int,
@@ -432,7 +434,7 @@ async def run(args) -> int:
               f"'{ingest.video.name}' {ingest.video.width}x"
               f"{ingest.video.height}")
         if ingest.rungs:
-            print(f"  ladder ({args.profile}): "
+            print(f"  ladder ({args.profile}, {args.codec}): "
                   f"{', '.join(r.name for r in ingest.rungs)}")
         sessions = []
         for url in args.url:
