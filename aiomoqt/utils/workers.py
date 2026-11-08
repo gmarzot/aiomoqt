@@ -183,7 +183,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
-    stats = TrackStats()
+    stats = TrackStats(group_loss=True)
 
     def _on_object(msg, size_bytes, recv_time_us, group_id=None,
                    subgroup_id=None, *_args, **_kw):
@@ -485,6 +485,22 @@ def slot_delivering(hist, since: float, now: float, window_s: float,
     return (b_last - base[1]) / elapsed >= DELIVERING_FLOOR * expected_bps
 
 
+def judge_slot(state, snap, now: float, window_s: float, expected_bps: float,
+               late_ms: float) -> tuple:
+    """(delivering, lossy, late) for a slot from its latest snapshot.
+    Lossy: it lost an object in the last window_s. Late: p90 over late_ms
+    (0 = not judged). Delivering: at rate per slot_delivering(), or any
+    rate without expected_bps, and neither lossy nor late."""
+    if snap['loss'] > state['lost']:
+        state['lost_at'] = now
+    state['lost'] = snap['loss']
+    lossy = now - state['lost_at'] < window_s
+    late = bool(late_ms and snap['lat_n'] and snap['lat_p90_ms'] > late_ms)
+    at_rate = not expected_bps or slot_delivering(
+        state['hist'], state['since'], now, window_s, expected_bps)
+    return at_rate and not lossy and not late, lossy, late
+
+
 async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                                  events_queue):
     """Host config['batch_size'] subscriptions on one event loop, each
@@ -497,11 +513,15 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
        "lat_n", "lat_p90_ms", "lat_mean_ms" (worst slot with samples),
        "jitter_ms", "loss", "total_bytes", "total_objs",
        "refused" (subscribes the relay refused so far), "refusing" (slots
-       whose last subscribe it refused), "refused_reason"}
+       whose last subscribe it refused), "refused_reason",
+       "lossy" (slots that lost an object in the window), "late" (slots
+       with p90 over config 'slot_latency_ms')}
 
-    A slot is delivering per slot_delivering() against config
-    'per_sub_mbps' over config 'keep_window' seconds; without
-    per_sub_mbps every subscribed slot counts.
+    "loss" counts whole groups and group tails a slot never got. A slot
+    is delivering per slot_delivering() against config 'per_sub_mbps'
+    over config 'keep_window' seconds (without per_sub_mbps every
+    subscribed slot passes that test), and only while neither lossy
+    nor late.
     """
     worker_id = config['worker_id']
     K = max(1, int(config.get('batch_size', 1)))
@@ -514,13 +534,15 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     expected_bps = per_sub_mbps * 1e6 / 8
     window_s = float(config.get('keep_window', 3.0))
     behind_ms = float(config.get('too_far_behind') or 0.0) * 1000
+    late_ms = float(config.get('slot_latency_ms') or 0.0)
 
     # (stats, state) per slot; stats persist across a slot's reopens.
-    slots = [(TrackStats(), {'active': False, 'since': 0.0,
-                             'hist': deque(), 'refused': 0,
-                             'refusing': False, 'refused_reason': None,
-                             'behind_since': None, 'resubscribe_at': 0.0,
-                             'resubscribe': False, 'resubscribed': 0})
+    slots = [(TrackStats(group_loss=True),
+              {'active': False, 'since': 0.0, 'hist': deque(),
+               'lost': 0, 'lost_at': float('-inf'), 'refused': 0,
+               'refusing': False, 'refused_reason': None,
+               'behind_since': None, 'resubscribe_at': 0.0,
+               'resubscribe': False, 'resubscribed': 0})
              for _ in range(K)]
 
     async def _batch_stats_loop():
@@ -537,7 +559,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             active = delivering = 0
             refused = refusing = 0
             refused_reason = None
-            behind = resubscribed = 0
+            behind = resubscribed = lossy = late = 0
             for stats, state in slots:
                 refused += state['refused']
                 refusing += state['refusing']
@@ -566,12 +588,13 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 hist.append((now, snap['total_bytes']))
                 while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
                     hist.popleft()
+                ok, lost, slow = judge_slot(state, snap, now, window_s,
+                                            expected_bps, late_ms)
                 if state['active']:
                     active += 1
-                    if not expected_bps or slot_delivering(
-                            hist, state['since'], now, window_s,
-                            expected_bps):
-                        delivering += 1
+                    delivering += ok
+                    lossy += lost
+                    late += slow
             _post(events_queue, {
                 'kind': 'batch_stats', 'worker_id': worker_id,
                 'batch_size': K, 'active': active,
@@ -587,6 +610,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'refused': refused, 'refusing': refusing,
                 'refused_reason': refused_reason,
                 'behind': behind, 'resubscribed': resubscribed,
+                'lossy': lossy, 'late': late,
             })
             last_t = now
 

@@ -527,3 +527,109 @@ def test_summary_names_the_refusals(capsys):
                                  too_far_behind=False)
     ab._print_summary(state, controller, 1, None)
     assert '7 subscribes by the relay (relay overloaded)' in capsys.readouterr().out
+
+
+# -- a slot that lost objects or runs late is not delivering --------------
+
+def _feed(stats, groups, size=8):
+    for g in groups:
+        for o in range(size):
+            stats.on_object(SimpleNamespace(group_id=g, object_id=o, subgroup_id=0,
+                                            extensions=None), 100, 0)
+
+
+@pytest.mark.parametrize('groups, lost', [((0, 1, 2, 3, 4, 5), 0),
+                                          ((0, 1, 3, 4, 5), 8)])
+async def test_a_batch_slot_missing_a_group_is_not_delivering(monkeypatch, groups, lost):
+    async def supervisor(config, relay, stop_ev, stats, state, delay, shared):
+        state['active'] = True
+        _feed(stats, groups)
+        await stop_ev.wait()
+
+    monkeypatch.setattr(workers, '_slot_supervisor', supervisor)
+    monkeypatch.setattr(workers, 'SharedTransport',
+                        lambda **kw: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(workers, 'STATS_INTERVAL_S', 0.01)
+    stop, reports = threading.Event(), queue.Queue()
+    task = asyncio.create_task(workers._subscriber_batch_task(
+        dict(worker_id=0, batch_size=1, relay_url='moqt://127.0.0.1:4433'),
+        stop, reports))
+    report = await asyncio.to_thread(reports.get, timeout=5)
+    stop.set()
+    await task
+    assert report['loss'] == lost and report['active'] == 1
+    assert report['lossy'] == (1 if lost else 0)
+    assert report['delivering'] == (0 if lost else 1)
+
+
+def _judged():
+    return {'since': 0.0, 'hist': None, 'lost': 0, 'lost_at': float('-inf')}
+
+
+def test_a_slot_is_lossy_for_a_window_after_its_last_loss():
+    state, snap = _judged(), {'loss': 0, 'lat_n': 0, 'lat_p90_ms': 0.0}
+    assert workers.judge_slot(state, snap, 10.0, 3.0, 0, 0) == (True, False, False)
+    snap['loss'] = 2
+    assert workers.judge_slot(state, snap, 11.0, 3.0, 0, 0) == (False, True, False)
+    assert workers.judge_slot(state, snap, 13.5, 3.0, 0, 0) == (False, True, False)
+    assert workers.judge_slot(state, snap, 14.5, 3.0, 0, 0) == (True, False, False)
+
+
+@pytest.mark.parametrize('late_ms, p90, late', [(500, 501.0, True), (500, 499.0, False),
+                                                (0, 5000.0, False)])
+def test_a_slot_over_the_threshold_is_not_delivering(late_ms, p90, late):
+    snap = {'loss': 0, 'lat_n': 30, 'lat_p90_ms': p90}
+    assert workers.judge_slot(_judged(), snap, 10.0, 3.0, 0, late_ms) == (not late, False, late)
+
+
+async def test_actuator_reports_lossy_and_late_slots(monkeypatch):
+    act = _subs_actuator(monkeypatch)
+    events = await _mature_worker(act)
+    events.put(_report(delivering=0, lossy=1, late=1, loss=8, total_objs=40))
+    sig = await act.observe()
+    assert (sig.lossy_subs, sig.late_subs, sig.delivering_subs) == (1, 1, 0)
+    assert sig.health == 'degraded'
+    act._kill_worker(0)
+    assert act.lost_total == (8, 40)
+    await act.shutdown()
+
+
+@pytest.mark.parametrize('fields, label', [
+    (dict(refusing_subs=1, lossy_subs=1), 'hold (relay refusing)'),
+    (dict(lossy_subs=1, late_subs=1), 'hold (subs losing objects)'),
+    (dict(late_subs=1), 'hold (subs over threshold)'),
+    ({}, 'hold (shortfall)'),
+])
+def test_a_shortfall_hold_names_its_cause(fields, label):
+    sig = ab.Signal(t=0.0, level=1, latency_mean_ms=1.0, latency_p90_ms=1.0, loss_pct=0,
+                    shortfall=True, target_mbps=1, tx_mbps=1, rx_mbps=1, **fields)
+    assert ab._hold_label(sig, 'hold (shortfall)') == label
+
+
+def test_summary_reports_the_loss(capsys):
+    state = ab.BenchState()
+    actuator = SimpleNamespace(unit='subs', max_level=20, refused_total=0,
+                               lost_total=(8, 392))
+    controller = SimpleNamespace(actuator=actuator, high_water=10.0, pivots=[],
+                                 held_at_max=False, eq_level=0.0, wanted_mbps=0.0,
+                                 too_far_behind=False, peak_lossy=(2, 10),
+                                 peak_late=(0, 0))
+    ab._print_summary(state, controller, 1, None)
+    out = capsys.readouterr().out
+    assert 'Lost:        8 objects (2.00%), whole groups included' in out
+    assert 'peak 2 of 10 subscribers losing objects' in out
+    assert 'over the threshold' not in out
+
+
+@pytest.mark.parametrize('role, extra, late_ms', [
+    ('both', (), 100.0),
+    ('both', ('--latency-threshold', '500'), 500.0),
+    ('both', ('--too-far-behind', '2'), 2000.0),
+    ('sub', (), 0.0),
+])
+async def test_slots_judge_latency_only_on_one_host(monkeypatch, role, extra, late_ms):
+    configs = _processes(monkeypatch, fixed=role == 'pub')
+    _argv(monkeypatch, '--mode', 'subs', '--role', role, *extra)
+    await ab.main()
+    subs = [cfg for name, cfg in configs if name == 'sub_batch_worker_entry']
+    assert subs and all(cfg['slot_latency_ms'] == late_ms for cfg in subs)

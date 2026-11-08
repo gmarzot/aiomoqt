@@ -129,6 +129,10 @@ class Signal:
     refusing_subs: int = 0
     # subs-mode, --too-far-behind: slots past it.
     behind_subs: int = 0
+    # subs-mode: slots not delivering because they lost an object in the
+    # keep window, or their p90 is over the threshold.
+    lossy_subs: int = 0
+    late_subs: int = 0
 
 
 @dataclass
@@ -497,6 +501,17 @@ class BWActuator:
                 pass
 
 
+def _hold_label(sig: Signal, default: str) -> str:
+    """A shortfall hold, named by its cause when the slots report one."""
+    if sig.refusing_subs:
+        return "hold (relay refusing)"
+    if sig.lossy_subs:
+        return "hold (subs losing objects)"
+    if sig.late_subs:
+        return "hold (subs over threshold)"
+    return default
+
+
 def _delivering(batch: dict) -> int:
     """A batch's slots receiving their rate; 'active' from a worker
     that does not judge delivery."""
@@ -545,8 +560,11 @@ class SubsActuator:
                  stagger: float = 0.1,
                  shortfall_ratio: float = 0.85,
                  transport_options: Optional[dict] = None,
-                 too_far_behind: float = 0.0):
+                 too_far_behind: float = 0.0,
+                 slot_latency_ms: float = 0.0):
         self.too_far_behind = too_far_behind
+        # A slot with p90 over this stops counting as delivering; 0 = off.
+        self.slot_latency_ms = slot_latency_ms
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -612,6 +630,9 @@ class SubsActuator:
         self.refused_reason = None
         # Per-worker resubscribes under --too-far-behind, kept the same way.
         self._resubscribed: dict = {}
+        # Per-worker objects received and lost, kept the same way.
+        self._objs: dict = {}
+        self._lost: dict = {}
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
@@ -666,6 +687,8 @@ class SubsActuator:
                 self.refused_reason = msg.get('refused_reason')
             if msg.get('resubscribed', 0) > 0:
                 self._resubscribed[wid] = msg['resubscribed']
+            self._objs[wid] = msg.get('total_objs', 0)
+            self._lost[wid] = msg.get('loss', 0)
             self._oldest_report_s = max(self._oldest_report_s,
                                         now - msg.get('t', now))
             tick = self._tick.setdefault(
@@ -684,6 +707,11 @@ class SubsActuator:
     @property
     def resubscribed_total(self) -> int:
         return sum(self._resubscribed.values())
+
+    @property
+    def lost_total(self) -> tuple:
+        """Objects (lost, received) over the run, whole groups included."""
+        return sum(self._lost.values()), sum(self._objs.values())
 
     async def _drain_loop(self) -> None:
         while True:
@@ -733,6 +761,7 @@ class SubsActuator:
                 per_sub_mbps=self.per_sub_mbps,
                 keep_window=self.keep_window,
                 too_far_behind=self.too_far_behind,
+                slot_latency_ms=self.slot_latency_ms,
                 **self.transport_options,
             )
             from aiomoqt.utils.workers import sub_batch_worker_entry
@@ -925,6 +954,10 @@ class SubsActuator:
                               for wid in self._workers),
             behind_subs=sum(self._latest_batch.get(wid, {}).get('behind', 0)
                             for wid in self._workers),
+            lossy_subs=sum(self._latest_batch.get(wid, {}).get('lossy', 0)
+                           for wid in self._workers),
+            late_subs=sum(self._latest_batch.get(wid, {}).get('late', 0)
+                          for wid in self._workers),
         )
 
     async def shutdown(self) -> None:
@@ -991,8 +1024,10 @@ class AIMDController:
       then drain until headroom >= 0.2.
     - Shortfall: hold; sustained for 3 intervals, bw backs off toward
       the delivered rate and subs holds and respawns.
-    - Loss is reported, not acted on; in subs mode a slot losing over
-      half its rate stops counting as delivering, which is a shortfall.
+    - Loss counts whole groups and group tails never received. In subs
+      mode a slot stops counting as delivering, which is a shortfall,
+      while it gets under half its rate, lost an object in the keep
+      window, or has p90 over the threshold.
     - high_water: the best delivered level (bw: rx Mbps; subs:
       delivering subscribers) seen with headroom >= 0.2 and no shortfall.
     """
@@ -1012,6 +1047,7 @@ class AIMDController:
                  too_far_behind: bool = False):
         self.too_far_behind = too_far_behind
         self.peak_behind = (0, 0)  # most viewers past it, of how many
+        self.peak_lossy = self.peak_late = (0, 0)
         self.delivered_mbps = self.wanted_mbps = 0.0
         self.actuator = actuator
         self.state = state
@@ -1164,8 +1200,7 @@ class AIMDController:
                 if self.shortfall_streak < 3 * self._tpr:
                     # Onset: hold and watch. apply(level) is a reconcile
                     # (subs respawns lost workers); BW it's a no-op.
-                    self._emit(sig, "hold (relay refusing)" if sig.refusing_subs
-                               else "hold (watch)")
+                    self._emit(sig, _hold_label(sig, "hold (watch)"))
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
@@ -1192,8 +1227,7 @@ class AIMDController:
                     # reconcile (apply at the SAME target respawns it).
                     # Backing off here would kill more subs and
                     # re-introduce the setpoint-decay-on-loss bug.
-                    self._emit(sig, "hold (relay refusing)" if sig.refusing_subs
-                               else "hold (shortfall)")
+                    self._emit(sig, _hold_label(sig, "hold (shortfall)"))
                     await a.apply(level)
                 continue
 
@@ -1286,6 +1320,10 @@ class AIMDController:
         """Totals for the summary."""
         if sig.behind_subs > self.peak_behind[0]:
             self.peak_behind = (sig.behind_subs, sig.active_subs)
+        if sig.lossy_subs > self.peak_lossy[0]:
+            self.peak_lossy = (sig.lossy_subs, sig.active_subs)
+        if sig.late_subs > self.peak_late[0]:
+            self.peak_late = (sig.late_subs, sig.active_subs)
         per_sub = getattr(self.actuator, 'per_sub_mbps', None)
         if per_sub:
             self.delivered_mbps += sig.rx_mbps
@@ -1857,6 +1895,16 @@ def _print_summary(state: BenchState, controller, samples: int, args):
     if refused:
         print(f"  Refused:     {refused} subscribes by the relay "
               f"({controller.actuator.refused_reason})")
+    lost_total = getattr(controller.actuator, 'lost_total', None)
+    if lost_total is not None:
+        lost, got = lost_total
+        pct = 100 * lost / (lost + got) if lost + got else 0.0
+        print(f"  Lost:        {lost} objects ({pct:.2f}%), whole groups "
+              f"included")
+        for what, (n, of) in (("losing objects", controller.peak_lossy),
+                              ("over the threshold", controller.peak_late)):
+            if n:
+                print(f"  Not counted: peak {n} of {of} subscribers {what}")
     if controller.wanted_mbps:
         print(f"  Delivered:   "
               f"{100 * controller.delivered_mbps / controller.wanted_mbps:.1f}% "
@@ -2013,6 +2061,10 @@ async def main():
             shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
             too_far_behind=args.too_far_behind,
+            # Split hosts: absolute latency carries their clock offset.
+            slot_latency_ms=(0.0 if args.skew_safe_signals
+                             else args.too_far_behind * 1000
+                             or args.latency_threshold),
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
