@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- An object larger than a stream's send ring goes out in pieces instead of failing the write; through aiomoqt-relay at its 1 MiB `--stream-ring-cap`, a 4K keyframe no longer drops the subscriber. The relay logs a subscriber it drops for a failed forward at WARNING.
 - adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`, with one source port per subscriber. Needs aiopquic 0.8.0 on raw QUIC.
 - adaptive_bench `--exit max` also ends a run at its first back-off, if that comes before the max.
 - aiomoqt-relay `status.json` gains `totals.send_late_ms`, how overdue the network thread's next wake was on average, and its history, shown on the dashboard's loop lag tile. It needs aiopquic's `loop_late_us` counter, and reads null without it.

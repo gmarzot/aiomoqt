@@ -60,7 +60,7 @@ async def test_a_header_write_cut_short_resets_its_stream():
 
 
 async def test_a_failed_header_write_resets_its_stream():
-    track = relay._RelayedTrack(("ns", "t"))
+    track = relay._RelayedTrack(((b"ns",), b"t"))
     bad = _Fake()
 
     async def refuse(sid, data):
