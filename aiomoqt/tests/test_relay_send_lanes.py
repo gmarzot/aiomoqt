@@ -95,9 +95,9 @@ def _slow_down(session):
     streams drain slowly."""
     real = session.stream_write_drain
 
-    async def slow(stream_id, data):
+    async def slow(stream_id, data, end_stream=False):
         await asyncio.sleep(_SLOW_S)
-        await real(stream_id, data)
+        await real(stream_id, data, end_stream)
     session.stream_write_drain = slow
 
 
@@ -202,7 +202,8 @@ class _Fake:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self, initial=b"", priority=None):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
         self.log.append(("open", sid))
@@ -215,19 +216,23 @@ class _Fake:
                 self.stream_reset(sid, StreamResetCode.CANCELLED)
                 raise
             self.log.append(("data", sid))
+        if end_stream:
+            self.log.append(("fin", sid))
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
         if end_stream:
             self.log.append(("fin", sid))
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         await self.gate.wait()
         if sid in self._unwritten:
             self._unwritten.discard(sid)
             self.log.append(("hdr", sid))
         else:
             self.log.append(("data", sid))
+        if end_stream:
+            self.log.append(("fin", sid))
 
     def stream_reset(self, sid, code):
         self.log.append(("reset", sid, int(code)))
