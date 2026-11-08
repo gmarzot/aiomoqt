@@ -19,18 +19,19 @@ class _Downstream:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self, initial=b"", priority=None):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
-        if initial:
-            await self.stream_write_drain(sid, initial)
+        if initial or end_stream:
+            await self.stream_write_drain(sid, initial, end_stream)
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
         self.writes.append((sid, len(data), end_stream))
 
-    async def stream_write_drain(self, sid, data):
-        self.writes.append((sid, len(data), False))
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        self.writes.append((sid, len(data), end_stream))
 
     def stream_reset(self, sid, code):
         self.writes.append((sid, "reset", int(code)))
@@ -149,9 +150,9 @@ class _Capturing(_Downstream):
         self.data.setdefault(sid, bytearray()).extend(data)
         super().stream_write(sid, data, end_stream)
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         self.data.setdefault(sid, bytearray()).extend(data)
-        await super().stream_write_drain(sid, data)
+        await super().stream_write_drain(sid, data, end_stream)
 
 
 @pytest.mark.asyncio

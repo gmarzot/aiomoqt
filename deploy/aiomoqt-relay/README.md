@@ -169,13 +169,11 @@ an unknown key or a wrong type stops the relay with an error naming it. Flags ad
 compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
 environment. After copying an edited file over, run `docker compose restart relay`.
 
-`admission-cpu = 80` refuses new subscribers with `EXCESSIVE_LOAD` and a 5-15 s Retry Interval while
-the relay's busiest thread averages 80% or more over 8 s, until it falls below 65%. The subscriber
-count at closing stays a ceiling, rising 5% a minute while the gate is open: steal comes and goes on
-this VM, and a lull is not headroom. Viewers already attached keep their service and may add tracks.
-Thread time here includes hypervisor steal, which is why it tracks real headroom. On a kernel that
-leaves steal out of thread time it reads low. `max-subscribers = N` adds a fixed limit. `status.json` reports `totals.admission` and
-`totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
+New subscribers are not refused for load; past saturation the relay sheds instead. `lag-limit`
+(below) keeps each viewer near live by skipping groups, and per-session caps bound its requests.
+`admission-cpu = PCT` refuses new subscribers with `EXCESSIVE_LOAD` while the busiest thread is at
+PCT, and `max-subscribers = N` sets a fixed limit; neither is set here. `status.json` reports
+`totals.admission` and `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
 
 `lag-limit`, 5 s by default, keeps a viewer that close to live: past that, counting what its queue and
 its QUIC streams hold at the track's input rate, it skips to a newer group. It sees a freeze of up to
@@ -195,7 +193,8 @@ files. `crash.log` gets a `relay: start` line at each start and the faulthandler
 crash or watchdog stall. It is not rotated, so trim it by hand if it grows.
 
 In the log viewer, Shift- or Ctrl-click on "Load earlier" loads the whole selected file (up to
-200,000 records).
+200,000 records). The counters count the restarts, errors, warnings and crash dumps shown; each click
+steps to an earlier one. Level "warnings and errors" or "errors" shows only those lines.
 
 Log level: the switch in the log viewer's toolbar toggles DEBUG and logs `relay: debug logging
 on/off`; `docker kill -s USR1 aiomoqt-relay` steps INFO, DEBUG, TRACE, INFO and logs `relay: log
