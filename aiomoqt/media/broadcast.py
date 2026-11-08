@@ -265,8 +265,8 @@ class MediaPublisher:
 
     async def start(self, announce_namespace: bool = False,
                     publish_track: bool = True, forward: int = 0) -> None:
-        """Announce the broadcast, then install the session-level demux
-        over PublishedTrack's per-track handlers.
+        """Install the session-level demux over PublishedTrack's per-track
+        handlers, then announce the broadcast.
 
         announce_namespace: one PUBLISH_NAMESPACE for the broadcast; the
         relay forwards subscriber SUBSCRIBEs per track.
@@ -278,17 +278,7 @@ class MediaPublisher:
         if not (announce_namespace or publish_track):
             raise ValueError("start(): need announce_namespace or "
                              "publish_track")
-        if announce_namespace:
-            await self.session.publish_namespace(
-                namespace=self.namespace, wait_response=True)
-            logger.info(f"MediaPublisher: announced '{self.namespace}'")
-        for track in self._by_name.values():
-            if publish_track:
-                # The track may also serve other sessions; this is ours.
-                await track.publish(publish_track=True, forward=forward,
-                                    session=self.session)
-            else:
-                track._sub_for(self.session).state = TrackState.ANNOUNCED
+        # Before any announcement: a SUBSCRIBE may overtake its reply.
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._demux_subscribe)
         self.session.register_handler(
@@ -297,6 +287,19 @@ class MediaPublisher:
             MOQTMessageType.SUBSCRIBE_UPDATE, self._demux_update)
         self.session.register_handler(
             MOQTMessageType.FETCH, self._demux_fetch)
+        if not publish_track:
+            # Set first: an early SUBSCRIBE moves it on to SUBSCRIBED.
+            for track in self._by_name.values():
+                track._sub_for(self.session).state = TrackState.ANNOUNCED
+        if announce_namespace:
+            await self.session.publish_namespace(
+                namespace=self.namespace, wait_response=True)
+            logger.info(f"MediaPublisher: announced '{self.namespace}'")
+        if publish_track:
+            for track in self._by_name.values():
+                # The track may also serve other sessions; this is ours.
+                await track.publish(publish_track=True, forward=forward,
+                                    session=self.session)
 
     def _track_for_request(self, request_id) -> Optional[PublishedTrack]:
         for track in self._by_name.values():
