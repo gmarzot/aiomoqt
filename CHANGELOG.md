@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `abr_ingest`: an ABR ingester in front of a relay. A LOC broadcast dials in, or is subscribed from a relay, and goes out unchanged plus an H.264 ladder encoded by cymedia (NVENC or CPU) under the same namespace and catalog, each rung on the source's group and object IDs. It reports the delay from a frame's arrival to its hand-off, per track.
 - An object larger than a stream's send ring goes out in pieces instead of failing the write; through aiomoqt-relay at its 1 MiB `--stream-ring-cap`, a 4K keyframe no longer drops the subscriber. The relay logs a subscriber it drops for a failed forward at WARNING.
 - adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`, with one source port per subscriber. Needs aiopquic 0.8.0 on raw QUIC.
 - adaptive_bench `--exit max` also ends a run at its first back-off, if that comes before the max.

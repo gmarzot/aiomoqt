@@ -29,6 +29,8 @@ Pure Python. `aiopquic` (the QUIC transport) installs as a binary wheel automati
 
 HLS/DASH ingest (`pub_media --input`) needs PyAV, an optional extra:
 `uv pip install 'aiomoqt[media]'`. Without it, `--input` exits with that hint.
+The ABR ingester (`abr_ingest`) needs cymedia, which builds against the system's FFmpeg:
+`uv pip install git+https://github.com/gmarzot/cymedia`.
 
 ## Quick start
 
@@ -277,6 +279,7 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 | `aiomoqt.versions` | `aiomoqt-versions` | version report (aiomoqt, aiopquic, picoquic/picotls SHAs) |
 | `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, MPEG-TS, HLS/DASH, tone) |
 | `tools.sub_media` | — | catalog-driven media subscriber; writes playable files or measures delivery (`--analyze`) |
+| `tools.abr_ingest` | — | ABR ingester: a LOC broadcast in, the same broadcast plus an H.264 ladder out, one catalog |
 | `tools.pub_bench` | `moq-pub-bench` | publisher benchmark |
 | `tools.sub_bench` | `moq-sub-bench` | subscriber benchmark — latency, jitter, loss |
 | `tools.loopback_bench` | `moq-loopback-bench` | in-process publisher + subscriber, no relay |

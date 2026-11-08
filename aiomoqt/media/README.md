@@ -203,6 +203,39 @@ ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v:0 -map 0:v:1 -map 0:a:0 -c
 python -m aiomoqt.tools.pub_media $RELAY -N demo/bare --mp4 clip.mp4 --loop --no-catalog --loc-codecstring
 ```
 
+## ABR ladder
+
+`abr_ingest` sits in front of a relay. The source publisher dials it, and it publishes the source
+unchanged plus an H.264 ladder of its video, under the same namespace with one catalog. It needs
+cymedia, which builds against the system's FFmpeg:
+`uv pip install git+https://github.com/gmarzot/cymedia`.
+
+```bash
+python -m aiomoqt.tools.abr_ingest -Q -p 4443 -N live/x $RELAY
+python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --mp4 clip.mp4 --loop -t 0
+```
+
+- **Source.** LOC, announced with PUBLISH_NAMESPACE (`pub_media --pub-ns`). `--source URL`
+  subscribes it from a relay instead; publishing back to that relay needs another namespace,
+  `--out-ns`. The video track (`-T`, default the catalog's first) must be H.264. Every LOC track
+  passes through unchanged.
+- **Rungs.** `--rung WxH:BPS`, repeated. By default, those of 1440p, 1080p, 720p, 540p, 360p and
+  180p (13.5, 6.75, 3.75, 2.25, 0.9 and 0.3 Mbps) below the source height. Rung tracks are named
+  `video_<height>p` and join the source video's catalog altGroup.
+- **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
+  each group start. A rung that falls behind ends that group early and resumes at the next group
+  start, so a group never has a hole in it.
+- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, `h264_nvenc`; default) or `cpu`
+  (libopenh264, else libx264).
+- **Track Properties** pass through, timing ones to the rungs as well.
+- **Report.** Every `-i` seconds, per output track: frames, frames skipped while no subscriber
+  took the track (`idle`), drops, and the delay from a source frame's arrival to its hand-off to
+  the output track; rungs also show the encoder's share. `--no-ladder` passes the source
+  through, to measure the hand-off alone.
+- **Limits.** Publishing starts once the first source group is encoded, so the catalog is
+  complete from its first object. LOC H.264 sources only. Source catalog updates and
+  reconnects are not carried.
+
 ## Receiving
 
 `sub_media` reads the catalog, subscribes every media track it describes, and writes playable
@@ -239,6 +272,7 @@ python -m aiomoqt.tools.sub_media $RELAY -N demo/live --analyze -t 60 -i 5 --rep
 | `media/mpegts.py` | MPEG-TS demux to access units and audio frames, keeping the PES timestamps |
 | `media/dash.py` | MPD parsing and segment addressing |
 | `media/ingest.py` | PyAV ingest: any FFmpeg input to per-track CMAF chunks |
+| `media/abr.py` | `AbrLadder`: an H.264 LOC track to rungs through cymedia, on the source's IDs; `ladder_catalog()` |
 | `fanout.py` | `FanoutPublisher`: one broadcast on several relays |
 
 The top-level [README](../../README.md#api) has a short publisher and subscriber example.
