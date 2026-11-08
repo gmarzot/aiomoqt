@@ -466,16 +466,21 @@ confirmation instead. The summary's `Sustained` line is the level held to
 the end and for how long, or `not demonstrated`.
 
 `--join-steps R1,R2,...` measures the join rate instead: the most new
-subscribers per second admitted while an audience stays healthy. It holds
-`--max-subs` for `--base-s` (30 s) under the `--hold` checks, then for each
-rate, in joins/s from this host, has random subscribers close their session
-and rejoin on a new connection, for `--step-s` (15 s) after 2 s to settle.
-A step passes when 99% of its joins get a first object within 10 s, p99
-SUBSCRIBE_OK is within `--join-bound` (1000 ms), p99 first object within one
-group more, and the subscribers not rejoining stay clean; the first failing
-step ends the run. Each rejoin is out of the audience for a few seconds, so
-keep the audience well above the top rate times 5 s. The summary prints a
-`Join step` line per step and `Join rate: N subs/s supported`, or `not
+subscribers per second admitted while an audience stays healthy. The first
+`--watchers` share (0.25) of each group's subscribers are watchers, never
+cycled; the rest are joiners. It holds `--max-subs` (`--start-subs` is
+ignored) for `--base-s` (30 s) under the `--hold` checks on everyone, then
+for each rate, in joins/s from this host, has random joiners close their
+session and rejoin on a new connection, for `--step-s` (15 s) after 2 s to
+settle. A joiner is cycled again 1 s after its rejoin's first object. A step
+passes when joins were attempted at 90% of its rate or more, 99% of them got
+a first object within 10 s, p99 SUBSCRIBE_OK is within `--join-bound`
+(1000 ms), p99 first object within one group more, and the watchers stay
+clean; the first failing step ends the run. Too few joiners to keep up fails
+the step as `joiner pool exhausted`, and a warning after the base settles
+says when the pool is below the top rate's needs. The summary prints a `Join
+step` line per step and `Join rate: N subs/s supported`, marked
+`(pool-limited)` when only the pool stopped the next step, or `not
 demonstrated`.
 
 **Latency comes from the object's LOC timestamp** (property 0x10,

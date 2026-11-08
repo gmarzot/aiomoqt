@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -72,6 +73,8 @@ DELIVERING_FLOOR = 0.5
 JOIN_TIMEOUT_S = 10.0
 # Join latencies kept per report, per kind.
 JOIN_SAMPLES_MAX = 500
+# A joiner is cycled again no sooner than this after its rejoin's first object.
+JOINER_DWELL_S = 1.0
 
 # Spawn context for all bench parents. Linux pins "fork": Python 3.14
 # switched the Linux default to forkserver, whose by-name SemLock reopen
@@ -520,22 +523,25 @@ def judge_slot(state, snap, now: float, window_s: float, expected_bps: float,
     return at_rate and not lossy and not late, lossy, late
 
 
-def new_slot_state(tally: dict) -> dict:
-    """A batch slot's state; tally is the batch's, shared by its slots."""
-    return {'active': False, 'since': 0.0, 'hist': deque(),
+def new_slot_state(tally: dict, watcher: bool = True) -> dict:
+    """A batch slot's state; tally is the batch's, shared by its slots. A
+    watcher is never cycled; a joiner is (see pick_cycle_slot)."""
+    return {'watcher': watcher, 'joined_at': None,
+            'active': False, 'since': 0.0, 'hist': deque(),
             'lost': 0, 'lost_at': float('-inf'), 'refused': 0,
             'refusing': False, 'refused_reason': None,
             'behind_since': None, 'resubscribe_at': 0.0,
             'resubscribe': False, 'resubscribed': 0,
+            'carried': {'loss': 0, 'total_bytes': 0, 'total_objs': 0},
             'tally': tally, 'join_t0': None, 'join_setup_ms': None,
-            'join_sub_ms': None, 'join_first_at': None, 'cycle': False,
-            'cycling': False}
+            'join_sub_ms': None, 'join_first_at': None, 'cycle': False}
 
 
 def new_join_tally() -> dict:
     """A batch's joins since its last report: completed (first object
-    received), failed, and latencies in ms from the dial."""
-    return {'joins': 0, 'join_failed': 0, 'join_setup_ms': [],
+    received), failed, skipped (no joiner eligible), and latencies in ms
+    from the dial."""
+    return {'joins': 0, 'join_failed': 0, 'join_skipped': 0, 'join_setup_ms': [],
             'join_sub_ms': [], 'join_first_ms': []}
 
 
@@ -583,6 +589,7 @@ def join_first_object(state, now: float) -> None:
 def _join_done(state, first_t: float) -> None:
     t0 = state['join_t0']
     state['join_t0'] = None
+    state['joined_at'] = first_t
     tally = state.get('tally')
     if tally is not None:
         tally['joins'] += 1
@@ -596,7 +603,6 @@ def join_fail(state) -> None:
     if state.get('join_t0') is None:
         return
     state['join_t0'] = None
-    state['cycling'] = False
     tally = state.get('tally')
     if tally is not None:
         tally['join_failed'] += 1
@@ -608,15 +614,18 @@ def join_expire(state, now: float, timeout_s: float = JOIN_TIMEOUT_S) -> None:
         join_fail(state)
 
 
-def pick_cycle_slot(states, rng=random):
-    """Ask a random subscribed slot with no join pending to redial; None
-    when there is none."""
+def pick_cycle_slot(states, now: float, rng=random):
+    """Ask a random eligible joiner to redial; None when there is none. A
+    joiner is eligible while subscribed with its join complete, at least
+    JOINER_DWELL_S after that join's first object."""
     ready = [s for s in states
-             if s['active'] and s.get('join_t0') is None and not s.get('cycle')]
+             if not s['watcher'] and s['active'] and s['join_t0'] is None
+             and not s['cycle'] and s['joined_at'] is not None
+             and now - s['joined_at'] >= JOINER_DWELL_S]
     if not ready:
         return None
     s = rng.choice(ready)
-    s['cycle'] = s['cycling'] = True
+    s['cycle'] = True
     return s
 
 
@@ -633,22 +642,15 @@ def next_cycle(next_t, now: float, rate: float) -> tuple:
     return True, max(next_t + period, now)
 
 
-def mid_cycle(state, delivering: bool, now: float, window_s: float) -> bool:
-    """Whether a cycled slot is still rejoining: until, having redialed, it
-    delivers again, its join fails, or SLOT_GRACE_S + window_s after its
-    SUBSCRIBE_OK."""
-    if not state.get('cycling'):
-        return False
-    if (not state['cycle'] and state.get('join_t0') is None and state['active'] and (
-            delivering or now - state['since'] >= SLOT_GRACE_S + window_s)):
-        state['cycling'] = False
-    return state['cycling']
+def watcher_count(k: int, share) -> int:
+    """Watchers among a batch of k: ceil(share x k), all without a share."""
+    return k if share is None else min(k, math.ceil(share * k))
 
 
 def renew_stats(state, old):
     """A fresh TrackStats for a cycled slot's next viewer: a leave and
     rejoin is not loss. The old one's totals carry into the report."""
-    c = state.setdefault('carried', {'loss': 0, 'total_bytes': 0, 'total_objs': 0})
+    c = state['carried']
     if old is not None:
         c['loss'] += old.total_lost
         c['total_bytes'] += old.total_bytes
@@ -675,16 +677,19 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
        "refused" (subscribes the relay refused so far), "refusing" (slots
        whose last subscribe it refused), "refused_reason",
        "lossy" (slots that lost an object in the window), "late" (slots
-       with p90 over config 'slot_latency_ms'), "cycling" (slots
-       rejoining, per mid_cycle()), and new_join_tally()'s fields}
+       with p90 over config 'slot_latency_ms'), "judged" (slots the
+       health fields cover), and new_join_tally()'s fields}
 
     "loss" counts whole groups and group tails a slot never got. A slot
     is delivering per slot_delivering() against config 'per_sub_mbps'
     over config 'keep_window' seconds (without per_sub_mbps every
     subscribed slot passes that test), and only while neither lossy
-    nor late. Mid-cycle slots count toward neither lossy, late nor
-    latency. config 'cycle_rate' (a shared Value, joins/s) has a random
-    slot redial every 1/rate s.
+    nor late.
+
+    config 'cycle_rate' (a shared Value, joins/s) has a random joiner
+    redial every 1/rate s. The first watcher_count(K, config 'watchers')
+    slots are watchers; while the rate is above 0 the health fields (all
+    but the totals and the join tally) cover watchers only.
     """
     worker_id = config['worker_id']
     K = max(1, int(config.get('batch_size', 1)))
@@ -703,8 +708,9 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     tally = new_join_tally()
     # (stats, state) per slot; stats persist across a slot's reopens, and
     # state['stats'] replaces them once it cycles.
-    slots = [(TrackStats(group_loss=True), new_slot_state(tally))
-             for _ in range(K)]
+    n_watch = watcher_count(K, config.get('watchers'))
+    slots = [(TrackStats(group_loss=True), new_slot_state(tally, i < n_watch))
+             for i in range(K)]
 
     async def _batch_stats_loop():
         last_t = time.monotonic()
@@ -720,15 +726,21 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             active = delivering = 0
             refused = refusing = 0
             refused_reason = None
-            behind = resubscribed = lossy = late = cycling = 0
+            behind = resubscribed = lossy = late = judged = 0
+            cycling = cycle_rate is not None and cycle_rate.value > 0
             for stats, state in slots:
                 stats = state.get('stats') or stats
                 join_expire(state, now)
+                snap = stats.snapshot()
+                total_bytes += snap['total_bytes'] + state['carried']['total_bytes']
+                total_objs += snap['total_objs'] + state['carried']['total_objs']
+                if cycling and not state['watcher']:
+                    continue
+                judged += 1
                 refused += state['refused']
                 refusing += state['refusing']
                 refused_reason = state['refused_reason'] or refused_reason
                 resubscribed += state['resubscribed']
-                snap = stats.snapshot()
                 if behind_ms and slot_too_far_behind(
                         state, snap['lat_p90_ms'] if snap['lat_n'] else None,
                         now, behind_ms):
@@ -736,19 +748,14 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 agg_bytes += snap['rx_bytes']
                 agg_objs += snap['rx_objs']
                 agg_iv_lost += snap['iv_lost']
-                carried = state.get('carried') or {}
-                cum_loss += snap['loss'] + carried.get('loss', 0)
-                total_bytes += snap['total_bytes'] + carried.get('total_bytes', 0)
-                total_objs += snap['total_objs'] + carried.get('total_objs', 0)
+                cum_loss += snap['loss'] + state['carried']['loss']
                 hist = state['hist']
                 hist.append((now, snap['total_bytes']))
                 while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
                     hist.popleft()
                 ok, lost, slow = judge_slot(state, snap, now, window_s,
                                             expected_bps, late_ms)
-                mid = mid_cycle(state, ok, now, window_s)
-                cycling += mid
-                if snap['lat_n'] and not mid:
+                if snap['lat_n']:
                     lat_n += snap['lat_n']
                     p90, mean = snap['lat_p90_ms'], snap['lat_mean_ms']
                     worst_p90 = p90 if worst_p90 is None else max(worst_p90, p90)
@@ -759,9 +766,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 if state['active']:
                     active += 1
                     delivering += ok
-                    if not mid:
-                        lossy += lost
-                        late += slow
+                    lossy += lost
+                    late += slow
             _post(events_queue, {
                 'kind': 'batch_stats', 'worker_id': worker_id,
                 'batch_size': K, 'active': active,
@@ -777,7 +783,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'refused': refused, 'refusing': refusing,
                 'refused_reason': refused_reason,
                 'behind': behind, 'resubscribed': resubscribed,
-                'lossy': lossy, 'late': late, 'cycling': cycling,
+                'lossy': lossy, 'late': late, 'judged': judged,
                 **take_join_tally(tally),
             })
             last_t = now
@@ -789,7 +795,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             now = time.monotonic()
             due, next_t = next_cycle(next_t, now, cycle_rate.value)
             if due:
-                pick_cycle_slot(states)
+                if pick_cycle_slot(states, now) is None:
+                    tally['join_skipped'] += 1
                 continue
             wait = STOP_POLL_S if next_t is None else min(STOP_POLL_S, next_t - now)
             await asyncio.sleep(wait)

@@ -138,14 +138,14 @@ class Signal:
     # keep window, or their p90 is over the threshold.
     lossy_subs: int = 0
     late_subs: int = 0
-    # subs-mode joins since the last observe: completed, failed, and the
-    # completed ones' SUBSCRIBE_OK and first-object latencies (ms).
+    # subs-mode joins since the last observe: completed, failed, skipped
+    # (no joiner eligible), and the completed ones' SUBSCRIBE_OK and
+    # first-object latencies (ms).
     joins: int = 0
     join_failed: int = 0
+    join_skipped: int = 0
     join_sub_ms: list = field(default_factory=list)
     join_first_ms: list = field(default_factory=list)
-    # subs-mode: slots rejoining after a cycle; not counted as short.
-    cycling_subs: int = 0
 
 
 @dataclass
@@ -526,7 +526,8 @@ def _hold_label(sig: Signal, default: str) -> str:
 
 
 def _new_join_tick() -> dict:
-    return {'joins': 0, 'join_failed': 0, 'join_sub_ms': [], 'join_first_ms': []}
+    return {'joins': 0, 'join_failed': 0, 'join_skipped': 0,
+            'join_sub_ms': [], 'join_first_ms': []}
 
 
 def _delivering(batch: dict) -> int:
@@ -579,10 +580,13 @@ class SubsActuator:
                  transport_options: Optional[dict] = None,
                  too_far_behind: float = 0.0,
                  slot_latency_ms: float = 0.0,
-                 cycling: bool = False):
+                 cycling: bool = False,
+                 watchers: float = 0.25):
         self.too_far_behind = too_far_behind
-        # Workers get a shared cycle rate (joins/s); see set_join_rate().
+        # Workers get a shared cycle rate (joins/s), cycling their joiners
+        # and judging health on their watchers; see set_join_rate().
         self.cycling = cycling
+        self.watchers = watchers
         self._cycle_rates: dict = {}
         self._join_rate = 0.0
         self._joins = _new_join_tick()
@@ -715,6 +719,7 @@ class SubsActuator:
             j = self._joins
             j['joins'] += msg.get('joins', 0)
             j['join_failed'] += msg.get('join_failed', 0)
+            j['join_skipped'] += msg.get('join_skipped', 0)
             j['join_sub_ms'] += msg.get('join_sub_ms', ())
             j['join_first_ms'] += msg.get('join_first_ms', ())
             self._oldest_report_s = max(self._oldest_report_s,
@@ -794,6 +799,7 @@ class SubsActuator:
             )
             if self.cycling:
                 cfg['cycle_rate'] = self._cycle_rates[wid] = self._mp.Value('d', 0.0)
+                cfg['watchers'] = self.watchers
             from aiomoqt.utils.workers import sub_batch_worker_entry
             p = self._mp.Process(
                 target=sub_batch_worker_entry,
@@ -813,6 +819,15 @@ class SubsActuator:
         """Cycle subscribers at total_per_s joins/s, split across live workers."""
         self._join_rate = max(0.0, float(total_per_s))
         self._split_join_rate()
+
+    @property
+    def joiner_slots(self) -> int:
+        """Slots the target's workers cycle."""
+        from aiomoqt.utils.workers import watcher_count
+        if not self.cycling:
+            return 0
+        workers = -(-int(self._targeted) // self.batch_size)
+        return workers * (self.batch_size - watcher_count(self.batch_size, self.watchers))
 
     def _split_join_rate(self) -> None:
         live = [wid for wid in self._workers if wid in self._cycle_rates]
@@ -955,19 +970,17 @@ class SubsActuator:
         # so a partial final batch isn't over-expected. A group that never
         # delivers is still caught by the starve reaper above
         # (failed_this_window), which forces the shortfall independently.
-        # Mature slots count only while delivering their rate; slots
-        # rejoining after a cycle are expected of neither side.
+        # Mature slots count only while delivering their rate, and only the
+        # slots a worker judges: its watchers while it cycles joiners.
         mature_active = 0
         mature_target = 0
-        cycling = 0
         for wid in self._workers:
-            batch = self._latest_batch.get(wid, {})
-            cycling += int(batch.get('cycling', 0))
             if (now - self._spawned_t.get(wid, now)) < startup_grace:
                 continue
+            batch = self._latest_batch.get(wid, {})
             mature_active += _delivering(batch)
-            mature_target += self.batch_size - int(batch.get('cycling', 0))
-        mature_target = min(mature_target, target_subs - cycling)
+            mature_target += int(batch.get('judged', self.batch_size))
+        mature_target = min(mature_target, target_subs)
 
         # Aggregate check: the delivering subs together receive their rate.
         rx_mbps = rx_bps_total / 1e6
@@ -1016,7 +1029,6 @@ class SubsActuator:
                            for wid in self._workers),
             late_subs=sum(self._latest_batch.get(wid, {}).get('late', 0)
                           for wid in self._workers),
-            cycling_subs=cycling,
             **joins,
         )
 
@@ -1764,10 +1776,13 @@ class JoinStep:
     sub_ms: list = field(default_factory=list)
     first_ms: list = field(default_factory=list)
     fault: Optional[str] = None
+    skipped: int = 0        # scheduled joins with no joiner eligible
+    seconds: float = 0.0    # counted time
 
     def add(self, sig: Signal) -> None:
         self.joins += sig.joins
         self.failed += sig.join_failed
+        self.skipped += sig.join_skipped
         self.sub_ms += sig.join_sub_ms
         self.first_ms += sig.join_first_ms
 
@@ -1785,17 +1800,21 @@ class JoinRateController(HoldController):
     existing audience stays healthy (subs mode).
 
     Spawns the base audience (the max level), waits for actuator.settled()
-    and holds it base_s free of HoldController's faults. Then for each rate
-    in join_steps it cycles subscribers at that rate, waits SETTLE_S, and
-    measures step_s. A step passes with at least JOIN_OK_SHARE of its joins
-    completed, p99 SUBSCRIBE_OK within join_bound_ms, p99 first object
-    within join_bound_ms plus one group (group_s), and no fault among the
-    slots not mid-cycle. The first failing step ends the run; `supported`
-    is the last passing step's rate.
+    and holds it base_s free of HoldController's faults, judging every
+    subscriber. Then for each rate in join_steps it cycles joiners at that
+    rate, waits SETTLE_S, and measures step_s, judging health on watchers
+    only. A step passes with joins attempted at RATE_SHARE of its rate or
+    more, at least JOIN_OK_SHARE of them completed, p99 SUBSCRIBE_OK within
+    join_bound_ms, p99 first object within join_bound_ms plus one group
+    (group_s), and no watcher fault. The first failing step ends the run;
+    `supported` is the last passing step's rate, `pool_limited` whether
+    only too few eligible joiners failed the next.
     """
 
     SETTLE_S = 2.0
     JOIN_OK_SHARE = 0.99
+    RATE_SHARE = 0.9
+    POOL_EXHAUSTED = "joiner pool exhausted"
 
     def __init__(self, actuator, state: BenchState, *, join_steps, step_s: float,
                  base_s: float, join_bound_ms: float, group_s: float, **kw):
@@ -1807,9 +1826,17 @@ class JoinRateController(HoldController):
         self.supported: Optional[float] = None
         self.not_demonstrated: Optional[str] = None
 
+    @property
+    def pool_limited(self) -> bool:
+        return (self.supported is not None and bool(self.steps)
+                and self.steps[-1].fault == self.POOL_EXHAUSTED)
+
     def _judge(self, step: JoinStep) -> Optional[str]:
+        """The step's failure; a short rate only when nothing else failed."""
+        short = step.joins + step.failed < self.RATE_SHARE * step.rate * step.seconds
+        rate_why = self.POOL_EXHAUSTED if step.skipped else "rate not reached"
         if not step.joins:
-            return "no joins"
+            return rate_why if short and step.skipped and not step.failed else "no joins"
         if step.joins < self.JOIN_OK_SHARE * (step.joins + step.failed):
             return "joins failed"
         if _pctl(step.sub_ms, 99) > self.join_bound_ms:
@@ -1817,7 +1844,16 @@ class JoinRateController(HoldController):
         first_bound = self.join_bound_ms + 1000 * self.group_s
         if _pctl(step.first_ms, 99) > first_bound:
             return f"first object p99 over {first_bound:.0f} ms"
-        return None
+        return rate_why if short else None
+
+    def _warn_pool(self) -> None:
+        """Warn when the joiner pool cannot cycle at the top step's rate."""
+        from aiomoqt.utils.workers import JOINER_DWELL_S
+        pool, top = getattr(self.actuator, 'joiner_slots', None), max(self.join_steps)
+        reach = (pool or 0) / (JOINER_DWELL_S + 0.5)
+        if pool is not None and reach < top:
+            print(f"  warning: {pool} joiner slots reach about {reach:.0f} joins/s, "
+                  f"under the top step's {top:g}/s", flush=True)
 
     def _end(self, sig: Optional[Signal], reason: str, why: Optional[str] = None) -> None:
         """End the run: stop cycling, fail the open step with `why`."""
@@ -1892,6 +1928,8 @@ class JoinRateController(HoldController):
                     lost0 = a.lost_total[0]
                     self._emit(sig, "settle")
                     continue
+                if since is None:
+                    self._warn_pool()
                 why = self._fault(sig, p90, lost0)
                 if why:
                     self.not_demonstrated = f"base audience did not hold: {why}"
@@ -1915,7 +1953,8 @@ class JoinRateController(HoldController):
             self._since = self._since or prev_t
             step.add(sig)
             why = self._fault(sig, p90, lost0)
-            if why is None and now - self._since >= self.step_s:
+            step.seconds = now - self._since
+            if why is None and step.seconds >= self.step_s:
                 why = self._judge(step)
                 if why is None:
                     self.supported = step.rate
@@ -2212,9 +2251,13 @@ def parse_args():
                         "to count (default: 30)")
     p.add_argument("--join-steps", type=_join_steps, default=None, metavar="R1,R2,...",
                    help="subs-mode: measure the join rate. Hold --max-subs for "
-                        "--base-s, then cycle subscribers at each rate (joins/s "
+                        "--base-s, then cycle joiners at each rate (joins/s "
                         "from this process, ascending) for --step-s, until a "
-                        "step fails (default: off)")
+                        "step fails; --start-subs is ignored (default: off)")
+    p.add_argument("--watchers", type=float, default=0.25, metavar="SHARE",
+                   help="with --join-steps: share of each group's subscribers "
+                        "never cycled, whose health the steps judge; the rest "
+                        "join (default: 0.25)")
     p.add_argument("--step-s", type=float, default=15, metavar="SEC",
                    help="with --join-steps: seconds each rate is measured "
                         "(default: 15)")
@@ -2248,6 +2291,8 @@ def parse_args():
         p.error("--hold and --confirm: seconds")
     if min(args.step_s, args.base_s, args.join_bound) <= 0:
         p.error("--step-s, --base-s and --join-bound: positive")
+    if not 0 < args.watchers < 1:
+        p.error("--watchers: a share between 0 and 1")
     if args.join_steps:
         if args.mode != "subs":
             p.error("--join-steps is subs-mode only")
@@ -2375,9 +2420,10 @@ def _print_banner(args):
         print(f"  step and hold:      {args.hold:g} s per step, "
               f"{args.confirm:g} s to confirm")
     if getattr(args, "join_steps", None):
-        print(f"  join rate:          {args.max_subs} subs held {args.base_s:g} s, then "
-              f"{','.join(f'{r:g}' for r in args.join_steps)} joins/s, "
-              f"{args.step_s:g} s each, bound {args.join_bound:g} ms")
+        print(f"  join rate:          {args.max_subs} subs (--start-subs ignored) held "
+              f"{args.base_s:g} s, then {','.join(f'{r:g}' for r in args.join_steps)} "
+              f"joins/s, {args.step_s:g} s each, bound {args.join_bound:g} ms, "
+              f"{args.watchers:.0%} watchers")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
           + (" over baseline (split hosts)" if args.skew_safe_signals
              else ""))
@@ -2401,7 +2447,8 @@ def _print_summary(state: BenchState, controller, samples: int, args):
         for step in controller.steps:
             print(step.line())
         if controller.supported is not None:
-            print(f"  Join rate:   {controller.supported:g} subs/s supported")
+            print(f"  Join rate:   {controller.supported:g} subs/s supported"
+                  + (" (pool-limited)" if controller.pool_limited else ""))
         else:
             print(f"  Join rate:   not demonstrated "
                   f"({controller.not_demonstrated or 'no step passed'})")
@@ -2602,6 +2649,7 @@ async def main():
                              else args.too_far_behind * 1000
                              or args.latency_threshold),
             cycling=bool(args.join_steps),
+            watchers=args.watchers,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process

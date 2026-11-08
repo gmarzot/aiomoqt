@@ -22,9 +22,11 @@ class FakeJoins:
     initial_level = 1.0
 
     def __init__(self, p90=lambda rate: 20, sub_ms=lambda rate: 50,
-                 first_ms=lambda rate: 100, failed=lambda rate: 0, joins=lambda rate: 100):
+                 first_ms=lambda rate: 100, failed=lambda rate: 0, joins=lambda rate: 100,
+                 skipped=lambda rate: 0, joiner_slots=1000):
         self.p90, self.sub_ms, self.first_ms = p90, sub_ms, first_ms
-        self.failed, self.joins = failed, joins
+        self.failed, self.joins, self.skipped = failed, joins, skipped
+        self.joiner_slots = joiner_slots
         self.max_level, self.level, self.rate = 20.0, 0.0, 0.0
         self.rates = []
 
@@ -50,6 +52,7 @@ class FakeJoins:
                          latency_p90_ms=p90, loss_pct=0, shortfall=False,
                          target_mbps=1, tx_mbps=1, rx_mbps=1, joins=n,
                          join_failed=self.failed(r) if r else 0,
+                         join_skipped=self.skipped(r) if r else 0,
                          join_sub_ms=[self.sub_ms(r)] * n, join_first_ms=[self.first_ms(r)] * n)
 
 
@@ -164,6 +167,48 @@ def test_summary_lines(capsys):
     assert not any('High-water' in x or 'Sustained' in x for x in lines)
 
 
+async def test_a_pool_limited_step_keeps_the_last_rate(capsys):
+    relay = FakeJoins(joins=lambda rate: 0 if rate >= 20 else 100,
+                      skipped=lambda rate: 5 if rate >= 20 else 0)
+    ctl, state, _ = _ctl(relay)
+    await ctl.run()
+    assert ctl.steps[-1].fault == 'joiner pool exhausted' and ctl.pool_limited
+    ab._print_summary(state, ctl, 5, None)
+    out = capsys.readouterr().out
+    assert '  Join step:   20/s failed (joiner pool exhausted), 0 joins, 0 failed,' in out
+    assert '  Join rate:   10 subs/s supported (pool-limited)\n' in out
+
+
+def test_a_pool_exhausted_with_another_fault_fails_on_the_other():
+    ctl, _, _ = _ctl(FakeJoins())
+    step = ab.JoinStep(10, joins=50, sub_ms=[1500.0], first_ms=[1.0], skipped=3, seconds=10.0)
+    assert ctl._judge(step) == 'SUBSCRIBE_OK p99 over 1000 ms'
+    ctl.supported, ctl.steps = 5, [step]
+    step.fault = ctl._judge(step)
+    assert not ctl.pool_limited
+
+
+@pytest.mark.parametrize('attempts, skipped, why', [
+    (90, 0, None), (89, 0, 'rate not reached'), (89, 2, 'joiner pool exhausted'),
+    (0, 2, 'joiner pool exhausted'), (0, 0, 'no joins'),
+])
+def test_a_step_must_reach_ninety_percent_of_its_rate(attempts, skipped, why):
+    ctl, _, _ = _ctl(FakeJoins())
+    step = ab.JoinStep(10, joins=attempts, sub_ms=[1.0], first_ms=[1.0],
+                       skipped=skipped, seconds=10.0)
+    assert ctl._judge(step) == why
+
+
+@pytest.mark.parametrize('pool, warned', [(6, True), (90, False)])
+async def test_a_small_joiner_pool_warns_once(capsys, pool, warned):
+    ctl, _, _ = _ctl(FakeJoins(joiner_slots=pool))
+    await ctl.run()
+    out = capsys.readouterr().out
+    line = "  warning: 6 joiner slots reach about 4 joins/s, under the top step's 50/s"
+    assert out.count(line) == (1 if warned else 0)
+    assert ('warning' in out) is warned
+
+
 def test_percentile_is_nearest_rank():
     assert ab._pctl([], 99) == 0.0
     assert ab._pctl([3.0, 1.0, 2.0], 50) == 2.0
@@ -189,12 +234,23 @@ def test_exactly_one_percent_failed_passes():
     (['--join-steps', '0,5', '--mode', 'subs'], 'ascending'),
     (['--join-steps', 'a', '--mode', 'subs'], 'not a list of rates'),
     (['--join-steps', '5', '--mode', 'subs', '--step-s', '0'], 'positive'),
+    (['--join-steps', '5', '--mode', 'subs', '--watchers', '1'], 'between 0 and 1'),
+    (['--join-steps', '5', '--mode', 'subs', '--watchers', '0'], 'between 0 and 1'),
 ])
 def test_join_steps_refuses(monkeypatch, capsys, extra, why):
     monkeypatch.setattr(sys, 'argv', ['moq-adaptive-bench', 'moqt://127.0.0.1:4433', *extra])
     with pytest.raises(SystemExit):
         ab.parse_args()
     assert why in capsys.readouterr().err
+
+
+def test_the_banner_says_start_subs_is_ignored(monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv', ['moq-adaptive-bench', 'moqt://127.0.0.1:4433',
+                                      '--mode', 'subs', '--join-steps', '5,10',
+                                      '--max-subs', '40', '--start-subs', '7'])
+    ab._print_banner(ab.parse_args())
+    assert ('  join rate:          40 subs (--start-subs ignored) held 30 s, then 5,10 '
+            'joins/s, 15 s each, bound 1000 ms, 25% watchers') in capsys.readouterr().out
 
 
 def test_group_duration_follows_the_publisher(monkeypatch):
@@ -284,18 +340,26 @@ async def test_observe_totals_the_joins_of_the_tick(monkeypatch):
     await act.shutdown()
 
 
-async def test_slots_mid_cycle_are_not_a_shortfall(monkeypatch):
+async def test_only_judged_slots_are_expected_to_deliver(monkeypatch):
     act = _actuator(monkeypatch, step_subs=2, max_subs=2)
     await act.apply(2)
     act._spawned_t[0] -= 100.0
     for _ in range(3):
-        act._events_q.put(_report(active=1, delivering=1, cycling=1, rx_bytes=1_000_000))
+        act._events_q.put(_report(active=1, delivering=1, judged=1, rx_bytes=1_000_000))
         sig = await act.observe()
-        assert not sig.shortfall and sig.cycling_subs == 1
+        assert not sig.shortfall
     for _ in range(2):
         act._events_q.put(_report(active=1, delivering=1, rx_bytes=1_000_000))
         sig = await act.observe()
-    assert sig.shortfall, 'the same slot short without a cycle is'
+    assert sig.shortfall, 'the same slot short while judged is'
+    await act.shutdown()
+
+
+async def test_joiner_slots_and_watchers_reach_the_workers(monkeypatch):
+    act = _actuator(monkeypatch, step_subs=4, max_subs=8)
+    await act.apply(8)
+    assert act.joiner_slots == 6
+    assert all(p.cfg['watchers'] == 0.25 for p, _ in act._workers.values())
     await act.shutdown()
 
 
@@ -341,7 +405,7 @@ def test_a_join_without_a_first_object_fails_once():
     assert state['join_t0'] == 100.0
     workers.join_expire(state, 110.5)
     workers.join_fail(state)
-    assert state['tally']['join_failed'] == 1 and not state['cycling']
+    assert state['tally']['join_failed'] == 1
 
 
 def test_join_samples_are_capped():
@@ -356,12 +420,67 @@ def test_join_samples_are_capped():
     assert len(tally['join_first_ms']) == workers.JOIN_SAMPLES_MAX
 
 
-def test_a_cycle_picks_a_subscribed_slot_with_no_join_pending():
+def _joiner(**kw):
+    return _slot(**{'watcher': False, 'active': True, 'joined_at': 0.0, **kw})
+
+
+def test_a_cycle_picks_an_eligible_joiner():
     rng = random.Random(1)
-    states = [_slot(), _slot(active=True, join_t0=5.0), _slot(active=True)]
-    picked = workers.pick_cycle_slot(states, rng)
-    assert picked is states[2] and picked['cycle'] and picked['cycling']
-    assert workers.pick_cycle_slot(states, rng) is None
+    states = [_slot(active=True, joined_at=0.0), _joiner(active=False),
+              _joiner(join_t0=5.0), _joiner()]
+    picked = workers.pick_cycle_slot(states, 10.0, rng)
+    assert picked is states[3] and picked['cycle']
+    assert workers.pick_cycle_slot(states, 10.0, rng) is None, 'a watcher is never cycled'
+
+
+def test_a_joiner_is_eligible_after_its_first_object_and_the_dwell():
+    state = _joiner(joined_at=None)
+    workers.join_begin(state, 100.0)
+    workers.join_mark(state, 'join_sub_ms', 100.1)
+    assert workers.pick_cycle_slot([state], 105.0) is None, 'no first object yet'
+    workers.join_first_object(state, 100.2)
+    assert workers.pick_cycle_slot([state], 100.2 + workers.JOINER_DWELL_S - 0.01) is None
+    assert workers.pick_cycle_slot([state], 100.2 + workers.JOINER_DWELL_S) is state
+
+
+def test_watchers_are_the_first_share_of_a_batch():
+    assert workers.watcher_count(5, 0.25) == 2
+    assert workers.watcher_count(20, 0.25) == 5
+    assert workers.watcher_count(1, 0.25) == 1
+    assert workers.watcher_count(5, None) == 5
+
+
+def _feed(stats, groups):
+    for g in groups:
+        for o in range(8):
+            stats.on_object(SimpleNamespace(group_id=g, object_id=o, subgroup_id=0,
+                                            extensions=None), 100, 0)
+
+
+@pytest.mark.parametrize('rate, judged, lossy, skipped', [(0.0, 4, 3, False),
+                                                          (1000.0, 1, 0, True)])
+async def test_health_is_judged_on_watchers_while_joiners_cycle(
+        monkeypatch, rate, judged, lossy, skipped):
+    async def supervisor(config, relay, stop_ev, stats, state, delay, shared):
+        state['active'] = True
+        _feed(stats, (0, 1, 2, 3, 4, 5) if state['watcher'] else (0, 1, 3, 4, 5))
+        await stop_ev.wait()
+
+    monkeypatch.setattr(workers, '_slot_supervisor', supervisor)
+    monkeypatch.setattr(workers, 'SharedTransport',
+                        lambda **kw: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(workers, 'STATS_INTERVAL_S', 0.05)
+    stop, reports = threading.Event(), queue.Queue()
+    task = asyncio.create_task(workers._subscriber_batch_task(
+        dict(worker_id=0, batch_size=4, relay_url='moqt://127.0.0.1:4433', watchers=0.25,
+             cycle_rate=SimpleNamespace(value=rate)), stop, reports))
+    report = await asyncio.to_thread(reports.get, timeout=5)
+    stop.set()
+    await task
+    assert (report['judged'], report['lossy'], report['active']) == (judged, lossy, judged)
+    assert report['loss'] == 8 * lossy
+    assert report['total_objs'] == 4 * 40 + 8
+    assert (report['join_skipped'] > 0) is skipped, 'no joiner has joined yet'
 
 
 def test_cycles_follow_the_rate():
@@ -372,20 +491,6 @@ def test_cycles_follow_the_rate():
     assert workers.next_cycle(t, 10.3, 4.0) == (True, 10.5)
     assert workers.next_cycle(10.5, 15.0, 4.0) == (True, 15.0), 'catches up one cycle at most'
     assert workers.next_cycle(15.0, 15.0, 0) == (False, None)
-
-
-def test_a_cycled_slot_is_mid_cycle_until_it_delivers():
-    asked = _slot(cycle=True, cycling=True, active=True, since=0.0)
-    assert workers.mid_cycle(asked, True, 100.0, 3.0), 'not before it redials'
-    state = _slot(cycling=True, active=True, since=100.0)
-    workers.join_begin(state, 99.0)
-    assert workers.mid_cycle(state, False, 100.5, 3.0)
-    state['join_t0'] = None
-    assert workers.mid_cycle(state, False, 102.0, 3.0)
-    assert not workers.mid_cycle(state, True, 103.5, 3.0)
-    state['cycling'] = True
-    assert not workers.mid_cycle(state, False, 106.5, 3.0), 'bounded'
-    assert not workers.mid_cycle(_slot(active=True), False, 0.0, 3.0)
 
 
 def test_a_cycled_slot_starts_fresh_stats_and_keeps_the_totals():
