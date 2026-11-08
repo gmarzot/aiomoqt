@@ -9,7 +9,7 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
-from aiomoqt.types import MOQTMessageType
+from aiomoqt.types import MOQTMessageType, MOQTRequestError
 from aiomoqt.media import (
     Catalog, CatalogTrack, CatalogTrackPublisher, DeltaOp, InitData,
     LocTrackPublisher, MediaPublisher, MediaSubscriber, StreamMapping,
@@ -362,3 +362,56 @@ async def test_locmaf_tracks_subscribe_only_at_a_supported_version(monkeypatch):
     await sub._subscribe_media()
     assert subscribed == ["v03"] and seen == ["v03"]
     assert isinstance(sub.tracks["v03"], LocmafTrackSubscriber)
+
+
+_NS_DRAFTS = (16, 18, 22)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", _NS_DRAFTS)
+async def test_subscribe_before_namespace_ok_reaches_every_track(draft, use_quic):
+    # The peer subscribes to two tracks from its PUBLISH_NAMESPACE handler
+    # and acks only after both replies: the demux must already serve them.
+    port = (_BASE_PORT + 3 + 2 * _NS_DRAFTS.index(draft)
+            + (0 if use_quic else 1))
+    replies, catalog_objects = {}, []
+
+    async def _on_namespace(session, msg):
+        for name in ("catalog", "video"):
+            try:
+                replies[name] = await session.subscribe(
+                    msg.namespace, name, forward=1, wait_response=True,
+                    on_object=(lambda obj, *_: catalog_objects.append(obj))
+                    if name == "catalog" else None)
+            except MOQTRequestError as err:
+                replies[name] = err
+        session.publish_namespace_ok(msg)
+
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=draft)
+    server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE, _on_namespace)
+    quic_server = await server.serve()
+    client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=draft)
+    try:
+        async with client.connect() as session:
+            await session.client_session_init()
+            pub = MediaPublisher(session, _NS, _catalog())
+            pub.add_track(LocTrackPublisher(session, _NS, "video"))
+            await asyncio.wait_for(
+                pub.start(announce_namespace=True, publish_track=False), 5.0)
+            for _ in range(100):
+                if catalog_objects:
+                    break
+                await asyncio.sleep(0.02)
+            demand = {name: t.demand[0] for name, t in pub._by_name.items()}
+    finally:
+        quic_server.close()
+    refused = {name: r.error_code for name, r in replies.items()
+               if isinstance(r, MOQTRequestError)}
+    assert set(replies) == {"catalog", "video"} and not refused, refused
+    assert catalog_objects, "no catalog object delivered"
+    # The ack must not set a subscribed track back to ANNOUNCED.
+    assert demand == {"catalog": 1, "video": 1}, demand
