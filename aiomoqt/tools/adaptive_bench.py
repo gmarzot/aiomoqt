@@ -628,7 +628,7 @@ class SubsActuator:
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
-        # controller adding a group per --group-interval spawns one worker.
+        # controller adding a group per interval spawns one worker.
         self.batch_size = max(1, int(step_subs))
         # Startup grace is a FIXED floor, not interval-scaled: QUIC
         # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
@@ -777,10 +777,10 @@ class SubsActuator:
         target = workers_target * self.batch_size
         self._targeted = float(target)
         # Spawn-up is BOUNDED to one worker (one group of K) per call:
-        # the controller adds a group every --group-interval, so an unbounded
+        # the controller adds a group every interval, so an unbounded
         # respawn can't fire dozens of simultaneous batches at a
         # struggling relay (the death-spiral amplifier). Each worker
-        # spaces its own K handshakes internally by --stagger.
+        # spaces its own K handshakes internally by the stagger.
         if len(self._workers) < workers_target:
             wid = self._next_worker_id
             self._next_worker_id += 1
@@ -976,7 +976,7 @@ class SubsActuator:
 
         # Shortfall is judged only against MATURE workers — those past
         # their startup grace. A freshly-spawned group spends its first
-        # `startup_grace` bringing K slots online (staggered by --stagger)
+        # `startup_grace` bringing K slots online (staggered)
         # and self-healing the stragglers; holding it to its full K
         # immediately would read that ramp-up as a deficit and trip a
         # false shortfall the instant the controller adds a group. So a
@@ -1139,14 +1139,14 @@ class AIMDController:
         self.interval_s = interval_s
         # tick_s = how often we observe / decide / add a group; report_s
         # = how often we print a row + write CSV. Subs mode passes
-        # tick_s=group_interval so a group is added every --group-interval while
+        # tick_s=group_interval so a group is added every interval while
         # rows print every --interval. BW mode leaves tick_s=interval,
         # so every tick reports — byte-identical to the old behavior.
         self.report_s = interval_s
         self.tick_s = tick_s if (tick_s and tick_s > 0) else interval_s
         # Streaks are wall-clock windows; express them in ticks so the
         # dead-air / back-off / shortfall reaction times stay constant
-        # when tick_s < report_s (otherwise a short --group-interval would
+        # when tick_s < report_s (otherwise a short group interval would
         # make a dead-air abort fire in ~2s instead of ~3 intervals).
         self._tpr = max(1, round(self.report_s / self.tick_s))
         self._last_report_t = 0.0
@@ -1438,7 +1438,7 @@ class AIMDController:
 
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
-        ticks at tick_s (= --group-interval in subs mode), but rows print at
+        ticks at tick_s (the group interval in subs mode), but rows print at
         --interval; force=True always emits (terminal + back-off rows
         the user must not miss)."""
         now = time.monotonic()
@@ -2240,20 +2240,17 @@ def parse_args():
                    action=_cli.StoreGiven,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps; with --video, the profile's)")
-    p.add_argument("-I", "--group-interval", type=float, default=None,
-                   dest="group_interval", metavar="SEC",
-                   help="subs-mode: seconds between subscriber GROUPS "
-                        "(a group = --step-subs subs, so new subscribers per "
-                        "second = --step-subs / -I). The ramp cadence, "
-                        "independent of --interval (reporting). Default: "
-                        "--interval (one group per report).")
-    p.add_argument("-j", type=float, dest="group_interval", help=argparse.SUPPRESS)
-    p.add_argument("-S", "--stagger", type=float, default=0.1,
-                   help="subs-mode: seconds between individual joins "
-                        "WITHIN a group (default: 0.1), applied inside "
-                        "the worker as it opens its batch. Spaces QUIC "
-                        "Initials so a group doesn't burst the relay. "
-                        "0 = open the batch simultaneously.")
+    p.add_argument("-R", "--ramp-rate", type=float, default=None, metavar="SUBS/S",
+                   help="subs-mode: new subscribers per second, added one "
+                        "group (--step-subs) at a time. Default: one group "
+                        "per --interval.")
+    p.add_argument("-S", "--spread", type=float, default=None, metavar="F",
+                   help="with --ramp-rate: share of each group's slot, 0 to "
+                        "1, its joins spread over. 1 (default) spaces joins "
+                        "evenly; 0 opens the group at once.")
+    p.add_argument("-j", type=float, default=None, dest="group_interval",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--stagger", type=float, default=None, help=argparse.SUPPRESS)
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
@@ -2336,6 +2333,22 @@ def parse_args():
         p.error("--trial-gap, --base-s and --join-bound: positive")
     if not 0 < args.watchers < 1:
         p.error("--watchers: a share between 0 and 1")
+    if args.ramp_rate is not None and args.ramp_rate <= 0:
+        p.error("--ramp-rate: new subscribers per second, above 0")
+    if args.ramp_rate is not None and args.mode != "subs":
+        p.error("--ramp-rate is subs-mode only")
+    if args.spread is not None and args.ramp_rate is None:
+        p.error("--spread needs --ramp-rate")
+    if args.spread is not None and not 0 <= args.spread <= 1:
+        p.error("--spread: a share from 0 to 1")
+    if args.ramp_rate is not None and (args.group_interval is not None
+                                       or args.stagger is not None):
+        p.error("--ramp-rate replaces -j and --stagger; drop them")
+    if args.ramp_rate is not None:
+        args.group_interval = args.step_subs / args.ramp_rate
+        args.stagger = (1.0 if args.spread is None else args.spread) / args.ramp_rate
+    elif args.stagger is None:
+        args.stagger = 0.1
     if args.join_burst is not None:
         if args.join_burst < 1:
             p.error("--join-burst: a burst of at least 1")
@@ -2808,7 +2821,7 @@ async def main():
             mp_rate_queue=mp_rate_q, mp_events_queue=mp_events_q,
             mp_stop_event=mp_stop_event,
         )
-    # Subs mode adds a group (--step-subs) every --group-interval while rows
+    # Subs mode adds a group (--step-subs) every group interval while rows
     # print every --interval; BW mode ticks at --interval (tick_s=None).
     hold = (dict(hold_s=args.hold, confirm_s=args.confirm,
                  exit_sustained=args.exit_on == "sustained")
