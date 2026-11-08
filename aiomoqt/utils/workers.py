@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -68,6 +69,14 @@ RESUBSCRIBE_EVERY_S = (10.0, 20.0)
 # counts while it receives at least DELIVERING_FLOOR of its expected rate.
 SLOT_GRACE_S = 3.0
 DELIVERING_FLOOR = 0.5
+# A join with no first object this long after its dial has failed.
+JOIN_TIMEOUT_S = 10.0
+# Join latencies kept per report, per kind.
+JOIN_SAMPLES_MAX = 500
+# A joiner is cycled again no sooner than this after its rejoin's first object.
+JOINER_DWELL_S = 1.0
+# How often a batch checks for a new join trial.
+TRIAL_POLL_S = 0.01
 
 # Spawn context for all bench parents. Linux pins "fork": Python 3.14
 # switched the Linux default to forkserver, whose by-name SemLock reopen
@@ -343,7 +352,9 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
     reset the batch's cumulative totals or latency window.
 
     state['active'] reflects whether this slot is currently subscribed;
-    state['since'] is the time of its latest subscribe.
+    state['since'] is the time of its latest subscribe. Each dial is a
+    join, timed into state['tally'] (see join_begin). state['cycle'] asks
+    the slot to close its session and redial at once as a new viewer.
     """
     if initial_delay > 0:
         try:
@@ -356,10 +367,14 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                    subgroup_id=None, *_args, **_kw):
         stats.on_object(msg, size_bytes, recv_time_us, group_id,
                         subgroup_id)
+        if state['join_t0'] is not None:
+            join_first_object(state, time.monotonic())
 
     insecure = config.get('insecure', False)
     while not stop_ev.is_set():
         state['active'] = False
+        redial = False
+        join_begin(state, time.monotonic())
         try:
             client = MOQTClient(
                 relay.host, relay.port,
@@ -373,6 +388,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
             )
             async with client.connect() as session:
                 await session.client_session_init()
+                join_mark(state, 'join_setup_ms', time.monotonic())
                 resubscribe = True
                 while resubscribe and not stop_ev.is_set():
                     resubscribe = False
@@ -418,11 +434,15 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                             # let the outer loop reopen the whole slot.
                             break
                     if subscribed:
+                        join_mark(state, 'join_sub_ms', time.monotonic())
                         state['active'] = True
                         state['refusing'] = False
                         state['since'] = time.monotonic()
                         while not stop_ev.is_set():
                             if getattr(track, 'state', None) == TrackState.CLOSED:
+                                break
+                            if state.get('cycle'):
+                                redial = True
                                 break
                             if state['resubscribe']:
                                 # On this session, as a player would: its
@@ -432,13 +452,17 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                                 track.unsubscribe()
                                 resubscribe = True
                                 break
-                            await asyncio.sleep(STOP_POLL_S)
+                            await _poll_wait(state.get('wake'))
                         state['active'] = False
                 session.close()
         except Exception:
             pass
         if stop_ev.is_set():
             break
+        join_fail(state)
+        if redial:
+            stats = renew_stats(state, stats)
+            continue
         # Self-heal: brief backoff, then reopen this slot. Interruptible
         # so a stop during backoff exits promptly.
         try:
@@ -447,6 +471,18 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
         except asyncio.TimeoutError:
             pass
     state['active'] = False
+
+
+async def _poll_wait(wake) -> None:
+    """Sleep STOP_POLL_S, or less when the slot's wake event is set."""
+    if wake is None:
+        await asyncio.sleep(STOP_POLL_S)
+        return
+    try:
+        await asyncio.wait_for(wake.wait(), STOP_POLL_S)
+    except asyncio.TimeoutError:
+        pass
+    wake.clear()
 
 
 def slot_too_far_behind(state, p90_ms, now: float, limit_ms: float) -> bool:
@@ -501,6 +537,148 @@ def judge_slot(state, snap, now: float, window_s: float, expected_bps: float,
     return at_rate and not lossy and not late, lossy, late
 
 
+def new_slot_state(tally: dict, watcher: bool = True) -> dict:
+    """A batch slot's state; tally is the batch's, shared by its slots. A
+    watcher is never cycled; a joiner is (see pick_burst)."""
+    return {'watcher': watcher, 'joined_at': None,
+            'active': False, 'since': 0.0, 'hist': deque(),
+            'lost': 0, 'lost_at': float('-inf'), 'refused': 0,
+            'refusing': False, 'refused_reason': None,
+            'behind_since': None, 'resubscribe_at': 0.0,
+            'resubscribe': False, 'resubscribed': 0,
+            'carried': {'loss': 0, 'total_bytes': 0, 'total_objs': 0},
+            'tally': tally, 'join_t0': None, 'join_setup_ms': None,
+            'join_sub_ms': None, 'join_first_at': None, 'cycle': False,
+            'trial_t': None, 'wake': asyncio.Event()}
+
+
+def new_join_tally() -> dict:
+    """A batch's joins since its last report: completed (first object
+    received), failed, and latencies in ms from the dial; and for join
+    trials, keyed by trial start t, (t, SUBSCRIBE_OK ms, first object ms)
+    from t per completed join, t per failed join, and (t, joiners picked)."""
+    return {'joins': 0, 'join_failed': 0, 'join_setup_ms': [],
+            'join_sub_ms': [], 'join_first_ms': [],
+            'trial_joins': [], 'trial_failed': [], 'trial_picked': []}
+
+
+def take_join_tally(tally: dict) -> dict:
+    """The tally's figures, resetting it."""
+    out = dict(tally)
+    tally.update(new_join_tally())
+    return out
+
+
+def _keep(samples: list, v: float) -> None:
+    if len(samples) < JOIN_SAMPLES_MAX:
+        samples.append(v)
+
+
+def join_begin(state, now: float) -> None:
+    """A slot dials: time a new join from now."""
+    state['join_t0'] = now
+    state['join_setup_ms'] = state['join_sub_ms'] = state['join_first_at'] = None
+    state['cycle'] = False
+
+
+def join_mark(state, key: str, now: float) -> None:
+    """Record a pending join's setup ('join_setup_ms') or SUBSCRIBE_OK
+    ('join_sub_ms'), once. A first object seen before SUBSCRIBE_OK
+    completes the join at SUBSCRIBE_OK."""
+    t0 = state.get('join_t0')
+    if t0 is not None and state.get(key) is None:
+        state[key] = (now - t0) * 1000
+        if key == 'join_sub_ms' and state.get('join_first_at') is not None:
+            _join_done(state, state['join_first_at'])
+
+
+def join_first_object(state, now: float) -> None:
+    """A pending join's first object; completes it once SUBSCRIBE_OK is in."""
+    if state['join_t0'] is None:
+        return
+    if state['join_sub_ms'] is None:
+        if state.get('join_first_at') is None:
+            state['join_first_at'] = now
+        return
+    _join_done(state, now)
+
+
+def _join_done(state, first_t: float) -> None:
+    t0 = state['join_t0']
+    state['join_t0'] = None
+    state['joined_at'] = first_t
+    trial_t, state['trial_t'] = state.get('trial_t'), None
+    tally = state.get('tally')
+    if tally is not None:
+        tally['joins'] += 1
+        _keep(tally['join_setup_ms'], state['join_setup_ms'] or 0.0)
+        _keep(tally['join_sub_ms'], state['join_sub_ms'])
+        _keep(tally['join_first_ms'], (first_t - t0) * 1000)
+        if trial_t is not None:
+            sub_t = t0 + state['join_sub_ms'] / 1000
+            tally['trial_joins'].append(
+                (trial_t, (sub_t - trial_t) * 1000, (first_t - trial_t) * 1000))
+
+
+def join_fail(state) -> None:
+    """A pending join ends without a first object."""
+    if state.get('join_t0') is None:
+        return
+    state['join_t0'] = None
+    trial_t, state['trial_t'] = state.get('trial_t'), None
+    tally = state.get('tally')
+    if tally is not None:
+        tally['join_failed'] += 1
+        if trial_t is not None:
+            tally['trial_failed'].append(trial_t)
+
+
+def join_expire(state, now: float, timeout_s: float = JOIN_TIMEOUT_S) -> None:
+    t0 = state.get('join_t0')
+    if t0 is not None and now - t0 > timeout_s:
+        join_fail(state)
+
+
+def eligible(state, now: float) -> bool:
+    """A joiner subscribed with its join complete, at least JOINER_DWELL_S
+    after that join's first object."""
+    return (not state['watcher'] and state['active'] and state['join_t0'] is None
+            and not state['cycle'] and state['joined_at'] is not None
+            and now - state['joined_at'] >= JOINER_DWELL_S)
+
+
+def pick_burst(states, n: int, trial_t: float, now: float, rng=random) -> int:
+    """Have up to n random eligible joiners redial at once for the trial
+    started at trial_t; returns how many."""
+    ready = [s for s in states if eligible(s, now)]
+    picked = rng.sample(ready, min(n, len(ready)))
+    for s in picked:
+        s['cycle'], s['trial_t'] = True, trial_t
+        s['wake'].set()
+    return len(picked)
+
+
+def watcher_count(k: int, share) -> int:
+    """Watchers among a batch of k: ceil(share x k), all without a share."""
+    return k if share is None else min(k, math.ceil(share * k))
+
+
+def renew_stats(state, old):
+    """A fresh TrackStats for a cycled slot's next viewer: a leave and
+    rejoin is not loss. The old one's totals carry into the report."""
+    c = state['carried']
+    if old is not None:
+        c['loss'] += old.total_lost
+        c['total_bytes'] += old.total_bytes
+        c['total_objs'] += old.total_objects
+    state['lost'] = 0
+    state['lost_at'] = float('-inf')
+    if state.get('hist') is not None:
+        state['hist'].clear()
+    state['stats'] = TrackStats(group_loss=True)
+    return state['stats']
+
+
 async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                                  events_queue):
     """Host config['batch_size'] subscriptions on one event loop, each
@@ -515,13 +693,21 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
        "refused" (subscribes the relay refused so far), "refusing" (slots
        whose last subscribe it refused), "refused_reason",
        "lossy" (slots that lost an object in the window), "late" (slots
-       with p90 over config 'slot_latency_ms')}
+       with p90 over config 'slot_latency_ms'), "judged" (slots the
+       health fields cover), and new_join_tally()'s fields}
 
     "loss" counts whole groups and group tails a slot never got. A slot
     is delivering per slot_delivering() against config 'per_sub_mbps'
     over config 'keep_window' seconds (without per_sub_mbps every
     subscribed slot passes that test), and only while neither lossy
     nor late.
+
+    config 'trial' (a shared Array: trial start time, joiners) starts a
+    join trial when its time changes: that many eligible joiners redial at
+    once (pick_burst). The first watcher_count(K, config 'watchers') slots
+    are watchers; once a trial has started the health fields (all but the
+    totals and the join tally) cover watchers only. "eligible" counts the
+    joiners a trial could pick now.
     """
     worker_id = config['worker_id']
     K = max(1, int(config.get('batch_size', 1)))
@@ -536,14 +722,13 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     behind_ms = float(config.get('too_far_behind') or 0.0) * 1000
     late_ms = float(config.get('slot_latency_ms') or 0.0)
 
-    # (stats, state) per slot; stats persist across a slot's reopens.
-    slots = [(TrackStats(group_loss=True),
-              {'active': False, 'since': 0.0, 'hist': deque(),
-               'lost': 0, 'lost_at': float('-inf'), 'refused': 0,
-               'refusing': False, 'refused_reason': None,
-               'behind_since': None, 'resubscribe_at': 0.0,
-               'resubscribe': False, 'resubscribed': 0})
-             for _ in range(K)]
+    trial = config.get('trial')
+    tally = new_join_tally()
+    # (stats, state) per slot; stats persist across a slot's reopens, and
+    # state['stats'] replaces them once it cycles.
+    n_watch = watcher_count(K, config.get('watchers'))
+    slots = [(TrackStats(group_loss=True), new_slot_state(tally, i < n_watch))
+             for i in range(K)]
 
     async def _batch_stats_loop():
         last_t = time.monotonic()
@@ -559,13 +744,22 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             active = delivering = 0
             refused = refusing = 0
             refused_reason = None
-            behind = resubscribed = lossy = late = 0
+            behind = resubscribed = lossy = late = judged = ready = 0
+            cycling = trial is not None and trial[0] > 0
             for stats, state in slots:
+                ready += eligible(state, now)
+                stats = state.get('stats') or stats
+                join_expire(state, now)
+                snap = stats.snapshot()
+                total_bytes += snap['total_bytes'] + state['carried']['total_bytes']
+                total_objs += snap['total_objs'] + state['carried']['total_objs']
+                if cycling and not state['watcher']:
+                    continue
+                judged += 1
                 refused += state['refused']
                 refusing += state['refusing']
                 refused_reason = state['refused_reason'] or refused_reason
                 resubscribed += state['resubscribed']
-                snap = stats.snapshot()
                 if behind_ms and slot_too_far_behind(
                         state, snap['lat_p90_ms'] if snap['lat_n'] else None,
                         now, behind_ms):
@@ -573,9 +767,13 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 agg_bytes += snap['rx_bytes']
                 agg_objs += snap['rx_objs']
                 agg_iv_lost += snap['iv_lost']
-                cum_loss += snap['loss']
-                total_bytes += snap['total_bytes']
-                total_objs += snap['total_objs']
+                cum_loss += snap['loss'] + state['carried']['loss']
+                hist = state['hist']
+                hist.append((now, snap['total_bytes']))
+                while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
+                    hist.popleft()
+                ok, lost, slow = judge_slot(state, snap, now, window_s,
+                                            expected_bps, late_ms)
                 if snap['lat_n']:
                     lat_n += snap['lat_n']
                     p90, mean = snap['lat_p90_ms'], snap['lat_mean_ms']
@@ -584,12 +782,6 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                                   else max(worst_mean, mean))
                 jitter_sum += snap['jitter_ms']
                 jitter_n += 1
-                hist = state['hist']
-                hist.append((now, snap['total_bytes']))
-                while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
-                    hist.popleft()
-                ok, lost, slow = judge_slot(state, snap, now, window_s,
-                                            expected_bps, late_ms)
                 if state['active']:
                     active += 1
                     delivering += ok
@@ -610,9 +802,22 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'refused': refused, 'refusing': refusing,
                 'refused_reason': refused_reason,
                 'behind': behind, 'resubscribed': resubscribed,
-                'lossy': lossy, 'late': late,
+                'lossy': lossy, 'late': late, 'judged': judged, 'eligible': ready,
+                **take_join_tally(tally),
             })
             last_t = now
+
+    async def _trial_loop():
+        states = [state for _, state in slots]
+        seen = 0.0
+        while not stop_ev.is_set():
+            with trial.get_lock():
+                t, n = trial[0], int(trial[1])
+            if t > 0 and t != seen:
+                seen = t
+                tally['trial_picked'].append(
+                    (t, pick_burst(states, n, t, time.monotonic())))
+            await asyncio.sleep(TRIAL_POLL_S)
 
     # One picoquic thread; one source port per sub, so a relay hashing them
     # spreads them like viewers.
@@ -625,6 +830,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
         for i, (stats, state) in enumerate(slots)
     ]
     stats_task = asyncio.create_task(_batch_stats_loop())
+    if trial is not None:
+        supervisors.append(asyncio.create_task(_trial_loop()))
     stop_task = asyncio.create_task(stop_ev.wait())
     try:
         await stop_task

@@ -876,7 +876,7 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
             track = tracks.get(u.track)
             if track is None:
                 continue
-            key = u.key
+            key, end = u.key, False
             stamp = dmx.to_us(u.pts)
             if wall0 is not None:
                 if stamp < wall0:
@@ -895,8 +895,9 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
                 else:
                     key = n_audio % audio_per_group == 0
                     n_audio += 1
+                    end = n_audio % audio_per_group == 0
             await _send(track, stats[u.track], u.payload, key,
-                        timestamp=stamp)
+                        timestamp=stamp, end=end)
         if eof or time.monotonic() >= deadline:
             break
         chunk = await loop.run_in_executor(None, fh.read1, 65536)
@@ -1239,10 +1240,10 @@ async def _pace(start: float, ts_us: int, pace: bool):
 
 async def _send(track, stats, payload: bytes, key: bool,
                 timestamp: Optional[Union[int, Fraction]] = None,
-                group_id: Optional[int] = None):
+                group_id: Optional[int] = None, end: bool = False):
     """Send one frame, or drop it while no subscriber has started
     generation: a paced feeder stays on the clock instead of queueing a
-    backlog for a late joiner.
+    backlog for a late joiner. `end` makes it its group's last frame.
 
     LOC timestamps without a TIMESCALE property are µs since the Unix
     epoch — players schedule against the wall clock. Paced sources pass
@@ -1256,7 +1257,7 @@ async def _send(track, stats, payload: bytes, key: bool,
         timestamp = entry_us
     stamp = (timestamp * track.timescale // 1_000_000 if track.timescale
              else round_us(timestamp))
-    kw = {}
+    kw = {'end_of_group': True} if end else {}
     frindell = getattr(track, 'frindell', None)
     if frindell is not None:
         kw['capture_us'] = timestamp
@@ -1412,11 +1413,13 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
         at = _exact(ts + offset * 1_000_000)
         await _pace(start, round_us(at), not args.no_pace)
         capture = _exact(wall0 + at)
+        end = False
         if m is not None:
             key, group = m.group_of(capture) != group, m.group_of(capture)
         else:
             key = i % per_group == 0
-        await _send(track, stats, payload, key, timestamp=capture)
+            end = (i + 1) % per_group == 0
+        await _send(track, stats, payload, key, timestamp=capture, end=end)
     await track.finish()
 
 
@@ -1459,17 +1462,20 @@ async def _feed_mp4_track(track, mp4: _Mp4Pass, args,
                        else offset + base + mp4.period if loop else None)
                 payload = wrap(s, ts, None if nxt is None
                                else round(nxt * 1_000_000))
+            end = False
             if grid is not None:
                 key = grid.group_of(capture) != group
                 group = grid.group_of(capture)
             elif group_frames is not None:
                 key = n % group_frames == 0
                 n += 1
+                end = n % group_frames == 0
             else:
                 key = s.key_frame
             if prft and key:
                 payload = _with_prft(payload, round_us(capture))
-            await _send(track, stats, payload, key, timestamp=capture)
+            await _send(track, stats, payload, key, timestamp=capture,
+                        end=end)
         k += 1
         if not loop or k * mp4.period > args.duration:
             break
