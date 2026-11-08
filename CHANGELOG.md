@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `MediaPublisher.start()` sets up its SUBSCRIBE, PUBLISH_OK, update and FETCH handling before it announces, so a peer that subscribes as soon as it acks the namespace (or before, from d18) gets the track instead of DOES_NOT_EXIST. Seen with `pub_media --pub-ns`.
 - pub_media's LOC audio with fixed grouping (`--audio-frames-per-group`, by default one frame per group) sends a group's end with its last frame, so a one-frame audio group costs one write per subscriber. `LocTrackPublisher.send_frame()` takes `end_of_group=`; the frame after an ended group opens the next group.
 - adaptive_bench counts the whole groups and group tails a subscriber never got as lost; before, its loss column read 0.0% while a relay shed groups. In subs mode a subscriber that lost an object in the keep window, or (with `--role both`) has p90 over the threshold, no longer counts as delivering, so it is a shortfall and stays out of high-water: `hold (subs losing objects)` and `hold (subs over threshold)` name it, and the summary gains `Lost` and the peak of each.
 - A group's last object, its END_OF_GROUP marker and the FIN leave in one stream write, at a generating publisher and through aiomoqt-relay, so a one-object group (audio, catalog) costs one write per subscriber instead of two; a PER_OBJECT stream opens with its FIN. `SubgroupDelivery.write()` and `FanoutDelivery.write()` take `end_of_group=`, `open_uni_stream()` takes `end_stream=`.
