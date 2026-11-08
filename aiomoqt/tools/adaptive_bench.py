@@ -576,6 +576,7 @@ class SubsActuator:
                  min_subs: int, max_subs: int,
                  start_subs: int, step_subs: int,
                  object_size: int, per_sub_mbps: float,
+                 side_tracks: tuple = (),
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
@@ -614,6 +615,7 @@ class SubsActuator:
         self.initial_level = float(start_subs)
         self.object_size = object_size
         self.per_sub_mbps = per_sub_mbps
+        self.side_tracks = side_tracks
         self.sub_filter = sub_filter
         self.interval_s = interval_s
         # Seconds between consecutive handshakes in a spawn batch —
@@ -797,6 +799,7 @@ class SubsActuator:
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
                 per_sub_mbps=self.per_sub_mbps,
+                side_tracks=self.side_tracks,
                 keep_window=self.keep_window,
                 too_far_behind=self.too_far_behind,
                 slot_latency_ms=self.slot_latency_ms,
@@ -2186,6 +2189,10 @@ def parse_args():
                    dest="group_size", action=_cli.StoreGiven,
                    help="objects per group (default: 4096)")
     _cli.add_video(p)
+    _cli.add_side_tracks(p)
+    p.add_argument("-D", "--datagram", action=_cli.StoreTrueGiven,
+                   help="With --video --audio: the audio track as "
+                        "ObjectDatagrams")
     p.add_argument("--start-mbps", type=float, default=10.0,
                    help="initial aggregate bitrate (default: 10)")
     p.add_argument("--step-mbps", type=float, default=10.0,
@@ -2429,6 +2436,9 @@ def parse_args():
     if not args.pub_ns and not args.pub_both:
         args.pub_both = True
 
+    _cli.check_side_tracks(p, args)
+    if args.datagram:
+        p.error("-D applies only with --video --audio")
     if args.trackname is None:
         args.trackname = f"adaptive-bench-{uuid.uuid4().hex[:4]}"
 
@@ -2440,7 +2450,8 @@ def parse_args():
         if "sub_mbps" in _cli.given(args):
             p.error("--video sets the track's bitrate; drop --sub-mbps")
         _cli.check_video(p, args)
-        args.sub_mbps = args.object_size * 8 * args.video_fps / 1e6
+        args.sub_mbps = (args.object_size * 8 * args.video_fps / 1e6
+                         + _cli.side_tracks_mbps(args.side_tracks))
 
     args.scenario = Scenario(
         object_size=args.object_size,
@@ -2458,7 +2469,8 @@ def _video_cfg(args) -> dict:
     """Worker config keys for a --video publisher; empty without one."""
     if not args.video:
         return {}
-    return dict(video=args.video, video_fps=args.video_fps)
+    return dict(video=args.video, video_fps=args.video_fps,
+                side_tracks=args.side_tracks)
 
 
 def _print_banner(args):
@@ -2613,6 +2625,8 @@ async def _run_fixed_publisher(args) -> int:
           f"at {args.sub_mbps} Mbps; run the subscriber host with:")
     shape = (f"--video {args.video} -g {args.group_size}" if args.video
              else f"--sub-mbps {args.sub_mbps}")
+    for name, *_ in args.side_tracks:
+        shape += f" --{name}"
     print(f"    moq-adaptive-bench {args.relay_url} --mode subs "
           f"--role sub -N {args.namespace} -T {args.trackname} {shape}")
     published = failed = interrupted = False
@@ -2719,6 +2733,7 @@ async def main():
             start_subs=args.start_subs, step_subs=args.step_subs,
             object_size=args.scenario.object_size,
             per_sub_mbps=args.sub_mbps,
+            side_tracks=args.side_tracks,
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,

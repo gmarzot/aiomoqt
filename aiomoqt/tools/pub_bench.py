@@ -50,12 +50,6 @@ PRIOR_OBJECT_ID_GAP = 0x3E
 # --fetch-history a --prefill track gets when none is given.
 _PREFILL_HISTORY = 1 << 20
 
-# --audio: AAC at 128 kbps, 1024-sample frames at 48 kHz.
-AUDIO_RATE = 48000 / 1024
-AUDIO_OBJECT_SIZE = 341
-CATALOG_RATE = 1.0
-CATALOG_OBJECT_SIZE = 512
-
 
 class _GapTrack(PublishedTrack):
     """Even Group and Object IDs only, each Object carrying the gap
@@ -147,18 +141,7 @@ The URL scheme selects the transport:
     parser.add_argument('--second-track', action='store_true',
                         help='Also PUBLISH <trackname>-2, whose objects '
                              'differ, with the --forward state')
-    parser.add_argument('--audio', action='store_true',
-                        help="With --video: also publish 'audio', "
-                             f"{AUDIO_OBJECT_SIZE} B objects at "
-                             f"{AUDIO_RATE:g}/s (AAC, 128 kbps), one "
-                             "object per group; with -D, as "
-                             "ObjectDatagrams")
-    parser.add_argument('--catalog', action='store_true',
-                        help="With --video: also publish 'catalog', "
-                             f"{CATALOG_OBJECT_SIZE} B objects at "
-                             f"{CATALOG_RATE:g}/s, one object per group. "
-                             "With --audio or --catalog, -T defaults to "
-                             "'video'")
+    _cli.add_side_tracks(parser)
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -187,21 +170,9 @@ The URL scheme selects the transport:
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
-    # With --video, -D applies to the --audio track.
-    args.audio_datagram = bool(args.video and args.audio and args.datagram)
-    if args.audio_datagram:
-        args.datagram = False
-        _cli.given(args).discard('datagram')
+    _cli.check_side_tracks(parser, args)
     _cli.check_video(parser, args)
     _cli.check_datagram(parser, args)
-    side = [n for n in ('audio', 'catalog') if getattr(args, n)]
-    for name in side:
-        if not args.video:
-            parser.error(f'--{name} needs --video')
-    if side and args.trackname is None:
-        args.trackname = 'video'
-    if args.trackname in side:
-        parser.error(f"-T {args.trackname} clashes with --{args.trackname}")
     if args.prefill and not args.fetch_history:
         args.fetch_history = _PREFILL_HISTORY
     if args.trackname is None:
@@ -223,12 +194,8 @@ class _SideTrack(PublishedTrack):
 def _side_tracks(session, args):
     """The --catalog and --audio tracks: one object per group, so each
     object opens a subgroup stream."""
-    shapes = ([('catalog', CATALOG_OBJECT_SIZE, CATALOG_RATE)]
-              if args.catalog else [])
-    if args.audio:
-        shapes.append(('audio', AUDIO_OBJECT_SIZE, AUDIO_RATE))
     tracks = []
-    for name, size, rate in shapes:
+    for name, size, rate, datagram in args.side_tracks:
         t = _SideTrack(
             session,
             namespace=args.namespace,
@@ -236,8 +203,7 @@ def _side_tracks(session, args):
             object_size=size,
             group_size=1,
             rate=rate,
-            forwarding=(ForwardingPreference.DATAGRAM
-                        if name == 'audio' and args.audio_datagram
+            forwarding=(ForwardingPreference.DATAGRAM if datagram
                         else ForwardingPreference.SUBGROUP),
             auth_token=args.auth_token.encode() or None,
             timestamps=args.timestamps,

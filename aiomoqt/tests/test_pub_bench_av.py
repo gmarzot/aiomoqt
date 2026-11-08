@@ -10,6 +10,7 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import ObjectDatagram
 from aiomoqt.tools import pub_bench
+from aiomoqt.utils import cli as _cli
 from aiomoqt.track import SubscribedTrack, VideoTrack
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -112,14 +113,14 @@ async def test_audio_and_catalog_beside_video(tmp_path, use_quic,
     assert {size for _, _, _, size, _ in video} <= {
         prof["i_frame"], prof["p_frame"], prof["b_frame"]}
     assert len({gid for _, gid, _, _, _ in video}) < len(video)
-    for objs, size in ((audio, pub_bench.AUDIO_OBJECT_SIZE),
-                       (catalog, pub_bench.CATALOG_OBJECT_SIZE)):
+    for objs, size in ((audio, _cli.AUDIO_OBJECT_SIZE),
+                       (catalog, _cli.CATALOG_OBJECT_SIZE)):
         assert {s for _, _, _, s, _ in objs} == {size}
         assert {oid for _, _, oid, _, _ in objs} == {0}
         gids = [gid for _, gid, _, _, _ in objs]
         assert len(set(gids)) == len(gids)
     assert {d for *_, d in audio} == {audio_dgram}
     assert not any(d for *_, d in video + catalog)
-    assert _rate(audio) == pytest.approx(pub_bench.AUDIO_RATE, rel=0.1)
+    assert _rate(audio) == pytest.approx(_cli.AUDIO_RATE, rel=0.1)
     assert _rate(video) == pytest.approx(30, rel=0.1)
     assert 2 <= len(catalog) <= WINDOW_S + 2
