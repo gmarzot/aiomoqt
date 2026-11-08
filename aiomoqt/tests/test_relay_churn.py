@@ -125,7 +125,8 @@ class _Open:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self, initial=b"", priority=None):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         if initial:
             await self.stream_write_drain(3, initial)
         return 3
@@ -133,7 +134,7 @@ class _Open:
     def stream_write(self, _sid, data, end_stream=False):
         self.writes.append(data)
 
-    async def stream_write_drain(self, _sid, data):
+    async def stream_write_drain(self, _sid, data, end_stream=False):
         self.writes.append(data)
 
 
