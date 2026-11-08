@@ -11,9 +11,11 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
 from aiomoqt.delivery import FanoutDelivery, StreamMapping, SubgroupDelivery
+from aiomoqt.media import LocTrackPublisher
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
+from aiomoqt.tools import pub_media
 from aiomoqt.tools.moq_interop_relay import _RelayedTrack
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import ObjectStatus
@@ -62,6 +64,9 @@ class _Peer:
         self.resets.append(sid)
 
     def subscribe_done(self, *_a, **_kw):
+        pass
+
+    def _unbind_request(self, _rid):
         pass
 
 
@@ -138,6 +143,84 @@ async def test_per_object_stream_opens_with_its_fin():
     await d.write(0, 0, b"a", group_start=True)
     await d.write(0, 1, b"b")
     assert [[f for _, f in w] for w in peer.streams.values()] == [[True]] * 2
+
+
+# -- LOC packager -----------------------------------------------------
+
+async def _loc_run(frames):
+    """Feed `frames` (send_frame kwargs) to a LOC track on one peer: the
+    (group, object, end_of_group) of each write and each group stream's
+    fins, without the End of Track stream."""
+    peer = _Peer()
+    track = LocTrackPublisher(peer, _NS, "audio", media_kind="audio")
+    await track._start_generating(peer, "SUBSCRIBE")
+    out, seen = track._out, []
+    write = out.write
+
+    async def spy(group_id, object_id, payload, **kw):
+        seen.append((group_id, object_id, kw.get("end_of_group", False)))
+        await write(group_id, object_id, payload, **kw)
+    out.write = spy
+    for i, kw in enumerate(frames):
+        await track.send_frame(b"f%d" % i, **kw)
+    await track.finish()
+    await track._production
+    *groups, _ = peer.streams.values()
+    return seen, [[f for _, f in w] for w in groups]
+
+
+async def test_loc_one_frame_groups_end_in_their_frames_write():
+    seen, fins = await _loc_run(
+        [dict(key_frame=True, end_of_group=True)] * 4)
+    assert seen == [(g, 0, True) for g in range(4)]
+    assert fins == [[True]] * 4
+
+
+async def test_loc_frame_after_an_ended_group_opens_the_next():
+    seen, fins = await _loc_run([
+        dict(key_frame=True), {}, dict(end_of_group=True),
+        {}, dict(end_of_group=True)])
+    assert seen == [(0, 0, False), (0, 1, False), (0, 2, True),
+                    (1, 0, False), (1, 1, True)]
+    assert fins == [[False, False, True], [False, True]]
+
+
+class _Feed:
+    demand = [1]
+    timescale = None
+
+    def __init__(self):
+        self.frames = []
+
+    async def send_frame(self, payload, *, key_frame, timestamp,
+                         group_id=None, end_of_group=False):
+        self.frames.append((key_frame, end_of_group))
+
+    async def finish(self):
+        pass
+
+
+def _grouped(n, per):
+    return [(i % per == 0, i % per == per - 1) for i in range(n)]
+
+
+@pytest.mark.parametrize("per", [1, 3])
+async def test_pub_media_fixed_audio_groups_end_on_their_last_frame(per):
+    tone = _Feed()
+    await pub_media._feed_tone(
+        tone, SimpleNamespace(duration=0.2, freq=440.0, no_pace=True),
+        pub_media._TrackStats(), per_group=per)
+    assert len(tone.frames) >= 9
+    assert tone.frames == _grouped(len(tone.frames), per)
+    times = [i / 50 for i in range(10)]
+    samples = [SimpleNamespace(payload=b"a", key_frame=True)] * 10
+    mp4 = _Feed()
+    await pub_media._feed_mp4_track(
+        mp4, SimpleNamespace(period=0, times=times,
+                             samples=lambda: zip(samples, times)),
+        SimpleNamespace(duration=1.0, no_pace=True, loop=False),
+        pub_media._TrackStats(), group_frames=per)
+    assert mp4.frames == _grouped(10, per)
 
 
 # -- relay -----------------------------------------------------------
@@ -300,15 +383,33 @@ def relay_tables():
         t.clear()
 
 
+async def _stop(tasks):
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _feed_loc(track, size, gop, rate):
+    n = 0
+    while True:
+        await track.send_frame(bytes(size), key_frame=n % gop == 0,
+                               end_of_group=n % gop == gop - 1)
+        n += 1
+        await asyncio.sleep(1 / rate)
+
+
 @requires_certs
+@pytest.mark.parametrize("source", ["generated", "loc"])
 @pytest.mark.parametrize("draft", [18, 22])
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 async def test_two_tracks_one_write_per_object_through_the_relay(
-        use_quic, draft, relay_tables):
-    port = _BASE_PORT + 2 * (draft == 22) + (not use_quic)
+        use_quic, draft, source, relay_tables):
+    port = (_BASE_PORT + 4 * (source == "loc") + 2 * (draft == 22)
+            + (not use_quic))
     group = 5
     got = defaultdict(set)
     ends = {}
+    feeds = []
     server = relay._build_server("localhost", port, CERT, KEY,
                                  use_quic=use_quic, draft=draft)
     handle = await server.serve()
@@ -324,9 +425,16 @@ async def test_two_tracks_one_write_per_object_through_the_relay(
             pub_writes = _count_writes(pub)
             for name, size, gsize, rate in (("audio", 200, 1, 50),
                                             ("video", 3000, group, 30)):
-                PublishedTrack(pub, namespace=_NS, trackname=name,
-                               object_size=size, group_size=gsize,
-                               rate=rate).attach()
+                if source == "loc":
+                    track = LocTrackPublisher(pub, _NS, name,
+                                              media_kind=name)
+                    track.attach()
+                    feeds.append(asyncio.create_task(
+                        _feed_loc(track, size, gsize, rate)))
+                else:
+                    PublishedTrack(pub, namespace=_NS, trackname=name,
+                                   object_size=size, group_size=gsize,
+                                   rate=rate).attach()
             await pub.publish_namespace(namespace=_NS, wait_response=True)
             sub = await connect()
             relay_writes = None
@@ -347,7 +455,9 @@ async def test_two_tracks_one_write_per_object_through_the_relay(
             await asyncio.sleep(1.5)
             # Before the sessions close: closing resets the streams in flight.
             at_pub, at_relay, ended = pub_writes(), relay_writes(), dict(ends)
+            await _stop(feeds)
     finally:
+        await _stop(feeds)
         handle.close()
 
     for counts in (at_pub, at_relay):
