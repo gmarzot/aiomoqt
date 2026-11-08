@@ -1,8 +1,12 @@
-"""ABR ladder and abr_ingest end to end, on cymedia's CPU profile: a LOC
-source dials the ingester, which publishes it and its ladder to a relay."""
+"""ABR ladder and abr_ingest end to end: a LOC source dials the ingester,
+which publishes it and its ladder to a relay. Every test runs on a fake
+cymedia everywhere, and on cymedia's CPU profile where cymedia is installed."""
 import asyncio
+import functools
 import shutil
+import struct
 import subprocess
+import sys
 import time
 from collections import defaultdict
 
@@ -13,22 +17,15 @@ from aiomoqt.media.abr import AbrLadder, Rung
 from aiomoqt.media.broadcast import MediaPublisher, MediaSubscriber
 from aiomoqt.media.catalog import Catalog, CatalogTrack, InitData
 from aiomoqt.media.loc import LocFrame, LocTrackPublisher
-from aiomoqt.media.sources import AnnexBAssembler, avcc_codec_string
+from aiomoqt.media.sources import (
+    AnnexBAssembler, avcc_codec_string, avcc_from_sps_pps,
+)
+from aiomoqt.tests import _fake_cymedia
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._procs import free_udp_port
 from aiomoqt.tests._relay_wait import until_published
 
-cymedia = pytest.importorskip("cymedia")
-cymedia.set_ffmpeg_log_level(16)
-
-pytestmark = [
-    requires_certs,
-    pytest.mark.skipif(shutil.which('ffmpeg') is None,
-                       reason='the source clip needs the ffmpeg CLI'),
-    pytest.mark.skipif(not (cymedia.have_encoder('libopenh264')
-                            or cymedia.have_encoder('libx264')),
-                       reason='no software H.264 encoder in FFmpeg'),
-]
+pytestmark = requires_certs
 
 FPS = 30
 GOP = 15
@@ -36,10 +33,10 @@ SECONDS = 3
 RUNGS = [Rung(160, 120, 200_000), Rung(96, 72, 100_000)]
 
 
-@pytest.fixture(scope='module')
-def clip():
-    """avcC and (LOC payload, key) frames of a 320x240 H.264 clip with a
-    key frame every GOP frames."""
+@functools.lru_cache(maxsize=1)
+def _real_clip():
+    """avcC and (LOC payload, key) frames of a 320x240 H.264 clip with a key
+    frame every GOP frames."""
     raw = subprocess.run(
         ['ffmpeg', '-v', 'error', '-f', 'lavfi',
          '-i', f'testsrc2=size=320x240:rate={FPS}', '-t', str(SECONDS),
@@ -50,7 +47,31 @@ def clip():
     asm = AnnexBAssembler()
     frames = asm.feed(raw) + asm.close()
     assert asm.config is not None and frames[0][1]
-    return asm.config, frames
+    return asm.config, tuple(frames)
+
+
+def _fake_clip():
+    config = avcc_from_sps_pps(_fake_cymedia.sps(9), _fake_cymedia.PPS)
+    frames = [(struct.pack('>I', 4) + bytes([0x65 if n % GOP == 0 else 0x41,
+                                             n & 0xFF, 0, 0]), n % GOP == 0)
+              for n in range(SECONDS * FPS)]
+    return config, frames
+
+
+@pytest.fixture(params=['fake', 'cymedia'])
+def clip(request, monkeypatch):
+    """The source clip, with the cymedia the ladder will use in place."""
+    if request.param == 'fake':
+        monkeypatch.setitem(sys.modules, 'cymedia', _fake_cymedia)
+        return _fake_clip()
+    cymedia = pytest.importorskip('cymedia')
+    if shutil.which('ffmpeg') is None:
+        pytest.skip('the source clip needs the ffmpeg CLI')
+    if not (cymedia.have_encoder('libopenh264')
+            or cymedia.have_encoder('libx264')):
+        pytest.skip('no software H.264 encoder in FFmpeg')
+    cymedia.set_ffmpeg_log_level(16)
+    return _real_clip()
 
 
 async def test_ladder_keeps_source_ids_and_opens_groups_on_key_frames(clip):
