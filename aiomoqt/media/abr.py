@@ -10,6 +10,7 @@ AbrLadder needs cymedia: `uv pip install git+https://github.com/gmarzot/cymedia`
 from __future__ import annotations
 
 import asyncio
+import importlib
 import struct
 import time
 from collections import deque
@@ -167,7 +168,7 @@ class AbrLadder:
                  profile: str = 'nvenc', timescale: Optional[int] = None,
                  realtime: bool = True):
         try:
-            import cymedia
+            cymedia = importlib.import_module("cymedia")
         except ImportError as e:
             raise ImportError("the ABR ladder needs cymedia: uv pip install "
                               "git+https://github.com/gmarzot/cymedia") from e
@@ -195,6 +196,13 @@ class AbrLadder:
     def ready(self) -> asyncio.Event:
         """Set once every rung has its decoder config."""
         return self._ready
+
+    def rung_configs(self) -> List[bytes]:
+        """Every rung's avcC; raises before `ready`."""
+        configs = [c for c in self.configs if c is not None]
+        if len(configs) != len(self.rungs):
+            raise RuntimeError("a rung has no decoder config yet")
+        return configs
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self._loop = loop or asyncio.get_running_loop()

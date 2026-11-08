@@ -23,6 +23,7 @@ encoder's share. --no-ladder measures the hand-off alone.
 import argparse
 import asyncio
 import contextlib
+import importlib
 import signal
 import sys
 import time
@@ -176,7 +177,7 @@ async def _subscribe_source(args, session, on_frame):
 
 def _video_entry(catalog: Catalog, name: Optional[str]) -> CatalogTrack:
     for t in catalog.tracks:
-        if t.packaging != PACKAGING_LOC:
+        if t.packaging != PACKAGING_LOC or t.name is None:
             continue
         if (t.name == name if name else t.role == 'video'):
             return t
@@ -238,6 +239,7 @@ class _Ingest:
         self.catalog = catalog
         self.out_ns = args.out_ns or args.namespace
         self.video = _video_entry(catalog, args.trackname)
+        self.video_name: str = self.video.name or ''
         self.rungs: List[Rung] = (
             [] if args.no_ladder
             else args.rung or rungs_below(self.video.height or 0))
@@ -248,7 +250,7 @@ class _Ingest:
             self.fps = frame_rate(self.video.framerate)
         else:
             logger.warning(f"abr_ingest: catalog gives no framerate for "
-                           f"'{self.video.name}'; assuming {_FALLBACK_FPS:g}")
+                           f"'{self.video_name}'; assuming {_FALLBACK_FPS:g}")
             self.fps = frame_rate(_FALLBACK_FPS)
         self.ladder: Optional[AbrLadder] = None
         self.outputs: Dict[str, _Output] = {}
@@ -260,28 +262,28 @@ class _Ingest:
     def on_frame(self, name: str, frame: LocFrame, group_id: int,
                  object_id: int) -> None:
         now = time.monotonic_ns()
-        if name == self.video.name and frame.key_frame:
+        if name == self.video_name and frame.key_frame:
             if self.ladder is None and self.rungs:
                 self._start_ladder()
             self.keyed.set()
-        if name == self.video.name and self.ladder is not None:
+        if name == self.video_name and self.ladder is not None:
             self.ladder.push(frame, group_id, object_id)
         self._hand(name, frame, group_id, now)
 
     def _start_ladder(self) -> None:
-        import cymedia
+        cymedia = importlib.import_module("cymedia")
         cymedia.set_ffmpeg_log_level(32 if self.args.debug else 16)
-        src = self.sub.tracks[self.video.name]
-        self.ladder = AbrLadder(
+        src = self.sub.tracks[self.video_name]
+        ladder = self.ladder = AbrLadder(
             self.rungs, config=src.config, fps=self.fps,
             profile=self.args.profile, timescale=src.timescale,
             on_frame=self._on_rung)
-        self.ladder.start()
+        ladder.start()
 
     def _on_rung(self, i: int, frame: LocFrame, group_id: int,
                  object_id: int, pushed_ns: Optional[int]) -> None:
         out = self.outputs.get(self.rungs[i].name)
-        if out is not None:
+        if out is not None and self.ladder is not None:
             out.track.config = self.ladder.configs[i]
         self._hand(self.rungs[i].name, frame, group_id, pushed_ns)
 
@@ -297,10 +299,12 @@ class _Ingest:
         """Publish once the source has a key frame and every rung its
         decoder config, so the catalog is complete from the first."""
         await asyncio.wait_for(self.keyed.wait(), _cli.setup_timeout(self.args))
+        configs: List[bytes] = []
         if self.ladder is not None:
             await asyncio.wait_for(self.ladder.ready.wait(), _LADDER_READY_S)
-            catalog = ladder_catalog(self.catalog, self.video.name,
-                                     self.rungs, self.ladder.configs)
+            configs = self.ladder.rung_configs()
+            catalog = ladder_catalog(self.catalog, self.video_name,
+                                     self.rungs, configs)
         else:
             catalog = Catalog.from_json(self.catalog.to_json())
         catalog.tracks = [t for t in catalog.tracks
@@ -311,27 +315,27 @@ class _Ingest:
             for t in catalog.tracks:
                 t.namespace = None
         self.pub = FanoutPublisher(sessions, self.out_ns, catalog)
-        timescale = self.sub.tracks[self.video.name].timescale
+        timescale = self.sub.tracks[self.video_name].timescale
         video_props = {k: v for k, v in
-                       self.sub.properties(self.video.name).items()
+                       self.sub.properties(self.video_name).items()
                        if k != LOC_PROP_VIDEO_CONFIG}
         tracks = []
         for entry in catalog.tracks:
-            src = self.sub.tracks.get(entry.name)
+            name = entry.name or ''
+            src = self.sub.tracks.get(name)
             if src is not None:
                 track = LocTrackPublisher(
-                    self.pub.session, self.out_ns, entry.name,
+                    self.pub.session, self.out_ns, name,
                     config=src.config, timescale=src.timescale,
                     media_kind='audio' if entry.role == 'audio' else 'video',
                     codec_string=src.codec_string)
                 track.track_properties = (
-                    dict(self.sub.properties(entry.name)) or None)
+                    dict(self.sub.properties(name)) or None)
             else:
-                i = next(k for k, r in enumerate(self.rungs)
-                         if r.name == entry.name)
+                i = next(k for k, r in enumerate(self.rungs) if r.name == name)
                 track = LocTrackPublisher(
-                    self.pub.session, self.out_ns, entry.name,
-                    config=self.ladder.configs[i], timescale=timescale,
+                    self.pub.session, self.out_ns, name,
+                    config=configs[i], timescale=timescale,
                     media_kind='video')
                 track.track_properties = dict(video_props) or None
             tracks.append(track)
