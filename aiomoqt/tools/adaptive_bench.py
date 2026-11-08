@@ -7,7 +7,10 @@ process, or pub and sub processes with --mp); against a relay the
 publisher and subscribers always run in worker processes. A controller
 reads subscriber-side samples (p90 latency, achieved throughput,
 delivering subscribers) each interval and nudges one continuous
-publisher, or the subscriber count, up or down.
+publisher, or the subscriber count, up or down. Subs mode with --hold
+steps and holds instead, to the most subscribers it holds through a
+confirmation with no loss and p90 under the threshold, and holds them to
+the end of the run.
 
 Load axes are independent CLI flags: --object-size, -P streams,
 --start-mbps, --step-mbps, --max-mbps. With P > 1, each subgroup gets
@@ -793,6 +796,14 @@ class SubsActuator:
         self._last_bytes_t.pop(wid, None)
         self._spawned_t.pop(wid, None)
 
+    def settled(self) -> bool:
+        """The target's workers are all up and past their startup grace."""
+        now = time.monotonic()
+        want = -(-int(self._targeted) // self.batch_size)
+        return (len(self._workers) >= want
+                and all(now - t >= self._startup_grace
+                        for t in self._spawned_t.values()))
+
     async def observe(self) -> Signal:
         self._ensure_draining()
         self._drain_events()
@@ -1482,6 +1493,211 @@ CERT = find_cert([REPO_CERTS_DIR])
 KEY = find_key(CERT)
 
 
+class HoldController(AIMDController):
+    """Step and hold: the most subscribers held at equilibrium (subs mode).
+
+    Each step raises the level, waits until the new workers are past their
+    startup grace (actuator.settled()), then holds hold_s. From the step on,
+    a tick fails it when p90 is over the threshold, delivery falls short, a
+    subscriber fails, is refused, runs late or loses an object, or the lost
+    object count grows. A held step also fails while p90 is still rising:
+    the mean of its last half over RISE_RATIO x its first half plus
+    RISE_FLOOR x the threshold.
+
+    Steps add 10% of the level while the hold's p90 stayed under 10% of the
+    threshold, 5% under 25%, else one group; never less than one group. The
+    first failure drops straight back to the last level that passed, which
+    must run clean for recover_clean_s within recover_s and then pass a
+    confirm_s hold. Once confirmed the level is held, still checked, until
+    the run ends (exit_sustained ends it at once); a fault there steps
+    down one group and confirms again. A failed recovery or confirmation
+    does the same, MAX_RETREATS step-downs in all. `sustained` is (level,
+    p90 max) of the level held to the end, or None, and `held_s` how long
+    it has held since its confirmation began.
+    """
+
+    MAX_RETREATS = 3
+    RISE_RATIO = 1.25
+    RISE_FLOOR = 0.05
+
+    def __init__(self, actuator, state: BenchState, *, hold_s: float,
+                 confirm_s: float, recover_s: float = 15.0,
+                 recover_clean_s: float = 10.0, exit_sustained: bool = False,
+                 **kw):
+        super().__init__(actuator, state, **kw)
+        self.hold_s = hold_s
+        self.confirm_s = confirm_s
+        self.recover_s = recover_s
+        self.recover_clean_s = recover_clean_s
+        self.exit_sustained = exit_sustained
+        self.sustained: Optional[tuple] = None
+        self.held_s = 0.0
+        self.last_pass: Optional[float] = None
+        self.retreats = 0
+
+    def _next_level(self, level: float, p90_max: float) -> float:
+        a, thr = self.actuator, self.latency_threshold_ms
+        frac = 0.10 if p90_max < 0.10 * thr else 0.05 if p90_max < 0.25 * thr else 0.0
+        step = max(a.step_floor, round(level * frac / a.step_floor) * a.step_floor)
+        return min(a.max_level, level + step)
+
+    def _fault(self, sig: Signal, p90: float, lost0: int) -> Optional[str]:
+        if p90 > self.latency_threshold_ms:
+            return "p90 over"
+        for n, why in ((sig.failed_subs, "subscribers failed"),
+                       (sig.refusing_subs, "relay refusing"),
+                       (sig.lossy_subs, "subscribers losing objects"),
+                       (sig.late_subs, "subscribers over the threshold")):
+            if n:
+                return why
+        if sig.shortfall:
+            return "delivery short"
+        if self.actuator.lost_total[0] > lost0:
+            return "objects lost"
+        return None
+
+    def _rising(self, p90s: list) -> bool:
+        half = len(p90s) // 2
+        if half < 2:
+            return False
+        first, last = sum(p90s[:half]) / half, sum(p90s[-half:]) / half
+        return last > self.RISE_RATIO * first + self.RISE_FLOOR * self.latency_threshold_ms
+
+    def _finish(self, sig: Signal, reason: str) -> None:
+        self.state.ceiling_reason = reason
+        self._emit(sig, reason, force=True)
+        self.state.stop.set()
+
+    async def run(self):
+        state, a = self.state, self.actuator
+        level = a.initial_level
+        await a.apply(level)
+        phase = "step"                # step | recover | confirm | held
+        since = clean_since = None    # hold start; recovery's clean run start
+        p90s: list = []
+        lost0 = a.lost_total[0]
+        recover_t = 0.0
+        no_data = 0
+        while not state.stop.is_set():
+            try:
+                await asyncio.wait_for(state.stop.wait(), timeout=self.tick_s)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            if self.duration_s is not None and now - self.t0 >= self.duration_s:
+                state.ceiling_reason = (
+                    f"held {self.sustained[0]:.0f} {a.unit} to the end" if self.sustained
+                    else f"duration cap reached ({self.duration_s:.0f}s)")
+                state.stop.set()
+                break
+            sig = await a.observe()
+            self.samples += 1
+            state.received_data |= sig.rx_mbps > 0
+            if sig.rx_mbps <= 0:
+                no_data += 1
+                if no_data >= 3 * self._tpr:
+                    state.ceiling_reason = ("no data received — subscribe "
+                                            "failed or publisher stalled")
+                    state.failed = True
+                    self._emit(sig, "ABORT: rx=0", force=True)
+                    state.stop.set()
+                    return
+                self._emit(sig, "rx=0 (no data)")
+                continue
+            no_data = 0
+            self._tally(sig)
+            p90 = self._control_p90(sig)
+            await a.apply(level)      # reconcile: spawns the step's next worker
+
+            if phase == "recover":
+                # Loss counted late from the overshoot does not block recovery.
+                why = self._fault(sig, p90, a.lost_total[0]) or (
+                    None if a.settled() else "settling")
+                if why is None:
+                    clean_since = clean_since or now
+                    if now - clean_since >= self.recover_clean_s:
+                        phase, since, p90s, lost0 = "confirm", None, [], a.lost_total[0]
+                        self._emit(sig, "recovered", force=True)
+                    else:
+                        self._emit(sig, "recover")
+                    continue
+                clean_since = None
+                if now - recover_t < self.recover_s:
+                    self._emit(sig, f"recover ({why})")
+                    continue
+                level = await self._retreat(sig, level, "no recovery")
+                if level is None:
+                    return
+                recover_t = now
+                continue
+
+            why = self._fault(sig, p90, lost0)
+            if why is None:
+                if not a.settled():
+                    self._emit(sig, "settle")
+                    continue
+                if since is None:
+                    since, p90s = now, []
+                p90s.append(p90)
+                if phase == "held":
+                    self.sustained, self.held_s = (level, max(p90s)), now - since
+                    self._emit(sig, "hold (sustained)")
+                    continue
+                if now - since < (self.hold_s if phase == "step" else self.confirm_s):
+                    self._emit(sig, phase if phase == "confirm" else "hold")
+                    continue
+                if self._rising(p90s):
+                    why = "p90 still rising"
+            if why:
+                self.sustained = None
+                if phase == "step" and self.last_pass is None:
+                    self._finish(sig, f"not demonstrated: {why} at the first "
+                                      f"level, {level:.0f} {a.unit}")
+                    return
+                if phase == "step":
+                    level = self.last_pass
+                    await a.apply(level)
+                    self._emit(sig, f"fail ({why}), back to {level:.0f}", force=True)
+                else:
+                    level = await self._retreat(sig, level, why)
+                    if level is None:
+                        return
+                phase, recover_t, clean_since, since = "recover", now, None, None
+                continue
+
+            if phase == "confirm":
+                self.sustained, self.held_s = (level, max(p90s)), now - since
+                cap = f" (--max-{a.unit})" if level >= a.max_level else ""
+                reason = f"equilibrium confirmed at {level:.0f} {a.unit}{cap}"
+                if self.exit_sustained:
+                    self._finish(sig, reason)
+                    return
+                phase = "held"
+                self._emit(sig, reason, force=True)
+                continue
+            self.last_pass, held_max = level, max(p90s)
+            since, p90s, lost0 = None, [], a.lost_total[0]
+            if level >= a.max_level:
+                phase = "confirm"
+                self._emit(sig, "confirm (at max)", force=True)
+                continue
+            level = self._next_level(level, held_max)
+            await a.apply(level)
+            self._emit(sig, f"step to {level:.0f}", force=True)
+
+    async def _retreat(self, sig: Signal, level: float, why: str) -> Optional[float]:
+        """One group down after a failed recovery or confirmation; None ends the run."""
+        self.retreats += 1
+        if self.retreats > self.MAX_RETREATS or level - self.actuator.step_floor < self.actuator.min_level:
+            self._finish(sig, f"not demonstrated: {why} after {self.retreats - 1} step(s) down")
+            return None
+        level -= self.actuator.step_floor
+        await self.actuator.apply(level)
+        self._emit(sig, f"fail ({why}), down to {level:.0f}", force=True)
+        return level
+
+
 async def run_loopback_server(args, state: BenchState):
     """Server publishes bench.load at a rate controlled by state.rate_ops.
 
@@ -1736,12 +1952,21 @@ def parse_args():
                    help="run time; the run ends after this many seconds, "
                         "holding at --max-mbps / --max-subs once there. "
                         "0 (default): until Ctrl-C.")
-    p.add_argument("--exit", dest="exit_on", choices=("max",), default=None,
-                   metavar="COND",
+    p.add_argument("--exit", dest="exit_on", choices=("max", "sustained"),
+                   default=None, metavar="COND",
                    help="also end the run on COND; -t still applies. max: "
                         "on reaching --max-mbps / --max-subs, without "
                         "holding there, or at the first back-off if that "
-                        "comes sooner.")
+                        "comes sooner. sustained (with --hold): once the "
+                        "level is confirmed.")
+    p.add_argument("--hold", type=float, default=0, metavar="SEC",
+                   help="subs-mode: step and hold instead of ramping. Hold "
+                        "each step SEC seconds, drop back to the last passing "
+                        "level on the first bad tick, confirm it for "
+                        "--confirm, then hold it to the end (default: 0, ramp)")
+    p.add_argument("--confirm", type=float, default=30, metavar="SEC",
+                   help="with --hold: seconds the final level must hold "
+                        "to count (default: 30)")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -1762,6 +1987,16 @@ def parse_args():
         p.error("--too-far-behind is subs-mode only")
     if args.exit_on == "max" and args.role == "pub":
         p.error("--exit max: --role pub has no max to reach")
+    if args.hold < 0 or args.confirm <= 0:
+        p.error("--hold and --confirm: seconds")
+    if args.hold and args.mode != "subs":
+        p.error("--hold is subs-mode only")
+    if args.hold and args.exit_on == "max":
+        p.error("--hold confirms its own end; use --exit sustained, not max")
+    if args.exit_on == "sustained" and not args.hold:
+        p.error("--exit sustained needs --hold")
+    if args.hold and args.too_far_behind:
+        p.error("--hold judges each viewer's p90; drop --too-far-behind")
 
     # Splitting the run across hosts is subs-mode only. In subs mode the
     # publisher is fixed-rate and the controller's only actuator is the
@@ -1861,6 +2096,9 @@ def _print_banner(args):
     if args.too_far_behind:
         print(f"  too far behind:     {args.too_far_behind:g} s, back off over "
               f"{BEHIND_SHARE:.0%} of viewers")
+    if getattr(args, "hold", 0):
+        print(f"  step and hold:      {args.hold:g} s per step, "
+              f"{args.confirm:g} s to confirm")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
           + (" over baseline (split hosts)" if args.skew_safe_signals
              else ""))
@@ -1878,9 +2116,20 @@ def _print_summary(state: BenchState, controller, samples: int, args):
         from aiomoqt.utils.format import fmt_bps
         print(f"  High-water:  {fmt_bps(controller.high_water * 1e6)} "
               f"(rx delivered)")
-    else:
+    elif not isinstance(controller, HoldController):
         print(f"  High-water:  {controller.high_water:.1f} {unit}")
-    if controller.pivots:
+    if isinstance(controller, HoldController):
+        if controller.sustained:
+            level, p90 = controller.sustained
+            print(f"  Sustained:   {level:.0f} {unit}, held "
+                  f"{controller.held_s:.0f} s, p90 max {p90:.0f} ms, "
+                  f"0 objects lost")
+        else:
+            print("  Sustained:   not demonstrated")
+            if controller.last_pass is not None:
+                print(f"  Last step:   {controller.last_pass:.0f} {unit} held "
+                      f"{controller.hold_s:g} s, unconfirmed")
+    elif controller.pivots:
         print(f"  Equilibrium: {controller.eq_level:.1f} {unit} "
               f"({len(controller.pivots)} pivots)")
     elif controller.held_at_max:
@@ -2184,8 +2433,12 @@ async def main():
         )
     # Subs mode adds a group (--step-subs) every --join-rate while rows
     # print every --interval; BW mode ticks at --interval (tick_s=None).
-    controller = AIMDController(
+    hold = (dict(hold_s=args.hold, confirm_s=args.confirm,
+                 exit_sustained=args.exit_on == "sustained")
+            if args.hold else {})
+    controller = (HoldController if hold else AIMDController)(
         actuator, state,
+        **hold,
         interval_s=args.scenario.interval_s,
         writer=csv_writer,
         latency_threshold_ms=args.latency_threshold,

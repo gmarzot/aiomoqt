@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- adaptive_bench `--hold SEC` (subs mode): step and hold instead of ramping. Each step must hold SEC seconds with p90 under the threshold and settled, no shortfall and no lost object; the first failure drops back to the last passing level, which must then hold for `--confirm` (30 s) and is held to the end of the run, or to the confirmation with `--exit sustained`. The summary's `Sustained` line is that level and how long it held, or `not demonstrated`.
 - adaptive_bench counts the whole groups and group tails a subscriber never got as lost; before, its loss column read 0.0% while a relay shed groups. In subs mode a subscriber that lost an object in the keep window, or (with `--role both`) has p90 over the threshold, no longer counts as delivering, so it is a shortfall and stays out of high-water: `hold (subs losing objects)` and `hold (subs over threshold)` name it, and the summary gains `Lost` and the peak of each.
 - An object larger than a stream's send ring goes out in pieces instead of failing the write; through aiomoqt-relay at its 1 MiB `--stream-ring-cap`, a 4K keyframe no longer drops the subscriber. The relay logs a subscriber it drops for a failed forward at WARNING.
 - adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`, with one source port per subscriber. Needs aiopquic 0.8.0 on raw QUIC.

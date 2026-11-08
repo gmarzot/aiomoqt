@@ -453,6 +453,18 @@ up; `-t 0` or no `-t` runs until Ctrl-C. `--exit max` ends the run on
 reaching max instead, and `-t` still applies. For a fixed audience with no
 ramp use `load_sim --subs N` (flow E).
 
+`--hold SEC` measures an equilibrium instead of a ramp. Each step is held
+SEC seconds and passes only if every tick stays under the threshold with no
+shortfall, no lossy, late or refused subscriber and no lost object, and its
+p90 has stopped rising. Steps add 10% while p90 is under a tenth of the
+threshold, 5% under a quarter, then one group. The first failure drops
+straight back to the last passing level, which must then hold for
+`--confirm` (30 s). The level is then held, still checked, until `-t`, so
+subscriber hosts running side by side end together; a fault there steps down
+one group and confirms again. `--exit sustained` ends the run at the
+confirmation instead. The summary's `Sustained` line is the level held to
+the end and for how long, or `not demonstrated`.
+
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
 against a live broadcast reports real delivery latency. pub_media
