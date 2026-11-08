@@ -195,7 +195,8 @@ files. `crash.log` gets a `relay: start` line at each start and the faulthandler
 crash or watchdog stall. It is not rotated, so trim it by hand if it grows.
 
 In the log viewer, Shift- or Ctrl-click on "Load earlier" loads the whole selected file (up to
-200,000 records).
+200,000 records). The counters count the restarts, errors, warnings and crash dumps shown; each click
+steps to an earlier one. Level "warnings and errors" or "errors" shows only those lines.
 
 Log level: the switch in the log viewer's toolbar toggles DEBUG and logs `relay: debug logging
 on/off`; `docker kill -s USR1 aiomoqt-relay` steps INFO, DEBUG, TRACE, INFO and logs `relay: log
