@@ -465,23 +465,23 @@ one group and confirms again. `--exit sustained` ends the run at the
 confirmation instead. The summary's `Sustained` line is the level held to
 the end and for how long, or `not demonstrated`.
 
-`--join-steps R1,R2,...` measures the join rate instead: the most new
-subscribers per second admitted while an audience stays healthy. The first
-`--watchers` share (0.25) of each group's subscribers are watchers, never
-cycled; the rest are joiners. It holds `--max-subs` (`--start-subs` is
-ignored) for `--base-s` (30 s) under the `--hold` checks on everyone, then
-for each rate, in joins/s from this host, has random joiners close their
-session and rejoin on a new connection, for `--step-s` (15 s) after 2 s to
-settle. A joiner is cycled again 1 s after its rejoin's first object. A step
-passes when joins were attempted at 90% of its rate or more, 99% of them got
-a first object within 10 s, p99 SUBSCRIBE_OK is within `--join-bound`
-(1000 ms), p99 first object within one group more, and the watchers stay
-clean; the first failing step ends the run. Too few joiners to keep up fails
-the step as `joiner pool exhausted`, and a warning after the base settles
-says when the pool is below the top rate's needs. The summary prints a `Join
-step` line per step and `Join rate: N subs/s supported`, marked
-`(pool-limited)` when only the pool stopped the next step, or `not
-demonstrated`.
+`--join-search B0` measures the largest burst of joins a relay serves while
+an audience stays healthy. The first `--watchers` share (0.25) of each
+group's subscribers are watchers, never cycled; the rest are joiners. It
+holds `--max-subs` (`--start-subs` is ignored) for `--base-s` (30 s) under
+the `--hold` checks on everyone. A trial of B then has B joiners close their
+session and redial at once, spread across the workers. It passes when 99% of
+them get a first object within `--join-bound` (1000 ms) of the burst and the
+watchers stay clean until every join is done or timed out. Between trials the
+watchers must run clean for `--trial-gap` (5 s), within 30 s or the search
+ends. B grows by half from B0 (by a fifth once first-object p99 passes half
+the bound), up to `--join-max` and the eligible joiners; the first failure
+starts a bisection, and the result must then pass 3 times in a row, stepping
+down 10% on a failure, 3 times at most. A failing first trial halves B down
+to 1. Keep `--interval` and `-j` near 1 s so trials are watched closely. The
+summary prints a `Join trial` line per trial and `Join burst: N subscribers
+at once (confirmed 3x)`, marked `(at --join-max)` or `(pool-limited)` when a
+cap stopped the search without a failure, or `not demonstrated`.
 
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run

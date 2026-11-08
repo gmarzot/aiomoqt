@@ -75,6 +75,8 @@ JOIN_TIMEOUT_S = 10.0
 JOIN_SAMPLES_MAX = 500
 # A joiner is cycled again no sooner than this after its rejoin's first object.
 JOINER_DWELL_S = 1.0
+# How often a batch checks for a new join trial.
+TRIAL_POLL_S = 0.01
 
 # Spawn context for all bench parents. Linux pins "fork": Python 3.14
 # switched the Linux default to forkserver, whose by-name SemLock reopen
@@ -450,7 +452,7 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                                 track.unsubscribe()
                                 resubscribe = True
                                 break
-                            await asyncio.sleep(STOP_POLL_S)
+                            await _poll_wait(state.get('wake'))
                         state['active'] = False
                 session.close()
         except Exception:
@@ -469,6 +471,18 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
         except asyncio.TimeoutError:
             pass
     state['active'] = False
+
+
+async def _poll_wait(wake) -> None:
+    """Sleep STOP_POLL_S, or less when the slot's wake event is set."""
+    if wake is None:
+        await asyncio.sleep(STOP_POLL_S)
+        return
+    try:
+        await asyncio.wait_for(wake.wait(), STOP_POLL_S)
+    except asyncio.TimeoutError:
+        pass
+    wake.clear()
 
 
 def slot_too_far_behind(state, p90_ms, now: float, limit_ms: float) -> bool:
@@ -525,7 +539,7 @@ def judge_slot(state, snap, now: float, window_s: float, expected_bps: float,
 
 def new_slot_state(tally: dict, watcher: bool = True) -> dict:
     """A batch slot's state; tally is the batch's, shared by its slots. A
-    watcher is never cycled; a joiner is (see pick_cycle_slot)."""
+    watcher is never cycled; a joiner is (see pick_burst)."""
     return {'watcher': watcher, 'joined_at': None,
             'active': False, 'since': 0.0, 'hist': deque(),
             'lost': 0, 'lost_at': float('-inf'), 'refused': 0,
@@ -534,15 +548,18 @@ def new_slot_state(tally: dict, watcher: bool = True) -> dict:
             'resubscribe': False, 'resubscribed': 0,
             'carried': {'loss': 0, 'total_bytes': 0, 'total_objs': 0},
             'tally': tally, 'join_t0': None, 'join_setup_ms': None,
-            'join_sub_ms': None, 'join_first_at': None, 'cycle': False}
+            'join_sub_ms': None, 'join_first_at': None, 'cycle': False,
+            'trial_t': None, 'wake': asyncio.Event()}
 
 
 def new_join_tally() -> dict:
     """A batch's joins since its last report: completed (first object
-    received), failed, skipped (no joiner eligible), and latencies in ms
-    from the dial."""
-    return {'joins': 0, 'join_failed': 0, 'join_skipped': 0, 'join_setup_ms': [],
-            'join_sub_ms': [], 'join_first_ms': []}
+    received), failed, and latencies in ms from the dial; and for join
+    trials, keyed by trial start t, (t, SUBSCRIBE_OK ms, first object ms)
+    from t per completed join, t per failed join, and (t, joiners picked)."""
+    return {'joins': 0, 'join_failed': 0, 'join_setup_ms': [],
+            'join_sub_ms': [], 'join_first_ms': [],
+            'trial_joins': [], 'trial_failed': [], 'trial_picked': []}
 
 
 def take_join_tally(tally: dict) -> dict:
@@ -590,12 +607,17 @@ def _join_done(state, first_t: float) -> None:
     t0 = state['join_t0']
     state['join_t0'] = None
     state['joined_at'] = first_t
+    trial_t, state['trial_t'] = state.get('trial_t'), None
     tally = state.get('tally')
     if tally is not None:
         tally['joins'] += 1
         _keep(tally['join_setup_ms'], state['join_setup_ms'] or 0.0)
         _keep(tally['join_sub_ms'], state['join_sub_ms'])
         _keep(tally['join_first_ms'], (first_t - t0) * 1000)
+        if trial_t is not None:
+            sub_t = t0 + state['join_sub_ms'] / 1000
+            tally['trial_joins'].append(
+                (trial_t, (sub_t - trial_t) * 1000, (first_t - trial_t) * 1000))
 
 
 def join_fail(state) -> None:
@@ -603,9 +625,12 @@ def join_fail(state) -> None:
     if state.get('join_t0') is None:
         return
     state['join_t0'] = None
+    trial_t, state['trial_t'] = state.get('trial_t'), None
     tally = state.get('tally')
     if tally is not None:
         tally['join_failed'] += 1
+        if trial_t is not None:
+            tally['trial_failed'].append(trial_t)
 
 
 def join_expire(state, now: float, timeout_s: float = JOIN_TIMEOUT_S) -> None:
@@ -614,32 +639,23 @@ def join_expire(state, now: float, timeout_s: float = JOIN_TIMEOUT_S) -> None:
         join_fail(state)
 
 
-def pick_cycle_slot(states, now: float, rng=random):
-    """Ask a random eligible joiner to redial; None when there is none. A
-    joiner is eligible while subscribed with its join complete, at least
-    JOINER_DWELL_S after that join's first object."""
-    ready = [s for s in states
-             if not s['watcher'] and s['active'] and s['join_t0'] is None
-             and not s['cycle'] and s['joined_at'] is not None
-             and now - s['joined_at'] >= JOINER_DWELL_S]
-    if not ready:
-        return None
-    s = rng.choice(ready)
-    s['cycle'] = True
-    return s
+def eligible(state, now: float) -> bool:
+    """A joiner subscribed with its join complete, at least JOINER_DWELL_S
+    after that join's first object."""
+    return (not state['watcher'] and state['active'] and state['join_t0'] is None
+            and not state['cycle'] and state['joined_at'] is not None
+            and now - state['joined_at'] >= JOINER_DWELL_S)
 
 
-def next_cycle(next_t, now: float, rate: float) -> tuple:
-    """(due, next_t) for one cycle every 1/rate s; next_t None when off.
-    A late loop catches up by at most one cycle."""
-    if rate <= 0:
-        return False, None
-    period = 1.0 / rate
-    if next_t is None:
-        return False, now + period
-    if now < next_t:
-        return False, next_t
-    return True, max(next_t + period, now)
+def pick_burst(states, n: int, trial_t: float, now: float, rng=random) -> int:
+    """Have up to n random eligible joiners redial at once for the trial
+    started at trial_t; returns how many."""
+    ready = [s for s in states if eligible(s, now)]
+    picked = rng.sample(ready, min(n, len(ready)))
+    for s in picked:
+        s['cycle'], s['trial_t'] = True, trial_t
+        s['wake'].set()
+    return len(picked)
 
 
 def watcher_count(k: int, share) -> int:
@@ -686,10 +702,12 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     subscribed slot passes that test), and only while neither lossy
     nor late.
 
-    config 'cycle_rate' (a shared Value, joins/s) has a random joiner
-    redial every 1/rate s. The first watcher_count(K, config 'watchers')
-    slots are watchers; while the rate is above 0 the health fields (all
-    but the totals and the join tally) cover watchers only.
+    config 'trial' (a shared Array: trial start time, joiners) starts a
+    join trial when its time changes: that many eligible joiners redial at
+    once (pick_burst). The first watcher_count(K, config 'watchers') slots
+    are watchers; once a trial has started the health fields (all but the
+    totals and the join tally) cover watchers only. "eligible" counts the
+    joiners a trial could pick now.
     """
     worker_id = config['worker_id']
     K = max(1, int(config.get('batch_size', 1)))
@@ -704,7 +722,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     behind_ms = float(config.get('too_far_behind') or 0.0) * 1000
     late_ms = float(config.get('slot_latency_ms') or 0.0)
 
-    cycle_rate = config.get('cycle_rate')
+    trial = config.get('trial')
     tally = new_join_tally()
     # (stats, state) per slot; stats persist across a slot's reopens, and
     # state['stats'] replaces them once it cycles.
@@ -726,9 +744,10 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             active = delivering = 0
             refused = refusing = 0
             refused_reason = None
-            behind = resubscribed = lossy = late = judged = 0
-            cycling = cycle_rate is not None and cycle_rate.value > 0
+            behind = resubscribed = lossy = late = judged = ready = 0
+            cycling = trial is not None and trial[0] > 0
             for stats, state in slots:
+                ready += eligible(state, now)
                 stats = state.get('stats') or stats
                 join_expire(state, now)
                 snap = stats.snapshot()
@@ -783,23 +802,22 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'refused': refused, 'refusing': refusing,
                 'refused_reason': refused_reason,
                 'behind': behind, 'resubscribed': resubscribed,
-                'lossy': lossy, 'late': late, 'judged': judged,
+                'lossy': lossy, 'late': late, 'judged': judged, 'eligible': ready,
                 **take_join_tally(tally),
             })
             last_t = now
 
-    async def _cycle_loop():
+    async def _trial_loop():
         states = [state for _, state in slots]
-        next_t = None
+        seen = 0.0
         while not stop_ev.is_set():
-            now = time.monotonic()
-            due, next_t = next_cycle(next_t, now, cycle_rate.value)
-            if due:
-                if pick_cycle_slot(states, now) is None:
-                    tally['join_skipped'] += 1
-                continue
-            wait = STOP_POLL_S if next_t is None else min(STOP_POLL_S, next_t - now)
-            await asyncio.sleep(wait)
+            with trial.get_lock():
+                t, n = trial[0], int(trial[1])
+            if t > 0 and t != seen:
+                seen = t
+                tally['trial_picked'].append(
+                    (t, pick_burst(states, n, t, time.monotonic())))
+            await asyncio.sleep(TRIAL_POLL_S)
 
     # One picoquic thread; one source port per sub, so a relay hashing them
     # spreads them like viewers.
@@ -812,8 +830,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
         for i, (stats, state) in enumerate(slots)
     ]
     stats_task = asyncio.create_task(_batch_stats_loop())
-    if cycle_rate is not None:
-        supervisors.append(asyncio.create_task(_cycle_loop()))
+    if trial is not None:
+        supervisors.append(asyncio.create_task(_trial_loop()))
     stop_task = asyncio.create_task(stop_ev.wait())
     try:
         await stop_task

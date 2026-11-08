@@ -10,9 +10,9 @@ delivering subscribers) each interval and nudges one continuous
 publisher, or the subscriber count, up or down. Subs mode with --hold
 steps and holds instead, to the most subscribers it holds through a
 confirmation with no loss and p90 under the threshold, and holds them to
-the end of the run. Subs mode with --join-steps holds an audience and
-cycles its subscribers at rising join rates, to the most joins per second
-it admits with that audience healthy.
+the end of the run. Subs mode with --join-search holds an audience and
+has bursts of its subscribers rejoin at once, to the largest burst served
+with that audience healthy.
 
 Load axes are independent CLI flags: --object-size, -P streams,
 --start-mbps, --step-mbps, --max-mbps. With P > 1, each subgroup gets
@@ -27,6 +27,7 @@ Usage:
 import argparse
 import asyncio
 import csv
+import math
 import os
 import platform
 import sys
@@ -138,14 +139,6 @@ class Signal:
     # keep window, or their p90 is over the threshold.
     lossy_subs: int = 0
     late_subs: int = 0
-    # subs-mode joins since the last observe: completed, failed, skipped
-    # (no joiner eligible), and the completed ones' SUBSCRIBE_OK and
-    # first-object latencies (ms).
-    joins: int = 0
-    join_failed: int = 0
-    join_skipped: int = 0
-    join_sub_ms: list = field(default_factory=list)
-    join_first_ms: list = field(default_factory=list)
 
 
 @dataclass
@@ -525,9 +518,19 @@ def _hold_label(sig: Signal, default: str) -> str:
     return default
 
 
-def _new_join_tick() -> dict:
-    return {'joins': 0, 'join_failed': 0, 'join_skipped': 0,
-            'join_sub_ms': [], 'join_first_ms': []}
+def _apportion(b: int, counts: dict) -> dict:
+    """Split b over counts in proportion (largest remainder), at most each
+    count and their total."""
+    total = sum(counts.values())
+    b = min(b, total)
+    if b <= 0:
+        return {}
+    exact = {k: b * c / total for k, c in counts.items()}
+    out = {k: int(x) for k, x in exact.items()}
+    for k in sorted(counts, key=lambda k: exact[k] - out[k],
+                    reverse=True)[:b - sum(out.values())]:
+        out[k] += 1
+    return out
 
 
 def _delivering(batch: dict) -> int:
@@ -580,16 +583,15 @@ class SubsActuator:
                  transport_options: Optional[dict] = None,
                  too_far_behind: float = 0.0,
                  slot_latency_ms: float = 0.0,
-                 cycling: bool = False,
+                 join_search: bool = False,
                  watchers: float = 0.25):
         self.too_far_behind = too_far_behind
-        # Workers get a shared cycle rate (joins/s), cycling their joiners
-        # and judging health on their watchers; see set_join_rate().
-        self.cycling = cycling
+        # Workers get a shared trial Array (start time, joiners); see
+        # start_trial(). They judge health on watchers once one starts.
+        self.join_search = join_search
         self.watchers = watchers
-        self._cycle_rates: dict = {}
-        self._join_rate = 0.0
-        self._joins = _new_join_tick()
+        self._trial_arrays: dict = {}
+        self._trial: Optional[dict] = None
         # A slot with p90 over this stops counting as delivering; 0 = off.
         self.slot_latency_ms = slot_latency_ms
         self.relay_url = relay_url
@@ -716,12 +718,15 @@ class SubsActuator:
                 self._resubscribed[wid] = msg['resubscribed']
             self._objs[wid] = msg.get('total_objs', 0)
             self._lost[wid] = msg.get('loss', 0)
-            j = self._joins
-            j['joins'] += msg.get('joins', 0)
-            j['join_failed'] += msg.get('join_failed', 0)
-            j['join_skipped'] += msg.get('join_skipped', 0)
-            j['join_sub_ms'] += msg.get('join_sub_ms', ())
-            j['join_first_ms'] += msg.get('join_first_ms', ())
+            tr = self._trial
+            if tr is not None:
+                t = tr['t']
+                for pt, n in msg.get('trial_picked', ()):
+                    if pt == t:
+                        tr['picked'] += n
+                        tr['reported'].add(wid)
+                tr['joins'] += [(s, f) for jt, s, f in msg.get('trial_joins', ()) if jt == t]
+                tr['failed'] += sum(ft == t for ft in msg.get('trial_failed', ()))
             self._oldest_report_s = max(self._oldest_report_s,
                                         now - msg.get('t', now))
             tick = self._tick.setdefault(
@@ -797,8 +802,8 @@ class SubsActuator:
                 slot_latency_ms=self.slot_latency_ms,
                 **self.transport_options,
             )
-            if self.cycling:
-                cfg['cycle_rate'] = self._cycle_rates[wid] = self._mp.Value('d', 0.0)
+            if self.join_search:
+                cfg['trial'] = self._trial_arrays[wid] = self._mp.Array('d', 2)
                 cfg['watchers'] = self.watchers
             from aiomoqt.utils.workers import sub_batch_worker_entry
             p = self._mp.Process(
@@ -809,35 +814,46 @@ class SubsActuator:
             p.start()
             self._workers[wid] = (p, stop_ev)
             self._spawned_t[wid] = time.monotonic()
-            self._split_join_rate()
         # wind down
         while len(self._workers) > workers_target:
             wid = next(iter(self._workers))
             self._kill_worker(wid)
 
-    def set_join_rate(self, total_per_s: float) -> None:
-        """Cycle subscribers at total_per_s joins/s, split across live workers."""
-        self._join_rate = max(0.0, float(total_per_s))
-        self._split_join_rate()
+    def _eligible(self) -> dict:
+        return {wid: int(self._latest_batch.get(wid, {}).get('eligible', 0))
+                for wid in self._trial_arrays}
 
     @property
-    def joiner_slots(self) -> int:
-        """Slots the target's workers cycle."""
-        from aiomoqt.utils.workers import watcher_count
-        if not self.cycling:
-            return 0
-        workers = -(-int(self._targeted) // self.batch_size)
-        return workers * (self.batch_size - watcher_count(self.batch_size, self.watchers))
+    def eligible_total(self) -> int:
+        """Joiners a trial could pick, per the workers' last reports."""
+        return sum(self._eligible().values())
 
-    def _split_join_rate(self) -> None:
-        live = [wid for wid in self._workers if wid in self._cycle_rates]
-        for wid, v in self._cycle_rates.items():
-            v.value = self._join_rate / len(live) if wid in live else 0.0
+    def start_trial(self, b: int) -> float:
+        """Have b eligible joiners redial at once, spread over the workers in
+        proportion to their eligible counts; returns the trial start time."""
+        share = _apportion(b, self._eligible())
+        t = time.monotonic()
+        for wid, arr in self._trial_arrays.items():
+            with arr.get_lock():
+                arr[0], arr[1] = t, share.get(wid, 0)
+        self._trial = {'t': t, 'asked': set(self._trial_arrays), 'reported': set(),
+                       'picked': 0, 'joins': [], 'failed': 0}
+        return t
+
+    def trial_view(self) -> dict:
+        """The open trial: joiners picked, (SUBSCRIBE_OK ms, first object ms)
+        from its start per completed join, failed joins, and whether every
+        worker has picked and every pick has resolved."""
+        tr = self._trial or {'asked': set(), 'reported': set(), 'picked': 0,
+                             'joins': [], 'failed': 0}
+        resolved = (tr['asked'] <= tr['reported']
+                    and len(tr['joins']) + tr['failed'] >= tr['picked'])
+        return dict(picked=tr['picked'], joins=list(tr['joins']), failed=tr['failed'],
+                    resolved=resolved)
 
     def _kill_worker(self, wid):
         proc, stop_ev = self._workers.pop(wid, (None, None))
-        self._cycle_rates.pop(wid, None)
-        self._split_join_rate()
+        self._trial_arrays.pop(wid, None)
         if proc is None:
             return
         stop_ev.set()
@@ -897,8 +913,7 @@ class SubsActuator:
             lost = self._latest_batch.get(wid, {}).get('active',
                                                        self.batch_size)
             proc, stop_ev = self._workers.pop(wid, (None, None))
-            self._cycle_rates.pop(wid, None)
-            self._split_join_rate()
+            self._trial_arrays.pop(wid, None)
             if proc is not None:
                 stop_ev.set()
                 proc.join(timeout=0.5)
@@ -1002,7 +1017,6 @@ class SubsActuator:
 
         target_mbps = target_subs * self.per_sub_mbps
         avg_jitter_ms = jitter_sum / jitter_n if jitter_n else 0.0
-        joins, self._joins = self._joins, _new_join_tick()
         return Signal(
             t=now,
             level=float(target_subs),
@@ -1029,7 +1043,6 @@ class SubsActuator:
                            for wid in self._workers),
             late_subs=sum(self._latest_batch.get(wid, {}).get('late', 0)
                           for wid in self._workers),
-            **joins,
         )
 
     async def shutdown(self) -> None:
@@ -1768,205 +1781,240 @@ def _pctl(values, p: float) -> float:
 
 
 @dataclass
-class JoinStep:
-    """One join rate's results; fault None while it passes."""
-    rate: float
-    joins: int = 0
-    failed: int = 0
+class JoinTrial:
+    """One burst of b joins; passed only once judged."""
+    b: int
+    bound_ms: float
+    ok: int = 0                 # first object within bound_ms of the start
     sub_ms: list = field(default_factory=list)
     first_ms: list = field(default_factory=list)
+    burst_ms: float = 0.0       # start to the last first object within bound
     fault: Optional[str] = None
-    skipped: int = 0        # scheduled joins with no joiner eligible
-    seconds: float = 0.0    # counted time
+    passed: bool = False
 
-    def add(self, sig: Signal) -> None:
-        self.joins += sig.joins
-        self.failed += sig.join_failed
-        self.skipped += sig.join_skipped
-        self.sub_ms += sig.join_sub_ms
-        self.first_ms += sig.join_first_ms
+    def judge(self, joins: list, share: float) -> None:
+        """Take (SUBSCRIBE_OK ms, first object ms) per completed join."""
+        self.sub_ms = [s for s, _ in joins]
+        self.first_ms = [f for _, f in joins]
+        within = [f for f in self.first_ms if f <= self.bound_ms]
+        self.ok, self.burst_ms = len(within), max(within, default=0.0)
+        if self.fault is None and self.ok < share * self.b:
+            self.fault = "joins late or failed"
+        self.passed = self.fault is None
 
     def line(self) -> str:
-        verdict = "passed" if self.fault is None else f"failed ({self.fault})"
+        verdict = "passed" if self.passed else f"failed ({self.fault or 'run ended'})"
         sub, first = self.sub_ms, self.first_ms
-        return (f"  Join step:   {self.rate:g}/s {verdict}, {self.joins} joins, "
-                f"{self.failed} failed, SUBSCRIBE_OK p50/p99 "
+        return (f"  Join trial:  B={self.b} {verdict}, {self.ok}/{self.b} joined within "
+                f"{self.bound_ms:g} ms, SUBSCRIBE_OK p50/p99 "
                 f"{_pctl(sub, 50):.0f}/{_pctl(sub, 99):.0f} ms, first object p50/p99 "
-                f"{_pctl(first, 50):.0f}/{_pctl(first, 99):.0f} ms")
+                f"{_pctl(first, 50):.0f}/{_pctl(first, 99):.0f} ms, "
+                f"burst {self.burst_ms:.0f} ms")
 
 
-class JoinRateController(HoldController):
-    """Join rate: the most new subscribers per second admitted while an
-    existing audience stays healthy (subs mode).
+class JoinSearchController(HoldController):
+    """Join burst: the most subscribers joining at once that a relay serves
+    while an existing audience stays healthy (subs mode).
 
     Spawns the base audience (the max level), waits for actuator.settled()
-    and holds it base_s free of HoldController's faults, judging every
-    subscriber. Then for each rate in join_steps it cycles joiners at that
-    rate, waits SETTLE_S, and measures step_s, judging health on watchers
-    only. A step passes with joins attempted at RATE_SHARE of its rate or
-    more, at least JOIN_OK_SHARE of them completed, p99 SUBSCRIBE_OK within
-    join_bound_ms, p99 first object within join_bound_ms plus one group
-    (group_s), and no watcher fault. The first failing step ends the run;
-    `supported` is the last passing step's rate, `pool_limited` whether
-    only too few eligible joiners failed the next.
+    and holds it base_s free of HoldController's faults, judging everyone.
+    A trial of B has B eligible joiners redial at once; it passes when
+    JOIN_OK_SHARE of them get a first object within join_bound_ms of its
+    start and no watcher fault occurs until they are all done. Between
+    trials the watchers must run clean for trial_gap_s, within
+    RESET_TIMEOUT_S. The search grows B by GROW (GROW_NEAR once first-object
+    p99 passes half the bound), at most to join_max and the eligible pool;
+    bisects after the first failure; then needs CONFIRMS passes in a row,
+    stepping down 10% on a failure, MAX_STEP_DOWNS times at most. A failing
+    first trial halves B down to 1. `burst` is the confirmed B or None.
     """
 
-    SETTLE_S = 2.0
     JOIN_OK_SHARE = 0.99
-    RATE_SHARE = 0.9
-    POOL_EXHAUSTED = "joiner pool exhausted"
+    GROW, GROW_NEAR = 1.5, 1.2
+    CONFIRMS = 3
+    MAX_STEP_DOWNS = 3
+    RESET_TIMEOUT_S = 30.0
+    RESOLVE_SLACK_S = 5.0
 
-    def __init__(self, actuator, state: BenchState, *, join_steps, step_s: float,
-                 base_s: float, join_bound_ms: float, group_s: float, **kw):
+    def __init__(self, actuator, state: BenchState, *, b0: int, join_max: Optional[int],
+                 join_bound_ms: float, trial_gap_s: float, base_s: float, **kw):
         super().__init__(actuator, state, hold_s=base_s, confirm_s=base_s, **kw)
-        self.join_steps = list(join_steps)
-        self.step_s, self.base_s = step_s, base_s
-        self.join_bound_ms, self.group_s = join_bound_ms, group_s
-        self.steps: list = []
-        self.supported: Optional[float] = None
+        self.b0, self.join_max = b0, join_max
+        self.join_bound_ms, self.trial_gap_s, self.base_s = join_bound_ms, trial_gap_s, base_s
+        self.trials: list = []
+        self.burst: Optional[int] = None
+        self.confirmed = 0
+        self.cap_flag = ""
         self.not_demonstrated: Optional[str] = None
+        self._sig: Optional[Signal] = None
+        self._no_data = 0
+        self._ended = False
 
-    @property
-    def pool_limited(self) -> bool:
-        return (self.supported is not None and bool(self.steps)
-                and self.steps[-1].fault == self.POOL_EXHAUSTED)
+    async def _tick(self) -> Optional[Signal]:
+        """Wait a tick and observe; None once the run ends."""
+        state, a = self.state, self.actuator
+        try:
+            await asyncio.wait_for(state.stop.wait(), timeout=self.tick_s)
+            return None
+        except asyncio.TimeoutError:
+            pass
+        if self.duration_s is not None and time.monotonic() - self.t0 >= self.duration_s:
+            state.ceiling_reason = f"duration cap reached ({self.duration_s:.0f}s)"
+            state.stop.set()
+            return None
+        sig = self._sig = await a.observe()
+        self.samples += 1
+        state.received_data |= sig.rx_mbps > 0
+        self._no_data = self._no_data + 1 if sig.rx_mbps <= 0 else 0
+        if self._no_data >= 3 * self._tpr:
+            state.failed = True
+            state.ceiling_reason = "no data received — subscribe failed or publisher stalled"
+            self._emit(sig, "ABORT: rx=0", force=True)
+            state.stop.set()
+            return None
+        self._tally(sig)
+        await a.apply(a.max_level)    # reconcile: spawns the next worker
+        return sig
 
-    def _judge(self, step: JoinStep) -> Optional[str]:
-        """The step's failure; a short rate only when nothing else failed."""
-        short = step.joins + step.failed < self.RATE_SHARE * step.rate * step.seconds
-        rate_why = self.POOL_EXHAUSTED if step.skipped else "rate not reached"
-        if not step.joins:
-            return rate_why if short and step.skipped and not step.failed else "no joins"
-        if step.joins < self.JOIN_OK_SHARE * (step.joins + step.failed):
-            return "joins failed"
-        if _pctl(step.sub_ms, 99) > self.join_bound_ms:
-            return f"SUBSCRIBE_OK p99 over {self.join_bound_ms:g} ms"
-        first_bound = self.join_bound_ms + 1000 * self.group_s
-        if _pctl(step.first_ms, 99) > first_bound:
-            return f"first object p99 over {first_bound:.0f} ms"
-        return rate_why if short else None
+    def _why(self, sig: Signal, lost0: int) -> Optional[str]:
+        if sig.rx_mbps <= 0:
+            return "no data"
+        return self._fault(sig, self._control_p90(sig), lost0)
 
-    def _warn_pool(self) -> None:
-        """Warn when the joiner pool cannot cycle at the top step's rate."""
-        from aiomoqt.utils.workers import JOINER_DWELL_S
-        pool, top = getattr(self.actuator, 'joiner_slots', None), max(self.join_steps)
-        reach = (pool or 0) / (JOINER_DWELL_S + 0.5)
-        if pool is not None and reach < top:
-            print(f"  warning: {pool} joiner slots reach about {reach:.0f} joins/s, "
-                  f"under the top step's {top:g}/s", flush=True)
+    def _give_up(self, reason: str) -> None:
+        self.not_demonstrated, self._ended = reason, True
+        self._finish(self._sig, f"not demonstrated: {reason}")
 
-    def _end(self, sig: Optional[Signal], reason: str, why: Optional[str] = None) -> None:
-        """End the run: stop cycling, fail the open step with `why`."""
-        self.actuator.set_join_rate(0)
-        step = self.steps[-1] if self.steps else None
-        if why and step is not None and step.fault is None:
-            step.fault = why
-            if self.supported is None and self.not_demonstrated is None:
-                self.not_demonstrated = f"{step.rate:g}/s failed: {why}"
-        if self.supported is None and self.not_demonstrated is None:
-            self.not_demonstrated = reason
-        if sig is None:
-            self.state.ceiling_reason = reason
-            self.state.stop.set()
-        else:
-            self._finish(sig, reason)
-
-    def _next_step(self, sig: Signal, now: float) -> bool:
-        rate = next(self._rates, None)
-        if rate is None:
-            self._end(sig, f"all {len(self.steps)} join steps passed")
-            return False
-        self.steps.append(JoinStep(rate))
-        self._step_t, self._since = now, None
-        self.actuator.set_join_rate(rate)
-        self._emit(sig, f"join {rate:g}/s", force=True)
-        return True
+    def _cap(self) -> int:
+        pool = self.actuator.eligible_total
+        return pool if self.join_max is None else min(self.join_max, pool)
 
     async def run(self):
-        state, a = self.state, self.actuator
-        level = a.max_level
-        await a.apply(level)
-        self._rates = iter(self.join_steps)
-        phase, since = "base", None
+        await self.actuator.apply(self.actuator.max_level)
+        if await self._base():
+            await self._search()
+        if self.burst is None and self.not_demonstrated is None:
+            self.not_demonstrated = "run ended"
+
+    async def _base(self) -> bool:
+        a, since = self.actuator, None
         lost0 = a.lost_total[0]
-        tick_t = time.monotonic()
-        no_data = 0
-        while not state.stop.is_set():
-            try:
-                await asyncio.wait_for(state.stop.wait(), timeout=self.tick_s)
-                break
-            except asyncio.TimeoutError:
-                pass
-            now = time.monotonic()
-            if self.duration_s is not None and now - self.t0 >= self.duration_s:
-                if self.supported is None:
-                    self.not_demonstrated = (
-                        f"run ended during {self.steps[-1].rate:g}/s" if self.steps
-                        else "run ended before the steps")
-                self._end(None, f"duration cap reached ({self.duration_s:.0f}s)", "run ended")
-                break
-            sig = await a.observe()
-            prev_t, tick_t = tick_t, now
-            self.samples += 1
-            state.received_data |= sig.rx_mbps > 0
-            if sig.rx_mbps <= 0:
-                no_data += 1
-                if no_data >= 3 * self._tpr:
-                    state.failed = True
-                    self._end(sig, "no data received — subscribe failed or "
-                                   "publisher stalled", "no data")
-                    return
-                self._emit(sig, "rx=0 (no data)")
-                continue
-            no_data = 0
-            self._tally(sig)
-            p90 = self._control_p90(sig)
-            await a.apply(level)      # reconcile: spawns the next worker
-
-            if phase == "base":
-                if not a.settled():
-                    lost0 = a.lost_total[0]
-                    self._emit(sig, "settle")
-                    continue
-                if since is None:
-                    self._warn_pool()
-                why = self._fault(sig, p90, lost0)
-                if why:
-                    self.not_demonstrated = f"base audience did not hold: {why}"
-                    self._end(sig, f"not demonstrated: base audience did not hold ({why})")
-                    return
-                since = since or now
-                if now - since < self.base_s:
-                    self._emit(sig, "base")
-                    continue
-                phase = "steps"
-                if not self._next_step(sig, now):
-                    return
-                continue
-
-            step = self.steps[-1]
-            # Count only ticks that began after the step's settle.
-            if prev_t < self._step_t + self.SETTLE_S:
+        while True:
+            sig = await self._tick()
+            if sig is None:
+                return False
+            if not a.settled():
                 lost0 = a.lost_total[0]
-                self._emit(sig, f"join {step.rate:g}/s (settle)")
+                self._emit(sig, "settle")
                 continue
-            self._since = self._since or prev_t
-            step.add(sig)
-            why = self._fault(sig, p90, lost0)
-            step.seconds = now - self._since
-            if why is None and step.seconds >= self.step_s:
-                why = self._judge(step)
-                if why is None:
-                    self.supported = step.rate
-                    self._emit(sig, f"pass {step.rate:g}/s ({step.joins} joins)", force=True)
-                    lost0 = a.lost_total[0]
-                    if not self._next_step(sig, now):
-                        return
-                    continue
+            why = self._why(sig, lost0)
             if why:
-                self._end(sig, f"join step {step.rate:g}/s failed ({why})", why)
+                self.not_demonstrated = f"base audience did not hold: {why}"
+                self._finish(sig, f"not demonstrated: base audience did not hold ({why})")
+                return False
+            since = since or time.monotonic()
+            if time.monotonic() - since >= self.base_s:
+                return True
+            self._emit(sig, "base")
+
+    async def _trial(self, b: int) -> JoinTrial:
+        """Run one trial and the reset after it; sets _ended if the run ends."""
+        a = self.actuator
+        tr = JoinTrial(b, self.join_bound_ms)
+        self.trials.append(tr)
+        lost0 = a.lost_total[0]
+        t0 = a.start_trial(b)
+        self._emit(self._sig, f"trial B={b}", force=True)
+        from aiomoqt.utils.workers import JOIN_TIMEOUT_S
+        deadline = t0 + JOIN_TIMEOUT_S + self.RESOLVE_SLACK_S
+        while True:
+            sig = await self._tick()
+            if sig is None:
+                tr.fault, self._ended = "run ended", True
+                return tr
+            tr.fault = tr.fault or self._why(sig, lost0)
+            view = a.trial_view()
+            if view['resolved'] or time.monotonic() >= deadline:
+                break
+            self._emit(sig, f"trial B={b}")
+        tr.judge(view['joins'], self.JOIN_OK_SHARE)
+        self._emit(sig, f"B={b} " + ("passed" if tr.passed else f"failed ({tr.fault})"),
+                   force=True)
+        await self._reset(b)
+        return tr
+
+    async def _reset(self, b: int) -> None:
+        """Wait for the watchers to run clean for trial_gap_s."""
+        a, start, clean = self.actuator, time.monotonic(), None
+        lost0 = a.lost_total[0]
+        while True:
+            sig = await self._tick()
+            if sig is None:
+                self._ended = True
                 return
-            self._emit(sig, f"join {step.rate:g}/s")
+            now = time.monotonic()
+            if self._why(sig, lost0):
+                clean, lost0 = None, a.lost_total[0]
+            else:
+                clean = clean or now
+            if clean is not None and now - clean >= self.trial_gap_s:
+                return
+            if now - start >= self.RESET_TIMEOUT_S:
+                self._give_up(f"relay did not recover after B={b}")
+                return
+            self._emit(sig, "reset")
+
+    async def _search(self) -> None:
+        b, failed_b = self.b0, None
+        while True:
+            cap = self._cap()
+            if cap <= 0:
+                self._give_up("no eligible joiners")
+                return
+            b = min(b, cap)
+            last = await self._trial(b)
+            if self._ended:
+                return
+            if last.passed:
+                break
+            if b <= 1:
+                self._give_up(f"B=1 failed: {last.fault}")
+                return
+            failed_b, b = b, max(1, b // 2)
+        lo, hi, capped = b, failed_b, False
+        while hi is None:
+            cap = self._cap()
+            if lo >= cap:
+                capped = True
+                break
+            near = _pctl(last.first_ms, 99) > 0.5 * self.join_bound_ms
+            nxt = min(max(math.ceil(lo * (self.GROW_NEAR if near else self.GROW)), lo + 1), cap)
+            last = await self._trial(nxt)
+            if self._ended:
+                return
+            lo, hi = (nxt, hi) if last.passed else (lo, nxt)
+        while hi is not None and hi - lo > max(1, math.ceil(0.1 * lo)):
+            mid = (lo + hi) // 2
+            last = await self._trial(mid)
+            if self._ended:
+                return
+            lo, hi = (mid, hi) if last.passed else (lo, mid)
+        for downs in range(self.MAX_STEP_DOWNS + 1):
+            for _ in range(self.CONFIRMS):
+                last = await self._trial(lo)
+                if self._ended:
+                    return
+                if not last.passed:
+                    break
+            else:
+                self.burst, self.confirmed = lo, self.CONFIRMS
+                if capped:
+                    at_max = self.join_max is not None and lo >= self.join_max
+                    self.cap_flag = " (at --join-max)" if at_max else " (pool-limited)"
+                self._finish(self._sig, f"join burst of {lo} confirmed{self.cap_flag}")
+                return
+            hi, lo, capped = lo, max(1, math.floor(lo * 0.9)), False
+        self._give_up(f"confirmation failed after {self.MAX_STEP_DOWNS} step(s) down")
 
 
 async def run_loopback_server(args, state: BenchState):
@@ -2096,17 +2144,6 @@ async def run_subscriber_client(host: str, port: int, path: str,
 # ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
-
-def _join_steps(text: str) -> list:
-    """R1,R2,...: join rates in joins/s, ascending, each > 0."""
-    try:
-        rates = [float(r) for r in text.split(",")]
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a list of rates: {text!r}") from None
-    if any(r <= 0 for r in rates) or any(b <= a for a, b in zip(rates, rates[1:])):
-        raise argparse.ArgumentTypeError("rates must be > 0 and ascending")
-    return rates
-
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -2249,24 +2286,28 @@ def parse_args():
     p.add_argument("--confirm", type=float, default=30, metavar="SEC",
                    help="with --hold: seconds the final level must hold "
                         "to count (default: 30)")
-    p.add_argument("--join-steps", type=_join_steps, default=None, metavar="R1,R2,...",
-                   help="subs-mode: measure the join rate. Hold --max-subs for "
-                        "--base-s, then cycle joiners at each rate (joins/s "
-                        "from this process, ascending) for --step-s, until a "
-                        "step fails; --start-subs is ignored (default: off)")
-    p.add_argument("--watchers", type=float, default=0.25, metavar="SHARE",
-                   help="with --join-steps: share of each group's subscribers "
-                        "never cycled, whose health the steps judge; the rest "
-                        "join (default: 0.25)")
-    p.add_argument("--step-s", type=float, default=15, metavar="SEC",
-                   help="with --join-steps: seconds each rate is measured "
-                        "(default: 15)")
-    p.add_argument("--base-s", type=float, default=30, metavar="SEC",
-                   help="with --join-steps: seconds the base audience must "
-                        "hold first (default: 30)")
+    p.add_argument("--join-search", type=int, default=None, metavar="B0",
+                   help="subs-mode: find the largest burst of subscribers joining "
+                        "at once. Hold --max-subs for --base-s, then have B "
+                        "joiners redial together, from B0 up, bisecting after "
+                        "the first failure and confirming 3x; --start-subs is "
+                        "ignored (default: off)")
+    p.add_argument("--join-max", type=int, default=None, metavar="N",
+                   help="with --join-search: largest burst to try (default: the "
+                        "eligible joiner pool)")
     p.add_argument("--join-bound", type=float, default=1000, metavar="MS",
-                   help="with --join-steps: p99 SUBSCRIBE_OK bound; the first "
-                        "object may take one group more (default: 1000)")
+                   help="with --join-search: a join counts only with its first "
+                        "object within MS of the burst (default: 1000)")
+    p.add_argument("--trial-gap", type=float, default=5, metavar="SEC",
+                   help="with --join-search: seconds the watchers must run clean "
+                        "between bursts (default: 5)")
+    p.add_argument("--base-s", type=float, default=30, metavar="SEC",
+                   help="with --join-search: seconds the base audience must "
+                        "hold first (default: 30)")
+    p.add_argument("--watchers", type=float, default=0.25, metavar="SHARE",
+                   help="with --join-search: share of each group's subscribers "
+                        "never cycled, whose health the bursts are judged on; "
+                        "the rest join (default: 0.25)")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -2289,19 +2330,23 @@ def parse_args():
         p.error("--exit max: --role pub has no max to reach")
     if args.hold < 0 or args.confirm <= 0:
         p.error("--hold and --confirm: seconds")
-    if min(args.step_s, args.base_s, args.join_bound) <= 0:
-        p.error("--step-s, --base-s and --join-bound: positive")
+    if min(args.trial_gap, args.base_s, args.join_bound) <= 0:
+        p.error("--trial-gap, --base-s and --join-bound: positive")
     if not 0 < args.watchers < 1:
         p.error("--watchers: a share between 0 and 1")
-    if args.join_steps:
+    if args.join_search is not None:
+        if args.join_search < 1:
+            p.error("--join-search: a burst of at least 1")
+        if args.join_max is not None and args.join_max < args.join_search:
+            p.error("--join-max: at least --join-search")
         if args.mode != "subs":
-            p.error("--join-steps is subs-mode only")
+            p.error("--join-search is subs-mode only")
         if args.hold:
-            p.error("--join-steps runs its own steps; drop --hold")
+            p.error("--join-search runs its own trials; drop --hold")
         if args.exit_on:
-            p.error("--join-steps ends at its first failing step; drop --exit")
+            p.error("--join-search ends with its result; drop --exit")
         if args.too_far_behind:
-            p.error("--join-steps judges each viewer's p90; drop --too-far-behind")
+            p.error("--join-search judges each viewer's p90; drop --too-far-behind")
     if args.hold and args.mode != "subs":
         p.error("--hold is subs-mode only")
     if args.hold and args.exit_on == "max":
@@ -2367,13 +2412,6 @@ def parse_args():
     return args
 
 
-def _group_s(args) -> float:
-    """The publisher's group duration in seconds."""
-    if args.video:
-        return args.group_size / args.video_fps
-    return args.group_size / args.scenario.aggregate_ops(args.sub_mbps)
-
-
 def _video_cfg(args) -> dict:
     """Worker config keys for a --video publisher; empty without one."""
     if not args.video:
@@ -2419,10 +2457,11 @@ def _print_banner(args):
     if getattr(args, "hold", 0):
         print(f"  step and hold:      {args.hold:g} s per step, "
               f"{args.confirm:g} s to confirm")
-    if getattr(args, "join_steps", None):
-        print(f"  join rate:          {args.max_subs} subs (--start-subs ignored) held "
-              f"{args.base_s:g} s, then {','.join(f'{r:g}' for r in args.join_steps)} "
-              f"joins/s, {args.step_s:g} s each, bound {args.join_bound:g} ms, "
+    if getattr(args, "join_search", None):
+        top = f"B={args.join_max}" if args.join_max else "the pool"
+        print(f"  join search:        {args.max_subs} subs (--start-subs ignored) held "
+              f"{args.base_s:g} s, then bursts from B={args.join_search} to {top}, "
+              f"bound {args.join_bound:g} ms, gap {args.trial_gap:g} s, "
               f"{args.watchers:.0%} watchers")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
           + (" over baseline (split hosts)" if args.skew_safe_signals
@@ -2443,15 +2482,15 @@ def _print_summary(state: BenchState, controller, samples: int, args):
               f"(rx delivered)")
     elif not isinstance(controller, HoldController):
         print(f"  High-water:  {controller.high_water:.1f} {unit}")
-    if isinstance(controller, JoinRateController):
-        for step in controller.steps:
-            print(step.line())
-        if controller.supported is not None:
-            print(f"  Join rate:   {controller.supported:g} subs/s supported"
-                  + (" (pool-limited)" if controller.pool_limited else ""))
+    if isinstance(controller, JoinSearchController):
+        for trial in controller.trials:
+            print(trial.line())
+        if controller.burst is not None:
+            print(f"  Join burst:  {controller.burst} subscribers at once "
+                  f"(confirmed {controller.confirmed}x){controller.cap_flag}")
         else:
-            print(f"  Join rate:   not demonstrated "
-                  f"({controller.not_demonstrated or 'no step passed'})")
+            print(f"  Join burst:  not demonstrated "
+                  f"({controller.not_demonstrated or 'run ended'})")
     elif isinstance(controller, HoldController):
         if controller.sustained:
             level, p90 = controller.sustained
@@ -2648,7 +2687,7 @@ async def main():
             slot_latency_ms=(0.0 if args.skew_safe_signals
                              else args.too_far_behind * 1000
                              or args.latency_threshold),
-            cycling=bool(args.join_steps),
+            join_search=args.join_search is not None,
             watchers=args.watchers,
         )
     else:
@@ -2773,10 +2812,10 @@ async def main():
                  exit_sustained=args.exit_on == "sustained")
             if args.hold else {})
     kind = HoldController if hold else AIMDController
-    if args.join_steps:
-        kind, hold = JoinRateController, dict(
-            join_steps=args.join_steps, step_s=args.step_s, base_s=args.base_s,
-            join_bound_ms=args.join_bound, group_s=_group_s(args))
+    if args.join_search is not None:
+        kind, hold = JoinSearchController, dict(
+            b0=args.join_search, join_max=args.join_max, join_bound_ms=args.join_bound,
+            trial_gap_s=args.trial_gap, base_s=args.base_s)
     controller = kind(
         actuator, state,
         **hold,
