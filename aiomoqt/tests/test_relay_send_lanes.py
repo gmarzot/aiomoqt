@@ -361,7 +361,7 @@ class _Closing(_Fake):
         self._moqt_session_closed = loop.create_future()
         self._drain = loop.create_future()
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         await self._drain
 
     def close(self):
@@ -372,7 +372,7 @@ class _Closing(_Fake):
 class _Broken(_Fake):
     """A live session whose writes fail."""
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         raise ConnectionError("stream gone")
 
 
