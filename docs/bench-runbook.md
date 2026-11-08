@@ -420,7 +420,7 @@ python -m aiomoqt.tools.adaptive_bench moqt://127.0.0.1:4433 -k --draft 18 --mod
 On the **load host**:
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -R 0.5 -S 0.05 --sub-filter next-group-start -t 300 --report subs-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -R 0.5 --spread 0.05 --sub-filter next-group-start -t 300 --report subs-ramp.csv
 ```
 
 It prints what it is waiting for:
@@ -437,7 +437,7 @@ Ramp knobs:
 |---|---|
 | `--step-subs` | subscribers per group, and the batch size: one worker process hosts a group |
 | `-R` / `--ramp-rate` | new subscribers per second, added one `--step-subs` group at a time. Default: one group per `--interval` |
-| `-S` / `--spread` | share of each group's slot, 0 to 1, its joins spread over. 1 (default) spaces joins evenly; 0 opens the group at once |
+| `--spread` | share of each group's slot, 0 to 1, its joins spread over. 1 (default) spaces joins evenly; 0 opens the group at once |
 | `--sub-filter` | `next-group-start` skips the current-group replay some relays do on `latest-object`, the default |
 
 A subscriber counts toward the high-water mark only while it receives at

@@ -2244,13 +2244,13 @@ def parse_args():
                    help="subs-mode: new subscribers per second, added one "
                         "group (--step-subs) at a time. Default: one group "
                         "per --interval.")
-    p.add_argument("-S", "--spread", type=float, default=None, metavar="F",
+    p.add_argument("--spread", type=float, default=None, metavar="F",
                    help="with --ramp-rate: share of each group's slot, 0 to "
                         "1, its joins spread over. 1 (default) spaces joins "
                         "evenly; 0 opens the group at once.")
     p.add_argument("-j", type=float, default=None, dest="group_interval",
                    help=argparse.SUPPRESS)
-    p.add_argument("--stagger", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("-S", "--stagger", type=float, default=None, help=argparse.SUPPRESS)
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
@@ -2343,7 +2343,7 @@ def parse_args():
         p.error("--spread: a share from 0 to 1")
     if args.ramp_rate is not None and (args.group_interval is not None
                                        or args.stagger is not None):
-        p.error("--ramp-rate replaces -j and --stagger; drop them")
+        p.error("--ramp-rate replaces -j and -S/--stagger; drop them")
     if args.ramp_rate is not None:
         args.group_interval = args.step_subs / args.ramp_rate
         args.stagger = (1.0 if args.spread is None else args.spread) / args.ramp_rate
