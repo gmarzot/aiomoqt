@@ -3603,23 +3603,26 @@ class _MOQTSessionMixin:
         self._on_setup_complete()
 
     async def open_uni_stream(self, initial: bytes = b"",
-                              priority: Optional[int] = None) -> int:
+                              priority: Optional[int] = None,
+                              end_stream: bool = False) -> int:
         """Open a unidirectional data stream, set its transport priority
-        and write `initial` to it. Returns the stream ID. Over WebTransport
-        both travel with the create, so the stream header and the first
+        and write `initial` to it, ending the stream with it when
+        `end_stream`. Returns the stream ID. Over WebTransport all of it
+        travels with the create, so the stream header and the first
         object leave in one send."""
         if not self._is_wt:
             sid = self._quic.get_next_available_stream_id(is_unidirectional=True)
         else:
             with_data = (_WT_CREATE_WITH_DATA
-                         and (initial or priority is not None)
+                         and (initial or priority is not None or end_stream)
                          and len(initial) <= getattr(self, "stream_ring_cap", 0))
             create = self.create_stream
             # aiopquic-WT: round-trip to picoquic for stream-id allocation
             try:
                 if with_data:
                     return await create(
-                        bidir=False, initial=initial, priority=priority)
+                        bidir=False, initial=initial, priority=priority,
+                        end_stream=end_stream)
                 sid = await create(bidir=False)
             except WebTransportError:
                 # Session torn down while a producer was at a stream
@@ -3631,9 +3634,10 @@ class _MOQTSessionMixin:
                 raise
         if priority is not None:
             self.set_stream_priority(sid, priority)
-        if initial:
+        if initial or end_stream:
             try:
-                await self.stream_write_drain(sid, initial)
+                await self.stream_write_drain(sid, initial,
+                                              end_stream=end_stream)
             except BaseException:
                 # The caller never learns the id: reset the stream here.
                 self.stream_reset(sid, StreamResetCode.CANCELLED)
@@ -3862,7 +3866,8 @@ class _MOQTSessionMixin:
     # send_stream_data_drained's hard_wait_at.
     TX_RING_WAIT_AT = 0.9
 
-    def stream_write_nowait(self, stream_id: int, data: bytes) -> bool:
+    def stream_write_nowait(self, stream_id: int, data: bytes,
+                            end_stream: bool = False) -> bool:
         """stream_write_drain() when it would not wait: True once the
         transport holds `data`. False, with nothing written, when the
         session is closing, the stream is over its budget, the transport
@@ -3884,7 +3889,7 @@ class _MOQTSessionMixin:
         if quic.tx_event_ring_fill() > self.TX_RING_WAIT_AT:
             return False
         try:
-            quic.send_stream_data(stream_id, data)
+            quic.send_stream_data(stream_id, data, end_stream)
         except BufferError:
             return False
         except (AssertionError, AttributeError, ConnectionError) as e:

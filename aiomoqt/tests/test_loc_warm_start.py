@@ -79,7 +79,7 @@ class _Out:
         pass
 
     async def write(self, group_id, object_id, payload, *, extensions=None,
-                    group_start=False):
+                    group_start=False, end_of_group=False):
         self.written.append((group_id, object_id, group_start))
 
 

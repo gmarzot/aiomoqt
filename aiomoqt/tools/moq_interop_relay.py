@@ -18,10 +18,9 @@ Limits:
     (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
     --max-subscriptions-per-session SUBSCRIBEs held; past either, a
     request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
-  * Near overload (--admission-cpu), past the subscriber count the relay
-    last closed at, or at --max-subscribers, a session's first SUBSCRIBE is
-    refused the same way, with a randomized Retry Interval. Sessions already
-    subscribed may add tracks.
+  * At --max-subscribers, a session's first SUBSCRIBE is refused the same
+    way, with a randomized Retry Interval. Sessions already subscribed may
+    add tracks.
   * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
     oldest group dropped) under a relay-wide budget (--cache-bytes),
     which drops the oldest group of the least recently used track, never
@@ -260,7 +259,7 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A track's input rate falls by at most this factor per lane check.
+# A track's input rate falls by at most this factor per lane check with input.
 IN_RATE_DECAY = 0.9
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
@@ -427,13 +426,10 @@ MAX_NAMESPACES_PER_SESSION = 256
 MAX_SUBSCRIPTIONS_PER_SESSION = 1024
 # Retry Interval of a cap refusal: milliseconds before a retry, plus one.
 CAP_RETRY_MS = 1000
-# Admission: --admission-cpu's gate, sampled every ADMISSION_TICK_S over
-# ADMISSION_WINDOW_S; a refusal's Retry Interval spans ADMISSION_RETRY_MS.
-ADMISSION_TICK_S = 1.0
-ADMISSION_WINDOW_S = 8
+# --max-subscribers, 0 = no limit; a refusal's Retry Interval spans
+# ADMISSION_RETRY_MS.
 ADMISSION_RETRY_MS = (5000, 15000)
 MAX_SUBSCRIBERS = 0
-_admission: relay_status.AdmissionGate | None = None
 _admission_refused = 0
 # id(session) -> its SUBSCRIBE handlers still running.
 _subscribing: Counter = Counter()
@@ -679,17 +675,30 @@ class _RelayDelivery:
         self.session = d.session
         self.lane = None
 
-    async def send(self, item) -> bool:
+    async def send(self, item, end=None) -> bool:
         (gid, _cost, _live, _born, sgid, oid, payload, exts, prio, status,
          shape, encoded) = item
         track, d = self.track, self.d
         await track._forward_one(self.session, d.alias, gid, sgid, oid,
                                  payload, exts, prio, status, shape, encoded,
-                                 start=d.start, lost=d.lost, lane=self.lane)
+                                 start=d.start, lost=d.lost, lane=self.lane,
+                                 end=None if end is None else (end[5], end[9]))
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
+        if end is not None and end[5] is not None:
+            track._objects_out += 1
         return True
+
+    @staticmethod
+    def ends_stream(item, nxt) -> bool:
+        """`nxt`, queued behind object `item`, ends the subgroup stream
+        `item` is written on."""
+        shape = item[10]
+        return (nxt[0] == item[0] and item[5] is not None
+                and nxt[9] in _STREAM_ENDS and nxt[4] == item[4]
+                and item[9] not in _STREAM_ENDS
+                and not (shape and shape[0] == "DGRAM"))
 
     def reset_below(self, floor) -> None:
         self.track._reset_streams(self.session, floor)
@@ -712,16 +721,17 @@ class _TracedRelayDelivery(_RelayDelivery):
 
     __slots__ = ()
 
-    async def send(self, item) -> bool:
-        await super().send(item)
-        oid = item[5]
-        if oid is not None:
-            d = self.d
-            d.objects_sent += 1
-            d.bytes_sent += len(item[6] or b"")
-            loc = (item[0], oid)
-            if d.largest_sent is None or loc > d.largest_sent:
-                d.largest_sent = loc
+    async def send(self, item, end=None) -> bool:
+        await super().send(item, end)
+        for it in (item,) if end is None else (item, end):
+            oid = it[5]
+            if oid is not None:
+                d = self.d
+                d.objects_sent += 1
+                d.bytes_sent += len(it[6] or b"")
+                loc = (it[0], oid)
+                if d.largest_sent is None or loc > d.largest_sent:
+                    d.largest_sent = loc
         return True
 
 
@@ -1199,11 +1209,15 @@ class _RelayedTrack:
         return streamed or not self._datagrams
 
     def update_in_rate(self, now: float) -> None:
-        """Measure the input rate and hand it to the track's lanes."""
+        """Measure the input rate and hand it to the track's lanes. It holds
+        while nothing arrives, so a paused or silent upstream resumes under
+        the bound it had."""
         then, seen = self._rate_mark
         if now <= then:
             return
         self._rate_mark = (now, self._bytes_in)
+        if self._bytes_in == seen:
+            return
         rate = max((self._bytes_in - seen) / (now - then),
                    self._in_rate * IN_RATE_DECAY)
         self._in_rate = rate
@@ -1855,12 +1869,15 @@ class _RelayedTrack:
 
     async def _forward_one(self, session, alias, gid, sgid, oid,
                            payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None, lost=(), lane=None):
+                           encoded=None, start=None, lost=(), lane=None,
+                           end=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
-        (§11.3.2). `lane` is told what each write awaits."""
+        (§11.3.2). `end`, the (object id, status) of the stream end
+        queued behind the object, ends the stream in the object's write.
+        `lane` is told what each write awaits."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
@@ -1905,26 +1922,34 @@ class _RelayedTrack:
                 end_of_group=eog, first_object=first_obj,
                 prof=session._profile)
             initial = header.serialize().data
-            first = None
+            first = tail = None
             if status not in _STREAM_ENDS:
                 # The header and the first object open the stream together.
                 first = _object_data(header, payload, exts, oid, encoded)
                 initial += first
+                if end is not None:
+                    tail = self._end_data(header, gid, end, start, lost)
+                    if tail is not None:
+                        initial += tail
             try:
                 stream_id = await session.open_uni_stream(
-                    initial=initial, priority=_stream_band(session, prio))
+                    initial=initial, priority=_stream_band(session, prio),
+                    end_stream=tail is not None)
             except MOQTStreamStopped:
                 self._stopped.add(skey)
                 return
             if lane is not None:
                 lane.sid = stream_id
             entry = (stream_id, header)
-            self._streams[skey] = entry
+            if tail is None:
+                self._streams[skey] = entry
             self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
                 stream_id
             self._sent_streams[id(session)] = \
                 self._sent_streams.get(id(session), 0) + 1
             if first is not None:
+                if end is not None and tail is None:
+                    self._reset_stream(session, skey, entry)
                 return
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
@@ -1949,14 +1974,44 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         data = _object_data(header, payload, exts, oid, encoded)
+        tail = (None if end is None
+                else self._end_data(header, gid, end, start, lost))
         if lane is not None:
             lane.parked, lane.sid = "object", stream_id
         try:
-            await session.stream_write_drain(stream_id, data)
+            await session.stream_write_drain(
+                stream_id, data if tail is None else data + tail,
+                end_stream=tail is not None)
         except MOQTStreamStopped:
             # The session has reset the stream; the subscription goes on.
             self._streams.pop(skey, None)
             self._stopped.add(skey)
+            return
+        if end is None:
+            return
+        if tail is not None:
+            self._streams.pop(skey, None)
+        else:
+            self._reset_stream(session, skey, entry)
+
+    def _end_data(self, header, gid, end, start, lost):
+        """The bytes before the FIN that ends a stream for `end`, its
+        (object id, status): the upstream's marker, or nothing for a bare
+        FIN. None when the stream is short and is reset instead."""
+        if gid in lost or self._short(gid, start):
+            return None
+        oid, status = end
+        if status == "END":
+            return b""
+        return header.next_object(
+            payload=b"", status=status,
+            object_id=header.next_object_id if oid is None else oid).data
+
+    def _reset_stream(self, session, skey, entry) -> None:
+        """Reset a stream short of objects (§11.3.2), if still open."""
+        if self._streams.get(skey) is entry:
+            session.stream_reset(entry[0], StreamResetCode.INTERNAL_ERROR)
+            self._streams.pop(skey, None)
 
 
 # Statuses that end a subgroup stream instead of carrying an object.
@@ -2155,19 +2210,17 @@ def _subscriber_sessions() -> int:
     return len(ids)
 
 
+def _admits_new_subscriber() -> bool:
+    return not MAX_SUBSCRIBERS or _subscriber_sessions() < MAX_SUBSCRIBERS
+
+
 def _refused_by_load(session, msg) -> bool:
-    """Refuse a session's first SUBSCRIBE near overload or at
-    --max-subscribers. The watchdog's probe is exempt: refusing it would
-    exit the relay."""
-    gate = _admission
-    if (gate is None or gate.unlimited) and not MAX_SUBSCRIBERS:
-        return False
-    if (_internal_ns(_ns_tuple(msg.track_namespace))
+    """Refuse a session's first SUBSCRIBE at --max-subscribers. The
+    watchdog's probe is exempt: refusing it would exit the relay."""
+    if (not MAX_SUBSCRIBERS or _internal_ns(_ns_tuple(msg.track_namespace))
             or _session_subscriptions(session)):
         return False
-    held = _subscriber_sessions()
-    if ((gate is None or gate.admits(held))
-            and (not MAX_SUBSCRIBERS or held < MAX_SUBSCRIBERS)):
+    if _admits_new_subscriber():
         return False
     global _admission_refused
     _admission_refused += 1
@@ -2175,25 +2228,6 @@ def _refused_by_load(session, msg) -> bool:
         msg, RequestErrorCode.EXCESSIVE_LOAD, "relay overloaded",
         retry_interval=random.randint(*ADMISSION_RETRY_MS) + 1)
     return True
-
-
-async def _admission_watch(gate, load) -> None:
-    """Sample the busiest thread into the gate; WARNING on each change."""
-    while True:
-        await asyncio.sleep(ADMISSION_TICK_S)
-        if gate.update(load.sample(), _subscriber_sessions()):
-            if gate.open:
-                logger.warning(f"relay: admission open up to "
-                               f"{gate.ceiling:.0f} subscribers: busiest "
-                               f"thread {gate.mean:.0f}%; "
-                               f"{_admission_refused} refused so far")
-            else:
-                logger.warning(f"relay: admission closed at "
-                               f"{gate.ceiling:.0f} subscribers: busiest "
-                               f"thread {gate.mean:.0f}% over "
-                               f"{len(gate.samples)} samples (limit "
-                               f"{gate.close_pct:g}%): refusing new "
-                               f"subscribers with EXCESSIVE_LOAD")
 
 
 def _refused_over_cap(session, msg, what: str, cap: int, held: int) -> bool:
@@ -3908,15 +3942,6 @@ def parse_args(argv=None):
                         help="SUBSCRIBEs one session may hold; more are "
                              "refused with EXCESSIVE_LOAD. Default: "
                              f"{MAX_SUBSCRIPTIONS_PER_SESSION}")
-    parser.add_argument("--admission-cpu", type=float, default=0.0,
-                        metavar="PCT",
-                        help="Refuse new subscribers with EXCESSIVE_LOAD "
-                             "while the busiest thread's "
-                             f"{ADMISSION_WINDOW_S} s mean is at PCT, until "
-                             "it falls 15 points lower, and past the count "
-                             "it closed at, which then rises 5%% a minute. "
-                             "Sessions already subscribed may add tracks. "
-                             "Linux only. Default: 0, off")
     parser.add_argument("--max-subscribers", type=int, default=0,
                         metavar="N",
                         help="Sessions the relay serves SUBSCRIBEs for; new "
@@ -5280,15 +5305,8 @@ class _Status:
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
-            "admission": {
-                "open": _admission is None or _admission.open,
-                "thread_pct": (None if _admission is None
-                               or _admission.mean is None
-                               else round(_admission.mean, 1)),
-                "ceiling": (None if _admission is None
-                            or _admission.ceiling is None
-                            else round(_admission.ceiling)),
-                "refused": _admission_refused},
+            "admission": {"open": _admits_new_subscriber(),
+                          "refused": _admission_refused},
         }
         self._subs_peak = max(self._subs_peak, totals["subscribers"])
         totals["subscribers_peak"] = self._subs_peak
@@ -5787,9 +5805,8 @@ async def main():
               "--max-subscriptions-per-session must be above 0",
               file=sys.stderr)
         sys.exit(2)
-    if not 0 <= args.admission_cpu <= 100 or args.max_subscribers < 0:
-        print("Error: --admission-cpu must be 0-100 and --max-subscribers "
-              "0 or more", file=sys.stderr)
+    if args.max_subscribers < 0:
+        print("Error: --max-subscribers must be 0 or more", file=sys.stderr)
         sys.exit(2)
     global MAX_SUBSCRIBERS
     MAX_SUBSCRIBERS = args.max_subscribers
@@ -5832,12 +5849,6 @@ async def main():
         print(f"  upstream origin: {url}")
 
     _background.add(asyncio.create_task(_watch_lanes()))
-    if args.admission_cpu:
-        global _admission
-        _admission = relay_status.AdmissionGate(args.admission_cpu,
-                                                window=ADMISSION_WINDOW_S)
-        _background.add(asyncio.create_task(_admission_watch(
-            _admission, relay_status.ThreadLoad())))
 
     watchdog = None
     if args.watchdog > 0:
@@ -5864,8 +5875,7 @@ async def main():
                       "budget": CACHE_BUDGET_BYTES},
             "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
                             "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},
-            "admission": {"cpu_pct": args.admission_cpu,
-                          "max_subscribers": MAX_SUBSCRIBERS},
+            "admission": {"max_subscribers": MAX_SUBSCRIBERS},
         }, handles)
         _background.add(asyncio.create_task(status.run()))
 

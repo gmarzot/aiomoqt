@@ -59,10 +59,11 @@ class _FakeSession:
         self.resets, self.fins, self.writes, self.dgrams = [], [], [], []
         self._next = 2
 
-    async def open_uni_stream(self, initial=b"", priority=None):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         self._next += 4
-        if initial:
-            await self.stream_write_drain(self._next, initial)
+        if initial or end_stream:
+            await self.stream_write_drain(self._next, initial, end_stream)
         return self._next
 
     def set_stream_priority(self, *_):
@@ -70,6 +71,8 @@ class _FakeSession:
 
     async def stream_write_drain(self, sid, data, end_stream=False):
         self.writes.append(sid)
+        if end_stream:
+            self.fins.append(sid)
 
     def stream_write(self, sid, data, end_stream=False):
         if end_stream:
@@ -93,7 +96,7 @@ async def _run_lane(mapping, items, timeout):
     for group_id, object_id, age in items:
         lane.offer((group_id, OBJECT_RECORD_BYTES + 1, True,
                     time.monotonic() - age, object_id, b"p", None,
-                    object_id == 0, None))
+                    object_id == 0, None, False))
     await out.close()
     return session, delivery, lane
 

@@ -807,14 +807,12 @@
   ".totals.admission": [
    "object"
   ],
-  ".totals.admission.ceiling": [],
   ".totals.admission.open": [
    "bool"
   ],
   ".totals.admission.refused": [
    "int"
   ],
-  ".totals.admission.thread_pct": [],
   ".totals.by_draft": [
    "object"
   ],
