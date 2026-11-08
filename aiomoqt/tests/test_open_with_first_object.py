@@ -14,9 +14,12 @@ class _Session:
         self.opens, self.writes, self.fins = [], [], []
         self._next = 2
 
-    async def open_uni_stream(self, initial=b"", priority=None):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         self._next += 4
         self.opens.append((self._next, bytes(initial), priority))
+        if end_stream:
+            self.fins.append(self._next)
         return self._next
 
     def set_stream_priority(self, *_):
