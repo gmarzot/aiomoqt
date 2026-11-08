@@ -450,6 +450,76 @@ async def test_no_rate_leaves_the_byte_bound_alone():
     await _settle()
 
 
+def _lane(track, n=1):
+    return relay._RelayLane(track, track.add_downstream(_Fake(), n, n))
+
+
+@pytest.mark.parametrize("rate,deadline,expected", [
+    (2_000_000, 5.0, 10_000_000),      # 16 Mbps: past LANE_BYTES
+    (16_000_000, 5.0, 80_000_000),
+    (100_000, 5.0, 500_000),
+    (1_000, 5.0, LANE_MIN_BYTES),
+    (0.0, 5.0, relay.LANE_BYTES),      # no rate yet
+    (2_000_000, None, relay.LANE_BYTES),
+])
+async def test_a_relay_lane_follows_its_deadline_at_any_rate(
+        monkeypatch, rate, deadline, expected):
+    monkeypatch.setattr(relay, "_lanes", set())
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    lane = _lane(track)
+    lane.deadline = deadline
+    lane.rate = rate
+    assert lane.bound == expected
+    lane.stop()
+
+
+async def test_lanes_over_the_budget_go_back_to_lane_bytes_until_clear(
+        monkeypatch):
+    monkeypatch.setattr(relay, "_lanes", set())
+    monkeypatch.setattr(relay, "_lanes_over_budget", False)
+    monkeypatch.setattr(relay, "CACHE_BUDGET_BYTES", 1000)
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    lane = _lane(track)
+    lane.deadline = 5.0
+    lane.rate = 2_000_000
+
+    lane.bytes = 1000
+    relay._budget_lanes()
+    assert lane.bound == 10_000_000
+
+    lane.bytes = 1001
+    relay._budget_lanes()
+    assert relay._lanes_over_budget and lane.bound == relay.LANE_BYTES
+    lane.rate = 3_000_000
+    assert lane.bound == relay.LANE_BYTES
+
+    lane.bytes = 900                   # over 7/8 of the budget
+    relay._budget_lanes()
+    assert lane.bound == relay.LANE_BYTES
+
+    lane.bytes = 875
+    relay._budget_lanes()
+    assert not relay._lanes_over_budget and lane.bound == 15_000_000
+    assert relay._lane_bytes == 875
+    lane.stop()
+
+
+async def test_lanes_on_one_track_count_its_queue_once(monkeypatch):
+    monkeypatch.setattr(relay, "_lanes", set())
+    monkeypatch.setattr(relay, "_lanes_over_budget", False)
+    monkeypatch.setattr(relay, "CACHE_BUDGET_BYTES", 1000)
+    hot = relay._RelayedTrack(((b"ns",), b"hot"))
+    other = relay._RelayedTrack(((b"ns",), b"other"))
+    lanes = [_lane(hot, 1), _lane(hot, 2), _lane(other, 3)]
+    for lane, queued, transport in zip(lanes, (600, 400, 100), (10, 20, 30)):
+        lane.bytes, lane.tx_bytes = queued, transport
+    assert relay._held_by_lanes() == 600 + 100 + 10 + 20 + 30
+    relay._budget_lanes()
+    assert not relay._lanes_over_budget
+    for lane in lanes:
+        lane.stop()
+
+
 def test_the_input_rate_decays_from_a_peak_and_reaches_the_lanes():
     lane = SimpleNamespace(rate=0.0)
     track = SimpleNamespace(_rate_mark=(0.0, 0), _bytes_in=0, _in_rate=0.0,
@@ -542,7 +612,6 @@ async def test_a_track_resumed_after_a_long_pause_keeps_its_lane_bound(
     # The first viewer after two minutes paused, a little slower than the
     # track, gets its first whole group: the lane bound still comes from
     # the rate the track had, not the 64 KiB floor.
-    monkeypatch.setattr(relay, "LANE_BYTES", _BOUND)
     monkeypatch.setattr(relay, "_pause_after", 0.3)
     port = _BASE_PORT + 16 + 4 * (draft == 22) + 2 * (not use_quic)
     sizes = {"alt": _OBJ // 2, "video": _OBJ}
@@ -590,8 +659,10 @@ async def test_a_track_resumed_after_a_long_pause_keeps_its_lane_bound(
             assert await _until(lambda: first_group_ended(subs[name]), 4.0), (
                 name, subs[name].objects, subs[name].ends)
         bounds = {n: joined(n).lane.bound for n in sizes}
+        held = {n: int(tracks[n]._in_rate * joined(n).lane.deadline)
+                for n in sizes}
 
-    assert bounds == {"alt": _BOUND, "video": _BOUND}, bounds
+    assert bounds == held and min(bounds.values()) > LANE_MIN_BYTES, bounds
     for name, sub in subs.items():
         k = min(k for k, objs in sub.objects.items() if 0 in objs)
         assert sub.ends[k] == (True, None), (name, k, sub.ends[k])

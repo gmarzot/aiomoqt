@@ -870,6 +870,9 @@
   ".totals.ingress_bps": [
    "int"
   ],
+  ".totals.lane_bytes": [
+   "int"
+  ],
   ".totals.loop_lag_ms": [
    "object"
   ],
