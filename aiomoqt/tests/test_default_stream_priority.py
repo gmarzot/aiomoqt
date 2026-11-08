@@ -53,8 +53,9 @@ def _spy_open(monkeypatch):
     calls = []
     orig = _MOQTSessionMixin.open_uni_stream
 
-    async def spy(self, initial=b"", priority=None):
-        sid = await orig(self, initial=initial, priority=priority)
+    async def spy(self, initial=b"", priority=None, end_stream=False):
+        sid = await orig(self, initial=initial, priority=priority,
+                         end_stream=end_stream)
         if self._is_wt and priority is not None:
             calls.append((self, sid, priority, True))
         return sid
