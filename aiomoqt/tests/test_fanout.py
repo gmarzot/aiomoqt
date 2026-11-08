@@ -47,13 +47,14 @@ class _Session:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self, initial=b"", priority=None):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
         self.opened.append(sid)
-        if initial:
+        if initial or end_stream:
             try:
-                await self.stream_write_drain(sid, initial)
+                await self.stream_write_drain(sid, initial, end_stream)
             except BaseException:
                 self.stream_reset(sid, 0)
                 raise
@@ -68,9 +69,9 @@ class _Session:
     def fins(self, sid):
         return [w for w in self.writes if w[0] == sid and w[2]]
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         await self._gate.wait()
-        self.writes.append((sid, len(data), False))
+        self.writes.append((sid, len(data), end_stream))
 
     def _unbind_request(self, request_id):
         pass
@@ -389,11 +390,11 @@ class _Failing(_Session):
         super().__init__()
         self.failed = False
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         if not self.failed:
             self.failed = True
             raise RuntimeError("transport fault")
-        await super().stream_write_drain(sid, data)
+        await super().stream_write_drain(sid, data, end_stream)
 
 
 @pytest.mark.asyncio
@@ -468,21 +469,21 @@ class _Nowait(_Session):
         self.inline = 0
         self.data = []              # (stream_id, bytes, fin)
 
-    def stream_write_nowait(self, sid, data):
+    def stream_write_nowait(self, sid, data, end_stream=False):
         self.tries += 1
         if self.refuse(self.tries):
             return False
         self.inline += 1
-        self.data.append((sid, bytes(data), False))
+        self.data.append((sid, bytes(data), end_stream))
         return True
 
     def stream_write(self, sid, data, end_stream=False):
         super().stream_write(sid, data, end_stream)
         self.data.append((sid, bytes(data), end_stream))
 
-    async def stream_write_drain(self, sid, data):
-        await super().stream_write_drain(sid, data)
-        self.data.append((sid, bytes(data), False))
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        await super().stream_write_drain(sid, data, end_stream)
+        self.data.append((sid, bytes(data), end_stream))
 
     def streams(self):
         """Each stream's writes, streams in header order."""
@@ -560,7 +561,7 @@ async def test_an_offer_behind_a_queued_object_queues():
 
     def item(oid, payload):
         return (0, OBJECT_RECORD_BYTES + len(payload), True, None, oid,
-                payload, None, False, None)
+                payload, None, False, None, False)
     assert lane.offer(item(1, b"one"))                  # refused: queued
     assert lane.offer(item(2, b"two"))                  # no yield between
     assert s.tries == 1 and len(lane.items) == 2
