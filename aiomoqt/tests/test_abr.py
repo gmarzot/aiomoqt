@@ -5,11 +5,13 @@ import struct
 import pytest
 
 from aiomoqt.media.abr import (
-    DelayMeter, Rung, frame_rate, ladder_catalog, loc_from_annexb,
+    DelayMeter, Rung, frame_rate, ladder_catalog, loc_from_annexb, loc_from_obus,
     quantiles_ms, rungs_below,
 )
 from aiomoqt.media.catalog import Catalog, CatalogTrack, InitData
-from aiomoqt.media.sources import avcc_from_sps_pps
+from aiomoqt.media.sources import (
+    av1c_codec_string, av1c_from_sequence_header, avcc_from_sps_pps, obu_units,
+)
 
 SPS = bytes([0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40])
 SPS_BASELINE = bytes([0x67, 0x42, 0xC0, 0x1E, 0x8C])
@@ -17,6 +19,13 @@ PPS = bytes([0x68, 0xEB, 0xE3, 0xCB])
 SEI = bytes([0x06, 0x05, 0x01, 0x80])
 IDR = bytes([0x65, 0x88, 0x84, 0x00, 0x33])
 P_SLICE = bytes([0x41, 0x9A, 0x02, 0x10])
+# av1_nvenc's sequence header for 1280x720, and the av1C FFmpeg's mp4 muxer
+# writes for it.
+AV1_SEQ = bytes.fromhex("0a0b00000042a67fd9e010cc02")
+AV1_C = bytes.fromhex("81080c00") + AV1_SEQ
+AV1_TD = bytes([0x12, 0x00])
+AV1_FRAME = bytes([0x32, 0x03, 0xAA, 0xBB, 0xCC])
+AV1_PADDING = bytes([0x7A, 0x02, 0x00, 0x00])
 
 
 def _lp(*nals) -> bytes:
@@ -137,3 +146,32 @@ def test_delay_meter_and_quantiles():
     assert quantiles_ms(meter.take()) == (51.0, 100.0, 100.0)
     assert meter.take() == []
     assert quantiles_ms([]) is None
+
+
+def test_av1c_from_sequence_header_matches_ffmpeg():
+    assert av1c_from_sequence_header(AV1_SEQ) == AV1_C
+    assert av1c_codec_string(AV1_C) == 'av01.0.08M.08'
+
+
+def test_av1c_refuses_another_obu():
+    with pytest.raises(ValueError):
+        av1c_from_sequence_header(AV1_FRAME)
+
+
+def test_obu_units_refuses_an_overrun():
+    with pytest.raises(ValueError):
+        obu_units(bytes([0x32, 0x09, 0x00]))
+
+
+def test_loc_from_obus_drops_delimiters_and_padding():
+    payload, seq = loc_from_obus(AV1_TD + AV1_SEQ + AV1_FRAME + AV1_PADDING)
+    assert (payload, seq) == (AV1_SEQ + AV1_FRAME, AV1_SEQ)
+    assert loc_from_obus(AV1_TD + AV1_FRAME) == (AV1_FRAME, None)
+
+
+def test_ladder_catalog_names_av1_rungs():
+    cat = ladder_catalog(_source_catalog(), 'video', [Rung(1280, 720, 2_000_000)], [AV1_C])
+    rung = cat.find('video_720p')
+    assert rung.codec == 'av01.0.08M.08'
+    assert cat.resolve_init(rung) == AV1_C
+

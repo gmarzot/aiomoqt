@@ -1,9 +1,10 @@
 """A stand-in for the part of cymedia's Python API that aiomoqt uses, so the
 ABR ladder and abr_ingest run in tests without FFmpeg.
 
-Each push() becomes one Annex-B output per branch at once: SPS, PPS and an
-IDR slice at a group start, else a P slice; each carries its branch and
-object numbers."""
+Each push() becomes one output per branch at once, carrying its branch and
+object numbers. H.264: Annex B, SPS, PPS and an IDR slice at a group start,
+else a P slice. AV1: a temporal delimiter, a sequence header at a group
+start, then a frame OBU."""
 import os
 from typing import List, NamedTuple
 
@@ -31,6 +32,9 @@ def sps(branch: int) -> bytes:
 
 
 PPS = bytes([0x68, 0xCE, 0x3C, 0x80])
+# av1_nvenc's sequence header for 1280x720, 8-bit 4:2:0, level 4.0.
+AV1_SEQUENCE_HEADER = bytes.fromhex("0a0b00000042a67fd9e010cc02")
+_AV1_TD = b'\x12\x00'
 
 
 def set_ffmpeg_log_level(level: int) -> None:
@@ -42,9 +46,10 @@ def have_encoder(name: str) -> bool:
 
 
 class Graph:
-    def __init__(self, nbranches: int, realtime: bool = True):
+    def __init__(self, nbranches: int, realtime: bool = True, codec: str = 'h264'):
         self.nbranches = nbranches
         self.realtime = realtime
+        self.codec = codec
         self._r, self._w = os.pipe()
         os.set_blocking(self._r, False)
         self._queued: List[Output] = []
@@ -63,8 +68,13 @@ class Graph:
             self._last_group = group
         self.packets_in += 1
         for b in range(self.nbranches):
-            nal = bytes([0x65 if start else 0x41, b, obj & 0xFF]) + bytes(data[:8])
-            au = (_SC + sps(b) + _SC + PPS if start else b'') + _SC + nal
+            body = bytes([b, obj & 0xFF]) + bytes(data[:8])
+            if self.codec == 'av1':
+                frame = bytes([0x32, len(body)]) + body
+                au = _AV1_TD + (AV1_SEQUENCE_HEADER if start else b'') + frame
+            else:
+                nal = bytes([0x65 if start else 0x41]) + body
+                au = (_SC + sps(b) + _SC + PPS if start else b'') + _SC + nal
             self._queued.append(Output(b, group, obj, pts_us, start, start, au))
             self._out[b] += 1
             self._delays[b].append(1_000_000)
@@ -103,5 +113,6 @@ class Graph:
             os.close(self._w)
 
 
-def ladder(rungs, *, profile='nvenc', fps=(60, 1), realtime=True, **graph_kw) -> Graph:
-    return Graph(len(list(rungs)), realtime=realtime)
+def ladder(rungs, *, profile='nvenc', codec='h264', fps=(60, 1), realtime=True,
+           **graph_kw) -> Graph:
+    return Graph(len(list(rungs)), realtime=realtime, codec=codec)

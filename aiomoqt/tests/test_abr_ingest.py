@@ -13,12 +13,12 @@ from collections import defaultdict
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.media.abr import AbrLadder, Rung
+from aiomoqt.media.abr import AbrLadder, Rung, codec_string
 from aiomoqt.media.broadcast import MediaPublisher, MediaSubscriber
 from aiomoqt.media.catalog import Catalog, CatalogTrack, InitData
 from aiomoqt.media.loc import LocFrame, LocTrackPublisher
 from aiomoqt.media.sources import (
-    AnnexBAssembler, avcc_codec_string, avcc_from_sps_pps,
+    AnnexBAssembler, avcc_codec_string, avcc_from_sps_pps, obu_units,
 )
 from aiomoqt.tests import _fake_cymedia
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -59,22 +59,47 @@ def _fake_clip():
 
 
 @pytest.fixture(params=['fake', 'cymedia'])
-def clip(request, monkeypatch):
-    """The source clip, with the cymedia the ladder will use in place."""
+def impl(request, monkeypatch):
+    """The cymedia the ladder will use, put in place."""
     if request.param == 'fake':
         monkeypatch.setitem(sys.modules, 'cymedia', _fake_cymedia)
-        return _fake_clip()
+        return _fake_cymedia
     cymedia = pytest.importorskip('cymedia')
     if shutil.which('ffmpeg') is None:
         pytest.skip('the source clip needs the ffmpeg CLI')
-    if not (cymedia.have_encoder('libopenh264')
-            or cymedia.have_encoder('libx264')):
-        pytest.skip('no software H.264 encoder in FFmpeg')
     cymedia.set_ffmpeg_log_level(16)
-    return _real_clip()
+    return cymedia
 
 
-async def test_ladder_keeps_source_ids_and_opens_groups_on_key_frames(clip):
+def _needs(impl, codec):
+    """Skip unless the real cymedia has a software encoder for `codec`."""
+    if impl is _fake_cymedia:
+        return
+    if not getattr(impl, 'CODECS', ('h264',)).__contains__(codec):
+        pytest.skip(f'this cymedia has no {codec} ladders')
+    names = ('libaom-av1',) if codec == 'av1' else ('libopenh264', 'libx264')
+    if not any(impl.have_encoder(n) for n in names):
+        pytest.skip(f'no software {codec} encoder in FFmpeg')
+
+
+@pytest.fixture
+def clip(impl):
+    return _fake_clip() if impl is _fake_cymedia else _real_clip()
+
+
+def _rung_payload_ok(codec, payload, key):
+    """mp4-sample form: H.264 length-prefixed with no parameter sets, AV1
+    without temporal delimiters or padding and a sequence header on key
+    frames."""
+    if codec == 'av1':
+        kinds = [t for t, _ in obu_units(payload)]
+        return 2 not in kinds and 15 not in kinds and (1 in kinds) == key
+    return payload[:4] != b'\x00\x00\x00\x01' and (payload[4] & 0x1F) not in (7, 8)
+
+
+@pytest.mark.parametrize('codec', ['h264', 'av1'])
+async def test_ladder_keeps_source_ids_and_opens_groups_on_key_frames(impl, clip, codec):
+    _needs(impl, codec)
     config, frames = clip
     got = defaultdict(list)
 
@@ -83,7 +108,7 @@ async def test_ladder_keeps_source_ids_and_opens_groups_on_key_frames(clip):
                        frame.timestamp, frame.payload))
 
     ladder = AbrLadder(RUNGS, config=config, fps=(FPS, 1), profile='cpu',
-                       on_frame=on_frame, realtime=False)
+                       codec=codec, on_frame=on_frame, realtime=False)
     ladder.start()
     sent = []
     try:
@@ -104,10 +129,9 @@ async def test_ladder_keeps_source_ids_and_opens_groups_on_key_frames(clip):
     for i in range(len(RUNGS)):
         assert [(g, o, ts) for g, o, _, ts, _ in got[i]] == sent
         assert all(key == (o == 0) for _, o, key, _, _ in got[i])
-        # mp4-sample form: length prefixes, parameter sets in the config
-        assert all(p[:4] != b'\x00\x00\x00\x01' and (p[4] & 0x1F) not in (7, 8)
-                   for *_, p in got[i])
-        assert avcc_codec_string(ladder.configs[i]).startswith('avc1.')
+        assert all(_rung_payload_ok(codec, p, key) for _, _, key, _, p in got[i])
+        prefix = 'av01.' if codec == 'av1' else 'avc1.'
+        assert codec_string(ladder.configs[i]).startswith(prefix)
         assert ladder.wait[i].take()
 
 
@@ -137,9 +161,11 @@ async def _feed(video, audio, frames):
     await audio.finish()
 
 
-@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+@pytest.mark.parametrize('codec, use_quic', [('h264', True), ('h264', False), ('av1', True)],
+                         ids=['h264-quic', 'h264-wt', 'av1-quic'])
 async def test_ingester_publishes_source_and_ladder_in_one_catalog(
-        clip, use_quic):
+        impl, clip, codec, use_quic):
+    _needs(impl, codec)
     from aiomoqt.tools import abr_ingest
     from aiomoqt.tools import moq_interop_relay as relay
     relay._announced.clear()
@@ -153,7 +179,7 @@ async def test_ingester_publishes_source_and_ladder_in_one_catalog(
     handle = await server.serve()
     args = abr_ingest.parse_args([
         '-Q' if use_quic else '-W', '-p', str(ingest_port),
-        '--cert', CERT, '--key', KEY, '-N', ns, '--profile', 'cpu',
+        '--cert', CERT, '--key', KEY, '-N', ns, '--profile', 'cpu', '--codec', codec,
         '--rung', '160x120:200k', '--rung', '96x72:100k',
         '-k', '--draft', '18', '-t', '30', '-i', '1',
         f'{scheme}://localhost:{relay_port}/'])
@@ -195,6 +221,8 @@ async def test_ingester_publishes_source_and_ladder_in_one_catalog(
         handle.close()
     assert [t.name for t in catalog.tracks] == ['video', 'video_120p',
                                                 'video_72p', 'audio']
+    prefix = 'av01.' if codec == 'av1' else 'avc1.'
+    assert all(catalog.find(n).codec.startswith(prefix) for n in ('video_120p', 'video_72p'))
     alt = {t.altGroup for t in catalog.tracks if t.role == 'video'}
     assert len(alt) == 1 and None not in alt
     assert got['audio'] and got['video']

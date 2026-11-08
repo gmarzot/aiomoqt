@@ -1,4 +1,5 @@
-"""ABR ladder for a LOC H.264 video track, encoded with cymedia.
+"""ABR ladder for a LOC H.264 video track, encoded with cymedia as H.264 or
+AV1.
 
 Source frames in, LOC frames per rung out. Every rung keeps the source's
 group and object IDs and timestamps and opens each group on a key frame,
@@ -20,9 +21,14 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .catalog import Catalog, CatalogTrack, InitData
 from .loc import LocFrame
-from .sources import avcc_codec_string, avcc_from_sps_pps, split_annexb
+from .sources import (
+    av1c_codec_string, av1c_from_sequence_header, avcc_codec_string, avcc_from_sps_pps,
+    obu_units, split_annexb,
+)
 
 _SPS, _PPS, _AUD, _FILLER = 7, 8, 9, 12
+_OBU_SEQUENCE_HEADER, _OBU_TEMPORAL_DELIMITER, _OBU_PADDING = 1, 2, 15
+CODECS = ('h264', 'av1')
 
 
 @dataclass(frozen=True)
@@ -95,11 +101,26 @@ def loc_from_annexb(au: bytes) -> Tuple[bytes, Optional[bytes],
     return b''.join(parts), sps, pps
 
 
+def loc_from_obus(tu: bytes) -> Tuple[bytes, Optional[bytes]]:
+    """One AV1 temporal unit as a LOC payload, its OBUs less temporal
+    delimiters and padding, plus its sequence header OBU for the decoder
+    config. A key frame keeps its sequence header."""
+    units = obu_units(tu)
+    seq = next((u for t, u in units if t == _OBU_SEQUENCE_HEADER), None)
+    return b''.join(u for t, u in units
+                    if t not in (_OBU_TEMPORAL_DELIMITER, _OBU_PADDING)), seq
+
+
+def codec_string(config: bytes) -> str:
+    """The codec string of an avcC or av1C."""
+    return av1c_codec_string(config) if config[0] == 0x81 else avcc_codec_string(config)
+
+
 def ladder_catalog(source: Catalog, video: str, rungs: Sequence[Rung],
                    configs: Sequence[bytes]) -> Catalog:
     """The source catalog with each rung after `video`, in its altGroup:
     a copy of the video entry with the rung's name, size, bitrate, codec
-    and decoder config."""
+    and decoder config (avcC or av1C)."""
     cat = Catalog.from_json(source.to_json())
     src = cat.find(video)
     if src is None:
@@ -115,7 +136,7 @@ def ladder_catalog(source: Catalog, video: str, rungs: Sequence[Rung],
                    if r not in taken)
         entries.append(CatalogTrack.from_dict({
             **src.to_dict(), 'name': rung.name, 'label': f"{rung.height}p",
-            'codec': avcc_codec_string(cfg), 'width': rung.width,
+            'codec': codec_string(cfg), 'width': rung.width,
             'height': rung.height, 'bitrate': rung.bit_rate,
             'initRef': ref}))
         init.append(InitData.from_bytes(ref, cfg))
@@ -151,7 +172,7 @@ def quantiles_ms(ns: Sequence[int]) -> Optional[Tuple[float, float, float]]:
 
 
 class AbrLadder:
-    """Encodes a LOC H.264 video track into rungs with cymedia.
+    """Encodes a LOC H.264 video track into H.264 or AV1 rungs with cymedia.
 
     push() takes each source frame with its group and object IDs; the
     payload is length-prefixed when `config` (avcC) is given, else Annex B.
@@ -159,14 +180,14 @@ class AbrLadder:
     gets each rung frame with its source frame's IDs, timestamp and
     extensions, and a key frame at each group start. pushed_ns is the
     source frame's monotonic push time, or None. configs[i] is rung i's
-    avcC; wait[i] meters it from push to on_frame. A lagging rung skips the
+    avcC or av1C; wait[i] meters it from push to on_frame. A lagging rung skips the
     rest of a group, and a full engine drops whole input groups.
     """
 
     def __init__(self, rungs: Sequence[Rung], *, config: Optional[bytes],
                  fps: Tuple[int, int], on_frame: Callable,
-                 profile: str = 'nvenc', timescale: Optional[int] = None,
-                 realtime: bool = True):
+                 profile: str = 'nvenc', codec: str = 'h264',
+                 timescale: Optional[int] = None, realtime: bool = True):
         try:
             cymedia = importlib.import_module("cymedia")
         except ImportError as e:
@@ -174,6 +195,9 @@ class AbrLadder:
                               "uv pip install 'aiomoqt[abr]'") from e
         if not rungs:
             raise ValueError("no rungs")
+        if codec not in CODECS:
+            raise ValueError(f"codec {codec!r}: one of {', '.join(CODECS)}")
+        self.codec = codec
         self.rungs = list(rungs)
         self.timescale = timescale
         self.on_frame = on_frame
@@ -183,7 +207,8 @@ class AbrLadder:
         self.input_dropped = 0
         self._graph = cymedia.ladder(
             [cymedia.Rung(r.width, r.height, r.bit_rate) for r in self.rungs],
-            profile=profile, fps=fps, extradata=config, realtime=realtime)
+            profile=profile, fps=fps, extradata=config, realtime=realtime,
+            **({'codec': codec} if codec != 'h264' else {}))
         # (group, object) -> [timestamp, extensions, push ns, rungs to go]
         self._pending: Dict[Tuple[int, int], list] = {}
         self._group = -1
@@ -235,9 +260,10 @@ class AbrLadder:
     def _drain(self) -> None:
         for out in self._graph.read(0):
             i = out.branch
-            payload, sps, pps = loc_from_annexb(out.data)
-            if sps is not None and pps is not None:
-                self.configs[i] = avcc_from_sps_pps(sps, pps)
+            config = self._package(out.data)
+            payload = config[0]
+            if config[1] is not None:
+                self.configs[i] = config[1]
                 if not self._ready.is_set() and all(self.configs):
                     self._ready.set()
             key = (out.group, out.object)
@@ -253,6 +279,15 @@ class AbrLadder:
                                       timestamp=ts, extensions=exts,
                                       group_id=out.group),
                           out.group, out.object, pushed)
+
+    def _package(self, data: bytes) -> Tuple[bytes, Optional[bytes]]:
+        """A rung frame's LOC payload, and its decoder config if it has one."""
+        if self.codec == 'av1':
+            payload, seq = loc_from_obus(data)
+            return payload, (av1c_from_sequence_header(seq) if seq is not None else None)
+        payload, sps, pps = loc_from_annexb(data)
+        config = avcc_from_sps_pps(sps, pps) if sps is not None and pps is not None else None
+        return payload, config
 
     def engine_delays(self, i: int) -> List[int]:
         """Rung i's push-to-output engine delays since the last call, ns."""

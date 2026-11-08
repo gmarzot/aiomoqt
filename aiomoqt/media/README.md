@@ -206,7 +206,7 @@ python -m aiomoqt.tools.pub_media $RELAY -N demo/bare --mp4 clip.mp4 --loop --no
 ## ABR ladder
 
 `abr_ingest` sits in front of a relay. The source publisher dials it, and it publishes the source
-unchanged plus an H.264 ladder of its video, under the same namespace with one catalog. It needs
+unchanged plus an H.264 or AV1 ladder of its video, under the same namespace with one catalog. It needs
 [cymedia](https://github.com/gmarzot/cymedia), an optional extra that builds against the system's
 FFmpeg development files: `uv pip install 'aiomoqt[abr]'`.
 
@@ -225,8 +225,10 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
 - **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
   each group start. A rung that falls behind ends that group early and resumes at the next group
   start, so a group never has a hole in it.
-- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, `h264_nvenc`; default) or `cpu`
-  (libopenh264, else libx264).
+- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default) or `cpu` (software).
+- **Codec.** `--codec h264` (default) or `av1`: `av1_nvenc` on `nvenc`, libaom in realtime mode
+  on `cpu`. AV1 rungs carry an av1C in the catalog and a sequence header on each key frame.
+  The source passes through as H.264.
 - **Track Properties** pass through, timing ones to the rungs as well.
 - **Report.** Every `-i` seconds, per output track: frames, frames skipped while no subscriber
   took the track (`idle`), drops, and the delay from a source frame's arrival to its hand-off to
@@ -272,7 +274,7 @@ python -m aiomoqt.tools.sub_media $RELAY -N demo/live --analyze -t 60 -i 5 --rep
 | `media/mpegts.py` | MPEG-TS demux to access units and audio frames, keeping the PES timestamps |
 | `media/dash.py` | MPD parsing and segment addressing |
 | `media/ingest.py` | PyAV ingest: any FFmpeg input to per-track CMAF chunks |
-| `media/abr.py` | `AbrLadder`: an H.264 LOC track to rungs through cymedia, on the source's IDs; `ladder_catalog()` |
+| `media/abr.py` | `AbrLadder`: an H.264 LOC track to H.264 or AV1 rungs through cymedia, on the source's IDs; `ladder_catalog()` |
 | `fanout.py` | `FanoutPublisher`: one broadcast on several relays |
 
 The top-level [README](../../README.md#api) has a short publisher and subscriber example.
