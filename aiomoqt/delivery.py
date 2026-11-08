@@ -465,18 +465,27 @@ class SubgroupDelivery:
         FIN. No-op when no stream is open."""
         if self._stream_id is None:
             return
-        end_id = self._header.next_object_id
+        self.session.stream_write(self._stream_id,
+                                  self._end_bytes(self._header),
+                                  end_stream=True)
+        self._ended(self._stream_id, self._header.group_id)
+
+    def _end_bytes(self, hdr: SubgroupHeader) -> bytes:
+        """What precedes the FIN that ends hdr's stream: END_OF_GROUP,
+        or nothing where the peer's filter ends before it."""
+        end_id = hdr.next_object_id
         if (self.excludes_end is not None
-                and self.excludes_end(self._header.group_id, end_id)):
-            self.session.stream_write(self._stream_id, b"", end_stream=True)
-        else:
-            buf = self._header.end_group(object_id=end_id)
-            self.session.stream_write(self._stream_id, buf.data,
-                                      end_stream=True)
+                and self.excludes_end(hdr.group_id, end_id)):
+            return b""
+        return hdr.end_group(object_id=end_id).data
+
+    def _ended(self, sid: int, group_id: int) -> None:
+        """Stream `sid` of `group_id` is FINed."""
         if self.lane is not None:
-            self._tx_streams[self._stream_id] = self._header.group_id
-        self._stream_id = None
-        self._header = None
+            self._tx_streams[sid] = group_id
+        if sid == self._stream_id:
+            self._stream_id = None
+            self._header = None
 
     async def end_track(self, largest: Optional[tuple]) -> None:
         """Mark the end of the track with an End of Track status object:
@@ -529,14 +538,16 @@ class SubgroupDelivery:
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
                     group_start: bool = False,
-                    encoded: Optional[list] = None) -> bool:
+                    encoded: Optional[list] = None,
+                    end_of_group: bool = False) -> bool:
         """Place one object; False when the peer's filter excludes it.
-        `group_start` rotates the PER_GROUP stream. A callable
-        `extensions` is resolved against this session. `encoded` is a
-        list shared by the deliveries writing this object: peers in the
-        same encoding state reuse one encoding through it."""
+        `group_start` rotates the PER_GROUP stream; `end_of_group` closes
+        it in the object's write, as end_group() would after it. A
+        callable `extensions` is resolved against this session.
+        `encoded` is a list shared by the deliveries writing this object:
+        peers in the same encoding state reuse one encoding through it."""
         if self.passes is not None and not self.passes(group_id, object_id):
-            if group_start:
+            if group_start or end_of_group:
                 self.end_group()
             return False
         if group_id == self._stopped_group and not group_start:
@@ -569,13 +580,12 @@ class SubgroupDelivery:
                 first = hdr.serialize().data + self._object_bytes(
                     hdr, object_id, payload, extensions, encoded)
                 sid = await self.session.open_uni_stream(
-                    initial=first, priority=self.stream_priority)
+                    initial=first, priority=self.stream_priority,
+                    end_stream=True)
                 self.stream_count += 1
                 if lane is not None:
                     lane.sid, lane.parked = sid, "object"
-                self.session.stream_write(sid, b"", end_stream=True)
-                if lane is not None:
-                    self._tx_streams[sid] = group_id
+                self._ended(sid, group_id)
             else:  # PER_GROUP
                 if group_start or self._stream_id is None:
                     # A filter can admit a group part-way through: the stream
@@ -592,10 +602,13 @@ class SubgroupDelivery:
                     # The header and the first object open the stream together.
                     first = hdr.serialize().data + self._object_bytes(
                         hdr, object_id, payload, extensions, encoded)
+                    if end_of_group:
+                        first += self._end_bytes(hdr)
                     self._opening = group_id
                     try:
                         sid = await self.session.open_uni_stream(
-                            initial=first, priority=self.stream_priority)
+                            initial=first, priority=self.stream_priority,
+                            end_stream=end_of_group)
                     finally:
                         self._opening = None
                     self.stream_count += 1
@@ -604,16 +617,24 @@ class SubgroupDelivery:
                     if self._epoch != epoch:
                         self.session.stream_reset(sid, StreamResetCode.CANCELLED)
                         return False
-                    self._stream_id, self._header = sid, hdr
+                    if end_of_group:
+                        self._ended(sid, group_id)
+                    else:
+                        self._stream_id, self._header = sid, hdr
                     if lane is not None:
                         lane.parked = "object"
                 else:
                     sid, hdr = self._stream_id, self._header
                     data = self._object_bytes(hdr, object_id, payload,
                                               extensions, encoded)
-                    await self.session.stream_write_drain(sid, data)
+                    if end_of_group:
+                        data += self._end_bytes(hdr)
+                    await self.session.stream_write_drain(
+                        sid, data, end_stream=end_of_group)
                     if self._epoch != epoch:
                         return False
+                    if end_of_group:
+                        self._ended(sid, group_id)
         except MOQTStreamStopped:
             # The session has reset the stream; a group's is not reopened.
             if (self.mapping is StreamMapping.PER_GROUP
@@ -708,11 +729,18 @@ class SubgroupDelivery:
 
     # -- SendLane writer -------------------------------------------------
 
-    def send(self, item):
+    def send(self, item, end=None):
         """Write a SendLane item: (group_id, cost, live, born, object_id,
-        payload, extensions, group_start, encoded)."""
+        payload, extensions, group_start, encoded, end_of_group). `end`
+        is the END_GROUP queued behind it, closing the group in the same
+        write."""
         return self.write(item[0], item[4], item[5], extensions=item[6],
-                          group_start=item[7], encoded=item[8])
+                          group_start=item[7], encoded=item[8],
+                          end_of_group=item[9] or end is not None)
+
+    def ends_stream(self, item, nxt) -> bool:
+        """`nxt`, queued behind object `item`, closes its group stream."""
+        return nxt is _END_GROUP and self.mapping is StreamMapping.PER_GROUP
 
     def send_nowait(self, item) -> Optional[bool]:
         """send(item) when it completes without waiting: an object on the
@@ -723,8 +751,10 @@ class SubgroupDelivery:
         write = self._write_nowait
         if sid is None or item[7] or write is None:
             return None
-        group_id, object_id = item[0], item[4]
+        group_id, object_id, end = item[0], item[4], item[9]
         if self.passes is not None and not self.passes(group_id, object_id):
+            if end:
+                self.end_group()
             return False
         hdr = self._header
         last = hdr.next_object_id - 1
@@ -735,8 +765,10 @@ class SubgroupDelivery:
             extensions = extensions(self.session)
         data = self._object_bytes(hdr, object_id, payload, extensions,
                                   item[8])
+        if end:
+            data += self._end_bytes(hdr)
         try:
-            if not write(sid, data):
+            if not (write(sid, data, True) if end else write(sid, data)):
                 hdr.advance(last)
                 return None
         except MOQTStreamStopped:
@@ -744,6 +776,8 @@ class SubgroupDelivery:
             self._stream_id = None
             self._header = None
             return False
+        if end:
+            self._ended(sid, group_id)
         self._count_sent(group_id, object_id, payload)
         return True
 
@@ -821,6 +855,9 @@ class SendLane:
     tx_queued(floor) and expire(group_id), and end_track(largest) when
     the lane is given end_track(). A writer may set `parked`
     ("header" or "object") and `sid` on the lane while a send waits.
+    A writer with ends_stream(item, next) is handed an object and the
+    queued item behind it that ends the object's stream together, as
+    send(item, next), so both leave in one write.
 
     Write-through: a writer with send_nowait(item) is handed an object
     inline from offer() while the lane is empty and under its bound; it
@@ -1216,6 +1253,7 @@ class SendLane:
 
     async def _run(self) -> None:
         writer = self.writer
+        ends = getattr(writer, "ends_stream", None)
         woke = True
         try:
             while not self.stopped:
@@ -1264,9 +1302,15 @@ class SendLane:
                         self._lost = gid
                     self.done += 1
                     continue
+                end = None
+                if items and ends is not None and ends(item, items[0]):
+                    end = items.popleft()
+                    if end[0].__class__ is not str:
+                        self._uncount(end)
                 self.busy = True
                 try:
-                    sent = await writer.send(item)
+                    sent = await (writer.send(item) if end is None
+                                  else writer.send(item, end))
                 except (Exception, asyncio.CancelledError) as e:
                     if _cancelling():
                         raise
@@ -1277,7 +1321,7 @@ class SendLane:
                     self.busy = False
                 if sent and self.on_sent is not None:
                     self.on_sent(item)
-                self.done += 1
+                self.done += 1 if end is None else 2
         finally:
             self._exit()
 
@@ -1381,7 +1425,8 @@ class FanoutDelivery:
 
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
-                    group_start: bool = False) -> None:
+                    group_start: bool = False,
+                    end_of_group: bool = False) -> None:
         if self.error is not None:
             raise self.error
         if self.on_write is not None:
@@ -1400,7 +1445,7 @@ class FanoutDelivery:
             cost = retained_object_bytes(payload, extensions)
         item = (group_id, cost, True,
                 time.monotonic() if self._timed else None, object_id,
-                payload, extensions, group_start, encoded)
+                payload, extensions, group_start, encoded, end_of_group)
         self._group = group_id
         queued = False
         for lane in lanes:

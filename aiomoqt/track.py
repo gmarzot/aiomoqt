@@ -301,16 +301,27 @@ class _SubgroupSender:
     def end_stream(self) -> None:
         if self.stream_id is None:
             return
-        if self.short:
+        end = self.end_bytes()
+        if end is None:
             self.reset()
             return
+        self.session.stream_write(self.stream_id, end, end_stream=True)
+        self.closed()
+
+    def end_bytes(self) -> Optional[bytes]:
+        """What ends the open stream after the group's last object, with
+        a FIN: END_OF_GROUP on subgroup 0, else nothing. None when the
+        stream is short and must be reset instead."""
+        if self.short:
+            return None
         if self.subgroup_id == 0 and not self.sub.excludes_end(
                 self.header.group_id, self.track.group_size):
-            buf = self.header.end_group(object_id=self.track.group_size)
-            self.session.stream_write(self.stream_id, buf.data,
-                                      end_stream=True)
-        else:
-            self.session.stream_fin(self.stream_id)
+            return self.header.end_group(
+                object_id=self.track.group_size).data
+        return b""
+
+    def closed(self) -> None:
+        """The open stream has ended."""
         self.stream_id = None
         self.sub.senders.discard(self)
         self.track._stream_closed(self.sub)
@@ -326,63 +337,81 @@ class _SubgroupSender:
             payload, extensions, ObjectStatus.NORMAL, object_id)
 
     async def send(self, object_id: int, payload: bytes,
-                   extensions) -> int:
-        """Write one object; bytes written, 0 when the window excludes
-        it."""
+                   extensions, last: bool = False) -> int:
+        """Write one object, ending the stream with it when it is the
+        group's `last` on this subgroup; bytes written, 0 when the window
+        excludes it."""
         sub = self.sub
         if self.stopped or not (
                 sub.forward and sub.window is _UNFILTERED) and not sub.passes(
                 self.header.group_id, object_id):
             return 0
         session = self.session
+        data = end = None
         try:
             if self.stream_id is None:
-                self.stream_id = await session.open_uni_stream()
-                session.set_stream_priority(self.stream_id, self.band)
+                self.header.first_object = object_id == self.subgroup_id
+                initial = self.header.serialize().data
+                head = self._head(object_id)
+                if not head:
+                    # Header, object and any end open the stream together.
+                    data = self.header.next_object_bytes(
+                        payload, extensions, ObjectStatus.NORMAL, object_id)
+                    end = self.end_bytes() if last else None
+                    initial += data if end is None else data + end
+                if session._close_err is not None:
+                    raise asyncio.CancelledError
+                self.stream_id = await session.open_uni_stream(
+                    initial=initial, priority=self.band,
+                    end_stream=end is not None)
                 self.track._stream_count += 1
                 self.track._stream_opened(self.sub)
                 self.sub.senders.add(self)
-                self.header.first_object = object_id == self.subgroup_id
+                for earlier in head:
+                    await session.stream_write_drain(self.stream_id, earlier)
+            if data is None:
+                data = self.header.next_object_bytes(
+                    payload, extensions, ObjectStatus.NORMAL, object_id)
+                end = self.end_bytes() if last else None
                 if session._close_err is not None:
                     raise asyncio.CancelledError
                 await session.stream_write_drain(
-                    self.stream_id, self.header.serialize().data)
-                await self._send_head(object_id)
-            data = self.header.next_object_bytes(
-                payload, extensions, ObjectStatus.NORMAL, object_id)
-            if session._close_err is not None:
-                raise asyncio.CancelledError
-            await session.stream_write_drain(self.stream_id, data)
+                    self.stream_id, data if end is None else data + end,
+                    end_stream=end is not None)
+            if end is not None:
+                self.closed()
         except MOQTStreamStopped:
             self.stop()
             return 0
         return len(data)
 
-    async def _send_head(self, object_id: int) -> None:
+    def _head(self, object_id: int) -> list:
         """A stream opening past the first object the window admits in
         its group (resumed mid-group) first carries the earlier objects
-        from the history; lacking any, it is marked short (§11.3.2)."""
+        from the history, encoded here; lacking any, it is marked short
+        (§11.3.2)."""
         group_id = self.header.group_id
         step = self.track.num_subgroups
         first = max(self.sub.window[0], (group_id, 0))[1]
         first += (self.subgroup_id - first) % step
         missing = range(first, object_id, step)
         if not missing:
-            return
+            return []
         history = self.track._history
         held = {} if history is None else history._held(
             (group_id, first), (group_id, object_id - 1))
         recs = [held.get((group_id, oid)) for oid in missing]
         if any(r is None or (r[0] or 0) != self.subgroup_id for r in recs):
             self.short = True
-            return
+            return []
         session = self.session
+        out = []
         for oid, (_, payload, exts, _) in zip(missing, recs):
             if callable(exts):
                 exts = exts(session)
-            await session.stream_write_drain(
-                self.stream_id, self.header.next_object_bytes(
-                    payload, exts, ObjectStatus.NORMAL, oid))
+            out.append(self.header.next_object_bytes(
+                payload, exts, ObjectStatus.NORMAL, oid))
+        return out
 
     def stop(self) -> None:
         """The peer stopped the stream, which the session has reset: skip
@@ -2000,16 +2029,24 @@ class PublishedTrack(Track):
                     if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions, ts_charge)
+                last = cur_obj_id + self.num_subgroups >= self.group_size
                 data = sender.encode_open(cur_obj_id, payload, extensions)
                 if data is None:
                     obj_bytes = await sender.send(cur_obj_id, payload,
-                                                  extensions)
+                                                  extensions, last)
                 else:
                     if session._close_err is not None:
                         raise asyncio.CancelledError
                     try:
-                        await session.stream_write_drain(sender.stream_id,
-                                                         data)
+                        end = sender.end_bytes() if last else None
+                        if end is None:
+                            await session.stream_write_drain(
+                                sender.stream_id, data)
+                        else:
+                            await session.stream_write_drain(
+                                sender.stream_id, data + end,
+                                end_stream=True)
+                            sender.closed()
                         obj_bytes = len(data)
                     except MOQTStreamStopped:
                         sender.stop()
@@ -2715,16 +2752,24 @@ class VideoTrack(PublishedTrack):
                     if stamp is None else stamp(group_id, cur_obj_id))
                 self._remember(group_id, cur_obj_id, payload, subgroup_id,
                                extensions, ts_charge)
+                last = cur_obj_id + self.num_subgroups >= self.group_size
                 data = sender.encode_open(cur_obj_id, payload, extensions)
                 if data is None:
                     obj_bytes = await sender.send(cur_obj_id, payload,
-                                                  extensions)
+                                                  extensions, last)
                 else:
                     if session._close_err is not None:
                         raise asyncio.CancelledError
                     try:
-                        await session.stream_write_drain(sender.stream_id,
-                                                         data)
+                        end = sender.end_bytes() if last else None
+                        if end is None:
+                            await session.stream_write_drain(
+                                sender.stream_id, data)
+                        else:
+                            await session.stream_write_drain(
+                                sender.stream_id, data + end,
+                                end_stream=True)
+                            sender.closed()
                         obj_bytes = len(data)
                     except MOQTStreamStopped:
                         sender.stop()

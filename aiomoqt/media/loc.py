@@ -81,13 +81,15 @@ class LocFrame:
     """One encoded media chunk. `timestamp` is in track timescale units
     (µs since Unix epoch when the track carries no TIMESCALE).
     `group_id` numbers the group a key frame opens (None: next).
-    `capture_us` is its wall-clock capture time for `frindell` timing."""
+    `capture_us` is its wall-clock capture time for `frindell` timing.
+    `end_of_group` makes it its group's last frame."""
     payload: bytes
     key_frame: bool = False
     timestamp: Optional[int] = None
     extensions: Optional[Dict[int, Any]] = None
     group_id: Optional[int] = None
     capture_us: Optional[int] = None
+    end_of_group: bool = False
 
 
 class LocTrackPublisher(PublishedTrack):
@@ -181,17 +183,21 @@ class LocTrackPublisher(PublishedTrack):
                          timestamp: Optional[int] = None,
                          extensions: Optional[Dict[int, Any]] = None,
                          group_id: Optional[int] = None,
-                         capture_us: Optional[int] = None) -> None:
+                         capture_us: Optional[int] = None,
+                         end_of_group: bool = False) -> None:
         """Queue one frame (awaits when the queue is full); raises the
         error that ended production (`error`), if one did.
 
         `group_id` sets the group a key frame opens, so tracks fed from
         one source can keep equally numbered groups time-aligned (msf
-        §4.2); ignored unless above the current group."""
+        §4.2); ignored unless above the current group. `end_of_group`
+        ends the group with this frame, its end leaving in the frame's
+        write; the next frame opens a group."""
         if self.error is not None:
             raise self.error
         await self._frames.put(LocFrame(payload, key_frame, timestamp,
-                                        extensions, group_id, capture_us))
+                                        extensions, group_id, capture_us,
+                                        end_of_group))
 
     def _timing_properties(self, vi64: bool) -> Dict[int, Any]:
         if self.frindell is None:
@@ -296,6 +302,7 @@ class LocTrackPublisher(PublishedTrack):
         obj_id = 0
         resume_on_key = True  # first group opens on a key frame
         paused_group = None   # a group opened on a key frame while paused
+        ended = False         # the last frame ended its group
         while True:
             frame = await self._frames.get()
             if frame is None:
@@ -306,7 +313,7 @@ class LocTrackPublisher(PublishedTrack):
                 # keeps the open group only.
                 out.reset_group()
                 resume_on_key = True
-                if frame.key_frame or group_id < 0:
+                if frame.key_frame or group_id < 0 or ended:
                     if paused_group is not None:
                         history.discard(paused_group)
                         paused_group = None
@@ -329,6 +336,7 @@ class LocTrackPublisher(PublishedTrack):
                     self._note_largest(group_id, obj_id)
                     self.frames_dropped += 1
                 obj_id += 1
+                ended = frame.end_of_group
                 continue
             if resume_on_key and not frame.key_frame:
                 # With its head held the open group continues; each peer's
@@ -338,7 +346,7 @@ class LocTrackPublisher(PublishedTrack):
                     continue
             resume_on_key = False
             paused_group = None
-            if frame.key_frame or group_id < 0:
+            if frame.key_frame or group_id < 0 or ended:
                 group_id = self._next_group(frame, group_id)
                 obj_id = 0
             group_start = obj_id == 0
@@ -350,9 +358,10 @@ class LocTrackPublisher(PublishedTrack):
                 group_id, obj_id, payload,
                 extensions=functools.partial(
                     self._object_extensions, frame, group_start),
-                group_start=group_start)
+                group_start=group_start, end_of_group=frame.end_of_group)
             self._note_largest(group_id, obj_id)
             obj_id += 1
+            ended = frame.end_of_group
             self._total_sent += 1
             self._total_bytes += len(payload)
 
