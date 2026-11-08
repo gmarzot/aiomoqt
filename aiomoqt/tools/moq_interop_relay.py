@@ -260,7 +260,7 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A track's input rate falls by at most this factor per lane check.
+# A track's input rate falls by at most this factor per lane check with input.
 IN_RATE_DECAY = 0.9
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
@@ -1215,11 +1215,15 @@ class _RelayedTrack:
         return streamed or not self._datagrams
 
     def update_in_rate(self, now: float) -> None:
-        """Measure the input rate and hand it to the track's lanes."""
+        """Measure the input rate and hand it to the track's lanes. It holds
+        while nothing arrives, so a paused or silent upstream resumes under
+        the bound it had."""
         then, seen = self._rate_mark
         if now <= then:
             return
         self._rate_mark = (now, self._bytes_in)
+        if self._bytes_in == seen:
+            return
         rate = max((self._bytes_in - seen) / (now - then),
                    self._in_rate * IN_RATE_DECAY)
         self._in_rate = rate
