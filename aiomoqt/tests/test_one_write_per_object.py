@@ -345,13 +345,14 @@ async def test_two_tracks_one_write_per_object_through_the_relay(
                                           name.encode())].downstream
                     relay_writes = _count_writes(d.session)
             await asyncio.sleep(1.5)
-            at_pub, at_relay = pub_writes(), relay_writes()
+            # Before the sessions close: closing resets the streams in flight.
+            at_pub, at_relay, ended = pub_writes(), relay_writes(), dict(ends)
     finally:
         handle.close()
 
     for counts in (at_pub, at_relay):
         assert counts.count(1) >= 20 and counts.count(group) >= 3, counts
         assert set(counts) <= {1, group}, counts
-    assert ends and all(ends.values()), ends
-    for (name, gid), clean in ends.items():
+    assert ended and all(ended.values()), [k for k, c in ended.items() if not c]
+    for (name, gid), clean in ended.items():
         assert got[(name, gid)] == set(range(1 if name == "audio" else group))
