@@ -90,13 +90,13 @@ class _Sub:
         return track
 
 
-def _slow_down(session):
-    """Every awaited write to `session` takes _SLOW_S: a subscriber whose
+def _slow_down(session, delay=_SLOW_S):
+    """Every awaited write to `session` takes `delay`: a subscriber whose
     streams drain slowly."""
     real = session.stream_write_drain
 
     async def slow(stream_id, data, end_stream=False):
-        await asyncio.sleep(_SLOW_S)
+        await asyncio.sleep(delay)
         await real(stream_id, data, end_stream)
     session.stream_write_drain = slow
 
@@ -458,11 +458,26 @@ def test_the_input_rate_decays_from_a_peak_and_reaches_the_lanes():
     track._bytes_in = 1000
     update(track, 1.0)
     assert track._in_rate == 1000 and lane.rate == 1000
-    update(track, 2.0)            # nothing arrived: held near the peak
+    track._bytes_in = 1100
+    update(track, 2.0)            # a lull: held near the peak
     assert lane.rate == pytest.approx(1000 * relay.IN_RATE_DECAY)
-    track._bytes_in = 3000
+    track._bytes_in = 3100
     update(track, 3.0)
     assert lane.rate == 2000
+
+
+def test_the_input_rate_holds_while_nothing_arrives():
+    lane = SimpleNamespace(rate=0.0)
+    track = SimpleNamespace(_rate_mark=(0.0, 0), _bytes_in=1000, _in_rate=0.0,
+                            _lanes=[lane])
+    update = relay._RelayedTrack.update_in_rate
+    update(track, 1.0)
+    for i in range(61):           # two minutes paused
+        update(track, 3.0 + 2 * i)
+    assert track._in_rate == 1000 and lane.rate == 1000
+    track._bytes_in = 1100
+    update(track, 125.0)
+    assert lane.rate == pytest.approx(1000 * relay.IN_RATE_DECAY)
 
 
 @requires_certs
@@ -517,6 +532,70 @@ async def test_a_viewer_past_the_lag_limit_sheds_under_the_byte_bound(
     for k, (clean, _code) in slow.ends.items():
         if clean:
             assert slow.objects[k] == set(range(_GROUP)), (k, slow.objects[k])
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_track_resumed_after_a_long_pause_keeps_its_lane_bound(
+        use_quic, draft, relay_tables, monkeypatch):
+    # The first viewer after two minutes paused, a little slower than the
+    # track, gets its first whole group: the lane bound still comes from
+    # the rate the track had, not the 64 KiB floor.
+    monkeypatch.setattr(relay, "LANE_BYTES", _BOUND)
+    monkeypatch.setattr(relay, "_pause_after", 0.3)
+    port = _BASE_PORT + 16 + 4 * (draft == 22) + 2 * (not use_quic)
+    sizes = {"alt": _OBJ // 2, "video": _OBJ}
+    async with _relay(port, use_quic, draft) as connect:
+        pub = await connect()
+        for name, size in sizes.items():
+            PublishedTrack(pub, namespace=_NS, trackname=name, object_size=size,
+                           group_size=_GROUP, rate=_RATE).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+
+        s1 = await connect()
+        watching = [await _Sub().subscribe(s1, n) for n in sizes]
+        tracks = {n: relay._tracks[(relay._ns_tuple(_NS), n.encode())]
+                  for n in sizes}
+        for _ in range(3):
+            await asyncio.sleep(0.5)
+            relay._check_lanes()
+        assert all(t._in_rate > 0 for t in tracks.values())
+        for sub in watching:
+            sub.unsubscribe()
+        assert await _until(lambda: all(t.paused for t in tracks.values()))
+        await asyncio.sleep(0.3)
+        for t in tracks.values():
+            for _ in range(61):       # two minutes of lane checks, paused
+                t.update_in_rate(t._rate_mark[0] + 2.0)
+
+        s2 = await connect()
+        subs = {n: _Sub() for n in sizes}
+        before = {n: set(map(id, (d.session for d in t.downstream)))
+                  for n, t in tracks.items()}
+
+        def joined(name):
+            (d,) = [d for d in tracks[name].downstream
+                    if id(d.session) not in before[name]]
+            return d
+        await subs["alt"].subscribe(s2, "alt")
+        _slow_down(joined("alt").session, delay=0.05)
+        await subs["video"].subscribe(s2, "video")
+
+        def first_group_ended(sub):
+            started = sorted(k for k, objs in sub.objects.items() if 0 in objs)
+            return bool(started) and started[0] in sub.ends
+
+        for name in sizes:
+            assert await _until(lambda: first_group_ended(subs[name]), 4.0), (
+                name, subs[name].objects, subs[name].ends)
+        bounds = {n: joined(n).lane.bound for n in sizes}
+
+    assert bounds == {"alt": _BOUND, "video": _BOUND}, bounds
+    for name, sub in subs.items():
+        k = min(k for k, objs in sub.objects.items() if 0 in objs)
+        assert sub.ends[k] == (True, None), (name, k, sub.ends[k])
+        assert sub.objects[k] == set(range(_GROUP)), (name, k, sub.objects[k])
 
 
 def test_the_deployed_relay_config_parses():
