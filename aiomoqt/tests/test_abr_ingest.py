@@ -75,7 +75,7 @@ def _needs(impl, codec):
     """Skip unless the real cymedia has a software encoder for `codec`."""
     if impl is _fake_cymedia:
         return
-    if not getattr(impl, 'CODECS', ('h264',)).__contains__(codec):
+    if codec not in getattr(impl, 'CODECS', ('h264',)):
         pytest.skip(f'this cymedia has no {codec} ladders')
     names = ('libaom-av1',) if codec == 'av1' else ('libopenh264', 'libx264')
     if not any(impl.have_encoder(n) for n in names):
