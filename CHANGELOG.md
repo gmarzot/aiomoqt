@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay holds a track's input rate while nothing arrives instead of decaying it, so a subscriber's send lane keeps its time bound through a pause or a silent upstream. Before, after about a minute paused the bound fell to its 64 KiB floor, and the first viewer to resume a high-rate track lost its first group.
 - adaptive_bench counts the whole groups and group tails a subscriber never got as lost; before, its loss column read 0.0% while a relay shed groups. In subs mode a subscriber that lost an object in the keep window, or (with `--role both`) has p90 over the threshold, no longer counts as delivering, so it is a shortfall and stays out of high-water: `hold (subs losing objects)` and `hold (subs over threshold)` name it, and the summary gains `Lost` and the peak of each.
 - An object larger than a stream's send ring goes out in pieces instead of failing the write; through aiomoqt-relay at its 1 MiB `--stream-ring-cap`, a 4K keyframe no longer drops the subscriber. The relay logs a subscriber it drops for a failed forward at WARNING.
 - adaptive_bench subs mode runs one picoquic worker per process instead of one per subscriber, on `MOQTClient(shared_transport=)`, with one source port per subscriber. Needs aiopquic 0.8.0 on raw QUIC.
