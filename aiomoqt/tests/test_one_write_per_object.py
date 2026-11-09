@@ -271,6 +271,33 @@ async def test_relay_forwards_the_marker_with_the_last_object():
     assert track._objects_out == 3
 
 
+async def test_relay_encodes_a_whole_stream_once_per_alias_and_draft(
+        monkeypatch):
+    built = []
+    real = relay.SubgroupHeader
+
+    def counted(**kw):
+        built.append(kw["track_alias"])
+        return real(**kw)
+    monkeypatch.setattr(relay, "SubgroupHeader", counted)
+    track = _RelayedTrack(("ns", "t"))
+    a, b, c, d = _Peer(), _Peer(), _Peer(), _Peer()
+    d._profile = profile_for(16)
+    for rid, (peer, alias) in enumerate(((a, 7), (b, 7), (c, 9), (d, 7))):
+        track.add_downstream(peer, alias, rid)
+    try:
+        track.on_object(_Obj(0), 0, 0, 0, 0)
+        track.on_stream_end(0, 0)
+        await _settle()
+    finally:
+        track.task.cancel()
+    assert sorted(built) == [7, 7, 9]
+    (wa,), (wb,), (wc,), (wd,) = (
+        list(p.streams.values())[0] for p in (a, b, c, d))
+    assert wa == wb and wa[1] and wc[1] and wd[1]
+    assert wa[0] != wc[0] and len(wa[0]) == len(wc[0])
+
+
 async def test_relay_sends_a_late_end_alone():
     track, peer = _relayed()
     try:

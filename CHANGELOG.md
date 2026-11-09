@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay shares a one-write stream's header and end bytes across subscribers instead of encoding them per viewer.
 - A raw QUIC data stream's priority goes with its first write, in one hand-off to the network thread.
 - adaptive_bench `--join-burst B0` (subs mode): the largest burst of joins a relay serves under an audience. It holds `--max-subs` for `--base-s` (30 s), then has B joiners redial at once while `--watchers` (a 0.25 share of each group) stay; a trial passes with 99% of them getting a first object within `--join-bound` (1000 ms) and the watchers healthy. B grows from B0 to `--join-max` or the joiner pool, bisects after the first failure and must pass 3 times in a row, with `--trial-gap` (5 s) of clean watchers between trials. The summary gives a `Join trial` line per trial and the confirmed `Join burst`.
 - adaptive_bench ramps with `-R`/`--ramp-rate` (new subscribers per second) and `--spread` (0 to 1, evenly spaced by default), replacing `-j`/`--join-rate` and `-S`/`--stagger`. `-j` and `-S`/`--stagger` still work, with their meaning in seconds.

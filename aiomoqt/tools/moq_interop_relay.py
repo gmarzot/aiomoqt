@@ -92,6 +92,7 @@ from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
+from functools import lru_cache
 import itertools
 import json
 import logging
@@ -442,12 +443,17 @@ _cap_warned: set = set()
 STREAM_SCHEDULING = "fifo"
 
 
+@lru_cache(maxsize=None)
+def _band_of(priority, discipline) -> int:
+    return to_stream_priority(priority, discipline=discipline)
+
+
 def _stream_band(session, priority) -> int:
     """Transport band for a downstream data stream of this publisher
     priority."""
     if priority is None or not 0 <= priority <= 255:
         priority = 128
-    return to_stream_priority(priority, discipline=getattr(
+    return _band_of(priority, getattr(
         session, 'stream_scheduling', STREAM_SCHEDULING))
 
 
@@ -1964,39 +1970,55 @@ class _RelayedTrack:
             # delivery semantics a subscriber checks, and re-encoding
             # with our own flags loses them.
             first_obj, eog, inherited = shape or (False, False, False)
-            header = SubgroupHeader(
-                track_alias=alias, group_id=gid, subgroup_id=sgid,
-                publisher_priority=prio, extensions_present=True,
-                end_of_group=eog, first_object=first_obj,
-                prof=session._profile)
-            initial = header.serialize().data
-            first = tail = None
-            if status not in _STREAM_ENDS:
-                # The header and the first object open the stream together.
-                first = _object_data(header, payload, exts, oid, encoded)
-                initial += first
-                if end is not None:
-                    tail = self._end_data(header, gid, end, start, lost)
-                    if tail is not None:
-                        initial += tail
+            # A stream written whole is the same bytes for every subscriber
+            # with this alias and draft: shared through `encoded`.
+            whole = (end is not None and status not in _STREAM_ENDS
+                     and gid not in lost and not self._short(gid, start))
+            prof = session._profile
+            parts = None
+            if whole and encoded is not None:
+                key = (alias, id(prof), end)
+                parts = encoded.get(key)
+            header = first = None
+            if parts is not None:
+                initial = b"".join(parts)
+            else:
+                header = SubgroupHeader(
+                    track_alias=alias, group_id=gid, subgroup_id=sgid,
+                    publisher_priority=prio, extensions_present=True,
+                    end_of_group=eog, first_object=first_obj, prof=prof)
+                initial = header.serialize().data
+                if status not in _STREAM_ENDS:
+                    # The header and the first object open the stream together.
+                    first = _object_data(header, payload, exts, oid, encoded)
+                    if whole:
+                        parts = (initial, first,
+                                 self._end_data(header, gid, end, start, lost))
+                        if encoded is not None:
+                            encoded[key] = parts
+                        initial = b"".join(parts)
+                    else:
+                        initial += first
             try:
                 stream_id = await session.open_uni_stream(
                     initial=initial, priority=_stream_band(session, prio),
-                    end_stream=tail is not None)
+                    end_stream=whole)
             except MOQTStreamStopped:
                 self._stopped.add(skey)
                 return
             if lane is not None:
                 lane.sid = stream_id
             entry = (stream_id, header)
-            if tail is None:
+            if not whole:
                 self._streams[skey] = entry
             self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
                 stream_id
             self._sent_streams[id(session)] = \
                 self._sent_streams.get(id(session), 0) + 1
+            if whole:
+                return
             if first is not None:
-                if end is not None and tail is None:
+                if end is not None:
                     self._reset_stream(session, skey, entry)
                 return
         stream_id, header = entry
