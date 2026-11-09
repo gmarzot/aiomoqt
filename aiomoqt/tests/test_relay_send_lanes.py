@@ -522,6 +522,22 @@ async def test_a_relay_lane_follows_its_deadline_at_any_rate(
     lane.stop()
 
 
+async def test_a_resume_tick_leaves_the_lane_bound_alone(monkeypatch):
+    monkeypatch.setattr(relay, "_lanes", set())
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    lane = _lane(track)
+    lane.deadline = 5.0
+    then = track._rate_mark[0]
+    track.update_in_rate(then + 2.0)
+    track._bytes_in += 10_000
+    track.update_in_rate(then + 4.0)
+    assert lane.bound == relay.LANE_BYTES
+    track._bytes_in += 200_000
+    track.update_in_rate(then + 6.0)
+    assert lane.bound == 500_000
+    lane.stop()
+
+
 async def test_lanes_over_the_budget_go_back_to_lane_bytes_until_clear(
         monkeypatch):
     monkeypatch.setattr(relay, "_lanes", set())
@@ -572,7 +588,7 @@ async def test_lanes_on_one_track_count_its_queue_once(monkeypatch):
 def test_the_input_rate_decays_from_a_peak_and_reaches_the_lanes():
     lane = SimpleNamespace(rate=0.0)
     track = SimpleNamespace(_rate_mark=(0.0, 0), _bytes_in=0, _in_rate=0.0,
-                            _lanes=[lane])
+                            _rate_idle=False, _lanes=[lane])
     update = relay._RelayedTrack.update_in_rate
     track._bytes_in = 1000
     update(track, 1.0)
@@ -588,14 +604,17 @@ def test_the_input_rate_decays_from_a_peak_and_reaches_the_lanes():
 def test_the_input_rate_holds_while_nothing_arrives():
     lane = SimpleNamespace(rate=0.0)
     track = SimpleNamespace(_rate_mark=(0.0, 0), _bytes_in=1000, _in_rate=0.0,
-                            _lanes=[lane])
+                            _rate_idle=False, _lanes=[lane])
     update = relay._RelayedTrack.update_in_rate
     update(track, 1.0)
     for i in range(61):           # two minutes paused
         update(track, 3.0 + 2 * i)
     assert track._in_rate == 1000 and lane.rate == 1000
     track._bytes_in = 1100
-    update(track, 125.0)
+    update(track, 125.0)          # the resume tick sets nothing
+    assert lane.rate == 1000
+    track._bytes_in = 1200
+    update(track, 127.0)
     assert lane.rate == pytest.approx(1000 * relay.IN_RATE_DECAY)
 
 
