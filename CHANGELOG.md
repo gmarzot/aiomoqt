@@ -44,7 +44,7 @@
 - moq_interop_client moq-test-* cases: the publisher waits up to 1 s for a relay to raise Forward State 0 with REQUEST_UPDATE; a downstream Stream Count that delivery never meets fails the case by name instead of timing out; a refused SUBSCRIBE leads a later timeout's message.
 - Bench output: a value that rounds up to a unit's limit shows in the next unit (`10Gbps`, not `10.0Gbps`; `1.0ms`, not `1000us`); loopback_bench prints its table header after the subscriber line.
 - LOC payloads in the clear are the bare frame (loc-04 §3.1.3, Secure Objects -01 §3.3): `LocTrackPublisher` and `LocTrackSubscriber` no longer send or expect the `0x0A 0x00` block; `loc_bare=` and `--loc-bare` are removed.
-- `abr_ingest`: an ABR ingester in front of a relay. A LOC broadcast dials in, or is subscribed from a relay, and goes out unchanged plus an H.264 or AV1 (`--codec`) ladder encoded by cymedia (NVENC or CPU; the `abr` extra) under the same namespace and catalog, each rung on the source's group and object IDs. It reports the delay from a frame's arrival to its hand-off, per track.
+- `abr_ingest`: an ABR ingester in front of a relay. A LOC broadcast dials in, or is subscribed from a relay, and goes out unchanged plus an H.264 or AV1 (`--codec`) ladder encoded by cymedia (NVENC, VideoToolbox or CPU; the `abr` extra) under the same namespace and catalog, each rung on the source's group and object IDs. It reports the delay from a frame's arrival to its hand-off, per track.
 
 ## v0.14.1
 

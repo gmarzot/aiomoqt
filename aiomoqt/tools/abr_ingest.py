@@ -78,7 +78,7 @@ def parse_args(argv=None):
     _cli.add_identity(parser, namespace='live/abr')
     parser.add_argument('--out-ns', metavar='NS',
                         help='Namespace to publish under (default: -N)')
-    parser.add_argument('--profile', choices=('nvenc', 'cpu'),
+    parser.add_argument('--profile', choices=('nvenc', 'videotoolbox', 'cpu'),
                         default='nvenc',
                         help='cymedia encoder profile (default: nvenc)')
     parser.add_argument('--codec', choices=CODECS, default='h264',
@@ -103,6 +103,8 @@ def parse_args(argv=None):
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args(argv)
+    if args.profile == 'videotoolbox' and args.codec != 'h264':
+        parser.error('--profile videotoolbox encodes H.264 only')
     if args.source and (args.quic or args.wt):
         parser.error('--source dials the source and -Q/-W listen for it: '
                      'pick one')
