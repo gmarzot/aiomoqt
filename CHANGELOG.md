@@ -2,7 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
-- Session admission with Common Access Tokens: `--auth-key KID:SECRET` makes a tool present a broad, non-expiring CAT in SETUP and makes aiomoqt-relay require one; the format is the one moqx verifies.
+- Session admission with Common Access Tokens: `--auth-key KID:SECRET` makes a tool present a broad, non-expiring CAT in SETUP and makes aiomoqt-relay require one and, from d16, check each request against its scopes; the format is the one moqx verifies.
 - Logs show an authorization token's length instead of its value.
 - A request that fails because its session closed names the close code in its reason.
 

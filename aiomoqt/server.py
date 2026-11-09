@@ -155,7 +155,8 @@ class MOQTServer(MOQTPeer):
         # with one of these log below WARNING at DEBUG (a health probe's
         # sessions, say).
         self.quiet_peers = tuple(quiet_peers)
-        # Requires a token in SETUP; None admits every session.
+        # Requires a token in SETUP and checks requests against it; None
+        # admits everything.
         self.auth = auth
         # MAX_FILTER_RANGES sent at d20+ (§9.1.6). Nonzero only where the
         # application applies Range Filters; 0 refuses them all.

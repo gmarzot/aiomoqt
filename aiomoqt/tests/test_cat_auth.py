@@ -5,7 +5,7 @@ import time
 import pytest
 
 from aiomoqt import cat
-from aiomoqt.cat import CatAuth
+from aiomoqt.cat import CatAuth, CatRefused
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
 from aiomoqt.messages import AuthToken, AuthTokenRef, ClientSetup
@@ -53,6 +53,14 @@ def _token(claims, alg=cat._ALG_HS256, kid="cat-dev"):
                     cat._bstr(AUTH._mac(protected, payload))]), 1)
 
 
+def _refusal(token):
+    try:
+        AUTH.admit(token)
+    except CatRefused as e:
+        return e.code
+    return None
+
+
 def _past():
     return int(time.time()) - 60
 
@@ -68,25 +76,25 @@ def _flip_payload(token):
 
 
 def test_moqx_issued_token_admits():
-    assert AUTH.refusal(ISSUED_ALL_ACTIONS) is None
+    assert _refusal(ISSUED_ALL_ACTIONS) is None
 
 
 def test_moqx_issued_token_without_client_setup_is_refused():
-    assert AUTH.refusal(ISSUED_NO_SETUP)[0] == DENIED
+    assert _refusal(ISSUED_NO_SETUP) == DENIED
 
 
 def test_minted_token_grants_every_action_without_expiry():
     token = AUTH.mint()
     assert token.token_type == cat.DEFAULT_TOKEN_TYPE
-    assert AUTH.refusal(token) is None
+    assert _refusal(token) is None
     claims = cat._decode(cat._decode(bytes(token))[2])
     assert cat._CLAIM_EXP not in claims
     assert cat._decode(claims[cat._CLAIM_MOQT]) == [[list(range(9))]]
 
 
 def test_future_expiry_and_absent_kid_admit():
-    assert AUTH.refusal(AUTH.mint(exp=int(time.time()) + 60)) is None
-    assert AUTH.refusal(_token([BROAD], kid=None)) is None
+    assert _refusal(AUTH.mint(exp=int(time.time()) + 60)) is None
+    assert _refusal(_token([BROAD], kid=None)) is None
 
 
 @pytest.mark.parametrize("build, code", [
@@ -120,7 +128,7 @@ def test_future_expiry_and_absent_kid_admit():
         "truncated", "trailing", "indefinite", "tagged", "deep", "huge-array",
         "oversize"])
 def test_refusals(build, code):
-    assert AUTH.refusal(build())[0] == code
+    assert _refusal(build()) == code
 
 
 def test_secret_stays_out_of_repr():

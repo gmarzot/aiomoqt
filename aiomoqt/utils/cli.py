@@ -354,7 +354,8 @@ def add_auth(p):
     p.add_argument('--auth-key', type=str, default=None, metavar='KID:SECRET',
                    help='Shared HMAC key for session admission: a client '
                         'presents a CAT granting everything, without expiry, '
-                        'in SETUP; a listener requires one. Also '
+                        'in SETUP; a listener requires one and checks each '
+                        'request against its grants. Also '
                         f'{AUTH_KEY_ENV}. Default: no auth')
     p.add_argument('--auth-token-type', type=int, default=None, metavar='N',
                    help="MOQT Auth Token Type of that CAT; must match the "

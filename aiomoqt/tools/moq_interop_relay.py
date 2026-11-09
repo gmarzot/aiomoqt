@@ -8,8 +8,8 @@ carries less traffic than the Rust and C++ relays.
 
 Limits:
 
-  * Authentication stops at session admission (--auth-key); no per-request
-    authorization and no rate limiting.
+  * Authorization only with --auth-key: SETUP and, from d16, each request
+    are checked against CAT grants. No rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
     subscriber holding what its deadline covers at the track's input
     rate, or LANE_BYTES with no rate or deadline yet or while the lanes
@@ -6010,7 +6010,7 @@ async def main():
     print(
         "=" * 64
         + "\n aiomoqt-relay: a MoQT relay in Python.\n"
-        " Session admission only with --auth-key; no rate limiting.\n"
+        " CAT authorization with --auth-key; no rate limiting.\n"
         + "=" * 64,
         file=sys.stderr,
     )

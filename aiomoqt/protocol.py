@@ -27,6 +27,9 @@ from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
 from .types import SCHEDULING, to_stream_priority
+from .cat import (ACTION_FETCH, ACTION_PUBLISH, ACTION_PUBLISH_NAMESPACE,
+                  ACTION_SUBSCRIBE, ACTION_SUBSCRIBE_NAMESPACE,
+                  ACTION_TRACK_STATUS, CatRefused, Grants)
 from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
                             FETCH_FLAGS_END_UNKNOWN, encode_padding,
                             DEFAULT_MAX_OBJECT_BYTES, MOQTObjectTooLarge)
@@ -574,6 +577,8 @@ class _MOQTSessionMixin:
             Callable[[AuthToken, MOQTMessage], Optional[int]]] = None
         self._auth_token_cache_used = 0
         self._auth_token_cache_max = 0
+        # What the SETUP token granted, when the server requires one.
+        self._auth_grants: Optional[Grants] = None
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
         # request id: the receive-side registry.
         self._track_aliases: Dict[int, int] = {}
@@ -1655,6 +1660,7 @@ class _MOQTSessionMixin:
                 self._quiet_token = quiet_session.set(True)
             control_log.info(f"MOQT event: control message parsed: {self._msgstr(msg)})")
             refusal = (self._resolve_auth_token(msg)
+                       or self._authorize_request(msg)
                        or self._refuse_request(msg))
             routed = refusal or self._track_handler(msg, handler)
             if routed is not None:
@@ -4213,14 +4219,52 @@ class _MOQTSessionMixin:
         """Close the session unless SETUP carries a token this server admits."""
         auth = (None if self._is_client
                 else getattr(getattr(self, '_session', None), 'auth', None))
-        refusal = auth and auth.refusal(
-            (options or {}).get(SetupParamType.AUTH_TOKEN))
-        if not refusal:
+        if auth is None:
             return False
-        code, reason = refusal
-        control_log.info(f"MOQT: session refused: {reason}")
-        self._close_session(code, reason)
-        return True
+        try:
+            self._auth_grants = auth.admit(
+                (options or {}).get(SetupParamType.AUTH_TOKEN))
+        except CatRefused as e:
+            control_log.info(f"MOQT: session refused: {e.reason}")
+            self._close_session(e.code, e.reason)
+            return True
+        return False
+
+    def _authorize_request(self, msg: MOQTMessage) -> Optional[Callable]:
+        """The handler refusing a d16+ request that neither the session's CAT
+        grants nor the token on the request cover."""
+        action = self._CAT_ACTIONS.get(type(msg))
+        rid = getattr(msg, 'request_id', None)
+        auth = (None if action is None or self._is_client
+                else getattr(getattr(self, '_session', None), 'auth', None))
+        if (auth is None or rid is None
+                or not is_draft16_or_later(self.negotiated_draft)):
+            return None
+        if isinstance(msg, Fetch) and _is_joining(msg.fetch_type):
+            # An unresolvable join is checked as the empty name: fails closed.
+            peer = self._peer_requests.get(msg.joining_request_id)
+            namespace, track = (peer[1] if peer and peer[0] is Subscribe
+                                else ((), b""))
+        else:
+            namespace = (getattr(msg, 'track_namespace', None)
+                         or getattr(msg, 'namespace', None)
+                         or getattr(msg, 'namespace_prefix', None) or ())
+            track = getattr(msg, 'track_name', None)
+        token = (msg.parameters or {}).get(ParamType.AUTH_TOKEN)
+        if auth.permits(action, namespace, track, token, self._auth_grants):
+            return None
+        return self._refusal(msg, int(rid), RequestErrorCode.UNAUTHORIZED,
+                             "authorization token does not permit action")
+
+    _CAT_ACTIONS = {
+        Subscribe: ACTION_SUBSCRIBE,
+        Fetch: ACTION_FETCH,
+        SubscribeNamespace: ACTION_SUBSCRIBE_NAMESPACE,
+        SubscribeTracks: ACTION_SUBSCRIBE_NAMESPACE,
+        TrackStatus: ACTION_TRACK_STATUS,
+        Publish: ACTION_PUBLISH,
+        PublishNamespace: ACTION_PUBLISH_NAMESPACE,
+    }
 
     def _check_setup_location(self, options: Optional[Dict]) -> None:
         """Refuse to send PATH or AUTHORITY where the peer must close."""
