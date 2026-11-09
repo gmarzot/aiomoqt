@@ -738,3 +738,39 @@ class TrackStats:
             ts_source=self.ts_source, ts_malformed=self.ts_malformed,
             loss_pct=(self.total_lost / expected * 100) if expected else 0.0,
         )
+
+
+class ViewerStats:
+    """One viewer's TrackStats per track, merged for the slot checks:
+    bytes, objects and loss sum; latency is the worst track's."""
+
+    _SUMMED = ('rx_objs', 'rx_bytes', 'iv_lost', 'lat_n', 'loss', 'groups',
+               'total_objs', 'total_bytes')
+
+    def __init__(self, names, **kwargs):
+        self.tracks = {name: TrackStats(**kwargs) for name in names}
+
+    @property
+    def total_lost(self) -> int:
+        return sum(t.total_lost for t in self.tracks.values())
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(t.total_bytes for t in self.tracks.values())
+
+    @property
+    def total_objects(self) -> int:
+        return sum(t.total_objects for t in self.tracks.values())
+
+    def snapshot(self) -> dict:
+        snaps = [t.snapshot() for t in self.tracks.values()]
+        merged = dict(snaps[0])
+        for key in self._SUMMED:
+            merged[key] = sum(s[key] for s in snaps)
+        timed = [s for s in snaps if s['lat_n']]
+        merged['lat_p90_ms'] = max((s['lat_p90_ms'] for s in timed), default=0.0)
+        merged['lat_p99_ms'] = max((s['lat_p99_ms'] for s in timed), default=0.0)
+        merged['lat_mean_ms'] = (sum(s['lat_mean_ms'] * s['lat_n'] for s in timed)
+                                 / merged['lat_n']) if merged['lat_n'] else 0.0
+        merged['jitter_ms'] = max(s['jitter_ms'] for s in snaps)
+        return merged

@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- adaptive_bench takes `--audio`, `--catalog` and, with them, `-D`, as pub_bench does: it publishes those tracks and in subs mode each viewer subscribes to every track, with latency, loss and bitrate counted across them. The flags now live in the shared CLI grid.
 - aiomoqt-relay ignores the rate tick that catches a track coming out of silence, so the first viewer of a track with no rate yet keeps the 4 MiB send lane until a full tick has measured it, instead of dropping to 64 KiB and shedding the first group.
 - adaptive_bench `--join-burst B0` (subs mode): the largest burst of joins a relay serves under an audience. It holds `--max-subs` for `--base-s` (30 s), then has B joiners redial at once while `--watchers` (a 0.25 share of each group) stay; a trial passes with 99% of them getting a first object within `--join-bound` (1000 ms) and the watchers healthy. B grows from B0 to `--join-max` or the joiner pool, bisects after the first failure and must pass 3 times in a row, with `--trial-gap` (5 s) of clean watchers between trials. The summary gives a `Join trial` line per trial and the confirmed `Join burst`.
 - adaptive_bench ramps with `-R`/`--ramp-rate` (new subscribers per second) and `--spread` (0 to 1, evenly spaced by default), replacing `-j`/`--join-rate` and `-S`/`--stagger`. `-j` and `-S`/`--stagger` still work, with their meaning in seconds.

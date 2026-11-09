@@ -344,7 +344,11 @@ there, and `-T v1080p` on both is what selects the track.
   `-g` stays objects per group, so it is the GOP length in frames (default
   one second of frames): `--video 1080p -r 60 -g 120` is 60 fps with 2 s
   GOPs. pub_bench, pub_server and adaptive_bench subs mode all take it.
-- `--video` refuses `-s`, `-P` and `-D`: the profile sets each frame's
+- `--audio` and `--catalog` add those tracks beside `--video` on `pub_bench` and
+  `adaptive_bench`, one object per group; `-D` then sends the audio as ObjectDatagrams.
+  In `adaptive_bench --mode subs` each viewer takes every track, with loss and worst
+  latency across them counted in its checks.
+- Otherwise `--video` refuses `-s`, `-P` and `-D`: the profile sets each frame's
   size, sends one stream, and its I-frames are far past the 1152-byte
   one-packet datagram ceiling. Flat alternative: `-s 4096 -r 120 -g 240`,
   which is 2 s groups at 120 objects per second. Stream turnover is rate

@@ -28,16 +28,17 @@ import signal
 import sys
 import time
 from collections import deque
+from functools import partial
 from typing import Any, Dict
 
 from aiomoqt.client import MOQTClient, SharedTransport
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
-from aiomoqt.track import SubscribedTrack, TrackState
+from aiomoqt.track import PublishedTrack, SubscribedTrack, TrackState
 from aiomoqt.types import FilterType, MOQTRequestError
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_handler, set_log_level
-from aiomoqt.utils.stats import TrackStats
+from aiomoqt.utils.stats import TrackStats, ViewerStats
 
 
 def apply_compat(compat) -> bool:
@@ -363,12 +364,51 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
         except asyncio.TimeoutError:
             pass
 
-    def _on_object(msg, size_bytes, recv_time_us, group_id=None,
-                   subgroup_id=None, *_args, **_kw):
-        stats.on_object(msg, size_bytes, recv_time_us, group_id,
-                        subgroup_id)
-        if state['join_t0'] is not None:
-            join_first_object(state, time.monotonic())
+    names = viewer_tracks(config)
+    multi = len(names) > 1
+
+    def _callback(name):
+        def _on_object(msg, size_bytes, recv_time_us, group_id=None,
+                       subgroup_id=None, *_args, **_kw):
+            (stats.tracks[name] if multi else stats).on_object(
+                msg, size_bytes, recv_time_us, group_id, subgroup_id)
+            if state['join_t0'] is not None:
+                join_first_object(state, time.monotonic())
+        return _on_object
+
+    async def _subscribe(session, name):
+        """The subscribed track, or None to reopen the whole slot."""
+        deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
+        while time.monotonic() < deadline and not stop_ev.is_set():
+            track = SubscribedTrack(session, config['namespace'],
+                                    trackname=name, on_object=_callback(name))
+            try:
+                ft = FilterType(config.get('sub_filter',
+                                           FilterType.LATEST_OBJECT))
+                await track.subscribe(timeout=SUBSCRIBE_EACH_TIMEOUT_S,
+                                      filter_type=ft)
+                return track
+            except Exception as e:
+                m = str(e)
+                unpublished = ('code=4' in m or 'does not exist' in m
+                               or 'no such namespace' in m)
+                # A resubscribe can reach the relay ahead of its
+                # unsubscribe.
+                if 'already subscribed' in m:
+                    await asyncio.sleep(0.3)
+                    continue
+                if isinstance(e, MOQTRequestError) and not unpublished:
+                    state['refused'] += 1
+                    state['refusing'] = True
+                    state['refused_reason'] = e.reason
+                if await retry_wait(e, stop_ev):
+                    deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
+                    continue
+                if unpublished:
+                    await asyncio.sleep(0.3)
+                    continue
+                return None
+        return None
 
     insecure = config.get('insecure', False)
     while not stop_ev.is_set():
@@ -392,54 +432,21 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                 resubscribe = True
                 while resubscribe and not stop_ev.is_set():
                     resubscribe = False
-                    deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
-                    track = None
-                    subscribed = False
-                    while time.monotonic() < deadline and not stop_ev.is_set():
-                        track = SubscribedTrack(
-                            session, config['namespace'],
-                            trackname=config['trackname'],
-                            on_object=_on_object,
-                        )
-                        try:
-                            ft = FilterType(config.get('sub_filter',
-                                                       FilterType.LATEST_OBJECT))
-                            await track.subscribe(
-                                timeout=SUBSCRIBE_EACH_TIMEOUT_S,
-                                filter_type=ft,
-                            )
-                            subscribed = True
+                    tracks = []
+                    for name in names:
+                        track = await _subscribe(session, name)
+                        if track is None:
+                            tracks = None
                             break
-                        except Exception as e:
-                            m = str(e)
-                            unpublished = ('code=4' in m or 'does not exist' in m
-                                           or 'no such namespace' in m)
-                            # A resubscribe can reach the relay ahead of its
-                            # unsubscribe.
-                            if 'already subscribed' in m:
-                                await asyncio.sleep(0.3)
-                                continue
-                            if isinstance(e, MOQTRequestError) and not unpublished:
-                                state['refused'] += 1
-                                state['refusing'] = True
-                                state['refused_reason'] = e.reason
-                            if await retry_wait(e, stop_ev):
-                                deadline = (time.monotonic()
-                                            + SUBSCRIBE_RETRY_WINDOW_S)
-                                continue
-                            if unpublished:
-                                await asyncio.sleep(0.3)
-                                continue
-                            # Other subscribe error: drop the connection and
-                            # let the outer loop reopen the whole slot.
-                            break
-                    if subscribed:
+                        tracks.append(track)
+                    if tracks:
                         join_mark(state, 'join_sub_ms', time.monotonic())
                         state['active'] = True
                         state['refusing'] = False
                         state['since'] = time.monotonic()
                         while not stop_ev.is_set():
-                            if getattr(track, 'state', None) == TrackState.CLOSED:
+                            if any(getattr(t, 'state', None) == TrackState.CLOSED
+                                   for t in tracks):
                                 break
                             if state.get('cycle'):
                                 redial = True
@@ -449,7 +456,8 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                                 # congestion state carries over.
                                 state['resubscribe'] = False
                                 state['resubscribed'] += 1
-                                track.unsubscribe()
+                                for t in tracks:
+                                    t.unsubscribe()
                                 resubscribe = True
                                 break
                             await _poll_wait(state.get('wake'))
@@ -535,6 +543,18 @@ def judge_slot(state, snap, now: float, window_s: float, expected_bps: float,
     at_rate = not expected_bps or slot_delivering(
         state['hist'], state['since'], now, window_s, expected_bps)
     return at_rate and not lossy and not late, lossy, late
+
+
+def viewer_tracks(config: Dict[str, Any]) -> list:
+    """The tracks one viewer takes: the main track and any side tracks."""
+    return [config['trackname'],
+            *(shape[0] for shape in config.get('side_tracks', ()))]
+
+
+def new_viewer_stats(config: Dict[str, Any]):
+    if not config.get('side_tracks'):
+        return TrackStats(group_loss=True)
+    return ViewerStats(viewer_tracks(config), group_loss=True)
 
 
 def new_slot_state(tally: dict, watcher: bool = True) -> dict:
@@ -675,7 +695,8 @@ def renew_stats(state, old):
     state['lost_at'] = float('-inf')
     if state.get('hist') is not None:
         state['hist'].clear()
-    state['stats'] = TrackStats(group_loss=True)
+    new_stats = state.get('new_stats')
+    state['stats'] = new_stats() if new_stats else TrackStats(group_loss=True)
     return state['stats']
 
 
@@ -727,8 +748,10 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     # (stats, state) per slot; stats persist across a slot's reopens, and
     # state['stats'] replaces them once it cycles.
     n_watch = watcher_count(K, config.get('watchers'))
-    slots = [(TrackStats(group_loss=True), new_slot_state(tally, i < n_watch))
+    slots = [(new_viewer_stats(config), new_slot_state(tally, i < n_watch))
              for i in range(K)]
+    for _, state in slots:
+        state['new_stats'] = partial(new_viewer_stats, config)
 
     async def _batch_stats_loop():
         last_t = time.monotonic()
@@ -869,7 +892,7 @@ def bench_track(session, config: Dict[str, Any], *, rate: float,
     """The bench publisher's track: a VideoTrack when config names a
     'video' profile ('video_fps', and 'group_size' as the GOP), else
     object_size x num_subgroups at `rate`."""
-    from aiomoqt.track import PublishedTrack, VideoTrack
+    from aiomoqt.track import VideoTrack
     if config.get('video'):
         return VideoTrack(session, config['namespace'], config['trackname'],
                           resolution=config['video'],
@@ -934,6 +957,19 @@ async def _publisher_task(config: Dict[str, Any], mp_stop_event,
                 publish_track=not config.get('pub_ns', False)
                               or config.get('pub_both', False),
             )
+            for name, size, rate, datagram in config.get('side_tracks', ()):
+                side = PublishedTrack(
+                    session, namespace=config['namespace'], trackname=name,
+                    object_size=size, group_size=1, rate=rate,
+                    forwarding=(ForwardingPreference.DATAGRAM if datagram
+                                else ForwardingPreference.SUBGROUP))
+                side._stats_header_printed = True
+                side._quiet = True
+                if config.get('pub_ns') and not config.get('pub_both'):
+                    side.attach()
+                else:
+                    await side.publish(announce_namespace=False,
+                                       publish_track=True)
 
             _post(events_queue, {
                 'kind': 'pub_health', 'state': 'published',
