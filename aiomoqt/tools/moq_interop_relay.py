@@ -10,7 +10,9 @@ Limits:
 
   * No authentication, authorization or rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
-    subscriber holding at most LANE_BYTES, counting its queued live
+    subscriber holding what its deadline covers at the track's input
+    rate, or LANE_BYTES with no rate or deadline yet or while the lanes
+    together hold more than --cache-bytes, counting its queued live
     objects and what its streams still hold in the transport: a
     subscriber that falls further behind loses whole groups, their
     streams reset.
@@ -113,8 +115,8 @@ from aiomoqt.types import (
     SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
-from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
-                              retained_object_bytes)
+from aiomoqt.delivery import (LANE_BYTES, LANE_MIN_BYTES, LANE_STALL_S,
+                              SendLane, retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -475,8 +477,42 @@ def _kib(n) -> str:
     return f"{n >> 20} MiB" if n % (1 << 20) == 0 else f"{n >> 10} KiB"
 
 
+def _held_by_lanes() -> int:
+    """Bytes the send lanes hold. A track's lanes queue the same objects, so
+    each track counts its longest queue; transport backlog is per lane."""
+    queued: dict = {}
+    transport = 0
+    for lane in _lanes:
+        if lane.bytes > queued.get(lane.track, 0):
+            queued[lane.track] = lane.bytes
+        transport += lane.tx_bytes
+    return sum(queued.values()) + transport
+
+
+def _budget_lanes() -> None:
+    """Hold every lane to LANE_BYTES once the lanes are over --cache-bytes,
+    until they are back under 7/8 of it."""
+    global _lane_bytes, _lanes_over_budget
+    _lane_bytes = _held_by_lanes()
+    limit = CACHE_BUDGET_BYTES * 7 // 8 if _lanes_over_budget \
+        else CACHE_BUDGET_BYTES
+    over = _lane_bytes > limit
+    if over == _lanes_over_budget:
+        return
+    _lanes_over_budget = over
+    if over:
+        logger.warning(f"relay: send lanes hold {_lane_bytes} bytes, over "
+                       f"--cache-bytes: each is back to {LANE_BYTES} bytes")
+    else:
+        logger.info(f"relay: send lanes hold {_lane_bytes} bytes: back to "
+                    f"their deadlines")
+    for lane in _lanes:
+        lane._set_bound()
+
+
 def _check_lanes() -> None:
     now = time.monotonic()
+    _budget_lanes()
     for track in list(_tracks.values()):
         track.update_in_rate(now)
     for lane in list(_lanes):
@@ -644,6 +680,9 @@ _budget = _CacheBudget()
 
 # Send lanes still running, including those draining past their track.
 _lanes: set = set()
+# What the lanes hold, and whether that has put them all back on LANE_BYTES.
+_lane_bytes = 0
+_lanes_over_budget = False
 
 
 def _tightest(*limits):
@@ -736,9 +775,10 @@ class _TracedRelayDelivery(_RelayDelivery):
 
 
 class _RelayLane(SendLane):
-    """One subscriber's SendLane, bounded by LANE_BYTES or its deadline at
-    the track's input rate, and registered for the stall check and the
-    status page. A failed write drops the subscriber."""
+    """One subscriber's SendLane, bounded by its deadline at the track's
+    input rate, or LANE_BYTES without both or while the lanes are over
+    budget, and registered for the stall check and the status page. A
+    failed write drops the subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -753,6 +793,12 @@ class _RelayLane(SendLane):
         self.rate = track._in_rate
         _lanes.add(self)
         track._lanes.add(self)
+
+    def _set_bound(self) -> None:
+        if _lanes_over_budget or self._deadline is None or self._rate <= 0:
+            super()._set_bound()
+        else:
+            self.bound = max(LANE_MIN_BYTES, int(self._rate * self._deadline))
 
     def _exit(self) -> None:
         _lanes.discard(self)
@@ -791,7 +837,9 @@ class _RelayLane(SendLane):
         log(f"relay: forward to {self._who()} failed, dropping the "
             f"subscriber: {error!r}")
         logger.debug("relay: forward failure", exc_info=error)
-        self.track._drops += 1
+        # A session that closed left on its own: not a drop.
+        if _session_live(self.d.session):
+            self.track._drops += 1
         self.track.drop_session(self.d.session)
         return False
 
@@ -3935,7 +3983,8 @@ def parse_args(argv=None):
                         default=CACHE_BUDGET_BYTES, metavar="BYTES",
                         help="Object cache budget across all tracks; past "
                              "it the least recently used tracks lose their "
-                             "oldest groups. Default: 256 MiB")
+                             "oldest groups. Send lanes holding more than "
+                             "this fall back to 4 MiB each. Default: 256 MiB")
     parser.add_argument("--max-namespaces-per-session", type=int,
                         default=MAX_NAMESPACES_PER_SESSION, metavar="N",
                         help="PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and "
@@ -5295,7 +5344,7 @@ class _Status:
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
-            "shed_bytes": self._shed,
+            "shed_bytes": self._shed, "lane_bytes": _lane_bytes,
             "fetches": sum(r["fetches"] for _, r in tracks),
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
