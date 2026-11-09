@@ -21,7 +21,8 @@ addressing
                        host[:port]                 WebTransport
                      There is no -q: an address you dial already says
                      how to reach it.
-  -Q/--quic          on tools that LISTEN (no URL to imply it). Both
+  -Q/--quic          on tools that LISTEN (no URL to imply it); abr_ingest
+                     listens for its source and dials its outputs. Both
   -W/--wt            together = serve both on one port via per-connection
                      ALPN dispatch. Neither = -W.
   --bind, -p/--port, --path      listener address. The path is shared by

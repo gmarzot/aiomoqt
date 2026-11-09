@@ -29,6 +29,8 @@ Pure Python. `aiopquic` (the QUIC transport) installs as a binary wheel automati
 
 HLS/DASH ingest (`pub_media --input`) needs PyAV, an optional extra:
 `uv pip install 'aiomoqt[media]'`. Without it, `--input` exits with that hint.
+The ABR ingester (`abr_ingest`) needs cymedia, an optional extra that builds against the system's
+FFmpeg development files: `uv pip install 'aiomoqt[abr]'`.
 
 ## Quick start
 
@@ -277,6 +279,7 @@ Each tool runs as a module (`python -m aiomoqt.tools.NAME`) and most also instal
 | `aiomoqt.versions` | `aiomoqt-versions` | version report (aiomoqt, aiopquic, picoquic/picotls SHAs) |
 | `tools.pub_media` | — | MSF/LOC/CMAF media publisher (mp4, live H.264, MPEG-TS, HLS/DASH, tone) |
 | `tools.sub_media` | — | catalog-driven media subscriber; writes playable files or measures delivery (`--analyze`) |
+| `tools.abr_ingest` | — | ABR ingester: a LOC broadcast in, the same broadcast plus an H.264 or AV1 ladder out, one catalog |
 | `tools.pub_bench` | `moq-pub-bench` | publisher benchmark |
 | `tools.sub_bench` | `moq-sub-bench` | subscriber benchmark — latency, jitter, loss |
 | `tools.loopback_bench` | `moq-loopback-bench` | in-process publisher + subscriber, no relay |
@@ -325,7 +328,7 @@ python -m aiomoqt.tools.moq_interop_client -l                                   
 
 `aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; one relay-wide budget (`--cache-bytes`, default 256 MiB) caps all tracks together by dropping the oldest group of the least recently used track, and past the budget plus 32 MiB the largest live group goes uncached. Cache and send lanes charge each object its payload, its properties and about 224 bytes of record overhead. A late subscriber starts at the live edge. For `--startup-hold` seconds after start (default 2, 0 = off), a SUBSCRIBE for a track no publisher serves yet waits for one, so viewers that reconnect after a restart before their publishers are answered, not refused. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
 
-Limits: no authentication, authorization or rate limiting; each subscriber's send lane holds up to 4 MiB, counting what its streams still hold in the transport, and a subscriber that falls further behind loses whole groups, their streams reset, and a lane that completes no write for 10 s logs one `lane stalled` WARNING; upstream Forward State is raised for a viewer and lowered once no viewer has forwarded the track for `--pause-after` seconds (default 60, 0 = never); a subscriber's objects older than its OBJECT_DELIVERY_TIMEOUT (the smaller of the publisher's and the subscriber's) or the track's MAX_CACHE_DURATION, or with neither set its live objects older than `--lag-limit` (default 5 s, 0 = never), are dropped, the subgroup reset with DELIVERY_TIMEOUT and the rest of the group skipped; past MAX_CACHE_DURATION a cached object is not served and a FETCH for it goes upstream. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
+Limits: no authentication, authorization or rate limiting; each subscriber's send lane holds what its delivery deadline covers at the track's input rate (4 MiB until that is known, or while the lanes together hold more than `--cache-bytes`), counting what its streams still hold in the transport, and a subscriber that falls further behind loses whole groups, their streams reset, and a lane that completes no write for 10 s logs one `lane stalled` WARNING; upstream Forward State is raised for a viewer and lowered once no viewer has forwarded the track for `--pause-after` seconds (default 60, 0 = never); a subscriber's objects older than its OBJECT_DELIVERY_TIMEOUT (the smaller of the publisher's and the subscriber's) or the track's MAX_CACHE_DURATION, or with neither set its live objects older than `--lag-limit` (default 5 s, 0 = never), are dropped, the subgroup reset with DELIVERY_TIMEOUT and the rest of the group skipped; past MAX_CACHE_DURATION a cached object is not served and a FETCH for it goes upstream. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
 ```bash
 aiomoqt-relay --port 4443 \
