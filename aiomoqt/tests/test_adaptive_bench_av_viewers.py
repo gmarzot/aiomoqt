@@ -2,6 +2,8 @@
 taking every track, and per-track stats merged for the slot checks; through
 the relay over raw QUIC and WebTransport."""
 import asyncio
+import signal
+import subprocess
 from functools import partial
 from types import SimpleNamespace
 
@@ -15,6 +17,16 @@ from aiomoqt.utils.stats import TrackStats, ViewerStats
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._procs import free_udp_port, spawn, stop, wait_for
 from aiomoqt.tests.test_adaptive_bench_workers import _argv, _processes
+
+
+def _interrupt(proc):
+    """SIGINT: the bench stops its publisher worker before exiting."""
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+    stop(proc)
 
 
 def _video_mbps(profile="720p"):
@@ -145,7 +157,7 @@ async def test_a_viewer_takes_every_track_through_the_relay(tmp_path, use_quic,
     finally:
         stop_ev.set()
         if pub is not None:
-            stop(pub)
+            _interrupt(pub)
         stop(relay)
     objs = {n: t.total_objects for n, t in stats.tracks.items()}
     assert objs["video"] >= 60 and objs["audio"] >= 100 and objs["catalog"] >= 2, objs

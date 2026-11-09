@@ -235,3 +235,52 @@ async def test_ingester_publishes_source_and_ladder_in_one_catalog(
                 assert got['video'][(g, o)][1] == ts
         # the subscriptions may start up to a group apart
         assert len(set(rung) & set(got['video'])) >= len(rung) - GOP
+
+
+async def test_source_url_waits_for_a_source_not_yet_published(impl, clip):
+    _needs(impl, 'h264')
+    from aiomoqt.tools import abr_ingest
+    from aiomoqt.tools import moq_interop_relay as relay
+    relay._announced.clear()
+    relay._tracks.clear()
+    config, frames = clip
+    ns, out_ns = 'abr/late', 'abr/late-out'
+    port = free_udp_port()
+    url = f'moqt://localhost:{port}/'
+    server = relay._build_server('localhost', port, CERT, KEY, use_quic=True, draft=18)
+    handle = await server.serve()
+    args = abr_ingest.parse_args([
+        '--source', url, '--out-ns', out_ns, '-N', ns, '--profile', 'cpu',
+        '--rung', '160x120:200k', '-k', '--draft', '18', '-t', '6', url])
+    ingest = asyncio.ensure_future(abr_ingest.run(args))
+    got = defaultdict(int)
+    try:
+        await asyncio.sleep(1.0)
+        assert not ingest.done()
+        client = MOQTClient('localhost', port, path='/', use_quic=True,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+            pub = MediaPublisher(session, ns, _source_catalog(config))
+            video = pub.add_track(LocTrackPublisher(session, ns, 'video', config=config))
+            audio = pub.add_track(LocTrackPublisher(session, ns, 'audio', media_kind='audio'))
+            await pub.start(announce_namespace=True, publish_track=False)
+            feeder = asyncio.ensure_future(_feed(video, audio, frames))
+            await until_published(out_ns, ['catalog', 'video', 'video_120p'], timeout=10)
+            sub_client = MOQTClient('localhost', port, path='/', use_quic=True,
+                                    verify_tls=False, supported_drafts=18)
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+
+                def on_frame(name, frame, group_id, object_id):
+                    got[name] += 1
+                sub = MediaSubscriber(sub_session, out_ns, on_frame=on_frame)
+                await sub.start(timeout=5)
+                await feeder
+                await asyncio.sleep(1.0)
+        assert await asyncio.wait_for(ingest, 10) == 0
+    finally:
+        if not ingest.done():
+            ingest.cancel()
+        handle.close()
+    assert got['video_120p'] > 0, dict(got)
