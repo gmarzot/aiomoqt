@@ -351,6 +351,55 @@ async def test_a_closed_session_stops_its_draining_lane(monkeypatch):
     assert not slow.kinds("done")
 
 
+class _Closing(_Fake):
+    """A session whose blocked write is cancelled when it closes, as a QUIC
+    close cancels its drain waiters."""
+
+    def __init__(self):
+        super().__init__(blocked=True)
+        loop = asyncio.get_running_loop()
+        self._moqt_session_closed = loop.create_future()
+        self._drain = loop.create_future()
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        await self._drain
+
+    def close(self):
+        self._moqt_session_closed.set_result(None)
+        self._drain.cancel()
+
+
+class _Broken(_Fake):
+    """A live session whose writes fail."""
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        raise ConnectionError("stream gone")
+
+
+async def test_a_session_closed_mid_write_is_not_a_drop():
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    viewer = _Closing()
+    d = track.add_downstream(viewer, 1, 1)
+    track.on_object(_obj(0, 0), 0, 0, 0, 0)
+    await _settle()
+    lane = d.lane
+    assert lane.busy
+    viewer.close()
+    await _settle()
+    assert lane.stopped and not track.downstream
+    assert track._drops == 0
+
+
+async def test_a_failed_forward_to_a_live_session_is_a_drop():
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    viewer = _Broken()
+    d = track.add_downstream(viewer, 1, 1)
+    track.on_object(_obj(0, 0), 0, 0, 0, 0)
+    await _settle()
+    assert d.lane.stopped and not track.downstream
+    assert track._drops == 1
+
+
 # -- the lane's time bound -------------------------------------------------
 class _Writer:
     """Holds `tx` bytes in the transport, and every send waits on `gate`."""

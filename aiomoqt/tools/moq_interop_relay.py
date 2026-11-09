@@ -837,7 +837,9 @@ class _RelayLane(SendLane):
         log(f"relay: forward to {self._who()} failed, dropping the "
             f"subscriber: {error!r}")
         logger.debug("relay: forward failure", exc_info=error)
-        self.track._drops += 1
+        # A session that closed left on its own: not a drop.
+        if _session_live(self.d.session):
+            self.track._drops += 1
         self.track.drop_session(self.d.session)
         return False
 
