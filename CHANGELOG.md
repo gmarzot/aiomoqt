@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.15.0 (unreleased)
+## v0.15.0rc1
+
+Release candidate, requires aiopquic 0.8.0rc1. Draft 14 is still included and will be removed before 0.15.0. Relay `--workers N` is Linux-only: a client whose address changes mid-session may be reset, and the watchdog's self-probe reaches only one worker. Threading beyond hash shards and a native data plane are not in this rc.
 
 - aiomoqt-relay writes datagrams and objects on an open stream without a coroutine when nothing has to wait.
 - aiomoqt-relay shares a one-write stream's header and end bytes across subscribers instead of encoding them per viewer.
