@@ -2,6 +2,10 @@
 
 ## v0.15.0 (unreleased)
 
+- Session admission with Common Access Tokens: `--auth-key KID:SECRET` makes a tool present a broad, non-expiring CAT in SETUP and makes aiomoqt-relay require one; the format is the one moqx verifies.
+- Logs show an authorization token's length instead of its value.
+- A request that fails because its session closed names the close code in its reason.
+
 - aiomoqt-relay writes datagrams and objects on an open stream without a coroutine when nothing has to wait.
 - aiomoqt-relay shares a one-write stream's header and end bytes across subscribers instead of encoding them per viewer.
 - A raw QUIC data stream's priority goes with its first write, in one hand-off to the network thread.

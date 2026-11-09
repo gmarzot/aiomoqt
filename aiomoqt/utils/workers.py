@@ -172,7 +172,7 @@ def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
     return {key: config[key] for key in (
         'congestion_control_algorithm', 'congestion_control_options',
         'packet_train_mode', 'flow_control_window', 'tx_max_queued_bytes',
-        'tx_max_inflight_bytes', 'keep_alive_interval',
+        'tx_max_inflight_bytes', 'keep_alive_interval', 'auth',
     ) if key in config}
 
 

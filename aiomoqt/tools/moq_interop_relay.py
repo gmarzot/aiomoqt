@@ -8,7 +8,8 @@ carries less traffic than the Rust and C++ relays.
 
 Limits:
 
-  * No authentication, authorization or rate limiting.
+  * Authentication stops at session admission (--auth-key); no per-request
+    authorization and no rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
     subscriber holding what its deadline covers at the track's input
     rate, or LANE_BYTES with no rate or deadline yet or while the lanes
@@ -146,7 +147,8 @@ from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
 from aiomoqt.utils.buffer import Buffer, BufferReadError
-from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth, add_help,
+                               add_logging, apply_logging, auth_from_args)
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -3893,7 +3895,8 @@ def transport_settings(args) -> dict:
             "max_connections": args.max_connections,
             "workers": args.workers,
             "stream_ring_cap": args.stream_ring_cap,
-            "tx_max_inflight_bytes": args.max_inflight_bytes}
+            "tx_max_inflight_bytes": args.max_inflight_bytes,
+            "auth": auth_from_args(args)}
 
 
 def parse_args(argv=None):
@@ -4071,6 +4074,7 @@ def parse_args(argv=None):
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
                              "DEBUG, TRACE, INFO")
+    add_auth(parser)
     add_logging(parser)
     add_help(parser)
     args = _parse_with_config(parser, argv)
@@ -4846,7 +4850,8 @@ async def _self_probe(host, port, use_quic, draft, timeout,
             for _ in range(2 if full else 1):
                 client = MOQTClient(host, port, path="/", use_quic=use_quic,
                                     verify_tls=False, supported_drafts=draft,
-                                    implementation=impl)
+                                    implementation=impl,
+                                    auth=auth_from_args(argparse.Namespace()))
                 s = await stack.enter_async_context(client.connect())
                 await s.client_session_init()
                 sessions.append(s)
@@ -4881,13 +4886,17 @@ _PROBE_CHILD = (
 
 
 async def _probe_in_child(host, port, use_quic, draft, timeout,
-                          full=True) -> bool:
+                          full=True, auth=None) -> bool:
     """Run one self-probe in a child process, so a crash in the probe's
-    client transport cannot take the relay down."""
+    client transport cannot take the relay down. `auth` reaches it in the
+    environment, off the command line."""
+    env = None if auth is None else {
+        **os.environ, AUTH_KEY_ENV: auth.spec,
+        AUTH_TYPE_ENV: str(auth.token_type)}
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _PROBE_CHILD, host, str(port),
         "1" if use_quic else "0", str(draft), str(timeout),
-        "1" if full else "0",
+        "1" if full else "0", env=env,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     try:
         _, err = await asyncio.wait_for(proc.communicate(), timeout + 15)
@@ -4974,7 +4983,7 @@ async def _diagnose_probe_miss(handles) -> None:
 
 
 async def _watchdog(period, host, port, use_quic, draft,
-                    handles=()) -> None:
+                    handles=(), auth=None) -> None:
     """Exit so the supervisor restarts the relay when it hangs or stops
     relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
     in a row, on the newest draft, that deliver no object. Each failed
@@ -4989,7 +4998,8 @@ async def _watchdog(period, host, port, use_quic, draft,
         full = ticks % WATCHDOG_FULL_EVERY == 0
         ticks += 1
         passed = await _probe_in_child(host, port, use_quic, newest,
-                                       min(period, WATCHDOG_PROBE_S), full)
+                                       min(period, WATCHDOG_PROBE_S), full,
+                                       auth)
         ok += passed
         if time.monotonic() >= report_at:
             logger.info(f"relay: watchdog: {ok}/{ticks} probes ok in the "
@@ -5974,7 +5984,7 @@ async def main():
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
         watchdog = asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft, handles))
+            args.draft, handles, transport["auth"]))
         _background.add(watchdog)
 
     if args.status_dir:
@@ -6000,7 +6010,7 @@ async def main():
     print(
         "=" * 64
         + "\n aiomoqt-relay: a MoQT relay in Python.\n"
-        " No authentication or rate limiting.\n"
+        " Session admission only with --auth-key; no rate limiting.\n"
         + "=" * 64,
         file=sys.stderr,
     )

@@ -1379,7 +1379,8 @@ async def test_relay_flags_reach_the_server(monkeypatch):
                          "max_connections": 4096,
                          "workers": 1,
                          "stream_ring_cap": 1 << 20,
-                         "tx_max_inflight_bytes": 512 << 10}
+                         "tx_max_inflight_bytes": 512 << 10,
+                         "auth": None}
     server = relay._build_server("localhost", 0, CERT, KEY, True, 18,
                                  **transport)
     assert (server.congestion_control_algorithm, server.max_connections,

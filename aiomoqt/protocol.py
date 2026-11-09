@@ -307,8 +307,18 @@ def _local_cause(event: Any) -> Optional[str]:
             or f"local error 0x{code:x}")
 
 
-def _closed_reason(reason: Any) -> str:
-    return f"session closed: {reason}" if reason else "session closed"
+def _closed_reason(code: Any, reason: Any) -> str:
+    """Why an awaited request failed: the close code, unless graceful, and
+    the peer's reason."""
+    parts = []
+    if code:
+        try:
+            parts.append(SessionCloseCode(int(code)).name)
+        except ValueError:
+            parts.append(f"0x{int(code):x}")
+    if reason:
+        parts.append(str(reason))
+    return "session closed: " + ": ".join(parts) if parts else "session closed"
 
 
 _LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7f)}
@@ -727,7 +737,7 @@ class _MOQTSessionMixin:
             self._pending_requests.pop(request_id, None)
             raise MOQTRequestError(
                 error_code=int(RequestErrorCode.INTERNAL_ERROR),
-                reason=_closed_reason(self._close_err[1]),
+                reason=_closed_reason(*self._close_err),
                 retry_interval=0)
         try:
             async with asyncio.timeout(timeout):
@@ -3229,14 +3239,14 @@ class _MOQTSessionMixin:
         if logger.isEnabledFor(logging.DEBUG):
             transport_log.debug(f"QUIC event: event not handled({class_name(event)})")
 
-    def _fail_pending(self, reason: str) -> None:
+    def _fail_pending(self, reason: str, code: int = 0) -> None:
         """A closed session answers nothing more: fail every awaited
         request and end every awaited fetch as unclean."""
         for fut in self._pending_requests.values():
             if not fut.done():
                 fut.set_exception(MOQTRequestError(
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),
-                    reason=_closed_reason(reason), retry_interval=0))
+                    reason=_closed_reason(code, reason), retry_interval=0))
                 fut.exception()  # marks it retrieved if nothing awaits it
         for fut in self._fetch_done_futures.values():
             if not fut.done():
@@ -3337,7 +3347,7 @@ class _MOQTSessionMixin:
                     self.close()
                 except Exception:
                     logger.debug("MOQT: close failed", exc_info=True)
-            self._fail_pending(reason_phrase)
+            self._fail_pending(reason_phrase, error_code)
         if self._reaper_handle is not None:
             self._reaper_handle.cancel()
             self._reaper_handle = None
@@ -3565,6 +3575,9 @@ class _MOQTSessionMixin:
         # Option (removed), count-less Setup Options. Pre-d18 sends
         # CLIENT_SETUP with the version list.
         params.update(self._implementation_option())
+        auth = getattr(getattr(self, '_session', None), 'auth', None)
+        if auth is not None:
+            params[SetupParamType.AUTH_TOKEN] = auth.mint()
         if parameters:
             params.update(parameters)  # caller SETUP options (e.g. AUTH_TOKEN)
         self._auth_token_cache_max = int(
@@ -4195,6 +4208,19 @@ class _MOQTSessionMixin:
                     code, f"{ptype.name} option from server or over WT")
                 return True
         return False
+
+    def _refuse_setup_auth(self, options: Optional[Dict]) -> bool:
+        """Close the session unless SETUP carries a token this server admits."""
+        auth = (None if self._is_client
+                else getattr(getattr(self, '_session', None), 'auth', None))
+        refusal = auth and auth.refusal(
+            (options or {}).get(SetupParamType.AUTH_TOKEN))
+        if not refusal:
+            return False
+        code, reason = refusal
+        control_log.info(f"MOQT: session refused: {reason}")
+        self._close_session(code, reason)
+        return True
 
     def _check_setup_location(self, options: Optional[Dict]) -> None:
         """Refuse to send PATH or AUTHORITY where the peer must close."""
@@ -6474,7 +6500,8 @@ class _MOQTSessionMixin:
             version_ok = (
                 is_draft16_or_later(self.negotiated_draft) or MOQT_VERSION_DRAFT14 in msg.versions
             )
-            if self._refuse_setup_location(msg.parameters):
+            if (self._refuse_setup_location(msg.parameters)
+                    or self._refuse_setup_auth(msg.parameters)):
                 return
             if version_ok:
                 self._ingest_request_limit(msg.parameters)
@@ -6999,7 +7026,7 @@ class _MOQTSessionMixin:
             return
         self._d18_setup_seen = True
         opts = getattr(msg, 'options', None) or {}
-        if self._refuse_setup_location(opts):
+        if self._refuse_setup_location(opts) or self._refuse_setup_auth(opts):
             return
         # Server side has no separate session-init step: bring up our own
         # control write-uni and send SETUP on first receipt of the peer's

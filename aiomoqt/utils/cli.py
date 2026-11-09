@@ -43,6 +43,7 @@ interval          -i/--interval
 session           --draft -k/--insecure --keylogfile --cc-algo
                   --cc-options --pacing-trains --fc-window
                   --max-queued-bytes --max-inflight-bytes --quic-debug
+                  --auth-key --auth-token-type
 keepalive         --keepalive
 fetch history     --fetch-history (long only)
 compat            --compat
@@ -55,7 +56,9 @@ split execution (tools that can run one end or both)
 """
 import argparse
 import logging
+import os
 
+from aiomoqt.cat import DEFAULT_TOKEN_TYPE, CatAuth
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
 from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
                                   parse_log_spec)
@@ -75,6 +78,9 @@ DGRAM_MAX_OBJECT = 1152
 VIDEO_PROFILES = ('240p', '270p', '360p', '480p',
                   '720p', '1080p', '1440p', '4k', '4kuhd')
 VIDEO_FPS = 30
+
+AUTH_KEY_ENV = 'AIOMOQT_AUTH_KEY'
+AUTH_TYPE_ENV = 'AIOMOQT_AUTH_TOKEN_TYPE'
 
 
 def _note_given(namespace, dest):
@@ -341,12 +347,40 @@ def add_session(p):
                         '(1 MiB). 0 disables.')
     p.add_argument('--quic-debug', action='store_true',
                    help='Verbose QUIC-layer logging')
+    add_auth(p)
+
+
+def add_auth(p):
+    p.add_argument('--auth-key', type=str, default=None, metavar='KID:SECRET',
+                   help='Shared HMAC key for session admission: a client '
+                        'presents a CAT granting everything, without expiry, '
+                        'in SETUP; a listener requires one. Also '
+                        f'{AUTH_KEY_ENV}. Default: no auth')
+    p.add_argument('--auth-token-type', type=int, default=None, metavar='N',
+                   help="MOQT Auth Token Type of that CAT; must match the "
+                        f"relay's. Also {AUTH_TYPE_ENV}. "
+                        f"Default: {DEFAULT_TOKEN_TYPE}")
+
+
+def auth_from_args(args):
+    """The CatAuth from --auth-key / --auth-token-type or their environment
+    variables, or None."""
+    spec = getattr(args, 'auth_key', None) or os.environ.get(AUTH_KEY_ENV)
+    if not spec:
+        return None
+    token_type = getattr(args, 'auth_token_type', None)
+    try:
+        if token_type is None:
+            token_type = int(os.environ.get(AUTH_TYPE_ENV, DEFAULT_TOKEN_TYPE))
+        return CatAuth.parse(spec, token_type)
+    except ValueError as e:
+        raise SystemExit(f"--auth-key: {e}") from None
 
 
 def transport_kwargs(args) -> dict:
     """MOQTClient / MOQTServer transport kwargs from the --cc-algo,
     --cc-options, --pacing-trains, --fc-window, --max-queued-bytes,
-    --max-inflight-bytes and --keepalive flags. An
+    --max-inflight-bytes, --keepalive and --auth-key flags. An
     unset flag is left out so the library default applies;
     --max-inflight-bytes 0 maps to None (disabled)."""
     kw = {}
@@ -362,6 +396,9 @@ def transport_kwargs(args) -> dict:
     inflight = getattr(args, 'max_inflight_bytes', None)
     if inflight is not None:
         kw['tx_max_inflight_bytes'] = inflight or None
+    auth = auth_from_args(args)
+    if auth is not None:
+        kw['auth'] = auth
     return kw
 
 
