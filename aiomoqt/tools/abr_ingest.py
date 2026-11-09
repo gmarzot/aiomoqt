@@ -8,8 +8,9 @@ dials (bump in the wire). pub_media announces with --pub-ns:
   python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns \\
       -N live/x --mp4 clip.mp4 --loop -t 0
 
---source URL subscribes the source from a relay instead; publishing back
-to that same relay needs another namespace (--out-ns).
+--source URL subscribes the source from a relay instead, waiting up to
+the setup timeout for it to be published; publishing back to that same
+relay needs another namespace (--out-ns).
 
 The video track (-T; default the catalog's first LOC video track) must be
 H.264. Every LOC track passes through unchanged. The rungs, H.264 or AV1
@@ -157,24 +158,26 @@ async def _accept(args, stack: contextlib.AsyncExitStack):
     return await found
 
 
-_NOT_YET = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+_NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+_SOURCE_POLL_S = 0.2
 
 
 async def _subscribe_source(args, session, on_frame):
-    """The source's MediaSubscriber and catalog. A publisher may announce
-    before it serves SUBSCRIBE, so does-not-exist retries until the setup
-    timeout."""
-    deadline = time.monotonic() + _cli.setup_timeout(args)
+    """The source's MediaSubscriber and catalog. With --source, waits up
+    to the setup timeout for a source not yet published on the relay."""
+    timeout = _cli.setup_timeout(args)
+    deadline = time.monotonic() + timeout
+    sub = MediaSubscriber(
+        session, args.namespace, on_frame=on_frame,
+        track_filter=lambda t: t.packaging == PACKAGING_LOC)
     while True:
-        sub = MediaSubscriber(
-            session, args.namespace, on_frame=on_frame,
-            track_filter=lambda t: t.packaging == PACKAGING_LOC)
         try:
-            return sub, await sub.start(timeout=_cli.setup_timeout(args))
+            return sub, await sub.start(timeout=timeout)
         except MOQTRequestError as e:
-            if e.error_code not in _NOT_YET or time.monotonic() > deadline:
+            if (not args.source or e.error_code not in _NO_SOURCE
+                    or time.monotonic() > deadline):
                 raise
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(_SOURCE_POLL_S)
 
 
 def _video_entry(catalog: Catalog, name: Optional[str]) -> CatalogTrack:
