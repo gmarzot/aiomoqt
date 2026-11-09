@@ -30,6 +30,9 @@ class _Downstream:
     def stream_write(self, sid, data, end_stream=False):
         self.writes.append((sid, len(data), end_stream))
 
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
     async def stream_write_drain(self, sid, data, end_stream=False):
         self.writes.append((sid, len(data), end_stream))
 
@@ -149,6 +152,9 @@ class _Capturing(_Downstream):
     def stream_write(self, sid, data, end_stream=False):
         self.data.setdefault(sid, bytearray()).extend(data)
         super().stream_write(sid, data, end_stream)
+
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
 
     async def stream_write_drain(self, sid, data, end_stream=False):
         self.data.setdefault(sid, bytearray()).extend(data)

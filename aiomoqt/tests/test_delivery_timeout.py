@@ -161,10 +161,10 @@ def _stall_once(session, after: int, seconds: float):
             until[0] = time.monotonic() + seconds
         return until[0] is not None and time.monotonic() < until[0]
 
-    async def held(sid, data, end_stream=False):
+    async def held(sid, data, end_stream=False, **kw):
         if stalled():
             await asyncio.sleep(until[0] - time.monotonic())
-        return await orig(sid, data, end_stream=end_stream)
+        return await orig(sid, data, end_stream=end_stream, **kw)
 
     def refused(sid, data):
         if stalled():

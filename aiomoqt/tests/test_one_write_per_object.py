@@ -49,6 +49,9 @@ class _Peer:
         self.streams[sid].append((bytes(initial), end_stream))
         return sid
 
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
     async def stream_write_drain(self, sid, data, end_stream=False):
         await self.gate.wait()
         self.streams[sid].append((bytes(data), end_stream))
@@ -56,7 +59,7 @@ class _Peer:
     def stream_write(self, sid, data, end_stream=False):
         self.streams[sid].append((bytes(data), end_stream))
 
-    def _nowait(self, sid, data, end_stream=False):
+    def _nowait(self, sid, data, end_stream=False, **_kw):
         self.streams[sid].append((bytes(data), end_stream))
         return True
 
@@ -271,6 +274,67 @@ async def test_relay_forwards_the_marker_with_the_last_object():
     assert track._objects_out == 3
 
 
+async def test_relay_encodes_a_whole_stream_once_per_alias_and_draft(
+        monkeypatch):
+    built = []
+    real = relay.SubgroupHeader
+
+    def counted(**kw):
+        built.append(kw["track_alias"])
+        return real(**kw)
+    monkeypatch.setattr(relay, "SubgroupHeader", counted)
+    track = _RelayedTrack(("ns", "t"))
+    a, b, c, d = _Peer(), _Peer(), _Peer(), _Peer()
+    d._profile = profile_for(16)
+    for rid, (peer, alias) in enumerate(((a, 7), (b, 7), (c, 9), (d, 7))):
+        track.add_downstream(peer, alias, rid)
+    try:
+        track.on_object(_Obj(0), 0, 0, 0, 0)
+        track.on_stream_end(0, 0)
+        await _settle()
+    finally:
+        track.task.cancel()
+    assert sorted(built) == [7, 7, 9]
+    (wa,), (wb,), (wc,), (wd,) = (
+        list(p.streams.values())[0] for p in (a, b, c, d))
+    assert wa == wb and wa[1] and wc[1] and wd[1]
+    assert wa[0] != wc[0] and len(wa[0]) == len(wc[0])
+
+
+async def test_relay_writes_an_open_stream_with_no_coroutine():
+    track = _RelayedTrack(("ns", "t"))
+    peer = _Peer(nowait=True)
+    track.add_downstream(peer, 7, 1)
+    try:
+        track.on_object(_Obj(0), 0, 0, 0, 0)
+        await _settle()
+        assert track._forward_one(peer, 7, 0, 0, 1, b"x", None, 128) is None
+    finally:
+        track.task.cancel()
+    (writes,) = peer.streams.values()
+    assert len(writes) == 2 and writes[1][0].endswith(b"x")
+
+
+async def test_relay_finishes_a_refused_write_once():
+    async def run(nowait):
+        track = _RelayedTrack(("ns", "t"))
+        peer = _Peer(nowait=nowait)
+        track.add_downstream(peer, 7, 1)
+        try:
+            track.on_object(_Obj(0), 0, 0, 0, 0)
+            await _settle()
+            for oid in (1, 2):
+                rest = track._forward_one(peer, 7, 0, 0, oid, b"x", None, 128)
+                assert (rest is None) is nowait
+                if rest is not None:
+                    await rest
+        finally:
+            track.task.cancel()
+        (writes,) = peer.streams.values()
+        return writes
+    assert await run(False) == await run(True)
+
+
 async def test_relay_sends_a_late_end_alone():
     track, peer = _relayed()
     try:
@@ -309,7 +373,7 @@ class _Quic:
     def get_next_available_stream_id(self, is_unidirectional=True):
         return 3
 
-    async def send_stream_data_drained(self, sid, data, end_stream=False):
+    async def send_stream_data_drained(self, sid, data, end_stream=False, **_kw):
         assert len(data) <= self._configuration.stream_ring_cap
         self.writes.append((sid, bytes(data), end_stream))
 
@@ -341,8 +405,8 @@ def _count_writes(session):
     writes, fins, opened = defaultdict(int), set(), set()
     send = t.send_stream_data
 
-    def send_stream_data(sid, data, end_stream=False):
-        send(sid, data, end_stream)
+    def send_stream_data(sid, data, end_stream=False, **kw):
+        send(sid, data, end_stream, **kw)
         writes[sid] += 1
         if end_stream:
             fins.add(sid)

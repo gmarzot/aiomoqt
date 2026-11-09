@@ -180,10 +180,11 @@ class _Sub:
 def _slow_down(session):
     real = session.stream_write_drain
 
-    async def slow(stream_id, data, end_stream=False):
+    async def slow(stream_id, data, end_stream=False, **kw):
         await asyncio.sleep(_SLOW_S)
-        await real(stream_id, data, end_stream)
+        await real(stream_id, data, end_stream, **kw)
     session.stream_write_drain = slow
+    session.stream_write_nowait = lambda *_a, **_kw: False
 
 
 def _publish(pub):

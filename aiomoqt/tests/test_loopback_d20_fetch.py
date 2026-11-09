@@ -381,7 +381,7 @@ async def test_fetch_priority_update_is_accepted(use_quic):
         pub = tracks["video"].session
         stalled = asyncio.Event()
 
-        async def _stall(stream_id, data, end_stream=False):
+        async def _stall(stream_id, data, end_stream=False, **kw):
             stalled.set()
             await asyncio.Event().wait()
         pub.stream_write_drain = _stall

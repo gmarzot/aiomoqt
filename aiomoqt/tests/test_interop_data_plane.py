@@ -55,9 +55,9 @@ async def test_canonical_case_through_the_relay(draft, use_quic):
 async def test_an_object_the_relay_drops_fails_the_case(monkeypatch):
     forward = relay._RelayedTrack._forward_one
 
-    async def drop_1_3(self, session, alias, gid, sgid, oid, *args, **kw):
+    def drop_1_3(self, session, alias, gid, sgid, oid, *args, **kw):
         if (gid, oid) != (1, 3):
-            await forward(self, session, alias, gid, sgid, oid, *args, **kw)
+            return forward(self, session, alias, gid, sgid, oid, *args, **kw)
 
     monkeypatch.setattr(relay._RelayedTrack, "_forward_one", drop_1_3)
     r = await _run(_BASE_PORT + 1, 18, True)

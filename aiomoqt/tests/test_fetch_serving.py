@@ -521,7 +521,7 @@ async def test_a_cancelled_fetch_resets_its_data_stream(use_quic):
         pub = tracks["video"].session
         stalled = asyncio.Event()
 
-        async def _stall(stream_id, data, end_stream=False):
+        async def _stall(stream_id, data, end_stream=False, **kw):
             stalled.set()
             await asyncio.Event().wait()
         pub.stream_write_drain = _stall

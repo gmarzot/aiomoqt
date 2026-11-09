@@ -92,6 +92,7 @@ from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
+from functools import lru_cache
 import itertools
 import json
 import logging
@@ -442,12 +443,17 @@ _cap_warned: set = set()
 STREAM_SCHEDULING = "fifo"
 
 
+@lru_cache(maxsize=None)
+def _band_of(priority, discipline) -> int:
+    return to_stream_priority(priority, discipline=discipline)
+
+
 def _stream_band(session, priority) -> int:
     """Transport band for a downstream data stream of this publisher
     priority."""
     if priority is None or not 0 <= priority <= 255:
         priority = 128
-    return to_stream_priority(priority, discipline=getattr(
+    return _band_of(priority, getattr(
         session, 'stream_scheduling', STREAM_SCHEDULING))
 
 
@@ -714,20 +720,21 @@ class _RelayDelivery:
         self.session = d.session
         self.lane = None
 
-    async def send(self, item, end=None) -> bool:
+    def send(self, item, end=None):
+        """True once written, else the awaitable that finishes the write."""
         (gid, _cost, _live, _born, sgid, oid, payload, exts, prio, status,
          shape, encoded) = item
         track, d = self.track, self.d
-        await track._forward_one(self.session, d.alias, gid, sgid, oid,
-                                 payload, exts, prio, status, shape, encoded,
-                                 start=d.start, lost=d.lost, lane=self.lane,
-                                 end=None if end is None else (end[5], end[9]))
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
         if end is not None and end[5] is not None:
             track._objects_out += 1
-        return True
+        rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
+                                  payload, exts, prio, status, shape, encoded,
+                                  start=d.start, lost=d.lost, lane=self.lane,
+                                  end=None if end is None else (end[5], end[9]))
+        return True if rest is None else rest
 
     @staticmethod
     def ends_stream(item, nxt) -> bool:
@@ -760,8 +767,8 @@ class _TracedRelayDelivery(_RelayDelivery):
 
     __slots__ = ()
 
-    async def send(self, item, end=None) -> bool:
-        await super().send(item, end)
+    def send(self, item, end=None):
+        rest = super().send(item, end)
         for it in (item,) if end is None else (item, end):
             oid = it[5]
             if oid is not None:
@@ -771,7 +778,7 @@ class _TracedRelayDelivery(_RelayDelivery):
                 loc = (it[0], oid)
                 if d.largest_sent is None or loc > d.largest_sent:
                     d.largest_sent = loc
-        return True
+        return rest
 
 
 class _RelayLane(SendLane):
@@ -1921,17 +1928,18 @@ class _RelayedTrack:
         return (start is not None and cf is not None
                 and max(start, (gid, 0)) < cf and gid not in self._heads)
 
-    async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None, lost=(), lane=None,
-                           end=None):
+    def _forward_one(self, session, alias, gid, sgid, oid,
+                     payload, exts, prio, status=None, shape=None,
+                     encoded=None, start=None, lost=(), lane=None,
+                     end=None):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
         (§11.3.2). `end`, the (object id, status) of the stream end
         queued behind the object, ends the stream in the object's write.
-        `lane` is told what each write awaits."""
+        `lane` is told what each write awaits. None once written, else the
+        awaitable that finishes the write."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
@@ -1963,48 +1971,9 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         if entry is None:
-            if lane is not None:
-                lane.parked, lane.sid = "header", None
-            # Mirror the upstream stream's shape: END_OF_GROUP,
-            # FIRST_OBJECT and the subgroup-id mode are part of the
-            # delivery semantics a subscriber checks, and re-encoding
-            # with our own flags loses them.
-            first_obj, eog, inherited = shape or (False, False, False)
-            header = SubgroupHeader(
-                track_alias=alias, group_id=gid, subgroup_id=sgid,
-                publisher_priority=prio, extensions_present=True,
-                end_of_group=eog, first_object=first_obj,
-                prof=session._profile)
-            initial = header.serialize().data
-            first = tail = None
-            if status not in _STREAM_ENDS:
-                # The header and the first object open the stream together.
-                first = _object_data(header, payload, exts, oid, encoded)
-                initial += first
-                if end is not None:
-                    tail = self._end_data(header, gid, end, start, lost)
-                    if tail is not None:
-                        initial += tail
-            try:
-                stream_id = await session.open_uni_stream(
-                    initial=initial, priority=_stream_band(session, prio),
-                    end_stream=tail is not None)
-            except MOQTStreamStopped:
-                self._stopped.add(skey)
-                return
-            if lane is not None:
-                lane.sid = stream_id
-            entry = (stream_id, header)
-            if tail is None:
-                self._streams[skey] = entry
-            self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
-                stream_id
-            self._sent_streams[id(session)] = \
-                self._sent_streams.get(id(session), 0) + 1
-            if first is not None:
-                if end is not None and tail is None:
-                    self._reset_stream(session, skey, entry)
-                return
+            return self._open_stream(
+                session, skey, alias, gid, sgid, oid, payload, exts, prio,
+                status, shape, encoded, start, lost, lane, end)
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
                       ObjectStatus.END_OF_TRACK) and (
@@ -2032,21 +2001,105 @@ class _RelayedTrack:
                 else self._end_data(header, gid, end, start, lost))
         if lane is not None:
             lane.parked, lane.sid = "object", stream_id
+        wire = data if tail is None else data + tail
+        ended = tail is not None
         try:
-            await session.stream_write_drain(
-                stream_id, data if tail is None else data + tail,
-                end_stream=tail is not None)
+            if session.stream_write_nowait(stream_id, wire, ended,
+                                           wait_at=_TX_YIELD_AT):
+                self._wrote(session, skey, entry, end, ended)
+                return None
+        except MOQTStreamStopped:
+            self._streams.pop(skey, None)
+            self._stopped.add(skey)
+            return None
+        return self._write_drain(session, skey, entry, wire, end, ended)
+
+    async def _write_drain(self, session, skey, entry, wire, end, ended):
+        try:
+            await session.stream_write_drain(entry[0], wire, end_stream=ended)
         except MOQTStreamStopped:
             # The session has reset the stream; the subscription goes on.
             self._streams.pop(skey, None)
             self._stopped.add(skey)
-            return
+            return True
+        self._wrote(session, skey, entry, end, ended)
+        return True
+
+    def _wrote(self, session, skey, entry, end, ended) -> None:
         if end is None:
             return
-        if tail is not None:
+        if ended:
             self._streams.pop(skey, None)
         else:
             self._reset_stream(session, skey, entry)
+
+    async def _open_stream(self, session, skey, alias, gid, sgid, oid,
+                           payload, exts, prio, status, shape, encoded,
+                           start, lost, lane, end):
+        """_forward_one for the write that opens a subgroup stream."""
+        if lane is not None:
+            lane.parked, lane.sid = "header", None
+        # Mirror the upstream stream's shape: END_OF_GROUP,
+        # FIRST_OBJECT and the subgroup-id mode are part of the
+        # delivery semantics a subscriber checks, and re-encoding
+        # with our own flags loses them.
+        first_obj, eog, inherited = shape or (False, False, False)
+        # A stream written whole is the same bytes for every subscriber
+        # with this alias and draft: shared through `encoded`.
+        whole = (end is not None and status not in _STREAM_ENDS
+                 and gid not in lost and not self._short(gid, start))
+        prof = session._profile
+        parts = None
+        if whole and encoded is not None:
+            key = (alias, id(prof), end)
+            parts = encoded.get(key)
+        header = first = None
+        if parts is not None:
+            initial = b"".join(parts)
+        else:
+            header = SubgroupHeader(
+                track_alias=alias, group_id=gid, subgroup_id=sgid,
+                publisher_priority=prio, extensions_present=True,
+                end_of_group=eog, first_object=first_obj, prof=prof)
+            initial = header.serialize().data
+            if status not in _STREAM_ENDS:
+                # The header and the first object open the stream together.
+                first = _object_data(header, payload, exts, oid, encoded)
+                if whole:
+                    parts = (initial, first,
+                             self._end_data(header, gid, end, start, lost))
+                    if encoded is not None:
+                        encoded[key] = parts
+                    initial = b"".join(parts)
+                else:
+                    initial += first
+        try:
+            stream_id = await session.open_uni_stream(
+                initial=initial, priority=_stream_band(session, prio),
+                end_stream=whole)
+        except MOQTStreamStopped:
+            self._stopped.add(skey)
+            return True
+        if lane is not None:
+            lane.sid = stream_id
+        entry = (stream_id, header)
+        if not whole:
+            self._streams[skey] = entry
+        self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
+            stream_id
+        self._sent_streams[id(session)] = \
+            self._sent_streams.get(id(session), 0) + 1
+        if whole:
+            return True
+        if first is not None:
+            if end is not None:
+                self._reset_stream(session, skey, entry)
+            return True
+        # A status object on the stream just opened.
+        rest = self._forward_one(session, alias, gid, sgid, oid, payload,
+                                 exts, prio, status, shape, encoded, start,
+                                 lost, lane, end)
+        return True if rest is None else await rest
 
     def _end_data(self, header, gid, end, start, lost):
         """The bytes before the FIN that ends a stream for `end`, its
@@ -2070,6 +2123,8 @@ class _RelayedTrack:
 
 # Statuses that end a subgroup stream instead of carrying an object.
 _STREAM_ENDS = ("END", ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)
+# TX event ring fill past which a write takes the drained path, which yields.
+_TX_YIELD_AT = 0.5
 
 
 def _object_data(header, payload, exts, oid, encoded):

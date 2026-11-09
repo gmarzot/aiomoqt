@@ -85,6 +85,7 @@ def _hold_drains(session):
         return stream_id
 
     session.stream_write_drain = held
+    session.stream_write_nowait = lambda *_a, **_kw: False
     session.open_uni_stream = held_open
     return release, parked
 
