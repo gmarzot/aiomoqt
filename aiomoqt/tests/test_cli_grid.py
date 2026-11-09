@@ -23,7 +23,7 @@ TOOLS = [
     "pub_bench", "sub_bench", "loopback_bench", "adaptive_bench",
     "pub_server", "load_sim", "relay_probe",
     "moq_interop_client", "moq_interop_relay", "moqtest_origin",
-    "pub_media", "sub_media",
+    "pub_media", "sub_media", "abr_ingest",
 ]
 
 EXAMPLES = ["pub_example", "sub_example", "join_example", "server_example"]
