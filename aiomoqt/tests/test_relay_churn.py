@@ -134,6 +134,9 @@ class _Open:
     def stream_write(self, _sid, data, end_stream=False):
         self.writes.append(data)
 
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
     async def stream_write_drain(self, _sid, data, end_stream=False):
         self.writes.append(data)
 

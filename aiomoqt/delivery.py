@@ -1309,8 +1309,10 @@ class SendLane:
                         self._uncount(end)
                 self.busy = True
                 try:
-                    sent = await (writer.send(item) if end is None
-                                  else writer.send(item, end))
+                    sent = (writer.send(item) if end is None
+                            else writer.send(item, end))
+                    if sent is not True:
+                        sent = await sent
                 except (Exception, asyncio.CancelledError) as e:
                     if _cancelling():
                         raise
