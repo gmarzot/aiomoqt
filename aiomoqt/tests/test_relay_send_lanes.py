@@ -95,9 +95,9 @@ def _slow_down(session, delay=_SLOW_S):
     streams drain slowly."""
     real = session.stream_write_drain
 
-    async def slow(stream_id, data, end_stream=False):
+    async def slow(stream_id, data, end_stream=False, **kw):
         await asyncio.sleep(delay)
-        await real(stream_id, data, end_stream)
+        await real(stream_id, data, end_stream, **kw)
     session.stream_write_drain = slow
 
 

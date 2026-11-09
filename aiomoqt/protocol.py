@@ -11,7 +11,9 @@ from types import MappingProxyType
 from typing import (Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, Union)
 
-from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
+from aiopquic.quic.connection import (
+    QuicConnection as _AioPQuicConnection, QuicErrorCode, stream_is_unidirectional,
+)
 from aiopquic.quic.events import (
     DatagramFrameReceived, HandshakeCompleted, ProtocolNegotiated, QuicEvent,
     StopSendingReceived, StreamDataReceived, StreamReset,
@@ -72,6 +74,10 @@ USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 _WT_CREATE_WITH_DATA = "initial" in inspect.signature(
     _AioPWTSession.create_stream).parameters
 
+
+# aiopquic before 0.8.0 sets a raw QUIC stream's priority apart from its writes.
+_RAW_WRITE_PRIORITY = "priority" in inspect.signature(
+    _AioPQuicConnection.send_stream_data_drained).parameters
 
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
 # Every WT stream is prefixed with <type, session_id> as two QUIC varints.
@@ -3632,12 +3638,16 @@ class _MOQTSessionMixin:
                 if not self._session_writable():
                     raise asyncio.CancelledError()
                 raise
-        if priority is not None:
+        if priority is not None and (
+                self._is_wt or not _RAW_WRITE_PRIORITY
+                or not (initial or end_stream)):
             self.set_stream_priority(sid, priority)
+            priority = None
         if initial or end_stream:
             try:
                 await self.stream_write_drain(sid, initial,
-                                              end_stream=end_stream)
+                                              end_stream=end_stream,
+                                              priority=priority)
             except BaseException:
                 # The caller never learns the id: reset the stream here.
                 self.stream_reset(sid, StreamResetCode.CANCELLED)
@@ -3791,8 +3801,9 @@ class _MOQTSessionMixin:
         return cap
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
-                                  end_stream: bool = False) -> None:
-        """Write bytes with backpressure.
+                                  end_stream: bool = False,
+                                  priority: Optional[int] = None) -> None:
+        """Write bytes with backpressure; `priority` applies with them.
 
         aiomoqt-owned policy: optional per-stream byte-budget cap
         with hysteresis (MOQTPeer.tx_max_inflight_bytes). The
@@ -3821,7 +3832,8 @@ class _MOQTSessionMixin:
             for at in range(0, len(data), piece):
                 await self.stream_write_drain(
                     stream_id, bytes(view[at:at + piece]),
-                    end_stream=end_stream and at + piece >= len(data))
+                    end_stream=end_stream and at + piece >= len(data),
+                    priority=None if at else priority)
             return
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
@@ -3846,8 +3858,13 @@ class _MOQTSessionMixin:
                 await sc_event.wait()
         # Delegate wire-level send + backpressure to aiopquic.
         try:
-            await quic.send_stream_data_drained(
-                stream_id, data, end_stream=end_stream)
+            if priority is None:
+                await quic.send_stream_data_drained(
+                    stream_id, data, end_stream=end_stream)
+            else:
+                await quic.send_stream_data_drained(
+                    stream_id, data, end_stream=end_stream,
+                    priority=priority)
         except (AssertionError, AttributeError, ConnectionError) as e:
             # Never return silently: a stream gone on a live session ends
             # that stream only; anything but ConnectionError there is

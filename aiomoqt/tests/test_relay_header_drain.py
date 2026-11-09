@@ -63,7 +63,7 @@ async def test_a_failed_header_write_resets_its_stream():
     track = relay._RelayedTrack(((b"ns",), b"t"))
     bad = _Fake()
 
-    async def refuse(sid, data):
+    async def refuse(sid, data, *_a, **_kw):
         raise RuntimeError("write failed")
     bad.stream_write_drain = refuse
     track.add_downstream(bad, 1, 1)
@@ -117,12 +117,12 @@ def _ring_full_once(session):
     seen = set()
     loop = asyncio.get_running_loop()
 
-    def send(stream_id, data, end_stream=False):
+    def send(stream_id, data, end_stream=False, **kw):
         if stream_id % 4 == 3 and stream_id not in seen:
             seen.add(stream_id)
             loop.call_later(0.005, quic.get_tx_data_drain_event(stream_id).set)
             raise BufferError("TX event ring full")
-        return real(stream_id, data, end_stream=end_stream)
+        return real(stream_id, data, end_stream=end_stream, **kw)
     quic.send_stream_data = send
     return seen
 

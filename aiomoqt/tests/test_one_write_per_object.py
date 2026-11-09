@@ -309,7 +309,7 @@ class _Quic:
     def get_next_available_stream_id(self, is_unidirectional=True):
         return 3
 
-    async def send_stream_data_drained(self, sid, data, end_stream=False):
+    async def send_stream_data_drained(self, sid, data, end_stream=False, **_kw):
         assert len(data) <= self._configuration.stream_ring_cap
         self.writes.append((sid, bytes(data), end_stream))
 
@@ -341,8 +341,8 @@ def _count_writes(session):
     writes, fins, opened = defaultdict(int), set(), set()
     send = t.send_stream_data
 
-    def send_stream_data(sid, data, end_stream=False):
-        send(sid, data, end_stream)
+    def send_stream_data(sid, data, end_stream=False, **kw):
+        send(sid, data, end_stream, **kw)
         writes[sid] += 1
         if end_stream:
             fins.add(sid)
