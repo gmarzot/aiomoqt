@@ -6,6 +6,7 @@
   moq-pub-bench moqt://relay:4433 -D -s 1100 -r 500      # datagrams
   moq-pub-bench moqt://relay:4433 --video 1080p          # media profile
   moq-pub-bench moqt://relay:4433 --video 720p -r 30 -g 60 --audio --catalog
+  moq-pub-bench moqt://relay:4433 --video 720p --audio -D   # audio as datagrams
 """
 import argparse
 import asyncio
@@ -150,7 +151,8 @@ The URL scheme selects the transport:
                         help="With --video: also publish 'audio', "
                              f"{AUDIO_OBJECT_SIZE} B objects at "
                              f"{AUDIO_RATE:g}/s (AAC, 128 kbps), one "
-                             "object per group")
+                             "object per group; with -D, as "
+                             "ObjectDatagrams")
     parser.add_argument('--catalog', action='store_true',
                         help="With --video: also publish 'catalog', "
                              f"{CATALOG_OBJECT_SIZE} B objects at "
@@ -185,6 +187,11 @@ The URL scheme selects the transport:
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
+    # With --video, -D applies to the --audio track.
+    args.audio_datagram = bool(args.video and args.audio and args.datagram)
+    if args.audio_datagram:
+        args.datagram = False
+        _cli.given(args).discard('datagram')
     _cli.check_video(parser, args)
     _cli.check_datagram(parser, args)
     side = [n for n in ('audio', 'catalog') if getattr(args, n)]
@@ -229,6 +236,9 @@ def _side_tracks(session, args):
             object_size=size,
             group_size=1,
             rate=rate,
+            forwarding=(ForwardingPreference.DATAGRAM
+                        if name == 'audio' and args.audio_datagram
+                        else ForwardingPreference.SUBGROUP),
             auth_token=args.auth_token.encode() or None,
             timestamps=args.timestamps,
         )

@@ -8,6 +8,7 @@ import time
 import pytest
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.messages import ObjectDatagram
 from aiomoqt.tools import pub_bench
 from aiomoqt.track import SubscribedTrack, VideoTrack
 
@@ -41,9 +42,24 @@ def test_trackname_may_not_take_a_side_track_name(monkeypatch, capsys):
     assert "clashes with --audio" in capsys.readouterr().err
 
 
+def test_datagram_with_video_applies_to_audio(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["pub_bench", "moqt://x:1", "--video",
+                                      "720p", "--audio", "-D"])
+    args = pub_bench.parse_args()
+    assert args.audio_datagram and not args.datagram
+
+
+def test_datagram_with_video_needs_audio(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["pub_bench", "moqt://x:1", "--video",
+                                      "720p", "-D"])
+    with pytest.raises(SystemExit):
+        pub_bench.parse_args()
+    assert "--video cannot be combined with -D" in capsys.readouterr().err
+
+
 async def _receive(port, use_quic, names):
-    """Subscribe `names` on one session; (recv time, group, object, size)
-    per name over WINDOW_S."""
+    """Subscribe `names` on one session; (recv time, group, object, size,
+    datagram) per name over WINDOW_S."""
     got = {n: [] for n in names}
     client = MOQTClient("127.0.0.1", port, path="/", use_quic=use_quic,
                         verify_tls=False)
@@ -53,7 +69,8 @@ async def _receive(port, use_quic, names):
             def on_object(msg, size, recv, gid, sg, *_a, _n=n, **_kw):
                 if not msg.status:
                     got[_n].append((time.monotonic(), gid, msg.object_id,
-                                    len(msg.payload)))
+                                    len(msg.payload),
+                                    isinstance(msg, ObjectDatagram)))
             await SubscribedTrack(session, "aiomoqt", n,
                                   on_object=on_object).subscribe()
         await asyncio.sleep(WINDOW_S)
@@ -65,8 +82,10 @@ def _rate(objs):
 
 
 @requires_certs
+@pytest.mark.parametrize("audio_dgram", [False, True], ids=["", "audio-dgram"])
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_audio_and_catalog_beside_video(tmp_path, use_quic):
+async def test_audio_and_catalog_beside_video(tmp_path, use_quic,
+                                              audio_dgram):
     port = free_udp_port()
     rlog = tmp_path / "relay.log"
     relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
@@ -78,7 +97,8 @@ async def test_audio_and_catalog_beside_video(tmp_path, use_quic):
                else f"https://127.0.0.1:{port}/")
         plog = tmp_path / "pub.log"
         pub = spawn("pub_bench", url, "-k", "--video", "240p", "-r", 30,
-                    "-g", 30, "--audio", "--catalog", "-t", 30, log=plog)
+                    "-g", 30, "--audio", "--catalog", "-t", 30,
+                    *(["-D"] if audio_dgram else []), log=plog)
         wait_for(plog, "Published 'aiomoqt/audio'", pub)
         got = await _receive(port, use_quic, ["catalog", "video", "audio"])
     finally:
@@ -89,15 +109,17 @@ async def test_audio_and_catalog_beside_video(tmp_path, use_quic):
     video, audio, catalog = got["video"], got["audio"], got["catalog"]
     assert video and audio and catalog, {k: len(v) for k, v in got.items()}
     prof = VideoTrack.PROFILES["240p"]
-    assert {size for *_, size in video} <= {
+    assert {size for _, _, _, size, _ in video} <= {
         prof["i_frame"], prof["p_frame"], prof["b_frame"]}
-    assert len({gid for _, gid, _, _ in video}) < len(video)
+    assert len({gid for _, gid, _, _, _ in video}) < len(video)
     for objs, size in ((audio, pub_bench.AUDIO_OBJECT_SIZE),
                        (catalog, pub_bench.CATALOG_OBJECT_SIZE)):
-        assert {s for *_, s in objs} == {size}
-        assert {oid for _, _, oid, _ in objs} == {0}
-        gids = [gid for _, gid, _, _ in objs]
+        assert {s for _, _, _, s, _ in objs} == {size}
+        assert {oid for _, _, oid, _, _ in objs} == {0}
+        gids = [gid for _, gid, _, _, _ in objs]
         assert len(set(gids)) == len(gids)
+    assert {d for *_, d in audio} == {audio_dgram}
+    assert not any(d for *_, d in video + catalog)
     assert _rate(audio) == pytest.approx(pub_bench.AUDIO_RATE, rel=0.1)
     assert _rate(video) == pytest.approx(30, rel=0.1)
     assert 2 <= len(catalog) <= WINDOW_S + 2
