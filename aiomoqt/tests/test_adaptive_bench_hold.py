@@ -68,11 +68,20 @@ async def test_ends_at_the_last_level_that_held():
 
 
 async def test_a_rising_p90_fails_the_step_under_the_threshold():
-    relay = FakeRelay(lambda level, t: 20 if level < 300 else 20 + 10_000 * t)
+    relay = FakeRelay(lambda level, t: 20 if level < 300 else 100 if t < 0.01 else 400)
     ctl, state, actions = _hold(relay)
     await ctl.run()
     assert 'fail (p90 still rising), reset, back to 250' in actions
     assert ctl.sustained == (250, 20)
+
+
+async def test_a_p90_swing_under_half_the_threshold_is_not_rising():
+    relay = FakeRelay(lambda level, t: 600 if level > 300 else 60 if t < 0.01 else 160)
+    ctl, state, actions = _hold(relay)
+    await ctl.run()
+    assert not any('rising' in action for action in actions)
+    assert 'fail (p90 over), reset, back to 300' in actions
+    assert ctl.sustained == (300, 160)
 
 
 async def test_lost_objects_fail_the_step():

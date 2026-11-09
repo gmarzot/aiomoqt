@@ -1586,8 +1586,8 @@ class HoldController(AIMDController):
     a tick fails it when p90 is over the threshold, delivery falls short, a
     subscriber fails, is refused, runs late or loses an object, or the lost
     object count grows. A held step also fails while p90 is still rising:
-    the mean of its last half over RISE_RATIO x its first half plus
-    RISE_FLOOR x the threshold.
+    the mean of its last half over RISE_MIN x the threshold and over
+    RISE_RATIO x its first half plus RISE_FLOOR x the threshold.
 
     Steps add 10% of the level while the hold's p90 stayed under 10% of the
     threshold, 5% under 25%, else one group; never less than one group. The
@@ -1604,6 +1604,7 @@ class HoldController(AIMDController):
     """
 
     MAX_RETREATS = 3
+    RISE_MIN = 0.5
     RISE_RATIO = 1.25
     RISE_FLOOR = 0.05
 
@@ -1649,7 +1650,8 @@ class HoldController(AIMDController):
         if half < 2:
             return False
         first, last = sum(p90s[:half]) / half, sum(p90s[-half:]) / half
-        return last > self.RISE_RATIO * first + self.RISE_FLOOR * self.latency_threshold_ms
+        thr = self.latency_threshold_ms
+        return last > self.RISE_MIN * thr and last > self.RISE_RATIO * first + self.RISE_FLOOR * thr
 
     def _finish(self, sig: Signal, reason: str) -> None:
         self.state.ceiling_reason = reason

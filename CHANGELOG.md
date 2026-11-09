@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- adaptive_bench `--hold` fails a step for rising p90 only once p90 is over half the threshold.
+
 ## v0.15.0rc1
 
 Release candidate, requires aiopquic 0.8.0rc1. Draft 14 is still included and will be removed before 0.15.0. Relay `--workers N` is Linux-only: a client whose address changes mid-session may be reset, and the watchdog's self-probe reaches only one worker. Threading beyond hash shards and a native data plane are not in this rc.

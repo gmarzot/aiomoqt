@@ -459,8 +459,8 @@ ramp use `load_sim --subs N` (flow E).
 
 `--hold SEC` measures an equilibrium instead of a ramp. Each step is held
 SEC seconds and passes only if every tick stays under the threshold with no
-shortfall, no lossy, late or refused subscriber and no lost object, and its
-p90 has stopped rising. Steps add 10% while p90 is under a tenth of the
+shortfall, no lossy, late or refused subscriber and no lost object, and, once
+p90 is over half the threshold, it has stopped rising. Steps add 10% while p90 is under a tenth of the
 threshold, 5% under a quarter, then one group. The first failure drops every
 subscriber, waits `--trial-gap` (5 s) and rejoins at the last passing level,
 because a relay that does not shed late work cannot drain a backlog under
