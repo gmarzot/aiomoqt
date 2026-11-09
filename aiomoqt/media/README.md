@@ -216,8 +216,8 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
 ```
 
 - **Source.** LOC, announced with PUBLISH_NAMESPACE (`pub_media --pub-ns`). `--source URL`
-  subscribes it from a relay instead; publishing back to that relay needs another namespace,
-  `--out-ns`. The video track (`-T`, default the catalog's first) must be H.264. Every LOC track
+  subscribes it from a relay instead, waiting up to the setup timeout (`-t`, else 30 s) for it to
+  be published; publishing back to that relay needs another namespace, `--out-ns`. The video track (`-T`, default the catalog's first) must be H.264. Every LOC track
   passes through unchanged.
 - **Rungs.** `--rung WxH:BPS`, repeated. By default, those of 1440p, 1080p, 720p, 540p, 360p and
   180p (13.5, 6.75, 3.75, 2.25, 0.9 and 0.3 Mbps) below the source height. Rung tracks are named
@@ -225,7 +225,8 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
 - **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
   each group start. A rung that falls behind ends that group early and resumes at the next group
   start, so a group never has a hole in it.
-- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default) or `cpu` (software).
+- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default), `videotoolbox` (macOS,
+  H.264 only) or `cpu` (software).
 - **Codec.** `--codec h264` (default) or `av1`: `av1_nvenc` on `nvenc`, libaom in realtime mode
   on `cpu`. AV1 rungs carry an av1C in the catalog and a sequence header on each key frame.
   The source passes through as H.264.

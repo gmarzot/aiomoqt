@@ -1046,6 +1046,7 @@ class _RelayedTrack:
         # the lanes' time bounds before the next burst.
         self._in_rate = 0.0
         self._rate_mark = (time.monotonic(), 0)
+        self._rate_idle = True
         self._bytes_in = 0
         self._bytes_out = 0
         self._peak_subs = 0
@@ -1266,12 +1267,17 @@ class _RelayedTrack:
     def update_in_rate(self, now: float) -> None:
         """Measure the input rate and hand it to the track's lanes. It holds
         while nothing arrives, so a paused or silent upstream resumes under
-        the bound it had."""
+        the bound it had. The first tick with bytes after silence sets nothing:
+        only part of it had traffic."""
         then, seen = self._rate_mark
         if now <= then:
             return
         self._rate_mark = (now, self._bytes_in)
         if self._bytes_in == seen:
+            self._rate_idle = True
+            return
+        if self._rate_idle:
+            self._rate_idle = False
             return
         rate = max((self._bytes_in - seen) / (now - then),
                    self._in_rate * IN_RATE_DECAY)

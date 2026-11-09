@@ -8,8 +8,9 @@ dials (bump in the wire). pub_media announces with --pub-ns:
   python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns \\
       -N live/x --mp4 clip.mp4 --loop -t 0
 
---source URL subscribes the source from a relay instead; publishing back
-to that same relay needs another namespace (--out-ns).
+--source URL subscribes the source from a relay instead, waiting up to
+the setup timeout for it to be published; publishing back to that same
+relay needs another namespace (--out-ns).
 
 The video track (-T; default the catalog's first LOC video track) must be
 H.264. Every LOC track passes through unchanged. The rungs, H.264 or AV1
@@ -77,7 +78,7 @@ def parse_args(argv=None):
     _cli.add_identity(parser, namespace='live/abr')
     parser.add_argument('--out-ns', metavar='NS',
                         help='Namespace to publish under (default: -N)')
-    parser.add_argument('--profile', choices=('nvenc', 'cpu'),
+    parser.add_argument('--profile', choices=('nvenc', 'videotoolbox', 'cpu'),
                         default='nvenc',
                         help='cymedia encoder profile (default: nvenc)')
     parser.add_argument('--codec', choices=CODECS, default='h264',
@@ -102,6 +103,8 @@ def parse_args(argv=None):
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args(argv)
+    if args.profile == 'videotoolbox' and args.codec != 'h264':
+        parser.error('--profile videotoolbox encodes H.264 only')
     if args.source and (args.quic or args.wt):
         parser.error('--source dials the source and -Q/-W listen for it: '
                      'pick one')
@@ -157,24 +160,26 @@ async def _accept(args, stack: contextlib.AsyncExitStack):
     return await found
 
 
-_NOT_YET = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+_NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+_SOURCE_POLL_S = 0.2
 
 
 async def _subscribe_source(args, session, on_frame):
-    """The source's MediaSubscriber and catalog. A publisher may announce
-    before it serves SUBSCRIBE, so does-not-exist retries until the setup
-    timeout."""
-    deadline = time.monotonic() + _cli.setup_timeout(args)
+    """The source's MediaSubscriber and catalog. With --source, waits up
+    to the setup timeout for a source not yet published on the relay."""
+    timeout = _cli.setup_timeout(args)
+    deadline = time.monotonic() + timeout
+    sub = MediaSubscriber(
+        session, args.namespace, on_frame=on_frame,
+        track_filter=lambda t: t.packaging == PACKAGING_LOC)
     while True:
-        sub = MediaSubscriber(
-            session, args.namespace, on_frame=on_frame,
-            track_filter=lambda t: t.packaging == PACKAGING_LOC)
         try:
-            return sub, await sub.start(timeout=_cli.setup_timeout(args))
+            return sub, await sub.start(timeout=timeout)
         except MOQTRequestError as e:
-            if e.error_code not in _NOT_YET or time.monotonic() > deadline:
+            if (not args.source or e.error_code not in _NO_SOURCE
+                    or time.monotonic() > deadline):
                 raise
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(_SOURCE_POLL_S)
 
 
 def _video_entry(catalog: Catalog, name: Optional[str]) -> CatalogTrack:
