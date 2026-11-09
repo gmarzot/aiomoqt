@@ -34,7 +34,7 @@ _CLOSE = ("CLOSE",)
 
 # Bytes a send lane holds, its queued live objects plus what its streams
 # still hold in the transport, before it sheds groups: the relay's per
-# subscriber, and a publisher's per peer.
+# subscriber until rate and deadline set it, and a publisher's per peer.
 LANE_BYTES = 4 * 1024 * 1024
 PUBLISHER_LANE_BYTES = 16 * 1024 * 1024
 # A lane's time bound never goes under this: a low-rate track's objects

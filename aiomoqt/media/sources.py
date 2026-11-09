@@ -740,6 +740,130 @@ def av1c_codec_string(av1c: bytes) -> str:
     return f"av01.{profile}.{level:02d}{tier}.{depth:02d}"
 
 
+def _av1_sequence_fields(payload: bytes) -> dict:
+    """The av1C fields of an AV1 sequence header OBU payload (AV1 §5.5)."""
+    r = _BitReader(payload)
+    profile = r.u(3)
+    r.u(1)                                  # still_picture
+    reduced = r.u(1)
+    tier = 0
+    if reduced:
+        level = r.u(5)
+    else:
+        decoder_model = 0
+        delay_len = 0
+        if r.u(1):                          # timing_info_present_flag
+            r.u(32)
+            r.u(32)
+            if r.u(1):                      # equal_picture_interval
+                r.ue()
+            decoder_model = r.u(1)
+            if decoder_model:
+                delay_len = r.u(5) + 1
+                r.u(32)
+                r.u(5)
+                r.u(5)
+        initial_delay = r.u(1)
+        level = None
+        for i in range(r.u(5) + 1):
+            r.u(12)                         # operating_point_idc
+            lvl = r.u(5)
+            t = r.u(1) if lvl > 7 else 0
+            if i == 0:
+                level, tier = lvl, t
+            if decoder_model and r.u(1):
+                r.u(delay_len)
+                r.u(delay_len)
+                r.u(1)
+            if initial_delay and r.u(1):
+                r.u(4)
+    wbits, hbits = r.u(4) + 1, r.u(4) + 1
+    r.u(wbits)
+    r.u(hbits)
+    if not reduced and r.u(1):              # frame_id_numbers_present_flag
+        r.u(4)
+        r.u(3)
+    r.u(3)                                  # 128x128 superblock, filter intra, intra edge
+    if not reduced:
+        r.u(4)                              # interintra, masked, warped, dual filter
+        order_hint = r.u(1)
+        if order_hint:
+            r.u(2)
+        force_sct = 2 if r.u(1) else r.u(1)
+        if force_sct > 0 and not r.u(1):
+            r.u(1)
+        if order_hint:
+            r.u(3)
+    r.u(3)                                  # superres, cdef, restoration
+    high = r.u(1)
+    twelve = r.u(1) if profile == 2 and high else 0
+    mono = 0 if profile == 1 else r.u(1)
+    cp = tc = mc = 2
+    if r.u(1):                              # color_description_present_flag
+        cp, tc, mc = r.u(8), r.u(8), r.u(8)
+    ss_x = ss_y = 1
+    csp = 0
+    if mono:
+        r.u(1)
+    elif cp == 1 and tc == 13 and mc == 0:
+        ss_x = ss_y = 0
+    else:
+        r.u(1)                              # color_range
+        if profile == 1:
+            ss_x = ss_y = 0
+        elif profile == 2:
+            if twelve:
+                ss_x = r.u(1)
+                ss_y = r.u(1) if ss_x else 0
+            else:
+                ss_x, ss_y = 1, 0
+        if ss_x and ss_y:
+            csp = r.u(2)
+    return dict(profile=profile, level=level, tier=tier, high=high, twelve=twelve,
+                mono=mono, ss_x=ss_x, ss_y=ss_y, csp=csp)
+
+
+def obu_units(tu: bytes) -> List[Tuple[int, bytes]]:
+    """The (type, OBU) pairs of an AV1 temporal unit in low-overhead form."""
+    out, i = [], 0
+    while i < len(tu):
+        start, h = i, tu[i]
+        i += 1 + ((h >> 2) & 1)
+        if h & 0x02:
+            size = shift = 0
+            while True:
+                if i >= len(tu):
+                    raise ValueError("truncated OBU size")
+                c = tu[i]
+                i += 1
+                size |= (c & 0x7F) << shift
+                shift += 7
+                if not c & 0x80:
+                    break
+        else:
+            size = len(tu) - i
+        if i + size > len(tu):
+            raise ValueError("OBU overruns its temporal unit")
+        out.append(((h >> 3) & 15, bytes(tu[start:i + size])))
+        i += size
+    return out
+
+
+def av1c_from_sequence_header(obu: bytes) -> bytes:
+    """An av1C record (AV1-ISOBMFF §2.3) carrying a sequence header OBU."""
+    (kind, unit), = obu_units(obu)
+    if kind != 1:
+        raise ValueError(f"OBU type {kind} is not a sequence header")
+    h = unit[0]
+    i = 1 + ((h >> 2) & 1)
+    while h & 0x02 and unit[i] & 0x80:
+        i += 1
+    f = _av1_sequence_fields(unit[i + 1 if h & 0x02 else i:])
+    return bytes([0x81, (f['profile'] << 5) | f['level'],
+                  (f['tier'] << 7) | (f['high'] << 6) | (f['twelve'] << 5) | (f['mono'] << 4)
+                  | (f['ss_x'] << 3) | (f['ss_y'] << 2) | f['csp'], 0]) + unit
+
+
 def hvcc_codec_string(hvcc: bytes, sample_entry: str = 'hvc1') -> str:
     """RFC 6381 codec string from hvcC (ISO/IEC 14496-15 Annex E, e.g.
     hvc1.1.6.L93.B0): compatibility flags bit-reversed, trailing zero
