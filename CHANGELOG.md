@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay no longer counts a subscriber that closes while a write to it is in flight as a drop, so `status.json` `drops` and the dashboard's Drops tile count only live subscribers the relay dropped. Before, closing a playing viewer's tab could count as one.
 - aiomoqt-relay holds a track's input rate while nothing arrives instead of decaying it, so a subscriber's send lane keeps its time bound through a pause or a silent upstream. Before, after about a minute paused the bound fell to its 64 KiB floor, and the first viewer to resume a high-rate track lost its first group.
 - `MediaPublisher.start()` sets up its SUBSCRIBE, PUBLISH_OK, update and FETCH handling before it announces, so a peer that subscribes as soon as it acks the namespace (or before, from d18) gets the track instead of DOES_NOT_EXIST. Seen with `pub_media --pub-ns`.
 - pub_media's LOC audio with fixed grouping (`--audio-frames-per-group`, by default one frame per group) sends a group's end with its last frame, so a one-frame audio group costs one write per subscriber. `LocTrackPublisher.send_frame()` takes `end_of_group=`; the frame after an ended group opens the next group.
