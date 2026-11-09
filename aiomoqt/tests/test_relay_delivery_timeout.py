@@ -184,6 +184,7 @@ def _slow_down(session):
         await asyncio.sleep(_SLOW_S)
         await real(stream_id, data, end_stream, **kw)
     session.stream_write_drain = slow
+    session.stream_write_nowait = lambda *_a, **_kw: False
 
 
 def _publish(pub):

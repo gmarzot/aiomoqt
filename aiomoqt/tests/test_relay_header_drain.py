@@ -66,6 +66,7 @@ async def test_a_failed_header_write_resets_its_stream():
     async def refuse(sid, data, *_a, **_kw):
         raise RuntimeError("write failed")
     bad.stream_write_drain = refuse
+    bad.stream_write_nowait = lambda *_a, **_kw: False
     track.add_downstream(bad, 1, 1)
     try:
         track.on_object(_obj(0, 0), 0, 0, 0, 0)

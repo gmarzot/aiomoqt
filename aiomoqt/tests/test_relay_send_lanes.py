@@ -99,6 +99,7 @@ def _slow_down(session, delay=_SLOW_S):
         await asyncio.sleep(delay)
         await real(stream_id, data, end_stream, **kw)
     session.stream_write_drain = slow
+    session.stream_write_nowait = lambda *_a, **_kw: False
 
 
 async def _until(pred, timeout=5.0):
@@ -223,6 +224,9 @@ class _Fake:
     def stream_write(self, sid, data, end_stream=False):
         if end_stream:
             self.log.append(("fin", sid))
+
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
 
     async def stream_write_drain(self, sid, data, end_stream=False):
         await self.gate.wait()
@@ -361,6 +365,9 @@ class _Closing(_Fake):
         self._moqt_session_closed = loop.create_future()
         self._drain = loop.create_future()
 
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
     async def stream_write_drain(self, sid, data, end_stream=False):
         await self._drain
 
@@ -371,6 +378,9 @@ class _Closing(_Fake):
 
 class _Broken(_Fake):
     """A live session whose writes fail."""
+
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
 
     async def stream_write_drain(self, sid, data, end_stream=False):
         raise ConnectionError("stream gone")

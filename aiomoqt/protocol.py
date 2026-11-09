@@ -3884,12 +3884,13 @@ class _MOQTSessionMixin:
     TX_RING_WAIT_AT = 0.9
 
     def stream_write_nowait(self, stream_id: int, data: bytes,
-                            end_stream: bool = False) -> bool:
+                            end_stream: bool = False,
+                            wait_at: float = TX_RING_WAIT_AT) -> bool:
         """stream_write_drain() when it would not wait: True once the
         transport holds `data`. False, with nothing written, when the
-        session is closing, the stream is over its budget, the transport
-        is near full or `data` is larger than the stream's ring. A
-        stopped stream raises MOQTStreamStopped."""
+        session is closing, the stream is over its budget, the TX event
+        ring is past `wait_at` or `data` is larger than the stream's ring.
+        A stopped stream raises MOQTStreamStopped."""
         quic = self._quic
         if not self._session_writable() or getattr(quic, 'closed', False):
             return False
@@ -3903,7 +3904,7 @@ class _MOQTSessionMixin:
         if (max_bytes is not None
                 and quic.tx_data_ring_used(stream_id) > max_bytes):
             return False
-        if quic.tx_event_ring_fill() > self.TX_RING_WAIT_AT:
+        if quic.tx_event_ring_fill() > wait_at:
             return False
         try:
             quic.send_stream_data(stream_id, data, end_stream)
