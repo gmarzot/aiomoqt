@@ -633,3 +633,43 @@ async def test_slots_judge_latency_only_on_one_host(monkeypatch, role, extra, la
     await ab.main()
     subs = [cfg for name, cfg in configs if name == 'sub_batch_worker_entry']
     assert subs and all(cfg['slot_latency_ms'] == late_ms for cfg in subs)
+
+
+def _ramp(monkeypatch, *extra):
+    monkeypatch.setattr(sys, 'argv', ['moq-adaptive-bench', 'moqt://127.0.0.1:4433',
+                                      '--mode', 'subs', '--step-subs', '50', *extra])
+    return ab.parse_args()
+
+
+@pytest.mark.parametrize('extra, interval, stagger', [
+    (['-R', '10'], 5.0, 0.1),
+    (['--ramp-rate', '10', '--spread', '0.2'], 5.0, 0.02),
+    (['-R', '10', '--spread', '0'], 5.0, 0.0),
+    (['-j', '5', '--stagger', '0.02'], 5.0, 0.02),
+    (['-j', '5', '-S', '0.02'], 5.0, 0.02),
+    ([], None, 0.1),
+])
+def test_ramp_rate_sets_the_group_interval_and_stagger(monkeypatch, extra, interval, stagger):
+    args = _ramp(monkeypatch, *extra)
+    assert (args.group_interval, args.stagger) == (interval, stagger)
+
+
+@pytest.mark.parametrize('extra, why', [
+    (['--spread', '0.5'], '--spread needs --ramp-rate'),
+    (['-R', '0'], 'above 0'),
+    (['-R', '10', '--spread', '1.5'], 'a share from 0 to 1'),
+    (['-R', '10', '-j', '5'], 'drop them'),
+    (['-R', '10', '--stagger', '0.1'], 'drop them'),
+    (['-R', '10', '-S', '0.1'], 'drop them'),
+])
+def test_ramp_rate_refuses(monkeypatch, capsys, extra, why):
+    with pytest.raises(SystemExit):
+        _ramp(monkeypatch, *extra)
+    assert why in capsys.readouterr().err
+
+
+def test_ramp_rate_is_subs_mode_only(monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv', ['moq-adaptive-bench', 'moqt://127.0.0.1:4433', '-R', '10'])
+    with pytest.raises(SystemExit):
+        ab.parse_args()
+    assert 'subs-mode only' in capsys.readouterr().err
