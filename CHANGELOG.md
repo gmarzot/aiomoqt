@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay's send lane follows its deadline at the track's input rate at any bitrate, instead of stopping at 4 MiB, so a 16 Mbps track keeps the full 5 s `--lag-limit`, not about 2 s. While the lanes together hold more than `--cache-bytes` each falls back to 4 MiB. `status.json` gains `totals.lane_bytes`.
 - aiomoqt-relay no longer counts a subscriber that closes while a write to it is in flight as a drop, so `status.json` `drops` and the dashboard's Drops tile count only live subscribers the relay dropped. Before, closing a playing viewer's tab could count as one.
 - aiomoqt-relay holds a track's input rate while nothing arrives instead of decaying it, so a subscriber's send lane keeps its time bound through a pause or a silent upstream. Before, after about a minute paused the bound fell to its 64 KiB floor, and the first viewer to resume a high-rate track lost its first group.
 - pub_bench: with `--video --audio`, `-D` sends the audio track as ObjectDatagrams while video stays on streams, as pub_media's `-D` does.
