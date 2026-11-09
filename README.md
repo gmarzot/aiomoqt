@@ -30,7 +30,9 @@ Pure Python. `aiopquic` (the QUIC transport) installs as a binary wheel automati
 HLS/DASH ingest (`pub_media --input`) needs PyAV, an optional extra:
 `uv pip install 'aiomoqt[media]'`. Without it, `--input` exits with that hint.
 The ABR ingester (`abr_ingest`) needs cymedia, an optional extra that builds against the system's
-FFmpeg development files: `uv pip install 'aiomoqt[abr]'`.
+FFmpeg development files: `uv pip install 'aiomoqt[abr]'`. cymedia's
+[`scripts/build-ffmpeg.sh`](https://github.com/gmarzot/cymedia/blob/main/scripts/build-ffmpeg.sh)
+builds an FFmpeg with what its profiles need.
 
 ## Quick start
 

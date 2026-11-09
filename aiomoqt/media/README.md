@@ -225,7 +225,8 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
 - **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
   each group start. A rung that falls behind ends that group early and resumes at the next group
   start, so a group never has a hole in it.
-- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default) or `cpu` (software).
+- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default), `videotoolbox` (macOS,
+  H.264 only) or `cpu` (software).
 - **Codec.** `--codec h264` (default) or `av1`: `av1_nvenc` on `nvenc`, libaom in realtime mode
   on `cpu`. AV1 rungs carry an av1C in the catalog and a sequence header on each key frame.
   The source passes through as H.264.
