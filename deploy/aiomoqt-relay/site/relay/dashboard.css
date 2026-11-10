@@ -35,10 +35,12 @@ code {
   margin-right: 9px; vertical-align: -2px;
 }
 .facts.first { display: flex; flex-direction: column; align-self: stretch; }
-.facts .badge-version { align-self: flex-start; margin-bottom: 8px; }
+/* Boxed text starts on the labels' edge; border and padding sit outside it. */
+.facts .badge-version { align-self: flex-start; margin: 0 0 8px -9px; }
+.facts.first .mono { grid-template-columns: 9ch minmax(0, 1fr); }
 .badge-version {
   background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
-  padding: 3px 12px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
+  padding: 3px 8px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
   monospace; overflow-wrap: anywhere;
 }
 
@@ -56,8 +58,11 @@ code {
 .mono dt { color: var(--gold); font-weight: 600; }
 .mono dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .facts .urls {
-  margin-top: auto; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
+  margin: auto 0 0 -9px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
+#badge-version { white-space: nowrap; }
+.badge-extra { font-weight: 400; font-size: 13px; color: var(--text); white-space: nowrap; }
+.badge-extra::before { content: " · "; color: var(--faint); }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }
 .copyable {

@@ -2,10 +2,11 @@
 
 ## v0.15.0 (unreleased)
 
+- The aiomoqt-relay dashboard's version badge also shows the worker count and the cache held of its budget (`48.9/256 MiB`; the per-track bound and evictions on hover). The URL box's labels line up with NAME and HOSTNAME.
+- abr_ingest follows its source's catalog updates: the ladder waits up to 5 s for a framerate before assuming 30 fps, and framerates and passthrough bitrates the source adds later are republished. A 60 fps `pub_media --ts` source, whose first catalog has neither until it has measured them, got rungs at about 1.7× their bitrate and a passthrough track with no bitrate.
 - aiomoqt-relay writes a datagram, or an object on a stream already open to the viewer, straight from the forward loop when the viewer's send lane is empty, instead of waking the lane's task for every object. New streams and cache replays still go through the lane.
 - aiomoqt-relay sheds a subscriber's groups once its oldest unsent live object, queued or still in the transport, is past the deadline (`--lag-limit` or the §8 delivery timeout), the same allowance on every track, instead of at a byte bound from the track's input rate, resetting the shed groups' streams with DELIVERY_TIMEOUT; a quiet scene no longer shrinks the lane below the next keyframe, small-object audio no longer sheds before video, and a catalog track keeps its newest group. The 4 MiB cap applies once the lanes together pass `--cache-bytes`. The shed WARNING states the time behind, the deadline and the bytes held.
 - load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
-- aiomoqt-relay's cache is bounded by memory only: `--cache-bytes` across all tracks and an eighth of it per track, with no 8-group cap, so a track with one object per group (LOC audio) keeps minutes of objects for FETCH instead of 0.17 s. Past the budget the least recently used track loses its oldest group, taken first from tracks holding more than their newest 10 s (at least `--lag-limit` plus one group). A `catalog` or `catalog.json` track keeps its newest group while its publisher is live. `status.json` gains `tracks[].cache_seconds`.
 
 ## v0.15.0rc1
 
