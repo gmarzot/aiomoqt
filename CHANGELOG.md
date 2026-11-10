@@ -4,6 +4,7 @@
 
 - aiomoqt-relay writes a datagram, or an object on a stream already open to the viewer, straight from the forward loop when the viewer's send lane is empty, instead of waking the lane's task for every object. New streams and cache replays still go through the lane.
 - load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
+- A finished FETCH's request stream is now closed by both ends: the requester FINs its half once the FETCH data stream ends and, once FETCH_OK or REQUEST_ERROR is in, sends STOP_SENDING on the other half; the publisher (or aiomoqt-relay) FINs its half after the data stream's FIN. Before, every finished FETCH kept a bidi stream open on d18 and later, so a session making many FETCHes ran out of stream credit.
 
 ## v0.15.0rc1
 
