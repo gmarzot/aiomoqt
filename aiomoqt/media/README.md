@@ -231,6 +231,7 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
   on `cpu`. AV1 rungs carry an av1C in the catalog and a sequence header on each key frame.
   The source passes through as H.264.
 - **Track Properties** pass through, timing ones to the rungs as well.
+- **Packaging.** `--packaging cmaf` publishes every output track as CMSF: one CMAF chunk per object, led by a `prft` with the capture time, the CMAF header in the catalog `initDataList`. Tracks whose codec no header covers (H.264, H.265, AV1, AAC and Opus do) are left out.
 - **Report.** Every `-i` seconds, per output track: frames, frames skipped while no subscriber
   took the track (`idle`), drops, and the delay from a source frame's arrival to its hand-off to
   the output track; rungs also show the encoder's share. `--no-ladder` passes the source
