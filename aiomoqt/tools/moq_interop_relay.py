@@ -41,9 +41,13 @@ Limits:
     OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
     and the subscriber's), else live objects past --lag-limit seconds,
     resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
-    the group. The same deadline at the track's input rate bounds what
-    the lane and its streams hold: past it, whole groups are shed. Past the track's MAX_CACHE_DURATION an object is neither
-    sent nor served from the cache: a request for it goes upstream.
+    the group. A subscriber whose oldest unsent live object, in the lane
+    or still in the transport, is past that deadline sheds whole groups,
+    also reset with DELIVERY_TIMEOUT; a catalog track keeps its newest.
+    Once the lanes together pass --cache-bytes, each is also held to
+    LANE_BYTES, shedding with CANCELLED. Past the track's
+    MAX_CACHE_DURATION an object is neither sent nor served from the
+    cache: a request for it goes upstream.
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
@@ -116,7 +120,7 @@ from aiomoqt.types import (
     SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
-from aiomoqt.delivery import (LANE_BYTES, LANE_MIN_BYTES, LANE_STALL_S,
+from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, LANE_TX_PROBE,
                               SendLane, retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
@@ -241,6 +245,8 @@ PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
+# Track names whose send lanes never shed their newest group.
+CATALOG_NAMES = (CATALOG_TRACK, b"catalog.json")
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
 DEFAULT_GROUP_ORDER_PROPERTY = 0x22
@@ -262,8 +268,6 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A track's input rate falls by at most this factor per lane check with input.
-IN_RATE_DECAY = 0.9
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -519,8 +523,6 @@ def _budget_lanes() -> None:
 def _check_lanes() -> None:
     now = time.monotonic()
     _budget_lanes()
-    for track in list(_tracks.values()):
-        track.update_in_rate(now)
     for lane in list(_lanes):
         lane.check(now, LANE_STALL_S)
 
@@ -728,6 +730,8 @@ class _RelayDelivery:
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
+            if _born is not None and self.lane is not None:
+                self.lane._mark(item)
         if end is not None and end[5] is not None:
             track._objects_out += 1
         rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
@@ -770,8 +774,8 @@ class _RelayDelivery:
                 and item[9] not in _STREAM_ENDS
                 and not (shape and shape[0] == "DGRAM"))
 
-    def reset_below(self, floor) -> None:
-        self.track._reset_streams(self.session, floor)
+    def reset_below(self, floor, code=StreamResetCode.CANCELLED) -> None:
+        self.track._reset_streams(self.session, floor, code)
 
     def close_streams(self) -> None:
         self.track._close_streams(self.session)
@@ -807,10 +811,12 @@ class _TracedRelayDelivery(_RelayDelivery):
 
 
 class _RelayLane(SendLane):
-    """One subscriber's SendLane, bounded by its deadline at the track's
-    input rate, or LANE_BYTES without both or while the lanes are over
-    budget, and registered for the stall check and the status page. A
-    failed write drops the subscriber."""
+    """One subscriber's SendLane, registered for the stall check and the
+    status page. It sheds once the oldest live object its subscriber has
+    not been sent is more than `deadline` old, counting what the
+    transport still holds of the track's streams; by bytes, past
+    LANE_BYTES, only without a deadline or while the lanes are over
+    budget. A failed write drops the subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -818,19 +824,117 @@ class _RelayLane(SendLane):
     def __init__(self, track, d):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
+        # (bytes written to the session's streams of the track before an
+        # object, its arrival time), one per LANE_TX_PROBE objects or group.
+        self._marks = deque()
+        self._mark_gid = None
+        self._mark_n = 0
+        # Arrival time of the oldest live object held, as last read.
+        self._oldest = None
+        # The last shed's cause: byte cap, else seconds behind; bytes held.
+        self._capped = False
+        self._behind = 0.0
+        self._held = 0
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
         self.d = d
-        self.rate = track._in_rate
+        self._catalog = track.key[1] in CATALOG_NAMES
         _lanes.add(self)
         track._lanes.add(self)
 
     def _set_bound(self) -> None:
-        if _lanes_over_budget or self._deadline is None or self._rate <= 0:
-            super()._set_bound()
-        else:
-            self.bound = max(LANE_MIN_BYTES, int(self._rate * self._deadline))
+        # 0: no byte bound.
+        self.bound = (LANE_BYTES if _lanes_over_budget
+                      or self._deadline is None else 0)
+
+    def _written(self) -> int:
+        return self.track._tx_written.get(id(self.d.session), 0)
+
+    def _mark(self, item) -> None:
+        """Note where live object `item`'s bytes start, before its write."""
+        if item[0] == self._mark_gid and self._mark_n < LANE_TX_PROBE:
+            self._mark_n += 1
+        elif self._deadline is not None:
+            self._mark_gid, self._mark_n = item[0], 1
+            self._marks.append((self._written(), item[3]))
+
+    def _probe(self, floor) -> None:
+        super()._probe(floor)
+        if self._deadline is not None:
+            self._oldest = self._oldest_born()
+
+    def _oldest_born(self):
+        """Arrival time of the oldest live object not yet sent. The
+        transport sends a session's streams of the track oldest first, so
+        its oldest unsent byte is `tx_bytes` before the end of what was
+        written; the first mark from there gives its time, at most one
+        mark late. Else the oldest queued, None for none."""
+        unsent = self._written() - self.tx_bytes
+        marks = self._marks
+        while marks and marks[0][0] < unsent:
+            marks.popleft()
+        if self.tx_bytes and marks:
+            return marks[0][1]
+        for it in self.items:
+            if it[0].__class__ is not str and it[3] is not None and it[2]:
+                return it[3]
+        return None
+
+    def _late(self, item) -> bool:
+        """The oldest live object held is past the deadline at `item`'s
+        arrival."""
+        oldest, born = self._oldest, item[3]
+        return (oldest is not None and born is not None
+                and born - oldest > self._deadline)
+
+    def _may_write(self, item) -> bool:
+        if self.bound and self.tx_bytes + item[1] > self.bound:
+            return False
+        if self._deadline is not None:
+            if self._late(item):
+                return False
+            if item[1] and item[3] is not None:
+                self._mark(item)
+        return True
+
+    def _over(self, item) -> bool:
+        held = self.bytes + self.tx_bytes
+        if self.bound and held > self.bound:
+            self._capped, self._held = True, held
+            self.cut_code = StreamResetCode.CANCELLED
+            return True
+        if self._deadline is None or item[3] is None:
+            return False
+        if self._oldest is None:
+            self._oldest = item[3]
+            return False
+        if not self._late(item):
+            return False
+        self._probe(self.floor)
+        if not self._late(item):
+            return False
+        self._capped, self._held = False, self.bytes + self.tx_bytes
+        self._behind = item[3] - self._oldest
+        # Past the deadline the expiry path enforces (§8).
+        self.cut_code = StreamResetCode.DELIVERY_TIMEOUT
+        return True
+
+    def _keeps(self, item) -> bool:
+        if self._catalog:
+            return True
+        if self.bound and self.bytes + self.tx_bytes > self.bound:
+            return False
+        return self._deadline is None or not self._late(item)
+
+    def _shed_reason(self) -> str:
+        if self._capped:
+            why = (" (send lanes over --cache-bytes)" if _lanes_over_budget
+                   else "")
+            return (f"at its {self.bound}-byte cap{why}, {self._held} bytes "
+                    f"held")
+        return (f"{self._behind:.2f} s behind (deadline "
+                f"{self._deadline:.1f} s), {self._held} bytes held")
 
     def _exit(self) -> None:
         _lanes.discard(self)
@@ -1000,6 +1104,8 @@ class _RelayedTrack:
         # id(session) -> {(group, subgroup): stream_id} of the streams
         # opened, kept past FIN until the transport has drained them.
         self._tx_streams: dict = {}
+        # id(session) -> bytes written to its streams of the track.
+        self._tx_written: dict = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -1069,11 +1175,6 @@ class _RelayedTrack:
         # Dashboard counters: payload bytes, most subscribers at once,
         # FETCHes served, subscribers dropped on a failed write.
         self._shed_done = 0      # bytes skipped by lanes that have ended
-        # Input bytes/s, held near recent peaks so a lull doesn't tighten
-        # the lanes' time bounds before the next burst.
-        self._in_rate = 0.0
-        self._rate_mark = (time.monotonic(), 0)
-        self._rate_idle = True
         self._bytes_in = 0
         self._bytes_out = 0
         self._peak_subs = 0
@@ -1224,6 +1325,8 @@ class _RelayedTrack:
             self._streams.pop(k, None)
         for k in [k for k in self._tx_streams if k not in draining]:
             del self._tx_streams[k]
+        for k in [k for k in self._tx_written if k not in draining]:
+            del self._tx_written[k]
 
     def _lane(self, d) -> "_RelayLane":
         if d.lane is None:
@@ -1290,27 +1393,6 @@ class _RelayedTrack:
                 self._streams.pop(k, None)
                 streamed = True
         return streamed or not self._datagrams
-
-    def update_in_rate(self, now: float) -> None:
-        """Measure the input rate and hand it to the track's lanes. It holds
-        while nothing arrives, so a paused or silent upstream resumes under
-        the bound it had. The first tick with bytes after silence sets nothing:
-        only part of it had traffic."""
-        then, seen = self._rate_mark
-        if now <= then:
-            return
-        self._rate_mark = (now, self._bytes_in)
-        if self._bytes_in == seen:
-            self._rate_idle = True
-            return
-        if self._rate_idle:
-            self._rate_idle = False
-            return
-        rate = max((self._bytes_in - seen) / (now - then),
-                   self._in_rate * IN_RATE_DECAY)
-        self._in_rate = rate
-        for lane in self._lanes:
-            lane.rate = rate
 
     def shed_bytes(self) -> int:
         """Bytes its lanes skipped, ended lanes included."""
@@ -1391,9 +1473,10 @@ class _RelayedTrack:
                     session.stream_reset(sid, int(reset_code))
                 self._streams.pop(k, None)
 
-    def _reset_streams(self, session, below) -> None:
-        """Reset the session's streams of groups below `below`: open ones,
-        and FINed ones the transport has not yet sent out."""
+    def _reset_streams(self, session, below,
+                       code=StreamResetCode.CANCELLED) -> None:
+        """Reset the session's streams of groups below `below` with `code`:
+        open ones, and FINed ones the transport has not yet sent out."""
         sk = id(session)
         tx = self._tx_streams.get(sk) or {}
         used = _tx_used(session)
@@ -1401,10 +1484,10 @@ class _RelayedTrack:
             if k[0] < below:
                 del tx[k]
                 if (sk, *k) not in self._streams and used(sid):
-                    session.stream_reset(sid, StreamResetCode.CANCELLED)
+                    session.stream_reset(sid, code)
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == sk and k[1] < below:
-                session.stream_reset(sid, StreamResetCode.CANCELLED)
+                session.stream_reset(sid, code)
                 self._streams.pop(k, None)
 
     def _tx_queued(self, session, floor=None) -> int:
@@ -1695,6 +1778,7 @@ class _RelayedTrack:
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
+        self._tx_written.pop(id(session), None)
 
     def _end_due(self, k, n) -> None:
         n += self._ends_due.get(k, 0)
@@ -2035,6 +2119,7 @@ class _RelayedTrack:
                 payload=b"", status=status,
                 object_id=header.next_object_id if oid is None else oid)
             session.stream_write(stream_id, buf.data, end_stream=True)
+            self._count_tx(session, len(buf.data))
             self._streams.pop(skey, None)
             return
         if nowait:
@@ -2049,6 +2134,8 @@ class _RelayedTrack:
         try:
             if session.stream_write_nowait(stream_id, wire, ended,
                                            wait_at=_TX_YIELD_AT):
+                tx = self._tx_written
+                tx[skey[0]] = tx.get(skey[0], 0) + len(wire)
                 self._wrote(session, skey, entry, end, ended)
                 return None
         except MOQTStreamStopped:
@@ -2061,6 +2148,8 @@ class _RelayedTrack:
         return self._write_drain(session, skey, entry, wire, end, ended)
 
     async def _write_drain(self, session, skey, entry, wire, end, ended):
+        # Counted before the wait: the transport takes it in pieces.
+        self._count_tx(session, len(wire))
         try:
             await session.stream_write_drain(entry[0], wire, end_stream=ended)
         except MOQTStreamStopped:
@@ -2070,6 +2159,10 @@ class _RelayedTrack:
             return True
         self._wrote(session, skey, entry, end, ended)
         return True
+
+    def _count_tx(self, session, n) -> None:
+        tx = self._tx_written
+        tx[id(session)] = tx.get(id(session), 0) + n
 
     def _wrote(self, session, skey, entry, end, ended) -> None:
         if end is None:
@@ -2119,6 +2212,7 @@ class _RelayedTrack:
                     initial = b"".join(parts)
                 else:
                     initial += first
+        self._count_tx(session, len(initial))
         try:
             stream_id = await session.open_uni_stream(
                 initial=initial, priority=_stream_band(session, prio),
