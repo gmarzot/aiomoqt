@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - `abr_ingest --packaging cmaf` publishes the source and the ladder as CMSF tracks: one CMAF chunk per object led by a `prft`, CMAF headers in the catalog.
+- abr_ingest's ladder drops a source frame that arrives after a newer group has started, instead of decoding it. A group's last object landing behind the next group's first ones stalled the decoder until the next key frame, about 2 s with no rung output. The final `ladder:` line counts them as late.
 - `pub_media --ts` and `--h264` keep filler data and end-of-sequence or end-of-stream NAL units in their access unit, for H.264 and H.265. A CBR source (NVENC or x264 `nal-hrd=cbr`) had each filler NAL published as a frame of its own, which decoders reject.
 - aiomoqt-relay's deploy gains a peer log: a `peers` service samples `status.json` into SQLite, and `/private/peers/` lists each IP's role, sessions and a sample of the namespaces it published or subscribed, per namespace its publisher and subscriber IPs, and daily totals.
 - The aiomoqt-relay dashboard's version badge also shows the worker count and the cache held of its budget (`48.9/256 MiB`; the per-track bound and evictions on hover). The URL box's labels line up with NAME and HOSTNAME.
