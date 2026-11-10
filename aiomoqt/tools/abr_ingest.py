@@ -460,7 +460,8 @@ class _Ingest:
             st = self.ladder.stats()
             lines.append(
                 f"  ladder: {self.ladder.frames_in} in, "
-                f"{self.ladder.input_dropped} dropped at input, groups "
+                f"{self.ladder.input_dropped} dropped at input, "
+                f"{self.ladder.late_dropped} late, groups "
                 f"abandoned per rung "
                 f"{[b['groups_abandoned'] for b in st['branches']]}")
         if final and self.before_start:
