@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.15.0 (unreleased)
+
+- load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
+
 ## v0.15.0rc1
 
 Release candidate, requires aiopquic 0.8.0rc1. Draft 14 is still included and will be removed before 0.15.0. Relay `--workers N` is Linux-only: a client whose address changes mid-session may be reset, and the watchdog's self-probe reaches only one worker. Threading beyond hash shards and a native data plane are not in this rc.
