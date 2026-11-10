@@ -72,37 +72,119 @@ def test_the_per_track_bound_is_bytes_only(monkeypatch):
     assert t._cache_bytes == 100 * cost == relay._budget.bytes
 
 
-def test_the_index_matches_a_full_scan():
-    rnd = random.Random(7)
-    t = _track("mixed")
-    held = []
-    for g in range(60):
-        objs = [(g, s, o) for s in range(3) for o in range(s, 12, 3)]
-        rnd.shuffle(objs)
-        for gid, sgid, oid in objs:
-            if rnd.random() < 0.1:
-                continue
-            status = (ObjectStatus.END_OF_GROUP if oid == 11 else None)
-            t._remember(gid, sgid, oid, b"x", None, 128, status)
-            held.append((gid, sgid, oid, status))
-    t._drop_oldest_group()
-    held = [h for h in held if h[0] > 0]
-    locs = sorted((h[0], h[2]) for h in held)
-    for _ in range(300):
-        a, b = sorted(rnd.sample(locs, 2))
-        want = sorted(loc for loc in locs if a <= loc <= b)
+def _check_index(t, held, rnd):
+    """The cache's index answers as a full scan of `held`, group ID ->
+    [(subgroup, object, status)] in group order."""
+    order = [(g, h[1]) for g in sorted(held) for h in held[g]]
+    locs = sorted(order)
+    cache = t._cache
+    assert [(c[0], c[2]) for c in cache] == order
+    assert [(c[0], c[2]) for c in reversed(cache)] == order[::-1]
+    assert len(cache) == len(order) and bool(cache) == bool(order)
+    assert list(cache.groups()) == sorted(held)
+    if not order:
+        return
+    assert (cache[0][0], cache[0][2]) == order[0]
+    assert (cache[-1][0], cache[-1][2]) == order[-1]
+    for g in sorted(held):
+        assert [c[2] for c in cache.group(g)] == [h[1] for h in held[g]]
+        assert cache.ids_below(g, 3) == [x for x in sorted(held) if x < g][-3:]
+    for _ in range(100):
+        a, b = sorted(rnd.choice(locs) for _ in range(2))
+        want = [loc for loc in locs if a <= loc <= b]
         assert [(o[0], o[2]) for o in t.cached_range(a, b)] == want
         assert [(o[0], o[2]) for o in t.cached_range(a, None)] == [
             loc for loc in locs if loc >= a]
         g = a[0]
-        oids = [h[2] for h in held if h[0] == g]
-        assert t.group_end(g, (g, 0)) == (g, max(oids))
+        assert t.group_end(g, (g, 0)) == (g, max(h[1] for h in held[g]))
         end = (b[0], b[1] + 1)
         assert t.holds_through(end) == any(
-            loc >= end or (h[0] == end[0] and h[3] is not None)
-            for h, loc in ((h, (h[0], h[2])) for h in held))
-    assert sorted(set(_groups(t))) == sorted({h[0] for h in held})
-    assert len(t._cache) == len(held)
+            (g, h[1]) >= end or (g == end[0] and h[2] is not None)
+            for g, hs in held.items() for h in hs)
+
+
+@pytest.mark.parametrize("block", [7, 256])
+def test_the_index_matches_a_full_scan(monkeypatch, block):
+    monkeypatch.setattr(relay, "CACHE_BLOCK_OBJECTS", block)
+    rnd = random.Random(7)
+    t = _track("mixed")
+    held = {}
+
+    def put(gid, sgid, oid):
+        status = ObjectStatus.END_OF_GROUP if oid == 11 else None
+        t._remember(gid, sgid, oid, b"x", None, 128, status)
+        held.setdefault(gid, []).append((sgid, oid, status))
+
+    late = []
+    for g in range(60):
+        objs = [(g, s, o) for s in range(3) for o in range(s, 12, 3)]
+        rnd.shuffle(objs)
+        for obj in objs:
+            r = rnd.random()
+            if r < 0.1:
+                continue
+            if r < 0.2:
+                # Arrives after newer groups' objects.
+                late.append(obj)
+                continue
+            put(*obj)
+        if late and rnd.random() < 0.3:
+            put(*late.pop(rnd.randrange(len(late))))
+    for obj in late:
+        put(*obj)
+    _check_index(t, held, rnd)
+
+    t._drop_oldest_group()
+    del held[0]
+    _check_index(t, held, rnd)
+
+    for _ in range(25):
+        c = t._cache.popleft()
+        g = min(held)
+        assert (c[0], c[2]) == (g, held[g][0][1])
+        del held[g][0]
+        if not held[g]:
+            del held[g]
+    _check_index(t, held, rnd)
+
+    for g in (sorted(held)[len(held) // 2], max(held)):
+        assert [c[2] for c in t._cache.pop_group(g)] == [
+            h[1] for h in held.pop(g)]
+    _check_index(t, held, rnd)
+
+    g = sorted(held)[2]
+    last = (g, sorted(h[1] for h in held[g])[len(held[g]) // 2])
+    dropped = sorted((c[0], c[2]) for c in t._cache.drop_through(last))
+    assert dropped == sorted((x, h[1]) for x, hs in held.items()
+                             for h in hs if (x, h[1]) <= last)
+    for x in list(held):
+        held[x] = [h for h in held[x] if (x, h[1]) > last]
+        if not held[x]:
+            del held[x]
+    _check_index(t, held, rnd)
+
+    # A backfill of older groups and of a held group's missing objects.
+    head = min(held)
+    missing = [o for o in range(12) if o not in {h[1] for h in held[head]}]
+    new = [(gid, 0, o) for gid in (head - 3, head - 1) for o in (2, 0, 1)]
+    new += [(head, o % 3, o) for o in missing]
+    rnd.shuffle(new)
+    t._cache.merge([relay._cache_record(gid, sgid, oid, b"x", None, 128,
+                                        None, None, 0.0)
+                    for gid, sgid, oid in new])
+    for gid, sgid, oid in new:
+        held.setdefault(gid, []).append((sgid, oid, None))
+    for gid in {n[0] for n in new}:
+        held[gid].sort(key=lambda h: h[1])
+    _check_index(t, held, rnd)
+
+    # A straggler of a dropped group starts that group again.
+    put(0, 1, 4)
+    _check_index(t, held, rnd)
+    while t._cache:
+        t._cache.popleft()
+    _check_index(t, {}, rnd)
+    assert t._cache._blocks == [[]]
 
 
 def test_the_budget_takes_first_from_tracks_above_their_floor(monkeypatch):

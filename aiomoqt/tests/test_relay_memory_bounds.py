@@ -50,8 +50,7 @@ def _subscribe(t):
 
 def _accounted(*tracks):
     for t in tracks:
-        assert t._cache_bytes == sum(retained_object_bytes(c[3], c[4])
-                                     for c in t._cache)
+        assert t._cache_bytes == sum(map(relay._record_cost, t._cache))
     assert relay._budget.bytes == sum(t._cache_bytes for t in tracks)
 
 
