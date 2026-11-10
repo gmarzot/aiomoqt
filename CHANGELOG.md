@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - aiomoqt-relay writes a datagram, or an object on a stream already open to the viewer, straight from the forward loop when the viewer's send lane is empty, instead of waking the lane's task for every object. New streams and cache replays still go through the lane.
+- load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
 
 ## v0.15.0rc1
 
