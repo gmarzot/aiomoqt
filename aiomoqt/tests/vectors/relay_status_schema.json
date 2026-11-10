@@ -980,6 +980,9 @@
   ".tracks[].cache_groups": [
    "int"
   ],
+  ".tracks[].cache_seconds": [
+   "float"
+  ],
   ".tracks[].drops": [
    "int"
   ],
