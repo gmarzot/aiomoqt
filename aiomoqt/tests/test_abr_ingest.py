@@ -18,7 +18,7 @@ from aiomoqt.media.broadcast import MediaPublisher, MediaSubscriber
 from aiomoqt.media.catalog import Catalog, CatalogTrack, InitData
 from aiomoqt.media.loc import LocFrame, LocTrackPublisher
 from aiomoqt.media.sources import (
-    AnnexBAssembler, avcc_codec_string, avcc_from_sps_pps, obu_units,
+    AnnexBAssembler, _boxes, _find, avcc_codec_string, avcc_from_sps_pps, obu_units,
 )
 from aiomoqt.tests import _fake_cymedia
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -135,6 +135,59 @@ async def test_ladder_keeps_source_ids_and_opens_groups_on_key_frames(impl, clip
         assert ladder.wait[i].take()
 
 
+async def test_ladder_drops_a_late_frame_of_an_older_group(impl, clip):
+    _needs(impl, 'h264')
+    config, frames = clip
+    got = []
+
+    def on_frame(i, frame, group_id, object_id, pushed_ns):
+        if i == 0:
+            got.append((group_id, object_id))
+
+    ladder = AbrLadder(RUNGS[:1], config=config, fps=(FPS, 1), profile='cpu',
+                       on_frame=on_frame, realtime=False)
+    ladder.start()
+    order = [(0, o) for o in range(GOP - 1)] + [(1, 0), (1, 1)] + [(0, GOP - 1)]
+    order += [(1, o) for o in range(2, GOP)]
+    pushed = {}
+    try:
+        for g, o in order:
+            payload, key = frames[g * GOP + o]
+            pushed[(g, o)] = ladder.push(
+                LocFrame(payload, key_frame=key, timestamp=(g * GOP + o) * 33_333), g, o)
+        assert await ladder.flush(10)
+    finally:
+        ladder.close()
+    assert pushed[(0, GOP - 1)] is False and ladder.late_dropped == 1
+    assert all(ok for k, ok in pushed.items() if k != (0, GOP - 1))
+    assert got == [k for k in order if k != (0, GOP - 1)]
+
+
+async def test_ladder_takes_a_restarted_source(impl, clip):
+    _needs(impl, 'h264')
+    config, frames = clip
+    got = []
+
+    def on_frame(i, frame, group_id, object_id, pushed_ns):
+        if i == 0:
+            got.append((group_id, object_id))
+
+    ladder = AbrLadder(RUNGS[:1], config=config, fps=(FPS, 1), profile='cpu',
+                       on_frame=on_frame, realtime=False)
+    ladder.start()
+    order = [(g, o) for g in range(4) for o in range(GOP)]
+    order += [(0, o) for o in range(GOP)]  # the source restarts at group 0
+    try:
+        pushed = [ladder.push(LocFrame(frames[g * GOP + o][0], key_frame=o == 0,
+                                       timestamp=n * 33_333), g, o)
+                  for n, (g, o) in enumerate(order)]
+        assert await ladder.flush(10)
+    finally:
+        ladder.close()
+    assert all(pushed) and ladder.late_dropped == 0
+    assert got == order
+
+
 def _source_catalog(config: bytes) -> Catalog:
     return Catalog(
         tracks=[
@@ -235,6 +288,103 @@ async def test_ingester_publishes_source_and_ladder_in_one_catalog(
                 assert got['video'][(g, o)][1] == ts
         # the subscriptions may start up to a group apart
         assert len(set(rung) & set(got['video'])) >= len(rung) - GOP
+
+
+_ASC = bytes([0x11, 0x90])  # AAC-LC, 48 kHz, stereo
+
+
+def _aac_source_catalog(config: bytes) -> Catalog:
+    cat = _source_catalog(config)
+    audio = cat.find('audio')
+    audio.codec, audio.channelConfig, audio.initRef = 'mp4a.40.2', '2', 'a0'
+    cat.initDataList.append(InitData.from_bytes('a0', _ASC))
+    return cat
+
+
+def _cmaf_object(payload: bytes):
+    """(sync, tfdt) of a CMSF object: prft, then one moof+mdat."""
+    from aiomoqt.media.cmaf import chunk_decode_time
+    tops = [t for t, _, _ in _boxes(payload, 0, len(payload))]
+    assert tops == [b'prft', b'moof', b'mdat'], tops
+    payload = payload[next(_boxes(payload, 0, len(payload)))[2]:]
+    trun = _find(payload, 0, len(payload), b'moof', b'traf', b'trun')
+    flags = struct.unpack_from('>I', payload, trun[0] + 20)[0]
+    return not flags & 0x10000, chunk_decode_time(payload)
+
+
+@pytest.mark.parametrize('codec', ['h264', 'av1'])
+async def test_ingester_publishes_cmaf_tracks(impl, clip, codec):
+    _needs(impl, codec)
+    from aiomoqt.media.cmaf import init_codec_string
+    from aiomoqt.tools import abr_ingest
+    from aiomoqt.tools import moq_interop_relay as relay
+    relay._announced.clear()
+    relay._tracks.clear()
+    config, frames = clip
+    ns = 'abr/cmaf'
+    relay_port, ingest_port = free_udp_port(), free_udp_port()
+    server = relay._build_server('localhost', relay_port, CERT, KEY,
+                                 use_quic=True, draft=18)
+    handle = await server.serve()
+    args = abr_ingest.parse_args([
+        '-Q', '-p', str(ingest_port), '--cert', CERT, '--key', KEY, '-N', ns,
+        '--profile', 'cpu', '--codec', codec, '--packaging', 'cmaf',
+        '--rung', '160x120:200k', '--rung', '96x72:100k',
+        '-k', '--draft', '18', '-t', '30', f'moqt://localhost:{relay_port}/'])
+    ingest = asyncio.ensure_future(abr_ingest.run(args))
+    got = defaultdict(dict)
+    try:
+        await asyncio.sleep(0.5)
+        pub_client = MOQTClient('localhost', ingest_port, path='/', use_quic=True,
+                                verify_tls=False, supported_drafts=18)
+        async with pub_client.connect() as pub_session:
+            await pub_session.client_session_init()
+            pub = MediaPublisher(pub_session, ns, _aac_source_catalog(config))
+            video = pub.add_track(LocTrackPublisher(pub_session, ns, 'video',
+                                                    config=config))
+            audio = pub.add_track(LocTrackPublisher(
+                pub_session, ns, 'audio', media_kind='audio', config=_ASC))
+            await pub.start(announce_namespace=True, publish_track=False)
+            feeder = asyncio.ensure_future(_feed(video, audio, frames))
+            await until_published(ns, ['catalog', 'video', 'audio',
+                                       'video_120p', 'video_72p'], timeout=15)
+            sub_client = MOQTClient('localhost', relay_port, path='/', use_quic=True,
+                                    verify_tls=False, supported_drafts=18)
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+
+                def on_frame(name, frame, group_id, object_id):
+                    got[name][(group_id, object_id)] = frame.payload
+                sub = MediaSubscriber(sub_session, ns, on_frame=on_frame)
+                catalog = await sub.start(timeout=5)
+                await feeder
+                await asyncio.sleep(1.0)
+        assert await asyncio.wait_for(ingest, 10) == 0
+    finally:
+        if not ingest.done():
+            ingest.cancel()
+        handle.close()
+    names = ['video', 'video_120p', 'video_72p', 'audio']
+    assert [t.name for t in catalog.tracks] == names
+    prefix = 'av01.' if codec == 'av1' else 'avc1.'
+    for t in catalog.tracks:
+        assert t.packaging == 'cmaf' and t.initRef
+        init = catalog.resolve_init(t)
+        assert init[4:8] == b'ftyp' and init_codec_string(init) == t.codec
+    assert all(catalog.find(n).codec.startswith(prefix)
+               for n in ('video_120p', 'video_72p'))
+    assert catalog.find('audio').codec == 'mp4a.40.2'
+    for name in names:
+        objects = got[name]
+        assert objects, f"{name}: no objects"
+        last = -1
+        for (g, o), payload in sorted(objects.items()):
+            sync, tfdt = _cmaf_object(payload)
+            assert sync == (o == 0), (name, g, o)
+            assert tfdt > last, (name, g, o)
+            last = tfdt
+    for name in ('video_120p', 'video_72p'):
+        assert len(got[name]) >= FPS, f"{name}: {len(got[name])} frames"
 
 
 async def test_source_url_waits_for_a_source_not_yet_published(impl, clip):
