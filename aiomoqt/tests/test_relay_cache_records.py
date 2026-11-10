@@ -23,36 +23,70 @@ def fresh_budget(monkeypatch):
     monkeypatch.setattr(relay, "CACHE_BUDGET_BYTES", 1 << 40)
 
 
-def test_cached_records_add_no_tracked_objects():
-    n = 200_000
-    t = relay._RelayedTrack(((b"gc",), b"audio"))
-    gc.collect()
-    before = len(gc.get_objects())
-    for g in range(n):
+def _fill(t, lo, hi):
+    for g in range(lo, hi):
         # One object per group, as LOC audio: the most per-group state.
         t._copy(None, g, 0, 0, False)
         t._heads.add((g, 0))
         t._remember(g, 0, 0, b"a", {2: 1 << 40 | g, 7: b"\x01\x02"}, 128,
                     ObjectStatus.NORMAL, (True, False, False), born=g * 0.02)
         t._ended.add((g, 0))
+
+
+def _records_tracked():
+    """Tracked tuples shaped like a cache record of _fill()."""
+    return sum(1 for o in gc.get_objects()
+               if type(o) is tuple and len(o) >= 9 and o[3] == b"a")
+
+
+def test_cached_records_add_no_tracked_objects():
+    t = relay._RelayedTrack(((b"gc",), b"audio"))
     gc.collect()
-    grown = len(gc.get_objects()) - before
-    assert len(t._cache) == n and t._cache.group_count() == n
-    assert grown < n // 100, grown
+    gc.disable()
+    try:
+        before = len(gc.get_objects())
+        _fill(t, 0, 50_000)
+        at_50k = len(gc.get_objects())
+        _fill(t, 50_000, 200_000)
+        at_200k = len(gc.get_objects())
+        # No collection has run: nothing per record may be tracked.
+        assert _records_tracked() == 0
+        assert at_50k - before < 50_000 // 100, at_50k - before
+        assert at_200k - at_50k < 150_000 // 100, at_200k - at_50k
+    finally:
+        gc.enable()
+    gc.collect()
+    assert len(gc.get_objects()) - before < 200_000 // 100
+    assert len(t._cache) == 200_000 and t._cache.group_count() == 200_000
     assert len(t._subgroups) <= 2 * relay.STATE_GROUPS
     t._drop_cache()
 
 
-def test_properties_thaw_to_what_was_frozen():
-    for props in ({2: 5, 3: b"x"}, {1: [b"a", b"b"]}, b"\x02\x05", None):
-        frozen = relay._cache_record(0, 0, 0, b"p", props, 128, None, None,
-                                     0.0)[4]
-        assert relay._thaw_props(frozen) == props
-    rec = relay._cache_record(0, 0, 0, b"p", {2: 5}, 128,
-                              ObjectStatus.END_OF_GROUP, None, 0.0)
-    assert relay._thaw_status(rec[6]) is ObjectStatus.END_OF_GROUP
-    assert relay._record_cost(rec) == relay.retained_object_bytes(
-        b"p", {2: 5})
+def test_records_read_back_as_written():
+    kvp = KeyValuePairs({2: 5, 9: b"d"})
+    kvp.duplicates = frozenset({2})
+    cases = [
+        (0, 0, b"p", {2: 5, 3: b"x"}, 128, None, (True, False, True)),
+        (1, None, b"", {1: [b"a", b"b"]}, None, ObjectStatus.END_OF_GROUP,
+         ("DGRAM", True)),
+        (2, 3, b"q" * 300, b"\x02\x05", 0, ObjectStatus.NORMAL, None),
+        (3, 0, b"r", kvp, 255, ObjectStatus.END_OF_TRACK, (1, 0, 0)),
+        (4, 0, b"s", None, 7, None, (False,)),
+    ]
+    c = relay._ObjectCache()
+    for gid, sgid, payload, props, prio, status, shape in cases:
+        c.append(gid, sgid, 0, payload, props, prio, status, shape, 1.5)
+    # In the open block, then sealed.
+    for _ in range(2):
+        for gid, sgid, payload, props, prio, status, shape in cases:
+            (r,) = c.group(gid)
+            assert r[:9] == (gid, sgid, 0, payload, props, prio, status,
+                             shape, 1.5)
+            assert [type(x) for x in r[7] or ()] == [
+                type(x) for x in shape or ()]
+            assert r[6] is status and r[3] is payload
+            assert r[9] == relay.retained_object_bytes(payload, props)
+        c._seal()
 
 
 class _Wire:

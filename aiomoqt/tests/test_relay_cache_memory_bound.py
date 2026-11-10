@@ -103,7 +103,7 @@ def _check_index(t, held, rnd):
             for g, hs in held.items() for h in hs)
 
 
-@pytest.mark.parametrize("block", [7, 256])
+@pytest.mark.parametrize("block", [7, 512])
 def test_the_index_matches_a_full_scan(monkeypatch, block):
     monkeypatch.setattr(relay, "CACHE_BLOCK_OBJECTS", block)
     rnd = random.Random(7)
@@ -139,22 +139,22 @@ def test_the_index_matches_a_full_scan(monkeypatch, block):
     _check_index(t, held, rnd)
 
     for _ in range(25):
-        c = t._cache.popleft()
+        gid, oid, _ = t._cache.popleft()
         g = min(held)
-        assert (c[0], c[2]) == (g, held[g][0][1])
+        assert (gid, oid) == (g, held[g][0][1])
         del held[g][0]
         if not held[g]:
             del held[g]
     _check_index(t, held, rnd)
 
     for g in (sorted(held)[len(held) // 2], max(held)):
-        assert [c[2] for c in t._cache.pop_group(g)] == [
+        assert [c[1] for c in t._cache.pop_group(g)] == [
             h[1] for h in held.pop(g)]
     _check_index(t, held, rnd)
 
     g = sorted(held)[2]
     last = (g, sorted(h[1] for h in held[g])[len(held[g]) // 2])
-    dropped = sorted((c[0], c[2]) for c in t._cache.drop_through(last))
+    dropped = sorted(c[:2] for c in t._cache.drop_through(last))
     assert dropped == sorted((x, h[1]) for x, hs in held.items()
                              for h in hs if (x, h[1]) <= last)
     for x in list(held):
@@ -169,8 +169,7 @@ def test_the_index_matches_a_full_scan(monkeypatch, block):
     new = [(gid, 0, o) for gid in (head - 3, head - 1) for o in (2, 0, 1)]
     new += [(head, o % 3, o) for o in missing]
     rnd.shuffle(new)
-    t._cache.merge([relay._cache_record(gid, sgid, oid, b"x", None, 128,
-                                        None, None, 0.0)
+    t._cache.merge([(gid, sgid, oid, b"x", None, 128, None, None, 0.0)
                     for gid, sgid, oid in new])
     for gid, sgid, oid in new:
         held.setdefault(gid, []).append((sgid, oid, None))
@@ -184,7 +183,7 @@ def test_the_index_matches_a_full_scan(monkeypatch, block):
     while t._cache:
         t._cache.popleft()
     _check_index(t, {}, rnd)
-    assert t._cache._blocks == [[]]
+    assert len(t._cache._cols) == 1 and not t._cache._cols[0]
 
 
 def test_the_budget_takes_first_from_tracks_above_their_floor(monkeypatch):

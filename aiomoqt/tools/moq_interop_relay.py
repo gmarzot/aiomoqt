@@ -106,6 +106,8 @@ from functools import lru_cache
 import itertools
 import json
 import logging
+import marshal
+from operator import itemgetter
 from logging.handlers import RotatingFileHandler
 import os
 import random
@@ -151,6 +153,7 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
+from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
                                  server_cert_dirs)
 from aiomoqt.utils.logger import (get_category_logger, get_log_level,
@@ -653,56 +656,69 @@ class _Downstream:
 
 
 # Records per cache block; a block also seals at CACHE_BLOCK_BYTES of
-# payload, which bounds what one live record keeps from being freed.
-CACHE_BLOCK_OBJECTS = 256
+# their cost.
+CACHE_BLOCK_OBJECTS = 512
+# Per-record fields of a block's int column: group, subgroup, object,
+# priority, status, shape code, properties charge, and where its
+# properties sit in the sealed block's bytes. -1 stands for None.
+_STRIDE = 9
+_CHARGE = 6
+_PSTART = 7
 CACHE_BLOCK_BYTES = 256 * 1024
 
 _OBJECT_STATUS = {int(s): s for s in ObjectStatus}
+# Sort key of a record or fetch row: (group, object).
+_LOCATION = itemgetter(0, 2)
+# Shape codes: -1 None, 0-7 the three stream flags as bits, 8-9 a
+# datagram and its end-of-group bit, 16 and up any other shape, interned.
+_FLAG_SHAPES = tuple((bool(c & 1), bool(c & 2), bool(c & 4))
+                     for c in range(8))
+_DGRAM_SHAPES = (("DGRAM", False), ("DGRAM", True))
+_OTHER_SHAPES: list = []
+_OTHER_CODES: dict = {}
 
 
-def _freeze_props(exts, charge):
-    """Object Properties as (charge, type, value, type, value, ...),
-    lists as tuples, so a cache record holds nothing the GC tracks;
-    `charge` is their properties_charge()."""
-    if not isinstance(exts, dict):
-        return exts
-    flat = [charge]
-    for k, v in exts.items():
-        flat.append(k)
-        flat.append(tuple(v) if isinstance(v, list) else v)
-    return tuple(flat)
+def _shape_code(shape) -> int:
+    if shape is None:
+        return -1
+    if shape.__class__ is tuple:
+        if (len(shape) == 3 and shape[0].__class__ is bool
+                and shape[1].__class__ is bool
+                and shape[2].__class__ is bool):
+            return shape[0] | shape[1] << 1 | shape[2] << 2
+        if (len(shape) == 2 and shape[0] == "DGRAM"
+                and shape[1].__class__ is bool):
+            return 8 + shape[1]
+    # Keyed with the element types too, so True and 1 stay apart.
+    key = (shape, tuple(map(type, shape)) if isinstance(shape, tuple)
+           else type(shape))
+    code = _OTHER_CODES.get(key)
+    if code is None:
+        code = _OTHER_CODES[key] = 16 + len(_OTHER_SHAPES)
+        _OTHER_SHAPES.append(shape)
+    return code
 
 
-def _thaw_props(frozen):
-    """The Object Properties _freeze_props() was given."""
-    if frozen.__class__ is not tuple:
-        return frozen
-    return {k: list(v) if v.__class__ is tuple else v
-            for k, v in zip(frozen[1::2], frozen[2::2])}
+def _shape(code):
+    if code < 0:
+        return None
+    if code < 8:
+        return _FLAG_SHAPES[code]
+    if code < 16:
+        return _DGRAM_SHAPES[code - 8]
+    return _OTHER_SHAPES[code - 16]
 
 
-def _thaw_status(status):
-    return _OBJECT_STATUS.get(status, status)
-
-
-def _cache_record(gid, sgid, oid, payload, exts, prio, status, shape, born,
-                  cost=None) -> tuple:
-    """(group, subgroup, object, payload, properties, priority, status,
-    shape, arrival), with the properties frozen and the status an int.
-    `cost`, when known, is the object's retained_object_bytes."""
-    if isinstance(exts, dict):
-        exts = _freeze_props(exts, properties_charge(exts) if cost is None
-                             else cost - retained_object_bytes(payload))
-    return (gid, sgid, oid, payload, exts, prio,
-            None if status is None else int(status), shape, born)
+def _dump_props(exts):
+    """Object Properties as marshal bytes; a dict subclass as a dict."""
+    if isinstance(exts, dict) and exts.__class__ is not dict:
+        exts = dict(exts)
+    return marshal.dumps(exts)
 
 
 def _record_cost(c) -> int:
     """A cache record's retained_object_bytes."""
-    p = c[4]
-    if p.__class__ is tuple:
-        return retained_object_bytes(c[3]) + p[0]
-    return retained_object_bytes(c[3], p)
+    return c[9]
 
 
 class _GroupKeys:
@@ -789,29 +805,38 @@ class _ObjectCache:
     objects in arrival order, laid out so the cyclic GC has nothing to
     traverse per object.
 
-    Records (_cache_record) sit in arrival order in blocks: sealed
-    blocks are tuples, the open block a list, a block with no live
-    record None. Each group is a row of array columns: its ID, its
-    record count, and the sequence number and block of its first and
-    last record. A group's records are those with its ID from its first
-    to its last; any other record with its ID is dead."""
+    Records sit in arrival order in blocks held in columns: per block an
+    int array of _STRIDE fields per record, an array of arrival times,
+    the payloads and the properties as marshal bytes: lists while the
+    block is open; once sealed, a tuple and one bytes object. A block with no
+    live record is freed. Each group is a row of array columns: its ID,
+    its record count, and the sequence number and block of its first
+    and last record. A group's records are those with its ID from its
+    first to its last; any other record with its ID is dead. Reads
+    build record tuples (_rec) as they go."""
 
-    __slots__ = ("_blocks", "_base", "_live", "_b0", "_seq", "_open_bytes",
-                 "_gid", "_cnt", "_fseq", "_fblk", "_lseq", "_lblk", "_h",
-                 "_n")
+    __slots__ = ("_cols", "_born", "_pay", "_props", "_base", "_live",
+                 "bytes", "_b0", "_seq", "_nbytes", "_gid", "_cnt", "_fseq",
+                 "_fblk", "_lseq", "_lblk", "_h", "_n")
 
     def __init__(self) -> None:
         self.clear()
 
     def clear(self) -> None:
-        self._blocks = [[]]
+        self._cols = [array("q")]
+        self._born = [array("d")]
+        self._pay = [[]]
+        self._props = [[]]
         # Per block: sequence number of its first record, live records.
         self._base = array("q", [0])
         self._live = array("q", [0])
-        # Number of _blocks[0].
+        # Cost of the live records.
+        self.bytes = 0
+        # Number of the first block held.
         self._b0 = 0
         self._seq = 0
-        self._open_bytes = 0
+        # Cost of the open block's records.
+        self._nbytes = 0
         self._gid = array("q")
         self._cnt = array("q")
         self._fseq = array("q")
@@ -828,28 +853,54 @@ class _ObjectCache:
     def __bool__(self) -> bool:
         return self._n > 0
 
-    def _at(self, blk, seq):
-        k = blk - self._b0
-        return self._blocks[k][seq - self._base[k]]
+    def _rec(self, k, j) -> tuple:
+        """Record `j` of held block `k`: (group, subgroup, object,
+        payload, properties, priority, status, shape, arrival,
+        retained_object_bytes)."""
+        cols = self._cols[k]
+        x = j * _STRIDE
+        gid, sg, oid, pr, st, sh, charge, ps, pl = cols[x:x + _STRIDE]
+        props = self._props[k]
+        if props.__class__ is list:
+            p = props[j]
+        else:
+            p = None if pl < 0 else props[ps:ps + pl]
+        pay = self._pay[k][j]
+        return (gid, None if sg < 0 else sg, oid, pay,
+                None if p is None else marshal.loads(p),
+                None if pr < 0 else pr,
+                None if st < 0 else _OBJECT_STATUS.get(st, st), _shape(sh),
+                self._born[k][j], retained_object_bytes(pay) + charge)
 
-    def _scan(self, i, blocks_too=False) -> list:
-        """Row `i`'s records in arrival order, or (block, record) pairs."""
+    def _cost(self, k, j) -> int:
+        return (retained_object_bytes(self._pay[k][j])
+                + self._cols[k][j * _STRIDE + _CHARGE])
+
+    def _at(self, b, seq):
+        """(held block, index) of a record."""
+        k = b - self._b0
+        return k, seq - self._base[k]
+
+    def _locs(self, i) -> list:
+        """(held block, index) of row `i`'s records, in arrival order."""
         g = self._gid[i]
         fs, ls = self._fseq[i], self._lseq[i]
-        blocks, base, b0 = self._blocks, self._base, self._b0
+        colsl, base, b0 = self._cols, self._base, self._b0
         out = []
-        for b in range(self._fblk[i], self._lblk[i] + 1):
-            blk = blocks[b - b0]
-            if blk is None:
+        for k in range(self._fblk[i] - b0, self._lblk[i] - b0 + 1):
+            cols = colsl[k]
+            if cols is None:
                 continue
-            s0 = base[b - b0]
+            s0 = base[k]
             lo = fs - s0
-            part = blk[lo if lo > 0 else 0:ls - s0 + 1]
-            if blocks_too:
-                out += [(b, r) for r in part if r[0] == g]
-            else:
-                out += [r for r in part if r[0] == g]
+            for j in range(lo if lo > 0 else 0,
+                           min(ls - s0 + 1, len(cols) // _STRIDE)):
+                if cols[j * _STRIDE] == g:
+                    out.append((k, j))
         return out
+
+    def _scan(self, i) -> list:
+        return [self._rec(k, j) for k, j in self._locs(i)]
 
     def _row(self, gid) -> int:
         g = self._gid
@@ -870,15 +921,27 @@ class _ObjectCache:
     def __getitem__(self, i):
         """The first (0) or the last (-1) object."""
         if self._n and i == 0:
-            return self.first_of(0)
+            return self._rec(*self._at(self._fblk[self._h],
+                                       self._fseq[self._h]))
         if self._n and i == -1:
-            return self._at(self._lblk[-1], self._lseq[-1])
+            return self._rec(*self._at(self._lblk[-1], self._lseq[-1]))
         raise IndexError(i)
 
-    def first_of(self, k):
-        """The first object of the `k`th oldest group."""
-        i = self._h + k
-        return self._at(self._fblk[i], self._fseq[i])
+    def head(self):
+        """(group, object) of the first object."""
+        k, j = self._at(self._fblk[self._h], self._fseq[self._h])
+        x = j * _STRIDE
+        return self._cols[k][x], self._cols[k][x + 2]
+
+    def born(self, n):
+        """Arrival of the first object of the `n`th oldest group, or of
+        the last object for -1."""
+        if n < 0:
+            k, j = self._at(self._lblk[-1], self._lseq[-1])
+        else:
+            i = self._h + n
+            k, j = self._at(self._fblk[i], self._fseq[i])
+        return self._born[k][j]
 
     def group_count(self) -> int:
         return len(self._gid) - self._h
@@ -891,53 +954,131 @@ class _ObjectCache:
         i = self._row(gid)
         return [] if i < 0 else self._scan(i)
 
+    def group_oids(self, gid) -> list:
+        """(object, status) of a group's objects, in arrival order;
+        status -1 for none."""
+        i = self._row(gid)
+        if i < 0:
+            return []
+        colsl = self._cols
+        return [(colsl[k][j * _STRIDE + 2], colsl[k][j * _STRIDE + 4])
+                for k, j in self._locs(i)]
+
     def between(self, lo, hi=None) -> list:
         """Objects of groups `lo` through `hi` (None: the newest), in no
         set order."""
+        return [self._rec(k, j) for k, j in self._span(lo, hi)]
+
+    def fetch_rows(self, lo, hi=None) -> list:
+        """between() as (group, subgroup, object, payload, properties,
+        priority, status)."""
+        out = []
+        colsl, pays, propsl = self._cols, self._pay, self._props
+        for k, a, b in self._ranges(lo, hi):
+            props = propsl[k]
+            it = iter(colsl[k][a * _STRIDE:b * _STRIDE])
+            for j, pay, (gid, sg, oid, pr, st, _, _, ps, pl) in zip(
+                    range(a, b), pays[k][a:b], zip(*[it] * _STRIDE)):
+                p = (props[j] if props.__class__ is list
+                     else None if pl < 0 else props[ps:ps + pl])
+                out.append((gid, None if sg < 0 else sg, oid, pay,
+                            None if p is None else marshal.loads(p),
+                            None if pr < 0 else pr,
+                            None if st < 0 else _OBJECT_STATUS.get(st, st)))
+        return out
+
+    def _span(self, lo, hi) -> list:
+        """(held block, index) of the objects of groups `lo` through
+        `hi`."""
+        return [(k, x) for k, a, b in self._ranges(lo, hi)
+                for x in range(a, b)]
+
+    def _ranges(self, lo, hi) -> list:
+        """(held block, first index, end index) runs of the objects of
+        groups `lo` through `hi`."""
         g = self._gid
         i = bisect_left(g, lo, self._h)
         j = len(g) if hi is None else bisect_right(g, hi, self._h)
         if j - i < 2:
-            return self._scan(i) if j > i else []
-        # One pass over the span the groups' records lie in; a record
-        # count above theirs means dead ones are in it.
+            return [(k, x, x + 1) for k, x in self._locs(i)] if j > i else []
+        # The span the groups' records lie in: when it holds just as many
+        # records, all are theirs; else one pass keeps those of their
+        # IDs, and a count above theirs means dead ones are among them.
         fseq, lseq = self._fseq[i:j], self._lseq[i:j]
-        k = i + fseq.index(min(fseq))
+        a = i + fseq.index(min(fseq))
         m = i + lseq.index(max(lseq))
-        fs, ls = self._fseq[k], self._lseq[m]
+        fs, ls = self._fseq[a], self._lseq[m]
+        total = sum(self._cnt[i:j])
+        whole = ls - fs + 1 == total
         glo, ghi = g[i], g[j - 1]
-        blocks, base, b0 = self._blocks, self._base, self._b0
-        out = []
-        for b in range(self._fblk[k], self._lblk[m] + 1):
-            blk = blocks[b - b0]
-            if blk is None:
+        colsl, base, b0 = self._cols, self._base, self._b0
+        runs = []
+        n = 0
+        for k in range(self._fblk[a] - b0, self._lblk[m] - b0 + 1):
+            cols = colsl[k]
+            if cols is None:
                 continue
-            s0 = base[b - b0]
+            s0 = base[k]
             first = fs - s0
-            out += [r for r in blk[first if first > 0 else 0:ls - s0 + 1]
-                    if glo <= r[0] <= ghi]
-        if len(out) == sum(self._cnt[i:j]):
-            return out
-        return [r for x in range(i, j) for r in self._scan(x)]
+            start = first if first > 0 else 0
+            stop = min(ls - s0 + 1, len(cols) // _STRIDE)
+            if whole:
+                runs.append((k, start, stop))
+                n += stop - start
+                continue
+            for x in range(start, stop):
+                if glo <= cols[x * _STRIDE] <= ghi:
+                    runs.append((k, x, x + 1))
+                    n += 1
+        if n != total:
+            return [(k, x, x + 1) for y in range(i, j)
+                    for k, x in self._locs(y)]
+        return runs
 
     def ids_below(self, gid, n) -> list:
         """The newest `n` cached group IDs below `gid`, ascending."""
         i = bisect_left(self._gid, gid, self._h)
         return self._gid[max(self._h, i - n):i].tolist()
 
-    def append(self, r) -> None:
-        gid = r[0]
+    def append(self, gid, sgid, oid, payload, exts, prio, status, shape,
+               born, cost=None) -> int:
+        """Add an object; returns its retained_object_bytes, `cost` when
+        known."""
+        if exts is None:
+            props, charge = None, 0
+        else:
+            props = _dump_props(exts)
+            charge = (properties_charge(exts) if cost is None
+                      else cost - retained_object_bytes(payload))
         seq = self._seq
         self._seq = seq + 1
-        blocks = self._blocks
-        blk = blocks[-1]
-        blk.append(r)
-        self._live[-1] += 1
-        b = self._b0 + len(blocks) - 1
+        cols = self._cols[-1]
+        cols.extend((gid, -1 if sgid is None else sgid, oid,
+                     -1 if prio is None else prio,
+                     -1 if status is None else status,
+                     -1 if shape is None else _shape_code(shape),
+                     charge, 0, -1))
+        k = len(self._cols) - 1
+        self._born[k].append(born)
+        self._pay[k].append(payload)
+        self._props[k].append(props)
+        self._live[k] += 1
+        size = (_delivery.OBJECT_RECORD_BYTES
+                + (len(payload) if payload else 0) + charge)
+        self.bytes += size
+        b = self._b0 + k
         g = self._gid
         n = len(g)
         if n > self._h and g[n - 1] == gid:
             i = n - 1
+        elif n == self._h or gid > g[n - 1]:
+            i = n
+            g.append(gid)
+            self._cnt.append(0)
+            self._fseq.append(seq)
+            self._fblk.append(b)
+            self._lseq.append(seq)
+            self._lblk.append(b)
         else:
             i = bisect_left(g, gid, self._h)
             if i == n or g[i] != gid:
@@ -951,46 +1092,82 @@ class _ObjectCache:
         self._lseq[i] = seq
         self._lblk[i] = b
         self._n += 1
-        if r[3]:
-            self._open_bytes += len(r[3])
-        if (len(blk) >= CACHE_BLOCK_OBJECTS
-                or self._open_bytes >= CACHE_BLOCK_BYTES):
+        self._nbytes += size
+        if (len(cols) >= CACHE_BLOCK_OBJECTS * _STRIDE
+                or self._nbytes >= CACHE_BLOCK_BYTES):
             self._seal()
+        return size
 
     def _seal(self) -> None:
-        blocks = self._blocks
-        blocks[-1] = tuple(blocks[-1]) if self._live[-1] else None
-        blocks.append([])
+        """Close the open block, freeing it when nothing in it lives."""
+        if self._live[-1]:
+            cols, props = self._cols[-1], self._props[-1]
+            parts, pos = [], 0
+            for j, p in enumerate(props):
+                if p is not None:
+                    cols[j * _STRIDE + _PSTART] = pos
+                    cols[j * _STRIDE + _PSTART + 1] = len(p)
+                    parts.append(p)
+                    pos += len(p)
+            self._props[-1] = b"".join(parts)
+            # A tuple of untracked payloads is untracked by the first
+            # collection that sees it; a list would be walked by each.
+            self._pay[-1] = tuple(self._pay[-1])
+        else:
+            self._free(len(self._cols) - 1)
+        self._cols.append(array("q"))
+        self._born.append(array("d"))
+        self._pay.append([])
+        self._props.append([])
         self._base.append(self._seq)
         self._live.append(0)
-        self._open_bytes = 0
-        if blocks[0] is None:
+        self._nbytes = 0
+        if self._cols[0] is None:
             self._trim()
 
-    def _kill(self, b) -> None:
-        """One record of block `b` is dead; free the block with none
-        left."""
-        k = b - self._b0
+    def _free(self, k) -> None:
+        self._cols[k] = self._born[k] = self._pay[k] = self._props[k] = None
+
+    def _kill(self, k, j, cost) -> None:
+        """Record `j` of held block `k`, of `cost`, is dead: its payload
+        and properties are released, and the block once none is left."""
+        self.bytes -= cost
         live = self._live
         live[k] -= 1
-        if live[k]:
+        if not live[k]:
+            if k == len(live) - 1:
+                self._seal()
+            else:
+                self._free(k)
+                if k == 0:
+                    self._trim()
             return
-        if k == len(live) - 1:
-            self._seal()
-        else:
-            self._blocks[k] = None
-            if k == 0:
-                self._trim()
+        pay = self._pay[k]
+        if pay.__class__ is tuple:
+            # Partly dead: sealed columns become lists again.
+            self._pay[k] = pay = list(pay)
+            self._props[k] = self._unjoin(k)
+        pay[j] = None
+        self._props[k][j] = None
+
+    def _unjoin(self, k) -> list:
+        """A sealed block's properties as one bytes object or None each."""
+        blob, cols = self._props[k], self._cols[k]
+        out = []
+        for x in range(_PSTART, len(cols), _STRIDE):
+            n = cols[x + 1]
+            out.append(None if n < 0 else blob[cols[x]:cols[x] + n])
+        return out
 
     def _trim(self) -> None:
         """Release the freed blocks at the front."""
-        blocks = self._blocks
+        cols = self._cols
         k = 0
-        while blocks[k] is None:
+        while cols[k] is None:
             k += 1
-        del blocks[:k]
-        del self._base[:k]
-        del self._live[:k]
+        for col in (cols, self._born, self._pay, self._props, self._base,
+                    self._live):
+            del col[:k]
         self._b0 += k
 
     def _drop_row(self, i) -> None:
@@ -1007,62 +1184,82 @@ class _ObjectCache:
                 del c[:h]
             self._h = 0
 
-    def _pop_row(self, i) -> list:
-        recs = self._scan(i, blocks_too=True)
-        self._n -= len(recs)
+    def _pop_row(self, i, recs=False) -> list:
+        """Drop row `i`: its records, or (group, object, cost) of each."""
+        locs = self._locs(i)
+        colsl = self._cols
+        costs = [self._cost(k, j) for k, j in locs]
+        if recs:
+            out = [self._rec(k, j) for k, j in locs]
+        else:
+            out = [(colsl[k][j * _STRIDE], colsl[k][j * _STRIDE + 2], c)
+                   for (k, j), c in zip(locs, costs)]
+        self._n -= len(locs)
         self._drop_row(i)
-        for b, _ in recs:
-            self._kill(b)
-        return [r for _, r in recs]
+        b0 = self._b0
+        for (k, j), c in zip(locs, costs):
+            # Killing may trim the front blocks, shifting held indexes.
+            self._kill(k + b0 - self._b0, j, c)
+        return out
+
+    def _readd(self, recs) -> None:
+        for r in recs:
+            self.append(*r[:9], cost=r[9])
 
     def merge(self, new) -> None:
-        """Add objects, keeping each group they land in in Object order."""
-        for r in new:
-            self.append(r)
-        for gid in {r[0] for r in new}:
+        """Add objects, given as append() arguments, keeping each group
+        they land in in Object order."""
+        for args in new:
+            self.append(*args)
+        for gid in {args[0] for args in new}:
             i = self._row(gid)
-            recs = self._scan(i)
-            ordered = sorted(recs, key=lambda r: r[2])
-            if any(a is not b for a, b in zip(recs, ordered)):
-                self._pop_row(i)
-                for r in ordered:
-                    self.append(r)
+            oids = [self._cols[k][j * _STRIDE + 2] for k, j in self._locs(i)]
+            if oids != sorted(oids):
+                recs = self._pop_row(i, recs=True)
+                recs.sort(key=lambda r: r[2])
+                self._readd(recs)
 
     def popleft(self):
-        """Drop and return the first object."""
+        """Drop the first object; returns its (group, object, cost)."""
         h = self._h
         b, s = self._fblk[h], self._fseq[h]
-        r = self._at(b, s)
+        k, j = self._at(b, s)
+        cols = self._cols[k]
+        x = j * _STRIDE
+        gid = cols[x]
+        cost = retained_object_bytes(self._pay[k][j]) + cols[x + _CHARGE]
+        out = (gid, cols[x + 2], cost)
         self._n -= 1
         left = self._cnt[h] - 1
         if left:
             self._cnt[h] = left
-            self._fblk[h], self._fseq[h] = self._next(r[0], b, s + 1)
+            self._fblk[h], self._fseq[h] = self._next(gid, k, s + 1)
         else:
             self._drop_row(h)
-        self._kill(b)
-        return r
+        self._kill(k, j, cost)
+        return out
 
-    def _next(self, gid, b, seq):
-        """(block, sequence number) of the first record of `gid` at or
-        after `seq`, which starts in block `b`."""
-        blocks, base, b0 = self._blocks, self._base, self._b0
-        k = b - b0
+    def _next(self, gid, k, seq):
+        """(block number, sequence number) of the first record of `gid`
+        at or after `seq`, which starts in held block `k`."""
+        colsl, base = self._cols, self._base
         while True:
-            blk = blocks[k]
-            if blk is not None:
+            cols = colsl[k]
+            if cols is not None:
                 s0 = base[k]
-                for j in range(max(seq - s0, 0), len(blk)):
-                    if blk[j][0] == gid:
-                        return b0 + k, s0 + j
+                for j in range(max(seq - s0, 0), len(cols) // _STRIDE):
+                    if cols[j * _STRIDE] == gid:
+                        return self._b0 + k, s0 + j
             k += 1
 
     def pop_group(self, gid) -> list:
+        """Drop a group; returns (group, object, cost) of its objects."""
         i = self._row(gid)
         return [] if i < 0 else self._pop_row(i)
 
     def drop_through(self, last) -> list:
-        """Drop and return the objects at or before Location `last`."""
+        """Drop the objects at or before Location `last`; returns their
+        (group, object, cost)."""
         out = []
         g = self._gid
         while self._n and g[self._h] < last[0]:
@@ -1071,12 +1268,26 @@ class _ObjectCache:
             recs = self._scan(self._h)
             if any(r[2] <= last[1] for r in recs):
                 self._pop_row(self._h)
-                for r in recs:
-                    if r[2] <= last[1]:
-                        out.append(r)
-                    else:
-                        self.append(r)
+                out += [(r[0], r[2], r[9]) for r in recs if r[2] <= last[1]]
+                self._readd([r for r in recs if r[2] > last[1]])
         return out
+
+    def expired(self, oldest):
+        """(Location of the newest object that arrived before `oldest`,
+        or None; the earliest arrival not before it, or inf)."""
+        last = None
+        floor = float("inf")
+        colsl, borns = self._cols, self._born
+        for i in range(self._h, len(self._gid)):
+            for k, j in self._locs(i):
+                t = borns[k][j]
+                if t < oldest:
+                    loc = (colsl[k][j * _STRIDE], colsl[k][j * _STRIDE + 2])
+                    if last is None or loc > last:
+                        last = loc
+                elif t < floor:
+                    floor = t
+        return last, floor
 
 
 class _CacheBudget:
@@ -1812,23 +2023,12 @@ class _RelayedTrack:
         oldest = time.monotonic() - age
         if self._born_floor >= oldest:
             return
-        last = None
-        floor = float("inf")
-        for c in self._cache:
-            if c[8] < oldest:
-                if last is None or (c[0], c[2]) > last:
-                    last = (c[0], c[2])
-            elif c[8] < floor:
-                floor = c[8]
-        self._born_floor = floor
+        last, self._born_floor = self._cache.expired(oldest)
         if last is None:
             return
-        size = 0
-        for c in self._cache.drop_through(last):
-            size += _record_cost(c)
-            self._note_lost(c[0], c[2])
-        self._cache_bytes -= size
-        _budget.bytes -= size
+        for gid, oid, _ in self._cache.drop_through(last):
+            self._note_lost(gid, oid)
+        self._sync_cache()
         self._prune()
 
     def _expire(self, session, group_id) -> bool:
@@ -2317,14 +2517,11 @@ class _RelayedTrack:
                 self._uncached = None
         if born is None:
             born = time.monotonic()
-        rec = _cache_record(gid, sgid, oid, payload, exts, prio, status,
-                            shape, born, cost)
-        self._cache.append(rec)
+        self._cache.append(gid, sgid, oid, payload, exts, prio, status,
+                           shape, born, cost)
         if born < self._born_floor:
             self._born_floor = born
-        size = _record_cost(rec)
-        self._cache_bytes += size
-        _budget.bytes += size
+        self._sync_cache()
         self.note_largest((gid, oid))
         _budget.touch(self)
         self._evict()
@@ -2332,14 +2529,19 @@ class _RelayedTrack:
     def _evict(self) -> None:
         """Drop the oldest objects past CACHE_BYTES, then hold the relay
         to its budget."""
-        while self._cache and self._cache_bytes > CACHE_BYTES:
-            dropped = self._cache.popleft()
-            size = _record_cost(dropped)
-            self._note_lost(dropped[0], dropped[2])
-            self._cache_bytes -= size
-            _budget.bytes -= size
+        cache = self._cache
+        while cache and cache.bytes > CACHE_BYTES:
+            gid, oid, _ = cache.popleft()
+            self._note_lost(gid, oid)
+        self._sync_cache()
         self._prune()
         _budget.enforce()
+
+    def _sync_cache(self) -> None:
+        """Charge the track and the budget what the cache holds."""
+        delta = self._cache.bytes - self._cache_bytes
+        self._cache_bytes += delta
+        _budget.bytes += delta
 
     def _evictable(self) -> bool:
         """Holds a group the budget may drop: anything but the newest
@@ -2360,15 +2562,15 @@ class _RelayedTrack:
         n = cache.group_count()
         if n < 2:
             return False
-        newest, oldest = cache[-1][8], cache[0][8]
+        newest, oldest = cache.born(-1), cache.born(0)
         floor = max(CACHE_FLOOR_S, _lag_limit + (newest - oldest) / (n - 1))
-        return newest - cache.first_of(1)[8] >= floor
+        return newest - cache.born(1) >= floor
 
     def cache_span_s(self) -> float:
         """Seconds between the oldest and the newest cached arrival."""
         if not self._cache:
             return 0.0
-        return round(max(self._cache[-1][8] - self._cache[0][8], 0.0), 1)
+        return round(max(self._cache.born(-1) - self._cache.born(0), 0.0), 1)
 
     def _drop_oldest_group(self) -> None:
         """Drop every cached object of the oldest group, so the cache
@@ -2392,23 +2594,21 @@ class _RelayedTrack:
 
     def _drop_group(self, gid) -> None:
         objs = self._cache.pop_group(gid)
-        size = sum(map(_record_cost, objs))
-        self._note_lost(gid, max(c[2] for c in objs))
-        self._cache_bytes -= size
-        _budget.bytes -= size
+        self._note_lost(gid, max(c[1] for c in objs))
+        self._sync_cache()
         self._prune()
 
     def _prune(self) -> None:
         """Forget per-group state below the oldest cached group, and what
         only live arrivals consult below STATE_GROUPS behind the newest;
         an empty cache leaves the budget's LRU."""
-        head = self._cache[0] if self._cache else None
+        head = self._cache.head() if self._cache else None
         floor = (head[0] if head is not None
                  else self.largest[0] if self.largest else 0)
         if self._lost:
             self._lost = {g: o for g, o in self._lost.items() if g >= floor}
         if self._gaps:
-            oldest = None if head is None else (head[0], head[2])
+            oldest = head
             self._gaps = [g for g in self._gaps if g[1] is None
                           or (oldest is not None and g[1] > oldest)]
         if head is None:
@@ -2452,7 +2652,7 @@ class _RelayedTrack:
                                                       d.window[1])
                        if d.passes(c[0], c[2])
                        and (d.filters is None
-                            or d.admits(c[1], c[2], c[5], _thaw_props(c[4])))),
+                            or d.admits(c[1], c[2], c[5], c[4]))),
                       key=lambda c: (c[0], c[1], c[2]))
         if objs:
             _budget.touch(self)
@@ -2461,11 +2661,10 @@ class _RelayedTrack:
         # never --lag-limit: stamps shift by that limit minus the deadline.
         limit = _tightest(self._timeout_s(d), self._max_age_s())
         shift = None if limit is None else limit - lane.deadline
-        for c in objs:
-            gid, sgid, oid, payload, exts, prio, status, shape, born = c
-            lane.offer(_item(gid, False, sgid, oid, payload,
-                             _thaw_props(exts), prio, _thaw_status(status),
-                             shape, cost=_record_cost(c),
+        for gid, sgid, oid, payload, exts, prio, status, shape, born, cost \
+                in objs:
+            lane.offer(_item(gid, False, sgid, oid, payload, exts, prio,
+                             status, shape, cost=cost,
                              born=None if shift is None else born + shift))
         for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
             if (gid, sgid) in self._ended:
@@ -2482,8 +2681,7 @@ class _RelayedTrack:
         self._expire_cache()
         if not self._cache:
             return False
-        first = (self._cache[0][0], self._cache[0][2])
-        return start >= first
+        return start >= self._cache.head()
 
     def holds_through(self, end) -> bool:
         """The cache reaches `end`: it holds an object at or past it, the
@@ -2491,11 +2689,11 @@ class _RelayedTrack:
         if not self._cache:
             return False
         newest = self._cache.groups()[-1]
-        if newest > end[0] or any(c[6] == ObjectStatus.END_OF_TRACK
-                                  for c in self._cache.group(newest)):
+        if newest > end[0] or any(st == ObjectStatus.END_OF_TRACK for _, st
+                                  in self._cache.group_oids(newest)):
             return True
-        return any(c[2] >= end[1] or c[6] == ObjectStatus.END_OF_GROUP
-                   for c in self._cache.group(end[0]))
+        return any(oid >= end[1] or st == ObjectStatus.END_OF_GROUP
+                   for oid, st in self._cache.group_oids(end[0]))
 
     def open_gap(self) -> None:
         """Note a pause: what is published from just past Largest, or
@@ -2517,7 +2715,7 @@ class _RelayedTrack:
         """The last cached Location of a group, which is its END_OF_GROUP
         when held; (group, 0) when none is held, and never before
         `start`."""
-        oids = [c[2] for c in self._cache.group(group_id)]
+        oids = [oid for oid, _ in self._cache.group_oids(group_id)]
         return max(start, (group_id, max(oids) if oids else 0))
 
     def cached_range(self, start, end):
@@ -2526,18 +2724,13 @@ class _RelayedTrack:
         across subgroups (§3.2.1)."""
         self._expire_cache()
         out = []
-        for gid, sgid, oid, payload, exts, prio, status, *_ in \
-                self._cache.between(start[0],
-                                    None if end is None else end[0]):
-            if (gid, oid) < start:
+        for o in self._cache.fetch_rows(start[0],
+                                        None if end is None else end[0]):
+            loc = (o[0], o[2])
+            if loc < start or (end is not None and loc > end):
                 continue
-            if end is not None and (gid, oid) > end:
-                continue
-            out.append((gid, sgid, oid, payload,
-                        exts if exts is None else _thaw_props(exts), prio,
-                        status if status is None
-                        else _OBJECT_STATUS.get(status, status)))
-        out.sort(key=lambda o: (o[0], o[2]))
+            out.append(o)
+        out.sort(key=_LOCATION)
         if out:
             _budget.touch(self)
         return out
@@ -3228,16 +3421,13 @@ async def _backfill(track, msg, largest) -> None:
         return
     held = {(c[0], c[2]) for c in track._cache.between(start[0], end[0])}
     now = time.monotonic()
-    new = [_cache_record(o.group_id, o.subgroup_id, o.object_id,
-                         bytes(o.payload), o.extensions or None,
-                         o.publisher_priority, o.status, None, now)
+    new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
+            o.extensions or None, o.publisher_priority, o.status, None, now)
            for o in objs if (o.group_id, o.object_id) not in held]
     track._cache.merge(new)
     if new and now < track._born_floor:
         track._born_floor = now
-    size = sum(map(_record_cost, new))
-    track._cache_bytes += size
-    _budget.bytes += size
+    track._sync_cache()
     _budget.touch(track)
     track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)

@@ -84,7 +84,7 @@ def test_the_record_charge_covers_a_cached_object(monkeypatch):
     per = _traced(lambda: [t._remember(0, 0, oid, _payload(oid), None, 128,
                                        ObjectStatus.NORMAL)
                            for oid in range(_N)]) / _N - 3
-    assert 0.75 * OBJECT_RECORD_BYTES < per <= OBJECT_RECORD_BYTES, per
+    assert 0.4 * OBJECT_RECORD_BYTES < per <= OBJECT_RECORD_BYTES, per
     t._drop_cache()
 
 
