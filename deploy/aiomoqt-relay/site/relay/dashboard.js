@@ -42,13 +42,19 @@ function relayUrls(relay) {
           quic: `moqt://${host}:${relay.quic_port || relay.port}`};
 }
 
-// Cache in use against its budget, and the per-track bound: a group count or bytes.
-function cacheText(c, T) {
-  if (!c) return '—';
-  const track = none(c.track_bytes) ? `${fmt.num(c.groups)} groups / ${fmt.bytes(c.bytes)}`
-    : fmt.bytes(c.track_bytes) + (none(c.floor_s) ? '' : `, newest ${c.floor_s} s kept`);
-  return `${fmt.bytes(T.cache_bytes)} of ${fmt.bytes(c.budget)} · per track ${track} · `
-    + fmt.plural(T.cache_evictions, 'eviction');
+const mib = (b) => b / 2 ** 20;
+
+// Cache held of its budget, in one unit: "48.9/256 MiB".
+function cacheShort(held, budget) {
+  const h = mib(held || 0);
+  return `${h < 100 ? h.toFixed(1) : Math.round(h)}/${Math.round(mib(budget))} MiB`;
+}
+
+// The per-track bound, a group count or bytes, and evictions.
+function cacheDetail(c, T) {
+  const track = none(c.track_bytes) ? `${fmt.num(c.groups)} groups / ${Math.round(mib(c.bytes))} MiB`
+    : `${Math.round(mib(c.track_bytes))} MiB` + (none(c.floor_s) ? '' : `, newest ${c.floor_s} s kept`);
+  return `cache per track ${track} · ${fmt.plural(T.cache_evictions, 'eviction')}`;
 }
 
 function renderRelay(s, urls) {
@@ -63,8 +69,14 @@ function renderRelay(s, urls) {
     .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
   $('uptime').textContent = fmt.uptime(r.uptime_s)
     + (r.watchdog_s ? ` · watchdog ${r.watchdog_s}s` : '');
-  $('workers').textContent = fmt.num(r.workers);
-  $('cache').textContent = cacheText(r.cache, s.totals || {});
+  const workers = $('badge-workers'), cache = $('badge-cache'), c = r.cache;
+  workers.hidden = none(r.workers);
+  if (!workers.hidden) workers.textContent = fmt.plural(r.workers, 'worker');
+  cache.hidden = !c || none(c.budget);
+  if (!cache.hidden) {
+    cache.textContent = cacheShort((s.totals || {}).cache_bytes, c.budget);
+    cache.title = cacheDetail(c, s.totals || {});
+  }
   $('date').textContent = fmt.date(s.generated);
   $('hw').textContent = [h.arch, h.cores && `${h.cores} vCPU`,
                          h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`]
