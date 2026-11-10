@@ -327,7 +327,8 @@ function trackDetail(r) {
     `${r.namespace} / ${r.name}`,
     `peak ${fmt.num(r.peak)} subscribers · ${fmt.bytes(r.bytes_out)} delivered · `
       + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
-    `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
+    `cache ${none(r.cache_seconds) ? '' : r.cache_seconds.toFixed(1) + ' s, '}`
+      + `${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
       + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
     ...(none(T.cache_budget) ? [] : [
       `relay cache ${fmt.bytes(T.cache_bytes)} of ${fmt.bytes(T.cache_budget)} · `
