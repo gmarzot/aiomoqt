@@ -80,7 +80,7 @@ async def _until(cond, what, tries=250):
         if cond():
             return
         await asyncio.sleep(0.02)
-    pytest.fail(what)
+    pytest.fail(what() if callable(what) else what)
 
 
 class _Client(_MOQTSessionMixin):
@@ -197,7 +197,8 @@ async def test_finished_fetches_release_their_request_streams(
         sessions.update(new)
         before.update(dict.fromkeys(new, 0))
         await _until(lambda: _bound(sessions) == before,
-                     "FETCH request streams still bound")
+                     lambda: f"request streams bound {_bound(sessions)}, "
+                             f"before {before}")
         assert not any(s._fetch_request_streams or s._fetch_closing
                        for s in sessions.values())
         cancelled = [r.getMessage() for r in caplog.records
