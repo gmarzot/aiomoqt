@@ -291,9 +291,11 @@ def test_descending_request_serves_groups_in_reverse():
     assert order == int(GroupOrder.DESCENDING)
 
 
-def test_cache_is_not_bounded_by_a_group_count():
-    t = _track([(g, 0) for g in range(40)])
-    assert {entry[0] for entry in t._cache} == set(range(40))
+def test_cache_drops_oldest_groups():
+    t = _track([(g, 0) for g in range(relay.CACHE_GROUPS + 4)])
+    groups = {entry[0] for entry in t._cache}
+    assert len(groups) == relay.CACHE_GROUPS
+    assert min(groups) == 4                      # oldest four evicted
 
 
 def test_cache_drops_on_the_byte_bound(monkeypatch):
