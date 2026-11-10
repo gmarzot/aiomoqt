@@ -174,7 +174,7 @@ print(ok.parameters.get(ParamType.AUTH_TOKEN))
 
 Auth is control-plane only; there is no per-object authentication.
 
-For session admission with a Common Access Token, `MOQTClient(auth=CatAuth(key_id, secret))` presents a token in SETUP that grants every action and does not expire, and `MOQTServer(auth=...)` refuses a session without a valid one. The tools and aiomoqt-relay take `--auth-key KID:SECRET` (or `AIOMOQT_AUTH_KEY`) and `--auth-token-type` (default 1; it must match the relay's). Tokens use the format moqx verifies, so moqx and aiomoqt-relay can share a key. From d16 a server checks each request too: the SETUP token's grants or a token on the request must cover its action, namespace and track. `CatAuth.mint(actions, namespace=..., track=...)` makes a narrower token. At d14 only SETUP is checked.
+For session admission with a Common Access Token, `MOQTClient(auth=CatAuth(key_id, secret))` presents a token in SETUP that grants every action and does not expire, and `MOQTServer(auth=...)` refuses a session without a valid one. The tools and aiomoqt-relay take `--auth-key KID:SECRET` (or `AIOMOQT_AUTH_KEY`) and `--auth-token-type` (default 1; it must match the relay's). Tokens use the format moqx verifies, so moqx and aiomoqt-relay can share a key. From d16 a server checks each request too: the SETUP token's grants or a token on the request must cover its action, namespace and track. `CatAuth.mint(actions, namespace=..., track=...)` makes a narrower token. At d14 only SETUP is checked. The token flows are charted in [docs/cat-auth.md](docs/cat-auth.md).
 
 ## Media
 

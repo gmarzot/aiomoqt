@@ -28,7 +28,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
 | `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
 | `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public aiomoqt-relay |
-| `docs/` | bench and demo runbooks |
+| `docs/` | bench and demo runbooks; CAT auth flows (`cat-auth.md`) |
 
 ## Setup
 
