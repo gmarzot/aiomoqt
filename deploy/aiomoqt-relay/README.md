@@ -8,6 +8,7 @@ dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, wit
 | `relay` | `aiomoqt-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, pauses a track upstream once no viewer has watched it for 60 s (`--pause-after`), writes `status/` and `relay-logs/` |
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
+| `peers` | `relay-peers` | `peers.py`: samples `status/status.json` every 5 s into `peers/peers.db` (IPs, roles, namespaces and tracks published or subscribed; 90 days of detail, daily totals kept) and writes `stats/peers.json` every minute for `/private/peers/`; no network |
 
 Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (OCI, Ubuntu 24.04 aarch64,
 Docker with Compose v2). The subnet's security list opens UDP 4433-4443 and TCP 80/443; the host's
@@ -43,7 +44,8 @@ relay-swap.sh, relay-rollback.sh
                           make an image the relay, and undo that (deploy/aiomoqt-relay here)
 rollback/                 per swap: the image it replaced (also tagged aiomoqt:rollback),
                           relay.toml and compose.yml; rollback/last is the newest
-stats/                    GoAccess reports: index.html (visitors), crawlers.html
+stats/                    GoAccess reports: index.html (visitors), crawlers.html; peers.json
+peers.py, peers/          the peer log collector and its SQLite database
 stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
 build/                    relay image build context
 ```
@@ -56,9 +58,9 @@ place and `/stats/` fails.
 ```sh
 tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml relay-swap.sh relay-rollback.sh site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
-cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
-# The relay and GoAccess run with no capabilities, so root must own what they write.
-sudo chown root:ubuntu status relay-logs cores stats && sudo chmod 2775 status relay-logs cores stats
+cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats peers
+# The relay, GoAccess and the peer log run with no capabilities, so root must own what they write.
+sudo chown root:ubuntu status relay-logs cores stats peers && sudo chmod 2775 status relay-logs cores stats peers
 printf 'moqadmin:%s\n' "$(openssl passwd -6)" > stats.htpasswd    # prompts for the password
 sudo tee /etc/logrotate.d/aiomoqt-relay >/dev/null <<'ROT'
 /home/ubuntu/aiomoqt-relay/logs/access.log {
@@ -221,6 +223,7 @@ image that produced one (`docker image ls aiomoqt`) for `gdb`, and delete them b
 curl -s https://aiomoqt-relay.marzresearch.net/status/status.json | python3 -c 'import json,sys,time; s=json.load(sys.stdin); print(round(time.time()-s["generated"]), "s old,", s["totals"]["sessions"], "sessions")'
 docker run --rm --network host --entrypoint python aiomoqt:dev -c 'import asyncio; from aiomoqt.tools import moq_interop_relay as r; print(asyncio.run(r._self_probe("127.0.0.1", 4443, True, 18, 8.0)))'
 curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/stats/    # 401 without the password
+curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/private/peers/    # 401 without the password
 curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/relay/logs/files/relay.log    # 401 too
 ```
 
