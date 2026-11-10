@@ -17,6 +17,10 @@ H.264. Every LOC track passes through unchanged. The rungs, H.264 or AV1
 (--codec), are encoded from the video by cymedia (uv pip install 'aiomoqt[abr]'), keep its group and
 object IDs, open each group on a key frame and join its catalog altGroup.
 
+The ladder encodes at the catalog's framerate, waiting up to 5 s for a
+source catalog update that gives one before assuming 30 fps. Framerates
+and passthrough bitrates the source adds later are republished.
+
 Each -i interval reports, per output track, the delay from a source
 frame's arrival to its hand-off to the output track; rungs add the
 encoder's share. --no-ladder measures the hand-off alone.
@@ -28,7 +32,7 @@ import importlib
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
@@ -54,6 +58,7 @@ CERT = find_cert()
 KEY = find_key(CERT)
 _QUEUE = 512          # frames per output track awaiting hand-off
 _FALLBACK_FPS = 30.0
+_FPS_WAIT_S = 5.0     # from the first key frame
 _LADDER_READY_S = 10.0
 _SHUTDOWN_DRAIN_S = 2.0
 EXIT_UNAVAILABLE = 69
@@ -164,13 +169,13 @@ _NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT
 _SOURCE_POLL_S = 0.2
 
 
-async def _subscribe_source(args, session, on_frame):
+async def _subscribe_source(args, session, on_frame, on_catalog):
     """The source's MediaSubscriber and catalog. With --source, waits up
     to the setup timeout for a source not yet published on the relay."""
     timeout = _cli.setup_timeout(args)
     deadline = time.monotonic() + timeout
     sub = MediaSubscriber(
-        session, args.namespace, on_frame=on_frame,
+        session, args.namespace, on_frame=on_frame, on_catalog=on_catalog,
         track_filter=lambda t: t.packaging == PACKAGING_LOC)
     while True:
         try:
@@ -253,29 +258,79 @@ class _Ingest:
         if not args.no_ladder and not self.rungs:
             raise SystemExit(f"  error: no default rung below the "
                              f"source's {self.video.height}p; give --rung")
-        if self.video.framerate:
-            self.fps = frame_rate(self.video.framerate)
-        else:
-            logger.warning(f"abr_ingest: catalog gives no framerate for "
-                           f"'{self.video_name}'; assuming {_FALLBACK_FPS:g}")
-            self.fps = frame_rate(_FALLBACK_FPS)
+        self.fps: Optional[Tuple[int, int]] = None
+        self._first_key: Optional[int] = None
         self.ladder: Optional[AbrLadder] = None
         self.outputs: Dict[str, _Output] = {}
         self.pub: Optional[FanoutPublisher] = None
         self.before_start = 0
         self.keyed = asyncio.Event()
         self._feeders: List[asyncio.Task] = []
+        self._republishing: Set[asyncio.Task] = set()
 
     def on_frame(self, name: str, frame: LocFrame, group_id: int,
                  object_id: int) -> None:
         now = time.monotonic_ns()
-        if name == self.video_name and frame.key_frame:
-            if self.ladder is None and self.rungs:
+        if (name == self.video_name and frame.key_frame
+                and not self.keyed.is_set() and self._rate_known(now)):
+            if self.rungs:
                 self._start_ladder()
             self.keyed.set()
         if name == self.video_name and self.ladder is not None:
             self.ladder.push(frame, group_id, object_id)
         self._hand(name, frame, group_id, now)
+
+    def _rate_known(self, now: int) -> bool:
+        """Whether the ladder can start: the catalog gives a framerate, or
+        _FPS_WAIT_S has passed since the first key frame (then
+        _FALLBACK_FPS)."""
+        if not self.rungs:
+            return True
+        if self.video.framerate:
+            self.fps = frame_rate(self.video.framerate)
+            return True
+        if self._first_key is None:
+            self._first_key = now
+            logger.info(f"abr_ingest: waiting up to {_FPS_WAIT_S:g} s for "
+                        f"a framerate for '{self.video_name}'")
+        if now - self._first_key < _FPS_WAIT_S * 1e9:
+            return False
+        logger.warning(f"abr_ingest: catalog gives no framerate for "
+                       f"'{self.video_name}'; assuming {_FALLBACK_FPS:g}")
+        self.fps = frame_rate(_FALLBACK_FPS)
+        return True
+
+    def on_catalog(self, catalog: Catalog) -> None:
+        """A source catalog update. Once publishing, framerates (rungs:
+        the video's) and passthrough bitrates it adds or changes are
+        republished."""
+        self.catalog = catalog
+        src = {t.name: t for t in catalog.tracks
+               if t.packaging == PACKAGING_LOC}
+        self.video = src.get(self.video_name, self.video)
+        if self.pub is None:
+            return
+        out = Catalog.from_json(self.pub.catalog_track.catalog.to_json())
+        rungs = {r.name for r in self.rungs}
+        changed = []
+        for t in out.tracks:
+            rung = t.name in rungs
+            s = self.video if rung else src.get(t.name)
+            if s is None:
+                continue
+            for field in ('framerate',) if rung else ('framerate', 'bitrate'):
+                value = getattr(s, field)
+                if value is not None and getattr(t, field) != value:
+                    setattr(t, field, value)
+                    changed.append(f"{t.name} {field} {value:g}")
+        if not changed:
+            return
+        out.generatedAt = int(time.time() * 1000)
+        logger.info(f"abr_ingest: catalog republished: {', '.join(changed)}")
+        task = asyncio.ensure_future(
+            self.pub.catalog_track.publish_catalog(out))
+        self._republishing.add(task)
+        task.add_done_callback(self._republishing.discard)
 
     def _start_ladder(self) -> None:
         cymedia = importlib.import_module("cymedia")
@@ -368,6 +423,8 @@ class _Ingest:
             return
         for s in sessions:
             s.drain()
+        if self._republishing:
+            await asyncio.wait(self._republishing, timeout=_SHUTDOWN_DRAIN_S)
         await self.pub.catalog_track.finish()
         deadline = time.monotonic() + _SHUTDOWN_DRAIN_S
         tracks = [*self.pub.tracks.values(), *self.pub.catalog_track.members]
@@ -433,7 +490,12 @@ async def run(args) -> int:
             if ingest is not None:
                 ingest.on_frame(name, frame, group_id, object_id)
 
-        sub, catalog = await _subscribe_source(args, source, on_frame)
+        def on_catalog(catalog):
+            if ingest is not None:
+                ingest.on_catalog(catalog)
+
+        sub, catalog = await _subscribe_source(args, source, on_frame,
+                                               on_catalog)
         ingest = _Ingest(args, sub, catalog)
         print(f"  source tracks: {', '.join(sub.tracks)}; video "
               f"'{ingest.video.name}' {ingest.video.width}x"
