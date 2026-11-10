@@ -251,8 +251,9 @@ PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
-# Track names whose send lanes never shed their newest group.
-CATALOG_NAMES = (CATALOG_TRACK, b"catalog.json")
+# Catalog track names: the cache keeps their newest group while the
+# publisher is live, and their send lanes never shed it.
+CATALOG_TRACKS = frozenset((CATALOG_TRACK, b"catalog.json"))
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
 DEFAULT_GROUP_ORDER_PROPERTY = 0x22
@@ -436,8 +437,6 @@ CACHE_BYTES = CACHE_BUDGET_BYTES // 8
 CACHE_FLOOR_S = 10.0
 # Groups below where upstream delivery began that a join backfills.
 BACKFILL_GROUPS = 8
-# Their newest group stays cached while their publisher is live.
-CATALOG_TRACKS = frozenset((CATALOG_TRACK, b"catalog.json"))
 
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
@@ -977,7 +976,7 @@ class _RelayLane(SendLane):
         writer.lane = self
         self.track = track
         self.d = d
-        self._catalog = track.key[1] in CATALOG_NAMES
+        self._catalog = track.key[1] in CATALOG_TRACKS
         _lanes.add(self)
         track._lanes.add(self)
 
