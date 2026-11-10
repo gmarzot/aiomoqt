@@ -746,7 +746,9 @@ class _RelayDelivery:
             return None
         track, d, session = self.track, self.d, self.session
         if not (shape.__class__ is tuple and shape and shape[0] == "DGRAM"
-                ) and (id(session), gid, sgid) not in track._streams:
+                ) and ((id(session), gid, sgid) not in track._streams
+                       or (gid, sgid) in track._ends_due):
+            # A stream end queued behind leaves with the lane's last write.
             return None
         if track._forward_one(session, d.alias, gid, sgid, oid, payload,
                               exts, prio, status, shape, encoded,
@@ -987,6 +989,8 @@ class _RelayedTrack:
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
         self.queue = asyncio.Queue()
+        # (group, subgroup) -> stream ends queued for the forward loop.
+        self._ends_due: dict = {}
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
         # terminal that lands first waits in the queue for it.
@@ -1503,6 +1507,7 @@ class _RelayedTrack:
                  "END" if clean else "RESET", reset_code))
             if clean:
                 self._ended.add(k)
+                self._end_due(k, 1)
             elif self._multi:
                 self._reset.add(k)
         self._ensure_drain()
@@ -1622,12 +1627,15 @@ class _RelayedTrack:
                 shape = (False,) + tuple(shape[1:])
             else:
                 self._opened.add(key)
+        status = getattr(msg, "status", None)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              payload, msg.extensions or None,
              128 if prio is None else prio,
-             getattr(msg, "status", None),
+             status,
              shape))
+        if status in _STREAM_ENDS:
+            self._end_due((gid, subgroup_id or 0), 1)
         self._ensure_drain()
 
     def _ensure_drain(self) -> None:
@@ -1688,10 +1696,19 @@ class _RelayedTrack:
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
 
+    def _end_due(self, k, n) -> None:
+        n += self._ends_due.get(k, 0)
+        if n > 0:
+            self._ends_due[k] = n
+        else:
+            self._ends_due.pop(k, None)
+
     async def _forward_loop(self):
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
+            if status in _STREAM_ENDS:
+                self._end_due((gid, sgid), -1)
             if status == "DONE":
                 # Terminal, in queue order: each subscriber's PUBLISH_DONE
                 # follows what its lane already holds.

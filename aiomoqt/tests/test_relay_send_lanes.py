@@ -792,6 +792,7 @@ class _Taking(_Fake):
             self.log.append(("fin", sid))
 
     def stream_write(self, sid, data, end_stream=False):
+        self.log.append(("write", sid))
         self.wire[sid] += bytes(data)
         if end_stream:
             self.log.append(("fin", sid))
@@ -831,6 +832,25 @@ async def test_an_object_on_an_open_stream_is_written_from_offer(lane_sends):
         assert sub.kinds("open") == [("open", 3, False)]
         assert len(sub.kinds("nowait")) == 3 and sub.kinds("fin") == [("fin", 3)]
         assert track._objects_out == 4
+    finally:
+        track.close()
+
+
+async def test_a_last_object_queued_with_its_end_leaves_in_one_write(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(3):
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_object(_obj(0, 3), 0, 0, 0, 0)
+        track.on_stream_end(0, 0)
+        await _settle()
+        assert lane_sends == [0, 3], lane_sends
+        assert len(sub.kinds("nowait")) == 3 and not sub.kinds("write")
+        assert sub.kinds("fin") == [("fin", 3)] and not track._ends_due
     finally:
         track.close()
 
