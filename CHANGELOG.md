@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `pub_media --ts` and `--h264` keep filler data and end-of-sequence or end-of-stream NAL units in their access unit, for H.264 and H.265. A CBR source (NVENC or x264 `nal-hrd=cbr`) had each filler NAL published as a frame of its own, which decoders reject.
 - aiomoqt-relay's deploy gains a peer log: a `peers` service samples `status.json` into SQLite, and `/private/peers/` lists each IP's role, sessions and a sample of the namespaces it published or subscribed, per namespace its publisher and subscriber IPs, and daily totals.
 - The aiomoqt-relay dashboard's version badge also shows the worker count and the cache held of its budget (`48.9/256 MiB`; the per-track bound and evictions on hover). The URL box's labels line up with NAME and HOSTNAME.
 - abr_ingest follows its source's catalog updates: the ladder waits up to 5 s for a framerate before assuming 30 fps, and framerates and passthrough bitrates the source adds later are republished. A 60 fps `pub_media --ts` source, whose first catalog has neither until it has measured them, got rungs at about 1.7× their bitrate and a passthrough track with no bitrate.
