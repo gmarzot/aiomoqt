@@ -1,6 +1,6 @@
-"""Relay cache bound with non-consecutive group IDs: CACHE_GROUPS counts
-groups held, so a publisher numbering groups by timestamp keeps its
-previous groups cached for fills and FETCH. Two tracks per session."""
+"""Relay cache with non-consecutive group IDs: a publisher numbering
+groups by timestamp keeps its previous groups cached for fills and
+FETCH. Two tracks per session."""
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.params import D20ParamType, LocationFilter
 from aiomoqt.tests import test_relay_fill as fill
@@ -19,17 +19,19 @@ _BASE = 1_792_805_227_259
 _STEP = 4_000
 
 
-def test_cache_holds_the_newest_groups_when_ids_skip():
+def test_cache_holds_the_newest_groups_when_ids_skip(monkeypatch):
     t = relay._RelayedTrack(((b"relay", b"sparse"), b"meta"))
     groups = [_BASE + k * _STEP for k in range(10)]
+    cost = relay.retained_object_bytes(b"x", None)
+    monkeypatch.setattr(relay, "CACHE_BYTES", 6 * cost)
     for g in groups:
         for oid in (0, 1):
             t._remember(g, 0, oid, b"x", None, 128, None)
-    kept = groups[-relay.CACHE_GROUPS:]
+    kept = groups[-3:]
     assert sorted({c[0] for c in t._cache}) == kept
-    assert sorted(t._groups) == kept
+    assert list(t._cache.groups()) == kept
     assert t.cache_covers((kept[0], 0))
-    assert not t.cache_covers((groups[-relay.CACHE_GROUPS - 1], 1))
+    assert not t.cache_covers((groups[-4], 1))
 
 
 class _Catalog(PublishedTrack):

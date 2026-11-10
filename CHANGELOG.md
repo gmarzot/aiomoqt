@@ -4,6 +4,7 @@
 
 - aiomoqt-relay writes a datagram, or an object on a stream already open to the viewer, straight from the forward loop when the viewer's send lane is empty, instead of waking the lane's task for every object. New streams and cache replays still go through the lane.
 - load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
+- aiomoqt-relay's cache is bounded by memory only: `--cache-bytes` across all tracks and an eighth of it per track, with no 8-group cap, so a track with one object per group (LOC audio) keeps minutes of objects for FETCH instead of 0.17 s. Past the budget the least recently used track loses its oldest group, taken first from tracks holding more than their newest 10 s (at least `--lag-limit` plus one group). A `catalog` or `catalog.json` track keeps its newest group while its publisher is live. `status.json` gains `tracks[].cache_seconds`.
 
 ## v0.15.0rc1
 
