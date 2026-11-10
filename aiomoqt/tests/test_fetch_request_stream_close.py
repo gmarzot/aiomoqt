@@ -102,6 +102,8 @@ class _Ops:
         s.stream_fin = lambda sid: self._end(s, sid, "fin", s._LOCAL_HALF)
         s.stream_stop_sending = lambda sid, code: self.ops.append(
             ("stop", sid))
+        s._request_half_ended = lambda sid, half: self.ops.append(
+            ("peer ended", sid))
         self.s = s
 
     def _end(self, s, sid, op, half):
@@ -116,7 +118,7 @@ def test_stop_sending_waits_for_the_reply():
     t.s._end_fetch_request(4)
     assert t.ops == [("fin", 0)]
     t.s._fetch_answered(4, error=False)
-    assert t.ops == [("fin", 0), ("stop", 0)]
+    assert t.ops == [("fin", 0), ("stop", 0), ("peer ended", 0)]
     assert t.s._fetch_closing == {0}
 
 
@@ -125,13 +127,13 @@ def test_a_reply_before_the_data_end_waits_for_it():
     t.s._fetch_answered(4, error=False)
     assert t.ops == []
     t.s._end_fetch_request(4)
-    assert t.ops == [("fin", 0), ("stop", 0)]
+    assert t.ops == [("fin", 0), ("stop", 0), ("peer ended", 0)]
 
 
 def test_a_request_error_closes_at_once():
     t = _Ops()
     t.s._fetch_answered(4, error=True)
-    assert t.ops == [("fin", 0), ("stop", 0)]
+    assert t.ops == [("fin", 0), ("stop", 0), ("peer ended", 0)]
 
 
 def test_a_peer_half_already_ended_gets_no_stop_sending():

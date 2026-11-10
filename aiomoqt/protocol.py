@@ -4013,13 +4013,16 @@ class _MOQTSessionMixin:
 
     def _stop_request_half(self, sid: int) -> None:
         """STOP_SENDING on the peer's half of a finished FETCH's request
-        stream; RFC 9000 §3.5 and §5.2 have the peer reset it."""
+        stream; RFC 9000 §3.5 and §5.2 have the peer reset it. That half
+        counts as ended here: a FIN already in flight may never surface
+        once its receive side is stopped."""
         if (self._request_stream_ends or {}).get(sid, 0) & self._PEER_HALF:
             return
         if self._fetch_closing is None:
             self._fetch_closing = set()
         self._fetch_closing.add(sid)
         self.stream_stop_sending(sid, StreamResetCode.CANCELLED)
+        self._request_half_ended(sid, self._PEER_HALF)
 
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
