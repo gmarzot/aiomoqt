@@ -171,7 +171,8 @@ EXAMPLE_SCENARIO = {
 # Events on events_queue (all tagged group/shard):
 #   {'kind':'evt','ev': 'joined'|'join_failed'|'left'|'ended'|'died', ...}
 #   {'kind':'group_stats', 'live', 'dt', 'rx_bytes', 'rx_objs' (over dt),
-#    'lat_p90_ms', 'total_bytes', 'total_objs', ...}   every STATS_INTERVAL_S
+#    'lat_p90_ms', 'lat_p99_ms', 'total_bytes', 'total_objs', ...}
+#   every STATS_INTERVAL_S
 # ---------------------------------------------------------------------------
 
 async def _slot_task(cfg, relay, slot, events_q, group, shard,
@@ -362,7 +363,7 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
             total_bytes = reaped_bytes
             total_objs = reaped_objs
             track_objs = dict(reaped_track_objs)
-            worst_p90 = 0.0
+            worst_p90 = worst_p99 = 0.0
             for s in slots.values():
                 for name, st in s["stats"].items():
                     snap = st.snapshot()
@@ -372,13 +373,15 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
                     total_objs += snap["total_objs"]
                     track_objs[name] += snap["total_objs"]
                     worst_p90 = max(worst_p90, snap["lat_p90_ms"])
+                    worst_p99 = max(worst_p99, snap["lat_p99_ms"])
                 if s["live"]:
                     live += 1
             _post(events_q, {
                 "kind": "group_stats", "group": group, "shard": shard,
                 "live": live, "dt": dt,
                 "rx_bytes": rx_bytes, "rx_objs": rx_objs,
-                "lat_p90_ms": worst_p90, "total_bytes": total_bytes,
+                "lat_p90_ms": worst_p90, "lat_p99_ms": worst_p99,
+                "total_bytes": total_bytes,
                 "total_objs": total_objs, "track_objs": track_objs,
                 "t": time.monotonic(),
             })
@@ -927,7 +930,7 @@ def main():
     if args.report:
         csv_f = open(args.report, "w")
         csv_f.write("t,namespace,track,live,target,rx_mbps,p90_ms,"
-                    f"joins,leaves,fails,{','.join(CPU_FIELDS)}\n")
+                    f"joins,leaves,fails,{','.join(CPU_FIELDS)},p99_ms\n")
         cpu_csv = _csv_line(cpu_fields())
 
     start = time.monotonic()
@@ -1002,6 +1005,9 @@ def main():
                 p90 = max((s.stats.get("lat_p90_ms", 0.0)
                            for g in groups.values() for s in g.shards),
                           default=0.0)
+                p99 = max((s.stats.get("lat_p99_ms", 0.0)
+                           for g in groups.values() for s in g.shards),
+                          default=0.0)
                 pubs_up = sum(1 for prt in pubs.values()
                               if prt.proc is not None and not prt.ended)
                 iv = {"join": 0, "leave": 0, "fail": 0}
@@ -1012,7 +1018,7 @@ def main():
                 line = (f"  T+{t:>5.0f}s  subs={live_total:<5} "
                         f"(+{iv['join']}/-{iv['leave']}"
                         f"/x{iv['fail']})  rx={fmt_bps(rx_bps):<10} "
-                        f"p90={p90:.0f}ms")
+                        f"p90={p90:.0f}ms p99={p99:.0f}ms")
                 if pubs:
                     line += f"  pubs={pubs_up}/{len(pubs)}"
                 print(line)
@@ -1020,7 +1026,7 @@ def main():
                     per_track: Dict[str, list] = {}
                     for g in groups.values():
                         row = per_track.setdefault(
-                            g.spec.key, [0, 0, 0, 0.0])
+                            g.spec.key, [0, 0, 0, 0.0, 0.0])
                         row[0] += g.live()
                         row[1] += g.spec.max_subs
                         row[2] += sum(_rx_Bps(s.stats)
@@ -1028,11 +1034,15 @@ def main():
                         row[3] = max(row[3],
                                      max((s.stats.get("lat_p90_ms", 0.0)
                                           for s in g.shards), default=0.0))
+                        row[4] = max(row[4],
+                                     max((s.stats.get("lat_p99_ms", 0.0)
+                                          for s in g.shards), default=0.0))
                     for key, row in per_track.items():
                         ns, tr = key.split("/", 1)
                         csv_f.write(f"{t:.0f},{ns},{tr},{row[0]},{row[1]},"
                                     f"{row[2] * 8 / 1e6:.2f},"
-                                    f"{row[3]:.1f},,,,{cpu_csv}\n")
+                                    f"{row[3]:.1f},,,,{cpu_csv},"
+                                    f"{row[4]:.1f}\n")
                     csv_f.flush()
 
             # --- end conditions ---
