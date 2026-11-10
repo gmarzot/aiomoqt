@@ -110,3 +110,25 @@ services:
       - ./stats:/report
     logging:
       options: {max-size: "10m", max-file: "3"}
+
+  peers:
+    image: python:3.14-slim
+    container_name: relay-peers
+    restart: unless-stopped
+    network_mode: none
+    cpuset: "0"
+    cpu_shares: 64
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    command: ["python", "/app/peers.py"]
+    volumes:
+      - ./peers.py:/app/peers.py:ro
+      - ./status:/status:ro
+      - ./peers:/peers
+      - ./stats:/report
+    logging:
+      options: {max-size: "10m", max-file: "3"}
