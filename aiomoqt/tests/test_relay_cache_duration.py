@@ -188,7 +188,7 @@ async def test_expired_objects_are_fetched_upstream_not_replayed(
                 filter_type=FilterType.ABSOLUTE_START, start_group=0,
                 start_object=0, on_object=joiners[name].on_object)
         await asyncio.sleep(0.5)
-        expired = {n: d.lane.expired for n, d in
+        expired = {n: d.lane.expired + d.lane.sheds for n, d in
                    ((n, [d for d in tracks[n].downstream
                          if d.session is d_slow.session][0]) for n in names)}
 
@@ -198,3 +198,4 @@ async def test_expired_objects_are_fetched_upstream_not_replayed(
         assert min(joiners[name].objects) > 0, (name, joiners[name].objects)
         assert expired[name] > 0, expired
         assert StreamResetCode.DELIVERY_TIMEOUT in lagging[name].resets
+        assert StreamResetCode.CANCELLED not in lagging[name].resets

@@ -851,7 +851,7 @@ class SendLane:
     stream marker; `live` objects count against the bound, a replay does
     not; `born` is the monotonic time it was produced, or None. The
     writer is the peer's delivery: send(item), end_group(),
-    reset_group(code), reset_below(floor), close_streams(), final(*args),
+    reset_group(code), reset_below(floor[, code]), close_streams(), final(*args),
     tx_queued(floor) and expire(group_id), and end_track(largest) when
     the lane is given end_track(). A writer may set `parked`
     ("header" or "object") and `sid` on the lane while a send waits.
@@ -862,6 +862,10 @@ class SendLane:
     Write-through: a writer with send_nowait(item) is handed an object
     inline from offer() while the lane is empty and under its bound; it
     is queued only when the writer would wait, so order is kept.
+
+    A subclass may replace the byte bound through _probe(), _may_write(),
+    _over(), _keeps() and _shed_reason(), and set `cut_code`, the reset
+    code of shed streams handed to reset_below() (None: the writer's).
     """
 
     log = logger
@@ -913,6 +917,7 @@ class SendLane:
         self._stalled = False
         self.stopped = False
         self._cut = False
+        self.cut_code = None
         self._closing = False
         self._wake = asyncio.Event()
         self._nowait = (getattr(writer, "send_nowait", None)
@@ -977,11 +982,11 @@ class SendLane:
         if live:
             if gid != self._probe_gid or self._probe_n >= LANE_TX_PROBE:
                 self._probe_gid, self._probe_n = gid, 0
-                self.tx_bytes = self.writer.tx_queued(floor)
+                self._probe(floor)
             self._probe_n += 1
         nowait = self._nowait
         if (nowait is not None and not self.items and not self.busy
-                and self.gate and self.tx_bytes + cost <= self.bound):
+                and self.gate and self._may_write(item)):
             try:
                 sent = nowait(item)
             except Exception as e:
@@ -1001,9 +1006,28 @@ class SendLane:
                 self.replay_bytes += cost
         self.items.append(item)
         self._wake.set()
-        if live and self.bytes + self.tx_bytes > self.bound:
-            self._shed(gid)
+        if live and self._over(item):
+            self._shed(item)
         return True
+
+    def _probe(self, floor) -> None:
+        """Read what the transport holds of the lane's groups from `floor`."""
+        self.tx_bytes = self.writer.tx_queued(floor)
+
+    def _may_write(self, item) -> bool:
+        """`item` may be written through."""
+        return self.tx_bytes + item[1] <= self.bound
+
+    def _over(self, item) -> bool:
+        """Shed, live `item` just queued."""
+        return self.bytes + self.tx_bytes > self.bound
+
+    def _keeps(self, item) -> bool:
+        """`item`'s group stays once the groups before it are shed."""
+        return self.bytes + self.tx_bytes <= self.bound
+
+    def _shed_reason(self) -> str:
+        return f"over its {self.bound}-byte send lane"
 
     def end_group(self) -> None:
         """Close the writer's open group once what is queued is out."""
@@ -1088,25 +1112,25 @@ class SendLane:
             self.floor = floor
             self._drop_below(floor, count)
 
-    def _shed(self, gid) -> None:
-        """Drop the groups queued before `gid`, and `gid` too if it alone
-        is over the bound; their open streams are reset first."""
+    def _shed(self, item) -> None:
+        """Drop the groups queued before `item`'s, and its group too unless
+        _keeps(item); their open streams are reset first."""
         writer = self.writer
-        floor = gid
+        gid = floor = item[0]
         held = writer.tx_queued(self.floor)
         self._drop_below(floor)
-        self.tx_bytes = writer.tx_queued(floor)
-        if self.bytes + self.tx_bytes > self.bound:
+        self._probe(floor)
+        if not self._keeps(item):
             floor = gid + 1
             self._drop_below(floor)
-            self.tx_bytes = writer.tx_queued(floor)
+            self._probe(floor)
         self.shed_bytes += max(held - self.tx_bytes, 0)
         self.floor = floor if self.floor is None else max(self.floor, floor)
         self._lost = self.floor - 1
         if self.busy and self.opening:
             # A parked header write waits on this session's transport
             # backlog, which only these resets free.
-            writer.reset_below(self.floor)
+            self._reset_below()
         if not self._cut:
             self._cut = True
             self.items.appendleft(_CUT)
@@ -1115,6 +1139,12 @@ class SendLane:
             self.shedding = True
             self.sheds += 1
             self._log_shed()
+
+    def _reset_below(self) -> None:
+        if self.cut_code is None:
+            self.writer.reset_below(self.floor)
+        else:
+            self.writer.reset_below(self.floor, self.cut_code)
 
     def _log_shed(self) -> None:
         """WARNING on the first shed, then one INFO line per SHED_LOG_S
@@ -1125,13 +1155,13 @@ class SendLane:
         who = f"{self.prefix}{self._who()}"
         if self._logged_at is None:
             self.log.warning(
-                f"{who} over its {self.bound}-byte send lane: resetting "
-                f"groups below {self.floor}")
+                f"{who} {self._shed_reason()}: resetting groups below "
+                f"{self.floor}")
         else:
             self.log.info(
                 f"{who} shed {self.sheds - self._logged_sheds} more "
-                f"time(s) over its send lane: resetting groups below "
-                f"{self.floor}")
+                f"time(s), last {self._shed_reason()}: resetting groups "
+                f"below {self.floor}")
         self._logged_at, self._logged_sheds = now, self.sheds
 
     def stop(self) -> bool:
@@ -1220,7 +1250,7 @@ class SendLane:
         try:
             if kind == "CUT":
                 self._cut = False
-                writer.reset_below(self.floor)
+                self._reset_below()
             elif kind == "END_GROUP":
                 writer.end_group()
             elif kind == "RESET_GROUP":

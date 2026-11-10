@@ -351,7 +351,7 @@ class _Ingest:
         if not args.no_ladder and not self.rungs:
             raise SystemExit(f"  error: no default rung below the "
                              f"source's {self.video.height}p; give --rung")
-        self.fps: Optional[Tuple[int, int]] = None
+        self.fps: Tuple[int, int] = frame_rate(_FALLBACK_FPS)
         self._first_key: Optional[int] = None
         self.ladder: Optional[AbrLadder] = None
         self.outputs: Dict[str, _Output] = {}
@@ -391,7 +391,6 @@ class _Ingest:
             return False
         logger.warning(f"abr_ingest: catalog gives no framerate for "
                        f"'{self.video_name}'; assuming {_FALLBACK_FPS:g}")
-        self.fps = frame_rate(_FALLBACK_FPS)
         return True
 
     def on_catalog(self, catalog: Catalog) -> None:

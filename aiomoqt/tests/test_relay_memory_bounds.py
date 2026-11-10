@@ -140,7 +140,9 @@ def test_empty_objects_are_charged_to_a_subscribed_track(monkeypatch):
     t._drop_cache()
 
 
-async def test_empty_objects_are_charged_to_a_send_lane():
+async def test_empty_objects_are_charged_to_a_send_lane(monkeypatch):
+    # No deadline: the lane is held to LANE_BYTES.
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     t = _track()
     lane = t._lane(_subscribe(t))
     # No yield: a subscriber whose lane never drains.
@@ -338,6 +340,7 @@ def _ring_backlog(session):
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP")
 async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
     monkeypatch.setattr(relay, "LANE_BYTES", 1 << 20)
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     caplog.set_level(logging.WARNING, logger="aiomoqt.relay")
     for table in (relay._announced, relay._announce_requests, relay._tracks):
         table.clear()
@@ -376,7 +379,7 @@ async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
             assert d.lane.sheds >= 5
             # One WARNING, the repeats folded into a line per SHED_LOG_S.
             warned = [r for r in caplog.records
-                      if "send lane" in r.getMessage()]
+                      if "resetting groups below" in r.getMessage()]
             assert len(warned) == 1, [r.getMessage() for r in warned]
     finally:
         if proc is not None:
