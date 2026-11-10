@@ -15,6 +15,7 @@ from aiopquic._binding._transport import TransportContext
 from aiopquic.asyncio.server import serve as aiopquic_serve
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.delivery import SendLane
 from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.types import (
     FilterType, ForwardingPreference, MOQTMessageType, MOQTRequestError,
@@ -571,6 +572,44 @@ async def test_published_tracks_reach_subscribers_at_d20_and_d22(draft,
             await asyncio.sleep(0.02)
         assert all(objects[n] for n in _SIZES), objects
         assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+@pytest.mark.parametrize("write_through", [True, False],
+                         ids=["through", "queued"])
+async def test_two_tracks_on_one_session_with_and_without_write_through(
+        write_through, use_quic, monkeypatch):
+    monkeypatch.setattr(SendLane, "write_through", write_through)
+    inline = []
+    real = relay._RelayDelivery.send_nowait
+
+    def counted(self, item):
+        sent = real(self, item)
+        if sent:
+            inline.append(item[5])
+        return sent
+    monkeypatch.setattr(relay._RelayDelivery, "send_nowait", counted)
+    port = _BASE_PORT + 180 + 2 * (not write_through) + (not use_quic)
+    async with _flowing(port, use_quic) as subscriber:
+        rx, objects = await subscriber()
+        for name in _SIZES:
+            await rx.subscribe(_FLOW_NS, name, forward=1, wait_response=True)
+        for _ in range(250):
+            if all(len(objects[n]) >= 4 * _GROUP for n in _SIZES):
+                break
+            await asyncio.sleep(0.02)
+        for name in _SIZES:
+            got = objects[name]
+            assert len(got) >= 4 * _GROUP, objects
+            assert len(set(got)) == len(got), got
+            groups = {}
+            for gid, oid in got:
+                groups.setdefault(gid, []).append(oid)
+            assert all(o == sorted(o) for o in groups.values()), got
+        assert rx._close_err is None
+    assert bool(inline) is write_through, inline
 
 
 _HAS_WORKERS = (sys.platform.startswith("linux")
