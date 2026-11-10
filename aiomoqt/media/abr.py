@@ -183,7 +183,8 @@ class AbrLadder:
     avcC or av1C; wait[i] meters it from push to on_frame. A lagging rung skips the
     rest of a group, and a full engine drops whole input groups. A frame of a group
     older than one already pushed is dropped (late_dropped): decoding it would stall
-    the decoder until the next key frame.
+    the decoder until the next key frame. A group start more than one group back is
+    a restarted source and is taken.
     """
 
     def __init__(self, rungs: Sequence[Rung], *, config: Optional[bytes],
@@ -242,8 +243,11 @@ class AbrLadder:
         if self._flushing:
             return False
         if group_id < self._group:
-            self.late_dropped += 1
-            return False
+            if object_id != 0 or group_id + 1 == self._group:
+                self.late_dropped += 1
+                return False
+            self._group = group_id - 1
+            self._pending.clear()
         ts = frame.timestamp
         pts = (0 if ts is None
                else ts * 1_000_000 // self.timescale if self.timescale

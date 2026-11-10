@@ -163,6 +163,31 @@ async def test_ladder_drops_a_late_frame_of_an_older_group(impl, clip):
     assert got == [k for k in order if k != (0, GOP - 1)]
 
 
+async def test_ladder_takes_a_restarted_source(impl, clip):
+    _needs(impl, 'h264')
+    config, frames = clip
+    got = []
+
+    def on_frame(i, frame, group_id, object_id, pushed_ns):
+        if i == 0:
+            got.append((group_id, object_id))
+
+    ladder = AbrLadder(RUNGS[:1], config=config, fps=(FPS, 1), profile='cpu',
+                       on_frame=on_frame, realtime=False)
+    ladder.start()
+    order = [(g, o) for g in range(4) for o in range(GOP)]
+    order += [(0, o) for o in range(GOP)]  # the source restarts at group 0
+    try:
+        pushed = [ladder.push(LocFrame(frames[g * GOP + o][0], key_frame=o == 0,
+                                       timestamp=n * 33_333), g, o)
+                  for n, (g, o) in enumerate(order)]
+        assert await ladder.flush(10)
+    finally:
+        ladder.close()
+    assert all(pushed) and ladder.late_dropped == 0
+    assert got == order
+
+
 def _source_catalog(config: bytes) -> Catalog:
     return Catalog(
         tracks=[
