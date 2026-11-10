@@ -284,3 +284,97 @@ async def test_source_url_waits_for_a_source_not_yet_published(impl, clip):
             ingest.cancel()
         handle.close()
     assert got['video_120p'] > 0, dict(got)
+
+
+def _bare_catalog(config: bytes, framerate=None, bitrate=None) -> Catalog:
+    cat = _source_catalog(config)
+    video = cat.find('video')
+    video.framerate, video.bitrate = framerate, bitrate
+    return cat
+
+
+@pytest.mark.parametrize('declared', ['later', 'never'])
+async def test_ingester_follows_source_catalog_updates(impl, clip, monkeypatch, declared):
+    """A source catalog without framerate or bitrate, as pub_media --ts
+    publishes first: the ladder waits for a framerate and later values
+    reach the published catalog; with none it starts at the fallback."""
+    _needs(impl, 'h264')
+    from aiomoqt.tools import abr_ingest
+    from aiomoqt.tools import moq_interop_relay as relay
+    relay._announced.clear()
+    relay._tracks.clear()
+    rates = []
+
+    class Ladder(abr_ingest.AbrLadder):
+        def __init__(self, *a, fps, **kw):
+            rates.append(fps)
+            super().__init__(*a, fps=fps, **kw)
+    monkeypatch.setattr(abr_ingest, 'AbrLadder', Ladder)
+    monkeypatch.setattr(abr_ingest, '_FALLBACK_FPS', 25.0)
+    if declared == 'never':
+        monkeypatch.setattr(abr_ingest, '_FPS_WAIT_S', 0.3)
+    config, frames = clip
+    ns = 'abr/follow'
+    relay_port, ingest_port = free_udp_port(), free_udp_port()
+    server = relay._build_server('localhost', relay_port, CERT, KEY, use_quic=True, draft=18)
+    handle = await server.serve()
+    args = abr_ingest.parse_args([
+        '-Q', '-p', str(ingest_port), '--cert', CERT, '--key', KEY, '-N', ns,
+        '--profile', 'cpu', '--rung', '160x120:200k', '-k', '--draft', '18',
+        '-t', '30', f'moqt://localhost:{relay_port}/'])
+    ingest = asyncio.ensure_future(abr_ingest.run(args))
+    got = defaultdict(int)
+    try:
+        await asyncio.sleep(0.5)
+        pub_client = MOQTClient('localhost', ingest_port, path='/', use_quic=True,
+                                verify_tls=False, supported_drafts=18)
+        async with pub_client.connect() as pub_session:
+            await pub_session.client_session_init()
+            pub = MediaPublisher(pub_session, ns, _bare_catalog(config))
+            video = pub.add_track(LocTrackPublisher(pub_session, ns, 'video', config=config))
+            audio = pub.add_track(LocTrackPublisher(pub_session, ns, 'audio', media_kind='audio'))
+            await pub.start(announce_namespace=True, publish_track=False)
+            feeder = asyncio.ensure_future(_feed(video, audio, frames))
+            if declared == 'later':
+                # after the ingester has seen a key frame
+                deadline = time.monotonic() + 10
+                while not video.subscriptions and time.monotonic() < deadline:
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(GOP / FPS + 0.1)
+                await pub.catalog_track.publish_catalog(_bare_catalog(config, FPS))
+            await until_published(ns, ['catalog', 'video', 'video_120p'], timeout=15)
+            if declared == 'later':
+                await pub.catalog_track.publish_catalog(
+                    _bare_catalog(config, FPS, 500_000))
+            sub_client = MOQTClient('localhost', relay_port, path='/', use_quic=True,
+                                    verify_tls=False, supported_drafts=18)
+            async with sub_client.connect() as sub_session:
+                await sub_session.client_session_init()
+
+                def on_frame(name, frame, group_id, object_id):
+                    got[name] += 1
+                sub = MediaSubscriber(sub_session, ns, on_frame=on_frame)
+                await sub.start(timeout=5)
+                if declared == 'later':
+                    deadline = time.monotonic() + 5
+                    while (sub.catalog.find('video').bitrate is None
+                           and time.monotonic() < deadline):
+                        await asyncio.sleep(0.05)
+                catalog = sub.catalog
+                await feeder
+                await asyncio.sleep(1.0)
+        assert await asyncio.wait_for(ingest, 10) == 0
+    finally:
+        if not ingest.done():
+            ingest.cancel()
+        handle.close()
+    assert got['video_120p'] > 0, dict(got)
+    if declared == 'later':
+        assert rates == [(FPS, 1)]
+        assert catalog.find('video').bitrate == 500_000
+        assert catalog.find('video').framerate == FPS
+        assert catalog.find('video_120p').framerate == FPS
+        assert catalog.find('video_120p').bitrate == 200_000
+    else:
+        assert rates == [(25, 1)]
+        assert catalog.find('video').bitrate is None

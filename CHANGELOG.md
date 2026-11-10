@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- abr_ingest follows its source's catalog updates: the ladder waits up to 5 s for a framerate before assuming 30 fps, and framerates and passthrough bitrates the source adds later are republished. A 60 fps `pub_media --ts` source, whose first catalog has neither until it has measured them, got rungs at about 1.7× their bitrate and a passthrough track with no bitrate.
 - aiomoqt-relay writes a datagram, or an object on a stream already open to the viewer, straight from the forward loop when the viewer's send lane is empty, instead of waking the lane's task for every object. New streams and cache replays still go through the lane.
 - load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
 
