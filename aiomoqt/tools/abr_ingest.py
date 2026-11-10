@@ -24,6 +24,9 @@ and passthrough bitrates the source adds later are republished.
 Each -i interval reports, per output track, the delay from a source
 frame's arrival to its hand-off to the output track; rungs add the
 encoder's share. --no-ladder measures the hand-off alone.
+
+--packaging cmaf publishes every output track as CMSF: one CMAF chunk
+per object, led by a prft, with the CMAF header in the catalog.
 """
 import argparse
 import asyncio
@@ -41,8 +44,17 @@ from aiomoqt.media.abr import (
     quantiles_ms, rungs_below,
 )
 from aiomoqt.media.broadcast import MediaSubscriber
-from aiomoqt.media.catalog import PACKAGING_LOC, Catalog, CatalogTrack
-from aiomoqt.media.loc import LOC_PROP_VIDEO_CONFIG, LocFrame, LocTrackPublisher
+from aiomoqt.media.catalog import (
+    PACKAGING_CMAF, PACKAGING_LOC, Catalog, CatalogTrack, InitData,
+)
+from aiomoqt.media.cmaf import (
+    CmafChunker, aac_track, asc_info, init_codec_string, opus_track, prft_box,
+    video_track,
+)
+from aiomoqt.media.loc import (
+    LOC_PROP_AUDIO_CONFIG, LOC_PROP_VIDEO_CONFIG, LocFrame, LocTrackPublisher,
+)
+from aiomoqt.media.mpegts import opus_samples
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
     MOQTMessageType, MOQTRequestError, RequestErrorCode, SubscribeErrorCode,
@@ -97,6 +109,10 @@ def parse_args(argv=None):
                              'height)')
     parser.add_argument('--no-ladder', action='store_true',
                         help='Pass the source through without a ladder')
+    parser.add_argument('--packaging', choices=(PACKAGING_LOC, PACKAGING_CMAF),
+                        default=PACKAGING_LOC,
+                        help='Output packaging (default: loc); cmaf = CMSF, '
+                             'one CMAF chunk per object')
     parser.add_argument('--cert', default=CERT,
                         help='TLS certificate for the listener')
     parser.add_argument('--key', default=KEY,
@@ -197,14 +213,89 @@ def _video_entry(catalog: Catalog, name: Optional[str]) -> CatalogTrack:
                      f"{repr(name) if name else ''} in the source catalog")
 
 
+_VIDEO_TIMESCALE = 90000
+_CONFIG_PROPS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
+
+
+class _Cmaf:
+    """One output track's LOC frames as CMSF objects: prft + one-sample
+    moof+mdat. tfdt is the LOC timestamp in track ticks, kept rising;
+    the prft carries the capture time."""
+
+    def __init__(self, track, loc_timescale: Optional[int],
+                 fps: Optional[Tuple[int, int]] = None,
+                 samples=None):
+        self.chunker = CmafChunker(track)
+        self.init = self.chunker.init_segment()
+        self.codec = init_codec_string(self.init)
+        self.video = track.width is not None
+        self._units = loc_timescale or 1_000_000
+        ts = self.chunker.timescale
+        self._frame = (None if fps is None
+                       else max(1, round(ts * fps[1] / fps[0])))
+        self._samples = samples  # audio: payload -> duration in ticks
+        self._last: Optional[int] = None
+        self._dur = self._frame or ts // 30
+
+    def wrap(self, frame: LocFrame) -> bytes:
+        ts = frame.timestamp
+        dt = None if ts is None else ts * self.chunker.timescale // self._units
+        if self._last is not None:
+            if dt is not None and dt > self._last and self._frame is None:
+                self._dur = dt - self._last
+            if dt is None or dt <= self._last:
+                dt = self._last + self._dur
+        dt = dt or 0
+        dur = (self._samples(frame.payload) if self._samples is not None
+               else self._frame or self._dur)
+        self._last = dt
+        chunk = self.chunker.chunk(frame.payload, dur,
+                                   frame.key_frame or not self.video,
+                                   decode_time=dt)
+        if ts is None:
+            return chunk
+        return prft_box(ts * 1_000_000 // self._units, dt) + chunk
+
+
+def _cmaf_for(entry: CatalogTrack, config: Optional[bytes],
+              codec: Optional[str], loc_timescale: Optional[int],
+              fps: Optional[Tuple[int, int]]) -> Optional[_Cmaf]:
+    """The CMSF packager for an output track; None if its codec or
+    config cannot make a CMAF header."""
+    codec = codec or ''
+    if entry.role == 'audio':
+        channels = (int(entry.channelConfig)
+                    if (entry.channelConfig or '').isdigit() else None)
+        if codec.startswith('mp4a.40') and config:
+            per_frame = asc_info(config)[2]
+            return _Cmaf(aac_track(config, entry.samplerate, channels),
+                         loc_timescale, samples=lambda _p: per_frame)
+        if codec == 'opus':
+            return _Cmaf(opus_track(channels or 2), loc_timescale,
+                         samples=opus_samples)
+        return None
+    fourcc = {'avc1': 'avc1', 'avc3': 'avc1', 'hvc1': 'hvc1', 'hev1': 'hvc1',
+              'av01': 'av01'}.get(codec[:4])
+    if fourcc is None or not config:
+        return None
+    if entry.framerate and fps is None:
+        fps = frame_rate(entry.framerate)
+    return _Cmaf(video_track(fourcc, config, entry.width or 0,
+                             entry.height or 0, _VIDEO_TIMESCALE),
+                 loc_timescale, fps=fps)
+
+
 class _Output:
     """One output track: a bounded hand-off queue and its meter. Frames
     are dropped while no peer takes them (`idle`), so a late subscriber
     gets live frames rather than a backlog. After a drop it skips to the
-    next group start, so object IDs stay the source's."""
+    next group start, so object IDs stay the source's. `cmaf` packages
+    each frame as a CMSF object."""
 
-    def __init__(self, track: LocTrackPublisher):
+    def __init__(self, track: LocTrackPublisher,
+                 cmaf: Optional[_Cmaf] = None):
         self.track = track
+        self.cmaf = cmaf
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE)
         self.meter = DelayMeter()
         self.frames = 0
@@ -234,8 +325,10 @@ class _Output:
             if item is None:
                 break
             frame, group_id, t0 = item
+            payload = (frame.payload if self.cmaf is None
+                       else self.cmaf.wrap(frame))
             await self.track.send_frame(
-                frame.payload, key_frame=frame.key_frame,
+                payload, key_frame=frame.key_frame,
                 timestamp=frame.timestamp, extensions=frame.extensions,
                 group_id=group_id)
             if t0 is not None:
@@ -264,6 +357,7 @@ class _Ingest:
         self.outputs: Dict[str, _Output] = {}
         self.pub: Optional[FanoutPublisher] = None
         self.before_start = 0
+        self.left_out: Set[str] = set()
         self.keyed = asyncio.Event()
         self._feeders: List[asyncio.Task] = []
         self._republishing: Set[asyncio.Task] = set()
@@ -344,7 +438,8 @@ class _Ingest:
     def _on_rung(self, i: int, frame: LocFrame, group_id: int,
                  object_id: int, pushed_ns: Optional[int]) -> None:
         out = self.outputs.get(self.rungs[i].name)
-        if out is not None and self.ladder is not None:
+        if (out is not None and out.cmaf is None
+                and self.ladder is not None):
             out.track.config = self.ladder.configs[i]
         self._hand(self.rungs[i].name, frame, group_id, pushed_ns)
 
@@ -352,7 +447,8 @@ class _Ingest:
               t0: Optional[int]) -> None:
         out = self.outputs.get(name)
         if out is None:
-            self.before_start += 1
+            if name not in self.left_out:
+                self.before_start += 1
             return
         out.put(frame, group_id, t0)
 
@@ -375,8 +471,11 @@ class _Ingest:
         if self.out_ns != self.args.namespace:
             for t in catalog.tracks:
                 t.namespace = None
-        self.pub = FanoutPublisher(sessions, self.out_ns, catalog)
         timescale = self.sub.tracks[self.video_name].timescale
+        as_cmaf = self.args.packaging == PACKAGING_CMAF
+        cmaf = (self._cmaf_catalog(catalog, configs, timescale)
+                if as_cmaf else {})
+        self.pub = FanoutPublisher(sessions, self.out_ns, catalog)
         video_props = {k: v for k, v in
                        self.sub.properties(self.video_name).items()
                        if k != LOC_PROP_VIDEO_CONFIG}
@@ -387,27 +486,64 @@ class _Ingest:
             if src is not None:
                 track = LocTrackPublisher(
                     self.pub.session, self.out_ns, name,
-                    config=src.config, timescale=src.timescale,
+                    config=None if as_cmaf else src.config,
+                    timescale=src.timescale,
                     media_kind='audio' if entry.role == 'audio' else 'video',
-                    codec_string=src.codec_string)
-                track.track_properties = (
-                    dict(self.sub.properties(name)) or None)
+                    codec_string=None if as_cmaf else src.codec_string)
+                props = self.sub.properties(name)
             else:
                 i = next(k for k, r in enumerate(self.rungs) if r.name == name)
                 track = LocTrackPublisher(
                     self.pub.session, self.out_ns, name,
-                    config=configs[i], timescale=timescale,
+                    config=None if as_cmaf else configs[i], timescale=timescale,
                     media_kind='video')
-                track.track_properties = dict(video_props) or None
+                props = video_props
+            if as_cmaf:
+                props = {k: v for k, v in props.items()
+                         if k not in _CONFIG_PROPS}
+            track.track_properties = dict(props) or None
             tracks.append(track)
         for track in tracks:
             self.pub.add_track(track)
         await self.pub.start(forward=0)
         for track in tracks:
-            out = self.outputs[track.trackname] = _Output(track)
+            out = self.outputs[track.trackname] = _Output(
+                track, cmaf.get(track.trackname))
             self._feeders.append(asyncio.ensure_future(out.feed()))
         print(f"  publishing '{self.out_ns}': "
               f"{', '.join(t.trackname for t in tracks)}")
+
+    def _cmaf_catalog(self, catalog: Catalog, configs: List[bytes],
+                      timescale: Optional[int]) -> Dict[str, _Cmaf]:
+        """Turn `catalog` into a CMSF one in place: each track packaged
+        cmaf, its CMAF header in initDataList, codec from that header.
+        A track no CMAF header can carry is left out."""
+        rungs = {r.name: i for i, r in enumerate(self.rungs)}
+        out: Dict[str, _Cmaf] = {}
+        kept, init = [], []
+        for entry in catalog.tracks:
+            name = entry.name or ''
+            if name in rungs:
+                pkg = _cmaf_for(entry, configs[rungs[name]], entry.codec,
+                                timescale, self.fps)
+            else:
+                src = self.sub.tracks[name]
+                pkg = _cmaf_for(entry, src.config,
+                                entry.codec or src.codec_string,
+                                src.timescale, None)
+            if pkg is None or pkg.codec is None:
+                logger.warning(f"abr_ingest: '{name}' ({entry.codec}) left "
+                               f"out: no CMAF header for it")
+                self.left_out.add(name)
+                continue
+            ref = f"cmaf{len(init)}"
+            entry.packaging, entry.initRef, entry.codec = (
+                PACKAGING_CMAF, ref, pkg.codec)
+            init.append(InitData.from_bytes(ref, pkg.init))
+            kept.append(entry)
+            out[name] = pkg
+        catalog.tracks, catalog.initDataList = kept, init or None
+        return out
 
     async def stop(self, sessions) -> None:
         if self.ladder is not None:
