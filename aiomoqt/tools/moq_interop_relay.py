@@ -736,6 +736,30 @@ class _RelayDelivery:
                                   end=None if end is None else (end[5], end[9]))
         return True if rest is None else rest
 
+    def send_nowait(self, item) -> bool | None:
+        """send(item) when it completes now: a live datagram, or an object
+        or stream end on an open stream that the transport takes. True
+        once written; None, nothing written, when it has to wait."""
+        (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
+         shape, encoded) = item
+        if not live:
+            return None
+        track, d, session = self.track, self.d, self.session
+        if not (shape.__class__ is tuple and shape and shape[0] == "DGRAM"
+                ) and ((id(session), gid, sgid) not in track._streams
+                       or (gid, sgid) in track._ends_due):
+            # A stream end queued behind leaves with the lane's last write.
+            return None
+        if track._forward_one(session, d.alias, gid, sgid, oid, payload,
+                              exts, prio, status, shape, encoded,
+                              start=d.start, lost=d.lost,
+                              nowait=True) is _NOT_SENT:
+            return None
+        if oid is not None:
+            track._objects_out += 1
+            track._bytes_out += len(payload or b"")
+        return True
+
     @staticmethod
     def ends_stream(item, nxt) -> bool:
         """`nxt`, queued behind object `item`, ends the subgroup stream
@@ -766,6 +790,7 @@ class _TracedRelayDelivery(_RelayDelivery):
     """--trace-subscribers: also counts what the subscription is sent."""
 
     __slots__ = ()
+    send_nowait = None
 
     def send(self, item, end=None):
         rest = super().send(item, end)
@@ -964,6 +989,8 @@ class _RelayedTrack:
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
         self.queue = asyncio.Queue()
+        # (group, subgroup) -> stream ends queued for the forward loop.
+        self._ends_due: dict = {}
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
         # terminal that lands first waits in the queue for it.
@@ -1480,6 +1507,7 @@ class _RelayedTrack:
                  "END" if clean else "RESET", reset_code))
             if clean:
                 self._ended.add(k)
+                self._end_due(k, 1)
             elif self._multi:
                 self._reset.add(k)
         self._ensure_drain()
@@ -1599,12 +1627,15 @@ class _RelayedTrack:
                 shape = (False,) + tuple(shape[1:])
             else:
                 self._opened.add(key)
+        status = getattr(msg, "status", None)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              payload, msg.extensions or None,
              128 if prio is None else prio,
-             getattr(msg, "status", None),
+             status,
              shape))
+        if status in _STREAM_ENDS:
+            self._end_due((gid, subgroup_id or 0), 1)
         self._ensure_drain()
 
     def _ensure_drain(self) -> None:
@@ -1665,10 +1696,19 @@ class _RelayedTrack:
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
 
+    def _end_due(self, k, n) -> None:
+        n += self._ends_due.get(k, 0)
+        if n > 0:
+            self._ends_due[k] = n
+        else:
+            self._ends_due.pop(k, None)
+
     async def _forward_loop(self):
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
+            if status in _STREAM_ENDS:
+                self._end_due((gid, sgid), -1)
             if status == "DONE":
                 # Terminal, in queue order: each subscriber's PUBLISH_DONE
                 # follows what its lane already holds.
@@ -1931,7 +1971,7 @@ class _RelayedTrack:
     def _forward_one(self, session, alias, gid, sgid, oid,
                      payload, exts, prio, status=None, shape=None,
                      encoded=None, start=None, lost=(), lane=None,
-                     end=None):
+                     end=None, nowait=False):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
@@ -1939,7 +1979,8 @@ class _RelayedTrack:
         (§11.3.2). `end`, the (object id, status) of the stream end
         queued behind the object, ends the stream in the object's write.
         `lane` is told what each write awaits. None once written, else the
-        awaitable that finishes the write."""
+        awaitable that finishes the write; with `nowait`, _NOT_SENT instead
+        and the stream's header state as it was."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
@@ -1996,6 +2037,8 @@ class _RelayedTrack:
             session.stream_write(stream_id, buf.data, end_stream=True)
             self._streams.pop(skey, None)
             return
+        if nowait:
+            last = header.next_object_id - 1
         data = _object_data(header, payload, exts, oid, encoded)
         tail = (None if end is None
                 else self._end_data(header, gid, end, start, lost))
@@ -2012,6 +2055,9 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             self._stopped.add(skey)
             return None
+        if nowait:
+            header.advance(last)
+            return _NOT_SENT
         return self._write_drain(session, skey, entry, wire, end, ended)
 
     async def _write_drain(self, session, skey, entry, wire, end, ended):
@@ -2123,6 +2169,8 @@ class _RelayedTrack:
 
 # Statuses that end a subgroup stream instead of carrying an object.
 _STREAM_ENDS = ("END", ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)
+# _forward_one(nowait=True): the transport refused the write.
+_NOT_SENT = object()
 # TX event ring fill past which a write takes the drained path, which yields.
 _TX_YIELD_AT = 0.5
 

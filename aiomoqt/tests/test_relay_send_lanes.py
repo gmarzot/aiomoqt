@@ -13,6 +13,7 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import canonical_stream_reset, profile_for
 from aiomoqt.delivery import LANE_MIN_BYTES, SendLane
+from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import StreamResetCode, SubscribeDoneCode
@@ -753,3 +754,178 @@ def test_the_deployed_relay_config_parses():
         pytest.skip("source tree only")
     args = relay.parse_args(["--config", str(path)])
     assert args.lag_limit == relay.LAG_LIMIT_S
+
+
+# -- write-through from offer() -----------------------------------------
+
+class _Taking(_Fake):
+    """A session whose transport takes a write without waiting unless
+    `take` is False, recording each stream's bytes."""
+
+    def __init__(self, take=True):
+        super().__init__()
+        self.take = take
+        self.wire = defaultdict(bytes)
+        self.dgrams = []
+
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
+        sid = self._next
+        self._next += 4
+        self.log.append(("open", sid, end_stream))
+        self.wire[sid] += bytes(initial)
+        return sid
+
+    def stream_write_nowait(self, sid, data, end_stream=False, **_kw):
+        if not self.take:
+            return False
+        self.log.append(("nowait", sid))
+        self.wire[sid] += bytes(data)
+        if end_stream:
+            self.log.append(("fin", sid))
+        return True
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        self.log.append(("drain", sid))
+        self.wire[sid] += bytes(data)
+        if end_stream:
+            self.log.append(("fin", sid))
+
+    def stream_write(self, sid, data, end_stream=False):
+        self.log.append(("write", sid))
+        self.wire[sid] += bytes(data)
+        if end_stream:
+            self.log.append(("fin", sid))
+
+    def datagram_max_payload(self):
+        return 1200
+
+    def send_dgram_message(self, buf):
+        self.dgrams.append(bytes(buf.data))
+
+
+@pytest.fixture
+def lane_sends(monkeypatch):
+    """Object ids written by a lane task, not from offer()."""
+    sends = []
+    real = relay._RelayDelivery.send
+
+    def counted(self, item, end=None):
+        sends.append(item[5])
+        return real(self, item, end)
+    monkeypatch.setattr(relay._RelayDelivery, "send", counted)
+    return sends
+
+
+async def test_an_object_on_an_open_stream_is_written_from_offer(lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(4):
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_stream_end(0, 0)
+        await _settle()
+        # Only the object that opened the stream waited for the lane task.
+        assert lane_sends == [0], lane_sends
+        assert sub.kinds("open") == [("open", 3, False)]
+        assert len(sub.kinds("nowait")) == 3 and sub.kinds("fin") == [("fin", 3)]
+        assert track._objects_out == 4
+    finally:
+        track.close()
+
+
+async def test_a_last_object_queued_with_its_end_leaves_in_one_write(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(3):
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_object(_obj(0, 3), 0, 0, 0, 0)
+        track.on_stream_end(0, 0)
+        await _settle()
+        assert lane_sends == [0, 3], lane_sends
+        assert len(sub.kinds("nowait")) == 3 and not sub.kinds("write")
+        assert sub.kinds("fin") == [("fin", 3)] and not track._ends_due
+    finally:
+        track.close()
+
+
+async def test_a_refused_write_is_queued_and_sent_once_with_the_same_bytes(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    taking, refusing = _Taking(), _Taking()
+    track.add_downstream(taking, 1, 1)
+    track.add_downstream(refusing, 1, 2)
+    try:
+        for oid in range(4):
+            refusing.take = oid != 2
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_stream_end(0, 0)
+        await _settle()
+        assert refusing.kinds("drain") == [("drain", 3)]
+        assert len(refusing.kinds("nowait")) == 2
+        assert lane_sends == [0, 0, 2], lane_sends
+        assert refusing.wire == taking.wire and taking.wire[3]
+    finally:
+        track.close()
+
+
+async def test_a_new_stream_still_opens_with_its_object_and_end(lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for gid in range(3):
+            track.on_object(_obj(gid, 0), 0, 0, gid, 0)
+            track.on_stream_end(gid, 0)
+            await _settle(5)
+        await _settle()
+        assert sub.kinds("open") == [("open", sid, True) for sid in (3, 7, 11)]
+        assert not sub.kinds("nowait") and not sub.kinds("fin")
+        assert lane_sends == [0, 0, 0]
+    finally:
+        track.close()
+
+
+async def test_a_datagram_is_written_from_offer(lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(3):
+            dgram = ObjectDatagram(track_alias=9, group_id=0, object_id=oid,
+                                   publisher_priority=128, extensions=None,
+                                   payload=b"x" * 100)
+            track.on_object(dgram, 100, 0, 0, 0)
+            await _settle(5)
+        assert len(sub.dgrams) == 3 and not lane_sends
+        assert not sub.kinds("open")
+    finally:
+        track.close()
+
+
+async def test_replays_and_traced_subscribers_stay_on_the_lane(monkeypatch):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    d = track.add_downstream(sub, 1, 1)
+    try:
+        track.on_object(_obj(0, 0), 0, 0, 0, 0)
+        await _settle(5)
+        replay = relay._item(0, False, 0, 1, b"x", None, 128, None, None)
+        assert d.lane.writer.send_nowait(replay) is None
+        assert not sub.kinds("nowait")
+    finally:
+        track.close()
+    monkeypatch.setattr(relay, "_trace_subscribers", True)
+    track = relay._RelayedTrack(("ns", "t2"))
+    try:
+        d = track.add_downstream(_Taking(), 1, 1)
+        assert track._lane(d)._nowait is None
+    finally:
+        track.close()
