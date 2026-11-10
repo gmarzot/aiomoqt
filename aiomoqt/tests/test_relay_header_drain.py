@@ -80,6 +80,7 @@ async def test_a_failed_header_write_resets_its_stream():
 
 async def test_a_lane_parked_on_a_header_resets_shed_groups(monkeypatch):
     monkeypatch.setattr(relay, "LANE_BYTES", 10_000)
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     track = relay._RelayedTrack(("ns", "t"))
     slow = _Fake()
     d = track.add_downstream(slow, 1, 1)
@@ -167,6 +168,7 @@ async def test_a_stalled_viewer_parks_only_its_own_lane(
     # Above aiopquic's 4 MiB per-connection gate on new streams, so the
     # stalled viewer's header writes park before its lane sheds.
     monkeypatch.setattr(relay, "LANE_BYTES", 6 << 20)
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     ns, name, rate, group = "hdrdrain/stall", "video", 200, 10
     port = _PORT + 2
     proc = None
