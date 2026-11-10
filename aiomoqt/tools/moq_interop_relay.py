@@ -23,13 +23,17 @@ Limits:
   * At --max-subscribers, a session's first SUBSCRIBE is refused the same
     way, with a randomized Retry Interval. Sessions already subscribed may
     add tracks.
-  * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
-    oldest group dropped) under a relay-wide budget (--cache-bytes),
-    which drops the oldest group of the least recently used track, never
-    the live group of a subscribed one: enough to answer a FETCH,
-    standalone or joining, over what it still holds; a late subscriber
-    starts at the live edge. Past CACHE_BUDGET_BYTES + CACHE_BYTES the
-    largest live group is dropped and the rest of it goes uncached. A
+  * A recent-object cache bounded by memory: --cache-bytes across all
+    tracks, an eighth of it per track (CACHE_BYTES), and the publisher's
+    MAX_CACHE_DURATION. Past the budget the least recently used track
+    loses its oldest group, taken first from tracks holding more than
+    their newest CACHE_FLOOR_S seconds (at least --lag-limit plus one
+    group), never the live group of a subscribed track or the newest
+    group of a catalog whose publisher is live: enough to answer a
+    FETCH, standalone or joining, over what it still holds; a late
+    subscriber starts at the live edge. Past CACHE_BUDGET_BYTES +
+    CACHE_BYTES the largest live group is dropped and the rest of it
+    goes uncached. A
     replay owed objects the cache no longer holds resets that subgroup
     stream rather than FIN it.
     Cache and lanes charge each object its payload, its properties and
@@ -109,6 +113,8 @@ import time
 import tomllib
 from collections import Counter
 from types import SimpleNamespace
+
+from sortedcontainers import SortedDict
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer, _listen_desc
@@ -422,11 +428,16 @@ def _fetch_sources(ns: tuple, track_name) -> list:
     return [owner, *pubs]
 
 
-# Recent-object cache bounds, per track: whichever is hit first.
-CACHE_GROUPS = 8
-CACHE_BYTES = 32 * 1024 * 1024
 # Relay-wide cache budget (--cache-bytes).
 CACHE_BUDGET_BYTES = 256 * 1024 * 1024
+# Per-track cache bound: an eighth of the budget.
+CACHE_BYTES = CACHE_BUDGET_BYTES // 8
+# Seconds of each track's newest objects the budget takes last.
+CACHE_FLOOR_S = 10.0
+# Groups below where upstream delivery began that a join backfills.
+BACKFILL_GROUPS = 8
+# Their newest group stays cached while their publisher is live.
+CATALOG_TRACKS = frozenset((CATALOG_TRACK, b"catalog.json"))
 
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
@@ -639,9 +650,134 @@ class _Downstream:
         return self.window[0]
 
 
+class _ObjectCache:
+    """A track's cached objects: group IDs ascending, each group's
+    objects in arrival order."""
+
+    __slots__ = ("_by_group", "_n", "_head_gid", "_head")
+
+    def __init__(self) -> None:
+        self._by_group = SortedDict()
+        self._n = 0
+        # The oldest group, kept for the per-object path.
+        self._head_gid = None
+        self._head = None
+
+    def _rehead(self) -> None:
+        if self._by_group:
+            self._head_gid, self._head = self._by_group.peekitem(0)
+        else:
+            self._head_gid = self._head = None
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __bool__(self) -> bool:
+        return self._n > 0
+
+    def __iter__(self):
+        for objs in self._by_group.values():
+            yield from objs
+
+    def __reversed__(self):
+        for objs in reversed(self._by_group.values()):
+            yield from reversed(objs)
+
+    def __getitem__(self, i):
+        """The first (0) or the last (-1) object."""
+        if self._n and i == 0:
+            return self._head[0]
+        if self._n and i == -1:
+            return self._by_group.peekitem(-1)[1][-1]
+        raise IndexError(i)
+
+    def groups(self):
+        """Cached group IDs, ascending."""
+        return self._by_group.keys()
+
+    def group(self, gid):
+        return self._by_group.get(gid, ())
+
+    def between(self, lo, hi=None):
+        """Objects of groups `lo` through `hi` (None: the newest)."""
+        by_group = self._by_group
+        for gid in by_group.irange(lo, hi):
+            yield from by_group[gid]
+
+    def ids_below(self, gid, n) -> list:
+        """The newest `n` cached group IDs below `gid`, ascending."""
+        ids = list(itertools.islice(self._by_group.irange(
+            maximum=gid, inclusive=(True, False), reverse=True), n))
+        ids.reverse()
+        return ids
+
+    def append(self, c) -> None:
+        gid = c[0]
+        objs = self._by_group.get(gid)
+        if objs is None:
+            objs = self._by_group[gid] = deque()
+            if self._head is None or gid < self._head_gid:
+                self._head_gid, self._head = gid, objs
+        objs.append(c)
+        self._n += 1
+
+    def merge(self, new) -> None:
+        """Add objects, keeping each group they land in in Object order."""
+        for c in new:
+            self.append(c)
+        for gid in {c[0] for c in new}:
+            self._by_group[gid] = deque(sorted(self._by_group[gid],
+                                               key=lambda c: c[2]))
+        self._rehead()
+
+    def popleft(self):
+        """Drop and return the first object."""
+        objs = self._head
+        c = objs.popleft()
+        if not objs:
+            del self._by_group[self._head_gid]
+            self._rehead()
+        self._n -= 1
+        return c
+
+    def pop_group(self, gid):
+        objs = self._by_group.pop(gid)
+        self._n -= len(objs)
+        if gid == self._head_gid:
+            self._rehead()
+        return objs
+
+    def drop_through(self, last) -> list:
+        """Drop and return the objects at or before Location `last`."""
+        out = []
+        by_group = self._by_group
+        while by_group:
+            gid, objs = by_group.peekitem(0)
+            if gid < last[0]:
+                out.extend(self.pop_group(gid))
+                continue
+            if gid == last[0]:
+                kept = deque(c for c in objs if c[2] > last[1])
+                out.extend(c for c in objs if c[2] <= last[1])
+                self._n -= len(objs) - len(kept)
+                if kept:
+                    by_group[gid] = kept
+                else:
+                    del by_group[gid]
+            break
+        self._rehead()
+        return out
+
+    def clear(self) -> None:
+        self._by_group.clear()
+        self._n = 0
+        self._head_gid = self._head = None
+
+
 class _CacheBudget:
     """Cache bytes across all tracks, held to CACHE_BUDGET_BYTES by
-    dropping the oldest group of the least recently used track."""
+    dropping the oldest group of the least recently used track, first
+    from tracks above their floor."""
 
     def __init__(self) -> None:
         # Tracks holding cached objects, least recently used first.
@@ -663,7 +799,9 @@ class _CacheBudget:
 
     def enforce(self) -> None:
         while self.bytes > CACHE_BUDGET_BYTES:
-            victim = next((t for t in self.lru if t._evictable()), None)
+            victim = next((t for t in self.lru if t._evictable()
+                           and t._above_floor()), None) or next(
+                (t for t in self.lru if t._evictable()), None)
             if victim is None and self.bytes > CACHE_BUDGET_BYTES + CACHE_BYTES:
                 largest = max(self.lru, key=lambda t: t._cache_bytes,
                               default=None)
@@ -1116,14 +1254,15 @@ class _RelayedTrack:
         self._closed = False
         # Alias of the PUBLISH feeding this track, on the publisher's session.
         self.publish_alias = None
-        # Recent objects, oldest first, for standalone FETCH. Bounded by
-        # groups and bytes; a relay with no cache can serve no fetch at
-        # all, and an unbounded one is a leak.
-        self._cache = deque()
+        # Recent objects for FETCH and replay, bounded by bytes; a relay
+        # with no cache can serve no fetch at all, and an unbounded one
+        # is a leak.
+        self._cache = _ObjectCache()
         self._cache_bytes = 0
-        # Objects cached per group ID; the bound counts groups, as IDs
-        # may skip.
-        self._groups = {}
+        # No cached object arrived before this.
+        self._born_floor = float("inf")
+        # Per-group state below this group is swept on the next _prune().
+        self._pruned_to = 0
         # Live group dropped at the relay's hard ceiling: the rest of it
         # is not cached.
         self._uncached = None
@@ -1361,22 +1500,23 @@ class _RelayedTrack:
         if age is None or not self._cache:
             return
         oldest = time.monotonic() - age
-        last = max(((c[0], c[2]) for c in self._cache if c[8] < oldest),
-                   default=None)
+        if self._born_floor >= oldest:
+            return
+        last = None
+        floor = float("inf")
+        for c in self._cache:
+            if c[8] < oldest:
+                if last is None or (c[0], c[2]) > last:
+                    last = (c[0], c[2])
+            elif c[8] < floor:
+                floor = c[8]
+        self._born_floor = floor
         if last is None:
             return
-        kept = deque()
         size = 0
-        for c in self._cache:
-            if (c[0], c[2]) > last:
-                kept.append(c)
-                continue
+        for c in self._cache.drop_through(last):
             size += retained_object_bytes(c[3], c[4])
             self._note_lost(c[0], c[2])
-            left = self._groups.pop(c[0]) - 1
-            if left:
-                self._groups[c[0]] = left
-        self._cache = kept
         self._cache_bytes -= size
         _budget.bytes -= size
         self._prune()
@@ -1408,7 +1548,7 @@ class _RelayedTrack:
         _budget.forget(self)
         self._cache.clear()
         self._cache_bytes = 0
-        self._groups.clear()
+        self._born_floor = float("inf")
 
     def _release_publish(self) -> None:
         """Drop the PUBLISH's handlers on the publisher's session, unless a
@@ -1865,51 +2005,70 @@ class _RelayedTrack:
                 return
             if gid > self._uncached:
                 self._uncached = None
+        if born is None:
+            born = time.monotonic()
         self._cache.append((gid, sgid, oid, payload, exts, prio, status,
-                            shape, time.monotonic() if born is None
-                            else born))
+                            shape, born))
+        if born < self._born_floor:
+            self._born_floor = born
         size = (retained_object_bytes(payload, exts) if cost is None
                 else cost)
         self._cache_bytes += size
         _budget.bytes += size
-        self._groups[gid] = self._groups.get(gid, 0) + 1
         self.note_largest((gid, oid))
         _budget.touch(self)
         self._evict()
 
     def _evict(self) -> None:
-        """Drop the oldest objects past CACHE_GROUPS groups or
-        CACHE_BYTES, then hold the relay to its budget."""
-        while self._cache and (len(self._groups) > CACHE_GROUPS
-                               or self._cache_bytes > CACHE_BYTES):
+        """Drop the oldest objects past CACHE_BYTES, then hold the relay
+        to its budget."""
+        while self._cache and self._cache_bytes > CACHE_BYTES:
             dropped = self._cache.popleft()
             size = retained_object_bytes(dropped[3], dropped[4])
             self._note_lost(dropped[0], dropped[2])
             self._cache_bytes -= size
             _budget.bytes -= size
-            left = self._groups.pop(dropped[0]) - 1
-            if left:
-                self._groups[dropped[0]] = left
         self._prune()
         _budget.enforce()
 
     def _evictable(self) -> bool:
         """Holds a group the budget may drop: anything but the newest
-        group of a track with a live subscriber."""
-        if len(self._groups) > 1:
-            return True
-        return bool(self._groups) and not any(
-            _session_live(d.session) for d in self.downstream)
+        group of a track with a live subscriber, or of a catalog whose
+        publisher is live."""
+        n = len(self._cache.groups())
+        if n != 1:
+            return n > 1
+        if (self.key[1] in CATALOG_TRACKS
+                and _session_live(_upstream_session(self))):
+            return False
+        return not any(_session_live(d.session) for d in self.downstream)
+
+    def _above_floor(self) -> bool:
+        """Without its oldest group the cache still spans the floor:
+        CACHE_FLOOR_S, or --lag-limit plus one group when longer."""
+        groups = self._cache.groups()
+        n = len(groups)
+        if n < 2:
+            return False
+        newest, oldest = self._cache[-1][8], self._cache[0][8]
+        floor = max(CACHE_FLOOR_S, _lag_limit + (newest - oldest) / (n - 1))
+        return newest - self._cache.group(groups[1])[0][8] >= floor
+
+    def cache_span_s(self) -> float:
+        """Seconds between the oldest and the newest cached arrival."""
+        if not self._cache:
+            return 0.0
+        return round(max(self._cache[-1][8] - self._cache[0][8], 0.0), 1)
 
     def _drop_oldest_group(self) -> None:
         """Drop every cached object of the oldest group, so the cache
         stays a contiguous run of the newest groups."""
-        self._drop_group(min(self._groups))
+        self._drop_group(self._cache.groups()[0])
 
     def _truncate_live(self) -> None:
         """At the relay's hard ceiling: drop the newest cached group and
         cache none of the rest of it. Live delivery is unaffected."""
-        gid = max(self._groups)
+        gid = self._cache.groups()[-1]
         logger.warning(
             f"relay: cache {_budget.bytes} bytes over its "
             f"{CACHE_BUDGET_BYTES + CACHE_BYTES}-byte ceiling: dropping "
@@ -1922,11 +2081,9 @@ class _RelayedTrack:
             self._lost[gid] = oid
 
     def _drop_group(self, gid) -> None:
-        size = sum(retained_object_bytes(c[3], c[4]) for c in self._cache
-                   if c[0] == gid)
-        self._note_lost(gid, max(c[2] for c in self._cache if c[0] == gid))
-        self._cache = deque(c for c in self._cache if c[0] != gid)
-        del self._groups[gid]
+        objs = self._cache.pop_group(gid)
+        size = sum(retained_object_bytes(c[3], c[4]) for c in objs)
+        self._note_lost(gid, max(c[2] for c in objs))
         self._cache_bytes -= size
         _budget.bytes -= size
         self._prune()
@@ -1934,27 +2091,34 @@ class _RelayedTrack:
     def _prune(self) -> None:
         """Forget per-group state below the oldest cached group; an
         empty cache leaves the budget's LRU."""
-        floor = (self._cache[0][0] if self._cache
+        head = self._cache[0] if self._cache else None
+        floor = (head[0] if head is not None
                  else self.largest[0] if self.largest else 0)
-        self._lost = {g: o for g, o in self._lost.items() if g >= floor}
-        oldest = (self._cache[0][0], self._cache[0][2]) if self._cache else None
-        self._gaps = [g for g in self._gaps if g[1] is None
-                      or (oldest is not None and g[1] > oldest)]
-        if not self._cache:
+        if self._lost:
+            self._lost = {g: o for g, o in self._lost.items() if g >= floor}
+        if self._gaps:
+            oldest = None if head is None else (head[0], head[2])
+            self._gaps = [g for g in self._gaps if g[1] is None
+                          or (oldest is not None and g[1] > oldest)]
+        if head is None:
             _budget.forget(self)
-        else:
-            first = self._cache[0][0]
-            self._floor = first
-            self._subgroups = {k: v for k, v in self._subgroups.items()
-                               if k[0] >= first}
-            self._reset = {k for k in self._reset if k[0] >= first}
-            self._dgrams = {k for k in self._dgrams if k[0] >= first}
-            self._ended = {k for k in self._ended if k[0] >= first}
-            self._opened = {k for k in self._opened if k[0] >= first}
-            self._heads = {g for g in self._heads if g >= first}
-            self._backfilled = {k for k in self._backfilled
-                                if k[0] >= first}
-            self._stopped = {k for k in self._stopped if k[1] >= first}
+            return
+        first = head[0]
+        self._floor = first
+        if first < self._pruned_to:
+            return
+        # Swept once the floor has moved past as many groups as are
+        # cached, so the cost per object stays flat.
+        self._pruned_to = first + len(self._cache.groups())
+        self._subgroups = {k: v for k, v in self._subgroups.items()
+                           if k[0] >= first}
+        self._reset = {k for k in self._reset if k[0] >= first}
+        self._dgrams = {k for k in self._dgrams if k[0] >= first}
+        self._ended = {k for k in self._ended if k[0] >= first}
+        self._opened = {k for k in self._opened if k[0] >= first}
+        self._heads = {g for g in self._heads if g >= first}
+        self._backfilled = {k for k in self._backfilled if k[0] >= first}
+        self._stopped = {k for k in self._stopped if k[1] >= first}
 
     def _replay(self, d) -> None:
         """Queue on `d`'s lane the cached objects inside its window, in
@@ -1965,7 +2129,9 @@ class _RelayedTrack:
             return
         self._expire_cache()
         d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
-        objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
+        objs = sorted((c for c in self._cache.between(d.start[0],
+                                                      d.window[1])
+                       if d.passes(c[0], c[2])
                        and d.admits(c[1], c[2], c[5], c[4])),
                       key=lambda c: (c[0], c[1], c[2]))
         if objs:
@@ -2000,10 +2166,15 @@ class _RelayedTrack:
     def holds_through(self, end) -> bool:
         """The cache reaches `end`: it holds an object at or past it, the
         End of Group of `end`'s group, or End of Track."""
+        if not self._cache:
+            return False
+        newest = self._cache.groups()[-1]
+        if any(c[6] == ObjectStatus.END_OF_TRACK
+               for c in self._cache.group(newest)):
+            return True
         return any((c[0], c[2]) >= end
-                   or c[6] == ObjectStatus.END_OF_TRACK
                    or (c[0] == end[0] and c[6] == ObjectStatus.END_OF_GROUP)
-                   for c in reversed(self._cache))
+                   for c in self._cache.between(end[0]))
 
     def open_gap(self) -> None:
         """Note a pause: what is published from just past Largest, or
@@ -2025,7 +2196,7 @@ class _RelayedTrack:
         """The last cached Location of a group, which is its END_OF_GROUP
         when held; (group, 0) when none is held, and never before
         `start`."""
-        oids = [c[2] for c in self._cache if c[0] == group_id]
+        oids = [c[2] for c in self._cache.group(group_id)]
         return max(start, (group_id, max(oids) if oids else 0))
 
     def cached_range(self, start, end):
@@ -2034,7 +2205,9 @@ class _RelayedTrack:
         across subgroups (§3.2.1)."""
         self._expire_cache()
         out = []
-        for gid, sgid, oid, payload, exts, prio, status, *_ in self._cache:
+        for gid, sgid, oid, payload, exts, prio, status, *_ in \
+                self._cache.between(start[0],
+                                    None if end is None else end[0]):
             if (gid, oid) < start:
                 continue
             if end is not None and (gid, oid) > end:
@@ -2709,11 +2882,10 @@ async def _backfill(track, msg, largest) -> None:
         return
     want = _subscription_window(msg, largest)[0]
     if want < (track.upstream_from or cf):
-        # The cache's reach: CACHE_GROUPS groups, by the IDs it has seen
-        # below cf, never short of a contiguous span.
-        seen = sorted(g for g in track._groups if g < cf[0])
-        reach = min([cf[0] - CACHE_GROUPS + 1,
-                     *seen[-(CACHE_GROUPS - 1):][:1]])
+        # BACKFILL_GROUPS groups, by the IDs cached below cf, never
+        # short of a contiguous span.
+        seen = track._cache.ids_below(cf[0], BACKFILL_GROUPS - 1)
+        reach = min([cf[0] - BACKFILL_GROUPS + 1, *seen[:1]])
         start = max(want, (max(0, reach), 0))
     else:
         start = max(want, (cf[0], 0))
@@ -2730,18 +2902,17 @@ async def _backfill(track, msg, largest) -> None:
     if (objs is None or track.complete_from != cf or track._closed
             or track.finished):
         return
-    held = {(c[0], c[2]) for c in track._cache}
+    held = {(c[0], c[2]) for c in track._cache.between(start[0], end[0])}
     now = time.monotonic()
     new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
             o.extensions or None, o.publisher_priority, o.status, None, now)
            for o in objs if (o.group_id, o.object_id) not in held]
-    track._cache = deque(sorted([*new, *track._cache],
-                                key=lambda c: (c[0], c[2])))
+    track._cache.merge(new)
+    if new and now < track._born_floor:
+        track._born_floor = now
     size = sum(retained_object_bytes(c[3], c[4]) for c in new)
     track._cache_bytes += size
     _budget.bytes += size
-    for c in new:
-        track._groups[c[0]] = track._groups.get(c[0], 0) + 1
     _budget.touch(track)
     track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)
@@ -2773,8 +2944,8 @@ async def _probe_catalog_head(track) -> None:
     head = SimpleNamespace(filter_type=FilterType.ABSOLUTE_START,
                            start_group=g, start_object=0, end_group=None)
     await _backfill(track, head, track.largest)
-    for c in list(track._cache):
-        if c[0] == g and c[2] == 0:
+    for c in list(track._cache.group(g)):
+        if c[2] == 0:
             _note_catalog(track.key[0], c[3])
             return
 
@@ -4184,10 +4355,12 @@ def parse_args(argv=None):
                              "--stream-ring-cap. Default: 512 KiB")
     parser.add_argument("--cache-bytes", type=int,
                         default=CACHE_BUDGET_BYTES, metavar="BYTES",
-                        help="Object cache budget across all tracks; past "
-                             "it the least recently used tracks lose their "
-                             "oldest groups. Send lanes holding more than "
-                             "this fall back to 4 MiB each. Default: 256 MiB")
+                        help="Object cache budget across all tracks, an "
+                             "eighth of it per track; past it the least "
+                             "recently used tracks lose their oldest groups, "
+                             "each keeping its newest 10 s while others hold "
+                             "more. Send lanes holding more than this fall "
+                             "back to 4 MiB each. Default: 256 MiB")
     parser.add_argument("--max-namespaces-per-session", type=int,
                         default=MAX_NAMESPACES_PER_SESSION, metavar="N",
                         help="PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and "
@@ -5417,7 +5590,8 @@ class _Status:
                 "latency_ms": (None if up is None or down is None
                                else round((up + down) / 2, 1)),
                 "largest": list(t.largest) if t.largest else None,
-                "cache_groups": len({c[0] for c in t._cache}),
+                "cache_groups": len(t._cache.groups()),
+                "cache_seconds": t.cache_span_s(),
                 "cache_bytes": t._cache_bytes,
                 "state": _track_state(t, t._bytes_in > p_in),
                 "origin": (f"{_transport(owner)} d{_draft(owner)}"
@@ -6056,8 +6230,9 @@ async def main():
     if args.drain_timeout < 0:
         print("Error: --drain-timeout must be 0 or more", file=sys.stderr)
         sys.exit(2)
-    global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
+    global CACHE_BUDGET_BYTES, CACHE_BYTES, STREAM_SCHEDULING
     CACHE_BUDGET_BYTES = args.cache_bytes
+    CACHE_BYTES = CACHE_BUDGET_BYTES // 8
     if (args.max_namespaces_per_session <= 0
             or args.max_subscriptions_per_session <= 0):
         print("Error: --max-namespaces-per-session and "
@@ -6131,7 +6306,7 @@ async def main():
             "started": time.time(),
             "watchdog_s": args.watchdog,
             "workers": args.workers,
-            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
+            "cache": {"track_bytes": CACHE_BYTES, "floor_s": CACHE_FLOOR_S,
                       "budget": CACHE_BUDGET_BYTES},
             "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
                             "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},
