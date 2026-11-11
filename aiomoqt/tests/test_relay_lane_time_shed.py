@@ -313,6 +313,27 @@ async def test_bytes_held_by_the_transport_count_toward_time_behind(lanes):
         int(StreamResetCode.DELIVERY_TIMEOUT)}
 
 
+async def test_a_lane_reads_only_the_marks_taken_since_it_joined(lanes):
+    track, _lane = lanes(_Viewer())
+    t = time.monotonic()
+    # Marks left under the id a new session reuses.
+    viewer = _Viewer()
+    for n in range(20):
+        track._marks.append(({id(viewer): 10**9 + n}, {id(viewer): t - 60}))
+    track._marks_n += 20
+    lane = track._lane(track.add_downstream(viewer, 2, 2))
+    for oid in range(_FPS):
+        _tick(t)
+        _offer(lane, _obj(0, oid, 4000, t))
+        t += 1 / _FPS
+        if oid == 0:
+            await _settle(5)
+    lane._probe(lane.floor)
+    assert lane.tx_bytes and lane._oldest >= t - 1.1, lane._oldest - t
+    lane.check_time(t)
+    assert not lane.late
+
+
 @pytest.mark.parametrize("name,keeps", [
     (b"catalog", True), (b"catalog.json", True), (b"video", False)])
 async def test_a_catalog_lane_never_sheds_its_newest_group(lanes, name, keeps):
@@ -422,9 +443,9 @@ async def test_a_viewer_keeping_up_costs_no_lane_check_per_object(
     await _settle()
     assert track._objects_out == 10 * _FPS and lane.sheds == 0
     assert len(calls) == 2 and not lane.late, calls
-    # A mark per LANE_MARK_S of arrivals, none per object.
-    assert len(lane._marks) <= (t - t0 - _DEADLINE) / relay.LANE_MARK_S + 1, (
-        len(lane._marks))
+    # A mark per LANE_MARK_S of arrivals, none per object; LANE_MARKS kept.
+    assert track._marks_n <= (t - t0) / relay.LANE_MARK_S + 1, track._marks_n
+    assert len(track._marks) <= relay.LANE_MARKS + 2, len(track._marks)
 
 
 async def test_the_late_mark_clears_without_a_deadline(lanes):

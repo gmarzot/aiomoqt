@@ -92,6 +92,7 @@ exits at once.
 
 import argparse
 import asyncio
+from bisect import bisect_right
 from collections import OrderedDict, deque
 import contextlib
 import datetime
@@ -270,8 +271,8 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A send lane notes its bytes written once per LANE_MARK_S of its track's
-# arrivals, at most LANE_MARKS times per deadline.
+# A track marks each session's bytes written once per LANE_MARK_S of its
+# arrivals, wider apart when LANE_MARKS have to span a longer deadline.
 LANE_MARK_S = 0.05
 LANE_MARKS = 100
 # --trace-subscribers: count what each subscription is sent.
@@ -776,12 +777,13 @@ class _RelayDelivery:
     """A subscriber's side of a relayed track, written by its SendLane:
     streams keep the upstream (group, subgroup) structure."""
 
-    __slots__ = ("track", "d", "session", "lane")
+    __slots__ = ("track", "d", "session", "sid", "lane")
 
     def __init__(self, track, d):
         self.track = track
         self.d = d
         self.session = d.session
+        self.sid = id(d.session)
         self.lane = None
 
     def send(self, item, end=None):
@@ -792,8 +794,8 @@ class _RelayDelivery:
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
-            if _born is not None and self.lane is not None:
-                self.lane._wborn = _born
+            if _born is not None:
+                track._tx_born[self.sid] = _born
         if end is not None and end[5] is not None:
             track._objects_out += 1
         rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
@@ -825,7 +827,7 @@ class _RelayDelivery:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
             if _born is not None:
-                self.lane._wborn = _born
+                track._tx_born[self.sid] = _born
         return True
 
     @staticmethod
@@ -890,18 +892,13 @@ class _RelayLane(SendLane):
     def __init__(self, track, d):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
-        # (bytes written to the session's streams of the track, arrival
-        # time of the newest object among them), from mark() and probes.
-        self._marks = deque()
-        # Arrival time of the newest object handed to the writer.
-        self._wborn = None
+        self._sid = id(d.session)
+        # The track's marks from this one on are the lane's own.
+        self._mark0 = track._marks_n
         # Arrival time of the oldest live object held, as last read.
         self._oldest = None
         # When check_time() is due, None for never.
         self._time_due = None
-        # mark() notes every _mark_every-th call.
-        self._mark_every = 1
-        self._mark_n = 0
         # The last shed's cause: byte cap, else seconds behind; bytes held.
         self._capped = False
         self._behind = 0.0
@@ -923,27 +920,10 @@ class _RelayLane(SendLane):
     def deadline(self, value) -> None:
         SendLane.deadline.fset(self, value)
         if self._deadline is not None:
-            self._mark_every = max(1, round(
-                self._deadline / LANE_MARKS / LANE_MARK_S))
+            track = self.track
+            track._mark_s = max(track._mark_s, self._deadline / LANE_MARKS)
         # The crossing may come sooner.
         _due_lane(self, time.monotonic())
-
-    def _written(self) -> int:
-        return self.track._tx_written.get(id(self.d.session), 0)
-
-    def mark(self) -> None:
-        """Note the bytes written so far and the arrival time of the newest
-        object among them."""
-        if self._deadline is None or self._wborn is None:
-            return
-        self._mark_n += 1
-        if self._mark_n < self._mark_every:
-            return
-        self._mark_n = 0
-        written = self._written()
-        marks = self._marks
-        if not marks or marks[-1][0] < written:
-            marks.append((written, self._wborn))
 
     def _probe(self, floor) -> None:
         super()._probe(floor)
@@ -954,17 +934,20 @@ class _RelayLane(SendLane):
         """Arrival time of the oldest live object not yet sent. The
         transport sends a session's streams of the track oldest first, so
         its oldest unsent byte is `tx_bytes` before the end of what was
-        written; the first mark past it gives its time, at most one mark
-        late. Else the oldest queued, None for none."""
-        written = self._written()
-        marks = self._marks
-        if self._wborn is not None and (not marks or marks[-1][0] < written):
-            marks.append((written, self._wborn))
-        unsent = written - self.tx_bytes
-        while marks and marks[0][0] <= unsent:
-            marks.popleft()
-        if self.tx_bytes and marks:
-            return marks[0][1]
+        written; the first of the track's marks past it gives its time, at
+        most one mark late. Else the oldest queued, None for none."""
+        if self.tx_bytes:
+            track, sid = self.track, self._sid
+            unsent = track._tx_written.get(sid, 0) - self.tx_bytes
+            marks = track._marks
+            # Older marks may hold another session's count under a reused id.
+            lo = max(0, self._mark0 - track._marks_n + len(marks))
+            i = bisect_right(marks, unsent, lo,
+                             key=lambda m: m[0].get(sid, 0))
+            born = (marks[i][1] if i < len(marks)
+                    else track._tx_born).get(sid)
+            if born is not None:
+                return born
         for it in self.items:
             if it[0].__class__ is not str and it[3] is not None and it[2]:
                 return it[3]
@@ -1200,8 +1183,10 @@ class _RelayedTrack:
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
-        # Arrival time of the next object that marks the lanes.
+        # Arrival time of the next object that marks.
         self._mark_at = 0.0
+        # Seconds of arrivals between marks.
+        self._mark_s = LANE_MARK_S
         self.queue = asyncio.Queue()
         # (group, subgroup) -> stream ends queued for the forward loop.
         self._ends_due: dict = {}
@@ -1216,6 +1201,12 @@ class _RelayedTrack:
         self._tx_streams: dict = {}
         # id(session) -> bytes written to its streams of the track.
         self._tx_written: dict = {}
+        # id(session) -> arrival time of the newest object among them.
+        self._tx_born: dict = {}
+        # Copies of (_tx_written, _tx_born), oldest first; _marks[0] is
+        # mark number _marks_n - len(_marks).
+        self._marks: list = []
+        self._marks_n = 0
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -1443,6 +1434,8 @@ class _RelayedTrack:
             del self._tx_streams[k]
         for k in [k for k in self._tx_written if k not in draining]:
             del self._tx_written[k]
+        for k in [k for k in self._tx_born if k not in draining]:
+            del self._tx_born[k]
 
     def _lane(self, d) -> "_RelayLane":
         if d.lane is None:
@@ -1902,6 +1895,7 @@ class _RelayedTrack:
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
         self._tx_written.pop(id(session), None)
+        self._tx_born.pop(id(session), None)
 
     def _end_due(self, k, n) -> None:
         n += self._ends_due.get(k, 0)
@@ -1979,11 +1973,17 @@ class _RelayedTrack:
                 self.mark_lanes(born)
 
     def mark_lanes(self, born) -> None:
-        """Each lane notes what it has written, LANE_MARK_S of arrivals
-        apart."""
-        self._mark_at = born + LANE_MARK_S
-        for lane in self._lanes:
-            lane.mark()
+        """Mark each session's bytes written and the newest arrival among
+        them, _mark_s of arrivals apart."""
+        self._mark_at = born + self._mark_s
+        if not self._lanes:
+            return
+        marks = self._marks
+        marks.append((self._tx_written.copy(), self._tx_born.copy()))
+        self._marks_n += 1
+        # LANE_MARKS span the longest deadline.
+        if len(marks) > LANE_MARKS + 2:
+            del marks[0]
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
                   shape=None, cost=None, born=None) -> None:
