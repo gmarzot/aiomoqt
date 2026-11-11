@@ -51,12 +51,14 @@ code {
 }
 
 .hero-grid {
-  display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content auto;
+  display: grid; grid-template-columns: max-content minmax(0, 1fr) auto;
   gap: 16px 32px; align-items: start;
 }
 /* UPTIME level with the last URL line. */
 .hero-grid > .facts:not(.first) { align-self: end; padding-bottom: 5px; }
-.hero-links { align-self: end; padding-bottom: 5px; }
+/* Above the facts block's top-right corner, taking no space in the grid. */
+.facts.side { position: relative; }
+.hero-links { position: absolute; right: 0; bottom: 100%; line-height: 1.2; white-space: nowrap; }
 .mono {
   display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 1px 12px; margin: 0;
   font: 13px/1.45 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
