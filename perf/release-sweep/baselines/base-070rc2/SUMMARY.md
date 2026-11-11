@@ -68,7 +68,7 @@ Medians. CI = bootstrap 95% over reps, shown only where n≥3 and n_ok≥2.
 | **R5b** | relay, 20 subs ×50 Mb/s (suppl.) | 1000 | 2/3 | **47.5** /sub | 47.44–47.57 | 0.19 |
 | **N1** | D-raw reference, P=4 unpaced (P1b) | line | 7/7 | **811.7** | 802.1–826.2 | 2.38 |
 | **N2** | M1 media shape, 1 sub (P1b) | ~4.8 | 7/7 | **4.83** | 4.82–4.84 | 0.27 |
-| **M1** | 1080p, 1 sub, 120 s | ~4.8 | 2/2 | **4.81** | n=2 | 0.15 |
+| **M1** | 1080p, 1 sub, 120 s | ~4.8 | 3/3 | **4.81** (4.81, 4.81, 4.83) | n=3 | 0.15 |
 | **M2** | 720p, 5 subs, 120 s | — | 0/0 | *pending* | — | — |
 | **C0** | 50 slots, steady, 0 churn (control) | 200 | 0/0 | *pending* | — | — |
 | **C1** | churn storm, 50 slots, 300 s | 200 | 0/0 | *pending* | — | — |
@@ -192,11 +192,11 @@ transport ceiling in §2, so a transport regression cannot show up here as
 throughput. They exist to catch CPU/scheduling effects at sub-percent scale —
 N2's CV is 0.27%, MDE N=3 **0.43%**, the tightest floor the program has.
 
-- M1 (1080p, 1 sub, 120 s) median **4.81 Mb/s**, CV 0.15%, **n=2** — the Phase 1e
-  block is still in flight, so M1 is *not yet* at its N=3 target; two reps reported.
+- M1 (1080p, 1 sub, 120 s) median **4.81 Mb/s**, n=3 (4.81 / 4.81 / 4.83, spread
+  0.4%), all three `dirty` under the clock-offset waiver. M2 was still running when
+  this was written.
 - M2 (720p, 5 subs, 120 s): **pending** — no result yet (§4).
-- N2 (same shape as M1, 7 reps, Phase 1b) **4.83 Mb/s**, CV 0.27% — the two M1
-  reps so far sit at **4.81**, i.e. **−0.4% vs N2**, inside N2's own 0.43% MDE.
+- N2 (same shape as M1, 7 reps, Phase 1b) **4.83 Mb/s**, CV 0.27% — M1 sits at **4.81** (3/3), i.e. **−0.4% vs N2**, inside N2's own 0.43% MDE.
   Media delivery is transport-insensitive on this rig, and any future media-shaped
   regression must be read against 0.43%, not against the 3.8% link floor.
 

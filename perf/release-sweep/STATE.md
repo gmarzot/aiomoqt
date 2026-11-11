@@ -510,8 +510,8 @@ accuracy.
 L/P/D/R/Ri baselines are consolidated from their canonical blocks; the Phase 1e
 media/churn block was relaunched at **02:33:51Z** (`runs/2026-11-11T02-33-51Z`)
 with `--waive stray_bench_process,clock_offset_jump` after the first attempt
-(02:28:34Z) aborted on a clock-offset jump, and had completed **M1 (2/2 reps,
-4.81 Mb/s)** when this note was written. **M2, C2, C1, C0 are not yet measured.**
+(02:28:34Z) aborted on a clock-offset jump, and had completed **M1 (3/3 reps,
+4.81 Mb/s: 4.81/4.81/4.83)** and started M2 when this note was written. **M2, C2, C1, C0 are not yet measured.**
 
 Delivered this pass:
 - `baselines/base-070rc2/SUMMARY.md` — headline table (L/P/D/R/Ri/M/C) + the five
