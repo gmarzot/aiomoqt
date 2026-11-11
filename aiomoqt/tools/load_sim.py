@@ -103,6 +103,10 @@ TICK_S = 1.0
 SUBS_DRAIN_GRACE_S = 5.0
 # A group fails below this fraction of rate x live-subscriber-seconds.
 EXPECTED_FLOOR = 0.5
+# Each track must also reach EXPECTED_FLOOR over every RECENT_S window
+# that owed at least RECENT_MIN_OBJS objects, so one that stops mid-run fails.
+RECENT_S = 10.0
+RECENT_MIN_OBJS = 5
 CMD_POLL_S = 0.1
 # Join commands in flight count against the group target until the host
 # reports an outcome; expire unanswered ones so a wedged shard can't
@@ -517,6 +521,10 @@ class GroupRT:
         self.max_live = 0
         self.expected_objs = 0.0
         self.expected_track = {p.track: 0.0 for p in spec.pubs}
+        # Per track: (now, delivered, owed) samples over RECENT_S, and the
+        # worst window below the floor as (delivered, owed, scenario t).
+        self.track_hist: Dict[str, deque] = {}
+        self.track_short: Dict[str, tuple] = {}
 
     def live(self) -> int:
         return sum(s.live for s in self.shards)
@@ -690,6 +698,38 @@ def _accrue_expected(groups: Dict[int, GroupRT], pubs: Dict[str, PubRT],
             owed = live * pub.fps * dt
             g.expected_objs += owed
             g.expected_track[pub.track] += owed
+
+
+def _note_recent(groups: Dict[int, GroupRT], t: float, now: float):
+    """Sample each track's delivered and owed objects; keep its worst full
+    RECENT_S window below EXPECTED_FLOOR in track_short."""
+    for g in groups.values():
+        for pub in g.spec.pubs:
+            name = pub.track
+            n = sum(s.stats.get("track_objs", {}).get(name, 0)
+                    for s in g.shards)
+            hist = g.track_hist.setdefault(name, deque())
+            hist.append((now, n, g.expected_track[name]))
+            while len(hist) > 1 and hist[1][0] <= now - RECENT_S:
+                hist.popleft()
+            t0, n0, e0 = hist[0]
+            if now - t0 < RECENT_S:
+                continue
+            got, owed = n - n0, g.expected_track[name] - e0
+            if owed < RECENT_MIN_OBJS or got >= owed * EXPECTED_FLOOR:
+                continue
+            worst = g.track_short.get(name)
+            if worst is None or got / owed < worst[0] / worst[1]:
+                g.track_short[name] = (got, owed, t)
+
+
+def _short_note(grt: "GroupRT", track: str) -> str:
+    short = grt.track_short.get(track)
+    if short is None:
+        return ""
+    got, owed, t = short
+    return (f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED over "
+            f"{RECENT_S:.0f}s at T+{t:.0f}s ({got}/{owed:.0f})")
 
 
 def _predict_egress(pubs: List[PubSpec], groups: List[GroupSpec]):
@@ -984,6 +1024,7 @@ def main():
             _accrue_expected(groups, pubs, t, now - last_tick)
             last_tick = now
             if not stopping:
+                _note_recent(groups, t, now)
                 for grt in groups.values():
                     _tick_group(grt, t, rng)
 
@@ -1127,6 +1168,9 @@ def _verdict(groups: Dict[int, "GroupRT"],
         elif total_objs < expected * EXPECTED_FLOOR:
             note = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
             failed = True
+        elif not gs.multi and _short_note(grt, gs.pubs[0].track):
+            note = _short_note(grt, gs.pubs[0].track)
+            failed = True
         track_lines = []
         if gs.multi:
             for ps in gs.pubs:
@@ -1138,6 +1182,8 @@ def _verdict(groups: Dict[int, "GroupRT"],
                     tnote = "  << NO OBJECTS"
                 elif grt.max_live and n < exp * EXPECTED_FLOOR:
                     tnote = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
+                elif grt.max_live:
+                    tnote = _short_note(grt, ps.track)
                 if tnote:
                     failed = True
                     note = note or f"  << {ps.track}: {tnote[5:]}"

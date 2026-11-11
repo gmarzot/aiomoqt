@@ -35,7 +35,7 @@ from aiomoqt.client import MOQTClient, SharedTransport
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import FilterType, MOQTRequestError
+from aiomoqt.types import FilterType, MOQTRequestError, ObjectStatus
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_handler, set_log_level
 from aiomoqt.utils.stats import TrackStats, ViewerStats
@@ -78,6 +78,9 @@ JOIN_SAMPLES_MAX = 500
 JOINER_DWELL_S = 1.0
 # How often a batch checks for a new join trial.
 TRIAL_POLL_S = 0.01
+
+# Object statuses that carry media; markers do not complete a join.
+_NORMAL = (None, ObjectStatus.NORMAL)
 
 # Spawn context for all bench parents. Linux pins "fork": Python 3.14
 # switched the Linux default to forkserver, whose by-name SemLock reopen
@@ -202,6 +205,13 @@ async def wait_tracks_end(tracks, stop_ev) -> Optional[str]:
         _cancel_all(pending | {stop})
 
 
+def _stats_options(config: Dict[str, Any]) -> Dict[str, Any]:
+    """TrackStats settings from config: 'lat_min_us' keeps negative
+    latency down to it, for a clock offset a baseline cancels."""
+    return ({'lat_min_us': int(config['lat_min_us'])}
+            if config.get('lat_min_us') is not None else {})
+
+
 def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
     """Forward explicit transport settings, retaining None to disable a budget."""
     return {key: config[key] for key in (
@@ -228,7 +238,7 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
     )
 
     stop_ev = _bridge_stop_event(mp_stop_event)
-    stats = TrackStats(group_loss=True)
+    stats = TrackStats(group_loss=True, **_stats_options(config))
 
     def _on_object(msg, size_bytes, recv_time_us, group_id=None,
                    subgroup_id=None, *_args, **_kw):
@@ -404,7 +414,8 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                        subgroup_id=None, *_args, **_kw):
             (stats.tracks[name] if multi else stats).on_object(
                 msg, size_bytes, recv_time_us, group_id, subgroup_id)
-            if state['join_t0'] is not None:
+            if (state['join_t0'] is not None
+                    and getattr(msg, 'status', None) in _NORMAL):
                 join_first_object(state, time.monotonic())
         return _on_object
 
@@ -574,20 +585,52 @@ def slot_delivering(hist, since: float, now: float, window_s: float,
     return (b_last - base[1]) / elapsed >= DELIVERING_FLOOR * expected_bps
 
 
+def starved_tracks(state, snap, now: float, window_s: float, sparse=(),
+                   grace_s: float = SLOT_GRACE_S) -> list:
+    """Record each track's cumulative object count from snap['tracks']
+    and return the tracks, other than `sparse` ones, whose count did not
+    advance over the last window_s counted from the slot's latest
+    subscribe. None inside the grace or without per-track counts."""
+    tracks = snap.get('tracks')
+    if not tracks:
+        return []
+    th = state.setdefault('track_hist', {})
+    for name, (objs, _bytes) in tracks.items():
+        hist = th.setdefault(name, deque())
+        hist.append((now, objs))
+        while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
+            hist.popleft()
+    if now - state['since'] < grace_s:
+        return []
+    start = max(state['since'], now - window_s)
+    out = []
+    for name, hist in th.items():
+        if name in sparse:
+            continue
+        base = next(((t, o) for t, o in hist if t >= start), None)
+        if base is not None and hist[-1][0] > base[0] and hist[-1][1] <= base[1]:
+            out.append(name)
+    return out
+
+
 def judge_slot(state, snap, now: float, window_s: float, expected_bps: float,
-               late_ms: float) -> tuple:
-    """(delivering, lossy, late) for a slot from its latest snapshot.
-    Lossy: it lost an object in the last window_s. Late: p90 over late_ms
-    (0 = not judged). Delivering: at rate per slot_delivering(), or any
-    rate without expected_bps, and neither lossy nor late."""
+               late_ms: float, sparse=()) -> tuple:
+    """(delivering, lossy, late, starved) for a slot from its latest
+    snapshot. Lossy: it lost an object in the last window_s. Late: p90
+    over late_ms (0 = not judged). Starved: a track other than `sparse`
+    ones stopped advancing (starved_tracks()). Delivering: at rate per
+    slot_delivering(), or any rate without expected_bps, and none of
+    lossy, late or starved."""
     if snap['loss'] > state['lost']:
         state['lost_at'] = now
     state['lost'] = snap['loss']
     lossy = now - state['lost_at'] < window_s
     late = bool(late_ms and snap['lat_n'] and snap['lat_p90_ms'] > late_ms)
+    starved = bool(starved_tracks(state, snap, now, window_s, sparse))
     at_rate = not expected_bps or slot_delivering(
         state['hist'], state['since'], now, window_s, expected_bps)
-    return at_rate and not lossy and not late, lossy, late
+    return (at_rate and not lossy and not late and not starved,
+            lossy, late, starved)
 
 
 def viewer_tracks(config: Dict[str, Any]) -> list:
@@ -598,8 +641,9 @@ def viewer_tracks(config: Dict[str, Any]) -> list:
 
 def new_viewer_stats(config: Dict[str, Any]):
     if not config.get('side_tracks'):
-        return TrackStats(group_loss=True)
-    return ViewerStats(viewer_tracks(config), group_loss=True)
+        return TrackStats(group_loss=True, **_stats_options(config))
+    return ViewerStats(viewer_tracks(config), group_loss=True,
+                       **_stats_options(config))
 
 
 def new_slot_state(tally: dict, watcher: bool = True) -> dict:
@@ -612,6 +656,7 @@ def new_slot_state(tally: dict, watcher: bool = True) -> dict:
             'behind_since': None, 'resubscribe_at': 0.0,
             'resubscribe': False, 'resubscribed': 0,
             'carried': {'loss': 0, 'total_bytes': 0, 'total_objs': 0},
+            'track_hist': {},
             'tally': tally, 'join_t0': None, 'join_setup_ms': None,
             'join_sub_ms': None, 'join_first_at': None, 'cycle': False,
             'trial_t': None, 'wake': asyncio.Event()}
@@ -640,8 +685,10 @@ def _keep(samples: list, v: float) -> None:
 
 
 def join_begin(state, now: float) -> None:
-    """A slot dials: time a new join from now."""
+    """A slot dials: time a new join from now. Until it completes the
+    slot has no joined_at, so a failed redial is not eligible."""
     state['join_t0'] = now
+    state['joined_at'] = None
     state['join_setup_ms'] = state['join_sub_ms'] = state['join_first_at'] = None
     state['cycle'] = False
 
@@ -740,6 +787,8 @@ def renew_stats(state, old):
     state['lost_at'] = float('-inf')
     if state.get('hist') is not None:
         state['hist'].clear()
+    if state.get('track_hist'):
+        state['track_hist'].clear()
     new_stats = state.get('new_stats')
     state['stats'] = new_stats() if new_stats else TrackStats(group_loss=True)
     return state['stats']
@@ -759,14 +808,16 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
        "refused" (subscribes the relay refused so far), "refusing" (slots
        whose last subscribe it refused), "refused_reason",
        "lossy" (slots that lost an object in the window), "late" (slots
-       with p90 over config 'slot_latency_ms'), "judged" (slots the
-       health fields cover), and new_join_tally()'s fields}
+       with p90 over config 'slot_latency_ms'), "track_starved" (slots
+       with a track that stopped advancing; config 'sparse_tracks' are
+       exempt), "judged" (slots the health fields cover), and
+       new_join_tally()'s fields}
 
     "loss" counts whole groups and group tails a slot never got. A slot
     is delivering per slot_delivering() against config 'per_sub_mbps'
     over config 'keep_window' seconds (without per_sub_mbps every
-    subscribed slot passes that test), and only while neither lossy
-    nor late.
+    subscribed slot passes that test), and only while not lossy, late
+    or track-starved.
 
     config 'trial' (a shared Array: trial start time, joiners) starts a
     join trial when its time changes: that many eligible joiners redial at
@@ -787,6 +838,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
     window_s = float(config.get('keep_window', 3.0))
     behind_ms = float(config.get('too_far_behind') or 0.0) * 1000
     late_ms = float(config.get('slot_latency_ms') or 0.0)
+    sparse = frozenset(config.get('sparse_tracks') or ())
 
     trial = config.get('trial')
     tally = new_join_tally()
@@ -813,6 +865,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
             refused = refusing = 0
             refused_reason = None
             behind = resubscribed = lossy = late = judged = ready = 0
+            starved_n = 0
             cycling = trial is not None and trial[0] > 0
             for stats, state in slots:
                 ready += eligible(state, now)
@@ -840,8 +893,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 hist.append((now, snap['total_bytes']))
                 while hist and hist[0][0] < now - window_s - STATS_INTERVAL_S:
                     hist.popleft()
-                ok, lost, slow = judge_slot(state, snap, now, window_s,
-                                            expected_bps, late_ms)
+                ok, lost, slow, starved = judge_slot(
+                    state, snap, now, window_s, expected_bps, late_ms, sparse)
                 if snap['lat_n']:
                     lat_n += snap['lat_n']
                     p90, mean = snap['lat_p90_ms'], snap['lat_mean_ms']
@@ -855,6 +908,7 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                     delivering += ok
                     lossy += lost
                     late += slow
+                    starved_n += starved
             _post(events_queue, {
                 'kind': 'batch_stats', 'worker_id': worker_id,
                 'batch_size': K, 'active': active,
@@ -870,7 +924,8 @@ async def _subscriber_batch_task(config: Dict[str, Any], mp_stop_event,
                 'refused': refused, 'refusing': refusing,
                 'refused_reason': refused_reason,
                 'behind': behind, 'resubscribed': resubscribed,
-                'lossy': lossy, 'late': late, 'judged': judged, 'eligible': ready,
+                'lossy': lossy, 'late': late, 'track_starved': starved_n,
+                'judged': judged, 'eligible': ready,
                 **take_join_tally(tally),
             })
             last_t = now
