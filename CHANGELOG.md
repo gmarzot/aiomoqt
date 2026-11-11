@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay no longer forwards a datagram twice when a second publisher of the track joins while that datagram is in flight.
 - aiomoqt-relay counts a subscriber's shed bytes once when its send lane ends; `status.json` `shed_bytes` and the dashboard counted them twice.
 - aiomoqt-relay ends a track that has forwarded its End of Track when the serving publisher ends, instead of failing over to another publisher of it: viewers got objects past the End of Track and marked the track malformed.
 - `abr_ingest --packaging cmaf` publishes the source and the ladder as CMSF tracks: one CMAF chunk per object led by a `prft`, CMAF headers in the catalog.

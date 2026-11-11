@@ -1520,6 +1520,33 @@ def test_end_of_track_fences_standby_objects():
     track.close()
 
 
+def test_a_late_standby_cannot_repeat_a_datagram():
+    track = relay._RelayedTrack(((b"relay", b"multi"), b"audio"))
+    track.attaching = True
+    msg = ObjectDatagram(track_alias=1, group_id=1, object_id=0,
+                         publisher_priority=128, payload=b"x")
+    track.on_object(msg, 1, 0, 1, 0)
+    track.note_largest((1, 0))
+    feed = relay._Feed()
+    feed.sub = SimpleNamespace(session=SimpleNamespace(), track_alias=2,
+                               largest=(1, 0))
+    track._multi = True
+    track.on_object(msg, 1, 0, 1, 0, feed=feed)
+    assert track._objects_in == 1 and track._copies == 1
+    track.close()
+
+
+def test_one_publishers_datagram_record_keeps_two_groups():
+    track = relay._RelayedTrack(((b"relay", b"multi"), b"audio"))
+    track.attaching = True
+    for gid in range(50):
+        track.on_object(ObjectDatagram(
+            track_alias=1, group_id=gid, object_id=0,
+            publisher_priority=128, payload=b"x"), 1, 0, gid, 0)
+    assert track._dgrams == {(48, 0), (49, 0)}
+    track.close()
+
+
 def test_a_closed_track_takes_no_objects():
     track = relay._RelayedTrack(("ns", "t"))
     track.close()

@@ -1061,8 +1061,10 @@ class _RelayedTrack:
         self._subgroups: dict = {}
         # (group, subgroup) reset downstream.
         self._reset = set()
-        # (group, object) of datagrams taken from several publishers.
+        # (group, object) of datagrams taken; with one publisher, only the
+        # newest two groups', for a standby joining later.
         self._dgrams = set()
+        self._dgram_gid = -1
         # Groups below this are pruned: another copy of them is dropped.
         self._floor = 0
         # Copies dropped as already taken from another publisher.
@@ -1651,11 +1653,14 @@ class _RelayedTrack:
         # another track.
         far = feed is not self.feed and not self._near(gid)
         if dgram:
-            if not self._multi:
-                return False
-            if far or (gid, oid) in self._dgrams:
+            if self._multi and far:
                 return True
+            if (gid, oid) in self._dgrams:
+                return self._multi
             self._dgrams.add((gid, oid))
+            if not self._multi and gid > self._dgram_gid:
+                self._dgram_gid = gid
+                self._dgrams = {k for k in self._dgrams if k[0] >= gid - 1}
             return False
         k = (gid, sgid)
         if self._multi and (gid < self._floor or k in self._ended
