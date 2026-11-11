@@ -25,9 +25,7 @@
 
     <div class="hero-grid">
       <div class="facts first">
-        <span class="badge-version"><span id="badge-version">aiomoqt-relay</span><span
-          class="badge-extra" id="badge-workers" hidden></span><span
-          class="badge-extra" id="badge-cache" hidden></span></span>
+        <span class="badge-version" id="badge-version">aiomoqt-relay</span>
         <dl class="mono">
           <dt>NAME:</dt><dd>aiomoqt-relay</dd>
           <dt>HOSTNAME:</dt><dd id="hostname">aiomoqt-relay.marzresearch.net</dd>
@@ -52,10 +50,11 @@
       <nav class="hero-links" aria-label="Relay detail">
         <a class="platform-link" href="platform/">platform detail ↗</a>
       </nav>
-      <div class="gauges" aria-label="Host utilization">
+      <div class="gauges" aria-label="Host and cache utilization">
         <figure class="gauge"><svg id="gauge-cpu" viewBox="0 0 120 104" role="img" aria-label="CPU"></svg><figcaption>CPU</figcaption></figure>
         <figure class="gauge"><svg id="gauge-ram" viewBox="0 0 120 104" role="img" aria-label="RAM"></svg><figcaption>RAM</figcaption></figure>
         <figure class="gauge"><svg id="gauge-disk" viewBox="0 0 120 104" role="img" aria-label="Disk"></svg><figcaption>DISK</figcaption></figure>
+        <figure class="gauge" id="fig-cache"><svg id="gauge-cache" viewBox="0 0 120 104" role="img" aria-label="Cache"></svg><figcaption>CACHE</figcaption></figure>
       </div>
     </div>
   </header>

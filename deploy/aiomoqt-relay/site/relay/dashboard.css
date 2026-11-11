@@ -61,8 +61,7 @@ code {
   margin: auto 0 0 -9px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
 #badge-version { white-space: nowrap; }
-.badge-extra { font-weight: 400; font-size: 13px; color: var(--text); white-space: nowrap; }
-.badge-extra::before { content: " · "; color: var(--faint); }
+.mono .foot { color: var(--dim); }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }
 .copyable {
@@ -87,6 +86,10 @@ code {
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
 .gauge .g-tick { fill: none; stroke-width: 3; }
+.gauge .g-ring-track, .gauge .g-ring { fill: none; stroke-width: 3; stroke-linecap: round; }
+.gauge .g-ring-track { stroke: var(--track); }
+.gauge .g-ring { stroke: var(--gold); }
+.gauge .g-sub { font: 600 10px Inter, system-ui, sans-serif; fill: var(--gold); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
 .gauge path.warn-level { stroke: var(--amber); }
@@ -354,7 +357,7 @@ footer [data-versions]:empty { display: none; }
   .kv dt { margin-top: 6px; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
-  .gauge, .gauge svg { width: 22vw; max-width: 120px; }
+  .gauge, .gauge svg { width: 20vw; max-width: 120px; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
   /* Phones hide namespaces' Origin, Tracks, Peak and tracks' Peak, Groups/s, Latency. */
