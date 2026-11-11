@@ -863,9 +863,12 @@ class SendLane:
     inline from offer() while the lane is empty and under its bound; it
     is queued only when the writer would wait, so order is kept.
 
-    A subclass may replace the byte bound through _probe(), _may_write(),
-    _over(), _keeps() and _shed_reason(), and set `cut_code`, the reset
-    code of shed streams handed to reset_below() (None: the writer's).
+    A subclass may replace the byte bound through _probe(), _over(),
+    _keeps() and _shed_reason(), and set `cut_code`, the reset code of
+    shed streams handed to reset_below() (None: the writer's). With
+    `bound` 0 there is no byte bound: offer() neither probes the
+    transport nor limits write-through by bytes. A subclass sets `late`
+    to stop write-through until its _over() decides.
     """
 
     log = logger
@@ -918,6 +921,7 @@ class SendLane:
         self.stopped = False
         self._cut = False
         self.cut_code = None
+        self.late = False
         self._closing = False
         self._wake = asyncio.Event()
         self._nowait = (getattr(writer, "send_nowait", None)
@@ -979,14 +983,16 @@ class SendLane:
             if cost and self.gate:
                 self.shed += 1
             return False
-        if live:
+        bound = self.bound
+        if live and bound:
             if gid != self._probe_gid or self._probe_n >= LANE_TX_PROBE:
                 self._probe_gid, self._probe_n = gid, 0
                 self._probe(floor)
             self._probe_n += 1
         nowait = self._nowait
         if (nowait is not None and not self.items and not self.busy
-                and self.gate and self._may_write(item)):
+                and self.gate and not self.late
+                and (not bound or self.tx_bytes + cost <= bound)):
             try:
                 sent = nowait(item)
             except Exception as e:
@@ -1013,10 +1019,6 @@ class SendLane:
     def _probe(self, floor) -> None:
         """Read what the transport holds of the lane's groups from `floor`."""
         self.tx_bytes = self.writer.tx_queued(floor)
-
-    def _may_write(self, item) -> bool:
-        """`item` may be written through."""
-        return self.tx_bytes + item[1] <= self.bound
 
     def _over(self, item) -> bool:
         """Shed, live `item` just queued."""
