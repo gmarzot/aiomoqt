@@ -100,10 +100,12 @@ function arc(r, f0, f1) {
 const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
 
 // `bands`: amber and red past 70% and 90%; without, high is good and stays green.
-// `ring`: 0-100 or null on a thin outer ring in place of the bands, labelled `ringLabel`.
+// `ring`: 0-100 or null on a thin outer ring in place of the bands, labelled `ringLabel`;
+// that dial is drawn smaller so the full ring keeps the others' scale.
 function drawGauge(svg, pct, bands = true, ring, ringLabel) {
   const tone = (v) => bands ? level(v) : 'ok';
-  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}));
+  const r = ringLabel === undefined ? G.r : G.r - 4;
+  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(r, 0, 1)}));
   if (bands) {
     svg.append(svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.7, 0.9)}),
                svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
@@ -113,14 +115,14 @@ function drawGauge(svg, pct, bands = true, ring, ringLabel) {
   text.textContent = none(pct) ? '—' : `${Math.round(pct)}%`;
   if (!none(pct)) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
-    svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
+    svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(r, 0, Math.max(f, 0.004))}));
   }
   svg.append(text);
   if (ringLabel === undefined) return;
-  svg.append(svgEl('path', {class: 'g-ring-track', d: arc(G.tick, 0, 1)}));
+  svg.append(svgEl('path', {class: 'g-ring-track', d: arc(G.tick - 4, 0, 1)}));
   if (!none(ring)) {
     const f = Math.min(Math.max(ring, 0), 100) / 100;
-    svg.append(svgEl('path', {class: 'g-ring', d: arc(G.tick, 0, Math.max(f, 0.004))}));
+    svg.append(svgEl('path', {class: 'g-ring', d: arc(G.tick - 4, 0, Math.max(f, 0.004))}));
   }
   const label = svgEl('text', {class: 'g-sub', x: G.cx, y: G.cy + 34, 'text-anchor': 'middle',
                                stroke: 'none'});
