@@ -938,8 +938,10 @@ class _RelayLane(SendLane):
 
     def _exit(self) -> None:
         _lanes.discard(self)
-        self.track._lanes.discard(self)
-        self.track._shed_done += self.shed_bytes
+        # stop() and the task's exit both land here: transfer once.
+        if self in self.track._lanes:
+            self.track._lanes.discard(self)
+            self.track._shed_done += self.shed_bytes
         super()._exit()
 
     def _who(self) -> str:
