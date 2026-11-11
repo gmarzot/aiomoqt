@@ -36,7 +36,10 @@ code {
 }
 .facts.first { display: flex; flex-direction: column; align-self: stretch; }
 /* Boxed text starts on the labels' edge; border and padding sit outside it. */
-.facts .badge-version { align-self: flex-start; margin: 0 0 8px -9px; }
+.badge-row {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin: 0 0 8px -9px;
+}
+.badge-row .foot { font: 13px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace; }
 .facts.first .mono { grid-template-columns: 9ch minmax(0, 1fr); }
 .badge-version {
   background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
@@ -61,7 +64,7 @@ code {
   margin: auto 0 0 -9px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
 #badge-version { white-space: nowrap; }
-.mono .foot { color: var(--dim); }
+.foot { color: var(--dim); white-space: nowrap; }
 .mono .nw { white-space: nowrap; }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }

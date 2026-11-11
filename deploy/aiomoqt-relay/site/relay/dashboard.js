@@ -76,9 +76,10 @@ function renderRelay(s, urls) {
               h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`].filter(Boolean);
   // Lines break only between items.
   const items = hw.flatMap((t, i) => [...(i ? [' · '] : []), el('span', {class: 'nw'}, t)]);
-  $('hw').replaceChildren(...(items.length ? items : ['—']), ...(none(r.workers) ? [] : [
-    ' ', el('span', {class: 'foot nw', title: 'picoquic worker threads'},
-            `· ${fmt.plural(r.workers, 'worker')}`)]));
+  $('hw').replaceChildren(...(items.length ? items : ['—']));
+  const workers = $('badge-workers');
+  workers.hidden = none(r.workers);
+  if (!workers.hidden) workers.textContent = fmt.plural(r.workers, 'worker');
   $('cpu-model').textContent = h.cpu_model || '—';
   $('os').textContent = h.os || '—';
 }
