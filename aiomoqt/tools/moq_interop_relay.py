@@ -120,8 +120,8 @@ from aiomoqt.types import (
     SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
-from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, LANE_TX_PROBE,
-                              SendLane, retained_object_bytes)
+from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
+                              retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -268,6 +268,11 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
+# A lane's time behind is checked LANE_TIME_CHECKS times per deadline,
+# LANE_TIME_MIN_S to LANE_TIME_MAX_S apart.
+LANE_TIME_CHECKS = 20
+LANE_TIME_MIN_S = 0.05
+LANE_TIME_MAX_S = 0.25
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -527,10 +532,32 @@ def _check_lanes() -> None:
         lane.check(now, LANE_STALL_S)
 
 
+def _time_lanes(now) -> float:
+    """Every lane's time-behind check that is due; seconds to the next."""
+    step = LANE_TIME_MAX_S
+    for lane in list(_lanes):
+        s = lane.check_time(now)
+        if s is not None and s < step:
+            step = s
+    return step
+
+
 async def _watch_lanes() -> None:
-    """Check every send lane for a stall, a few times per LANE_STALL_S."""
+    """Check each send lane's time behind when due, and every lane for a
+    stall a few times per LANE_STALL_S."""
+    step = LANE_TIME_MAX_S
+    stall_at = time.monotonic() + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
     while True:
-        await asyncio.sleep(min(STATUS_INTERVAL_S, LANE_STALL_S / 4))
+        await asyncio.sleep(step)
+        now = time.monotonic()
+        try:
+            step = _time_lanes(now)
+        except Exception:
+            step = LANE_TIME_MAX_S
+            logger.debug("relay: lane time check failed", exc_info=True)
+        if now < stall_at:
+            continue
+        stall_at = now + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
         try:
             _check_lanes()
         except Exception:
@@ -731,7 +758,7 @@ class _RelayDelivery:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
             if _born is not None and self.lane is not None:
-                self.lane._mark(item)
+                self.lane._wborn = _born
         if end is not None and end[5] is not None:
             track._objects_out += 1
         rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
@@ -762,6 +789,8 @@ class _RelayDelivery:
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
+            if _born is not None:
+                self.lane._wborn = _born
         return True
 
     @staticmethod
@@ -811,12 +840,13 @@ class _TracedRelayDelivery(_RelayDelivery):
 
 
 class _RelayLane(SendLane):
-    """One subscriber's SendLane, registered for the stall check and the
+    """One subscriber's SendLane, registered for the lane checks and the
     status page. It sheds once the oldest live object its subscriber has
     not been sent is more than `deadline` old, counting what the
-    transport still holds of the track's streams; by bytes, past
-    LANE_BYTES, only without a deadline or while the lanes are over
-    budget. A failed write drops the subscriber."""
+    transport still holds of the track's streams: check_time() marks it
+    late, the next object offered confirms. By bytes, past LANE_BYTES,
+    only without a deadline or while the lanes are over budget. A failed
+    write drops the subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -824,13 +854,14 @@ class _RelayLane(SendLane):
     def __init__(self, track, d):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
-        # (bytes written to the session's streams of the track before an
-        # object, its arrival time), one per LANE_TX_PROBE objects or group.
+        # (bytes written to the session's streams of the track, arrival
+        # time of the newest object among them), one per probe.
         self._marks = deque()
-        self._mark_gid = None
-        self._mark_n = 0
+        # Arrival time of the newest object handed to the writer.
+        self._wborn = None
         # Arrival time of the oldest live object held, as last read.
         self._oldest = None
+        self._time_due = 0.0
         # The last shed's cause: byte cap, else seconds behind; bytes held.
         self._capped = False
         self._behind = 0.0
@@ -851,14 +882,6 @@ class _RelayLane(SendLane):
     def _written(self) -> int:
         return self.track._tx_written.get(id(self.d.session), 0)
 
-    def _mark(self, item) -> None:
-        """Note where live object `item`'s bytes start, before its write."""
-        if item[0] == self._mark_gid and self._mark_n < LANE_TX_PROBE:
-            self._mark_n += 1
-        elif self._deadline is not None:
-            self._mark_gid, self._mark_n = item[0], 1
-            self._marks.append((self._written(), item[3]))
-
     def _probe(self, floor) -> None:
         super()._probe(floor)
         if self._deadline is not None:
@@ -868,11 +891,14 @@ class _RelayLane(SendLane):
         """Arrival time of the oldest live object not yet sent. The
         transport sends a session's streams of the track oldest first, so
         its oldest unsent byte is `tx_bytes` before the end of what was
-        written; the first mark from there gives its time, at most one
-        mark late. Else the oldest queued, None for none."""
-        unsent = self._written() - self.tx_bytes
+        written; the first mark past it gives its time, at most one probe
+        late. Else the oldest queued, None for none."""
+        written = self._written()
         marks = self._marks
-        while marks and marks[0][0] < unsent:
+        if self._wborn is not None and (not marks or marks[-1][0] < written):
+            marks.append((written, self._wborn))
+        unsent = written - self.tx_bytes
+        while marks and marks[0][0] <= unsent:
             marks.popleft()
         if self.tx_bytes and marks:
             return marks[0][1]
@@ -888,15 +914,22 @@ class _RelayLane(SendLane):
         return (oldest is not None and born is not None
                 and born - oldest > self._deadline)
 
-    def _may_write(self, item) -> bool:
-        if self.bound and self.tx_bytes + item[1] > self.bound:
-            return False
-        if self._deadline is not None:
-            if self._late(item):
-                return False
-            if item[1] and item[3] is not None:
-                self._mark(item)
-        return True
+    def check_time(self, now) -> float | None:
+        """Mark the lane late, once due, if the oldest live object it holds
+        arrived more than `deadline` before `now`. The seconds between
+        checks, None without a deadline."""
+        deadline = self._deadline
+        if deadline is None or self.stopped:
+            self.late = False
+            return None
+        step = min(max(deadline / LANE_TIME_CHECKS, LANE_TIME_MIN_S),
+                   LANE_TIME_MAX_S)
+        if now >= self._time_due:
+            self._time_due = now + step
+            self._probe(self.floor)
+            oldest = self._oldest
+            self.late = oldest is not None and now - oldest > deadline
+        return step
 
     def _over(self, item) -> bool:
         held = self.bytes + self.tx_bytes
@@ -904,14 +937,10 @@ class _RelayLane(SendLane):
             self._capped, self._held = True, held
             self.cut_code = StreamResetCode.CANCELLED
             return True
-        if self._deadline is None or item[3] is None:
-            return False
-        if self._oldest is None:
-            self._oldest = item[3]
-            return False
-        if not self._late(item):
+        if not self.late or self._deadline is None or item[3] is None:
             return False
         self._probe(self.floor)
+        self.late = False
         if not self._late(item):
             return False
         self._capped, self._held = False, self.bytes + self.tx_bytes

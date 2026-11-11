@@ -11,6 +11,7 @@ class FakeRelay:
     """A subs actuator whose p90 and loss follow the level and the time at it."""
     unit = 'subs'
     min_level = 50.0
+    keep_window = 0.0
     step_floor = initial_step = 50.0
 
     def __init__(self, p90, start=100, max_level=10_000, lost=lambda level, t: 0):
@@ -45,6 +46,17 @@ class FakeRelay:
                          target_mbps=1, tx_mbps=1, rx_mbps=1 if self.level else 0)
 
 
+def _backlog_until_reset(relay):
+    """After the overshoot to 350, 300 stays over the threshold until everyone is dropped."""
+    p90, over = relay.p90, []
+
+    def tracked(level, t):
+        over.append(level >= 350)
+        return 600 if level == 300 and any(over) and not relay.drops else p90(level, t)
+    relay.p90 = tracked
+    return relay
+
+
 def _hold(relay, exit_sustained=True, duration_s=30, recover_s=15.0):
     state = ab.BenchState()
     ctl = ab.HoldController(relay, state, hold_s=0.02, confirm_s=0.05, recover_s=recover_s,
@@ -63,7 +75,8 @@ async def test_ends_at_the_last_level_that_held():
     await ctl.run()
     assert ctl.sustained == (300, 20)
     assert state.ceiling_reason == 'equilibrium confirmed at 300 subs'
-    assert 'fail (p90 over), reset, back to 300' in actions
+    assert 'fail (p90 over), back to 300' in actions
+    assert relay.drops == 0, 'the passing audience stays on'
     assert max(relay.applied) == 350, 'one step past the knee, no further'
 
 
@@ -71,7 +84,7 @@ async def test_a_rising_p90_fails_the_step_under_the_threshold():
     relay = FakeRelay(lambda level, t: 20 if level < 300 else 20 + 10_000 * t)
     ctl, state, actions = _hold(relay)
     await ctl.run()
-    assert 'fail (p90 still rising), reset, back to 250' in actions
+    assert 'fail (p90 still rising), back to 250' in actions
     assert ctl.sustained == (250, 20)
 
 
@@ -79,7 +92,7 @@ async def test_lost_objects_fail_the_step():
     relay = FakeRelay(lambda level, t: 20, lost=lambda level, t: level >= 350)
     ctl, state, actions = _hold(relay)
     await ctl.run()
-    assert 'fail (objects lost), reset, back to 300' in actions
+    assert 'fail (objects lost), back to 300' in actions
     assert ctl.sustained == (300, 20)
 
 
@@ -87,30 +100,23 @@ async def test_a_failed_confirmation_steps_down_one_group():
     relay = FakeRelay(lambda level, t: 20 if level < 300 or (level == 300 and t < 0.03) else 600)
     ctl, state, actions = _hold(relay)
     await ctl.run()
-    assert 'fail (p90 over), reset, down to 250' in actions
+    assert 'fail (p90 over), down to 250' in actions
     assert ctl.sustained == (250, 20)
 
 
-async def test_a_failed_step_drops_everyone_then_rejoins_the_last_pass():
-    # The backlog from the overshoot only clears once every subscriber is gone.
-    relay = FakeRelay(lambda level, t: 600 if level >= 350 or (level == 300 and not relay.drops and relay.over) else 20)
-    relay.over = False
-    p90 = relay.p90
-
-    def tracked(level, t):
-        relay.over |= level >= 350
-        return p90(level, t)
-    relay.p90 = tracked
-    ctl, state, actions = _hold(relay)
+async def test_a_level_that_does_not_drain_gets_one_reset():
+    relay = _backlog_until_reset(FakeRelay(lambda level, t: 600 if level >= 350 else 20))
+    ctl, state, actions = _hold(relay, recover_s=0.03)
     await ctl.run()
     assert relay.drops == 1
-    assert 'fail (p90 over), reset, back to 300' in actions and 'rejoin to 300' in actions
+    assert 'fail (p90 over), back to 300' in actions
+    assert 'no recovery, reset at 300' in actions and 'rejoin to 300' in actions
     assert ctl.sustained == (300, 20)
 
 
 async def test_no_data_during_a_reset_does_not_abort():
-    relay = FakeRelay(lambda level, t: 600 if level >= 350 else 20)
-    ctl, state, actions = _hold(relay)
+    relay = _backlog_until_reset(FakeRelay(lambda level, t: 600 if level >= 350 else 20))
+    ctl, state, actions = _hold(relay, recover_s=0.03)
     ctl.reset_gap_s = 0.05
     await ctl.run()
     assert not state.failed and actions.count('reset') > 3
@@ -129,8 +135,9 @@ async def test_a_level_that_does_not_recover_steps_down():
     relay.apply = tracked
     ctl, state, actions = _hold(relay, recover_s=0.03)
     await ctl.run()
-    assert 'fail (p90 over), reset, back to 300' in actions
-    assert 'fail (no recovery), reset, down to 250' in actions
+    assert 'fail (p90 over), back to 300' in actions
+    assert 'no recovery, reset at 300' in actions and relay.drops == 1
+    assert 'fail (no recovery), down to 250' in actions
     assert ctl.sustained == (250, 20)
 
 
@@ -170,7 +177,7 @@ async def test_a_fault_after_confirmation_steps_down_and_confirms_again():
     relay = FakeRelay(lambda level, t: 600 if level == 200 and t > 0.12 else 20, max_level=200)
     ctl, state, actions = _hold(relay, exit_sustained=False, duration_s=0.5)
     await ctl.run()
-    assert 'fail (p90 over), reset, down to 150' in actions
+    assert 'fail (p90 over), down to 150' in actions
     assert ctl.sustained == (150, 20)
     assert state.ceiling_reason == 'held 150 subs to the end'
 
@@ -207,6 +214,24 @@ def test_settled_waits_for_every_worker_past_its_grace():
     assert not a.settled()
     del a._workers[2], a._spawned_t[2]
     assert not a.settled()
+
+
+async def test_shedding_stops_starting_workers_then_the_furthest_behind():
+    a = object.__new__(ab.SubsActuator)
+    now = time.monotonic()
+    a.min_level, a.max_level, a.batch_size, a._startup_grace = 10.0, 100.0, 10, 8.0
+    a._workers = dict.fromkeys(range(1, 6))
+    a._spawned_t = {1: now - 60, 2: now - 50, 3: now - 40, 4: now - 2, 5: now - 1}
+    a._latest_batch = {1: {'lat_p90_ms': 40}, 2: {'lat_p90_ms': 300}, 3: {'lat_p90_ms': 90}}
+    a._ensure_draining = a._reap_dead = lambda: 0
+    killed = []
+
+    def kill(wid):
+        killed.append(wid)
+        del a._workers[wid]
+    a._kill_worker = kill
+    await a.apply(20)
+    assert killed == [5, 4, 2] and list(a._workers) == [1, 3]
 
 
 @pytest.mark.parametrize('extra, why', [

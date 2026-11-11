@@ -182,6 +182,7 @@ class LiveStats:
         self._stride: dict = {}
         self._newest_gid = -1
         self._prune_at = 0
+        self._key_floor = -1
         # Jitter (RFC 3550)
         self._last_recv_ms = 0
         self._last_send_ms = 0
@@ -220,8 +221,9 @@ class LiveStats:
                 self._last_send_ms = send_us
 
         lost = 0
-        if not is_status:
-            gid = getattr(msg, 'group_id', group_id)
+        gid = getattr(msg, 'group_id', group_id)
+        # Groups below the pruned floor stay counted but get no loss keys.
+        if not is_status and (gid is None or gid >= self._key_floor):
             sid = subgroup_id if subgroup_id is not None else 0
             oid = msg.object_id
             key = (gid, sid)
@@ -253,6 +255,7 @@ class LiveStats:
             self._events.popleft()
 
     def _prune(self, floor: int) -> None:
+        self._key_floor = max(self._key_floor, floor)
         for d in (self._last_seen, self._stride):
             for k in [k for k in d if k[0] is not None and k[0] < floor]:
                 del d[k]
@@ -269,7 +272,8 @@ class LiveStats:
                           loss_pct=0.0, jitter_ms=self._jitter,
                           latency_known=False)
 
-        window_t = max(0.01, self._events[-1][0] - self._events[0][0])
+        # Through now, so silence after the last arrival lowers the rate.
+        window_t = max(0.01, t - max(self._events[0][0], cutoff))
         n = len(self._events)
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
@@ -295,6 +299,18 @@ class LiveStats:
 # ---------------------------------------------------------------------------
 # LoadActuator: the "how do we apply a load level" abstraction
 # ---------------------------------------------------------------------------
+
+def _overlap_bytes(window, lo: float, hi: float) -> float:
+    """Bytes of (t, bytes, dt) reports, each prorated by the share of its
+    interval [t - dt, t] inside [lo, hi]; dt 0 counts whole."""
+    total = 0.0
+    for t, b, dt in window:
+        if dt > 0:
+            total += b * max(0.0, min(t, hi) - max(t - dt, lo)) / dt
+        else:
+            total += b
+    return total
+
 
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
@@ -333,7 +349,7 @@ class BWActuator:
         self._events_q = mp_events_queue
         self._stop_ev = mp_stop_event
         # rolling stats aggregated from sub-worker events
-        self._mp_rx_window = []   # (t, rx_bytes)
+        self._mp_rx_window = []   # (t, rx_bytes, dt)
         # The one subscriber worker's latest windowed latency (its
         # TrackStats window matches _mp_window_s): (n, mean, p90).
         self._mp_lat = (0, 0.0, 0.0)
@@ -398,9 +414,8 @@ class BWActuator:
                 self._mp_tx_ring_streams = ev.get(
                     'tx_ring_streams', 0)
             elif kind == 'stats':
-                rx_bytes = ev.get('rx_bytes', 0)
-                if rx_bytes:
-                    self._mp_rx_window.append((t, rx_bytes))
+                self._mp_rx_window.append(
+                    (t, ev.get('rx_bytes', 0), ev.get('dt', 0.0)))
                 self._mp_lat = (ev.get('lat_n', 0),
                                 ev.get('lat_mean_ms', 0.0),
                                 ev.get('lat_p90_ms', 0.0))
@@ -415,9 +430,7 @@ class BWActuator:
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
-        self._mp_rx_window = [
-            (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
-        ]
+        self._mp_rx_window = [e for e in self._mp_rx_window if e[0] >= cutoff]
         self._mp_tx_window = [
             (t, b) for (t, b) in self._mp_tx_window if t >= cutoff
         ]
@@ -449,7 +462,6 @@ class BWActuator:
         self._drain_events()
         t = time.monotonic()
         lat_n, mean, p90 = self._mp_lat
-        rx_bytes = sum(b for (_, b) in self._mp_rx_window)
         # tx column reports wire-bytes (picoquic ground truth); falls
         # back to queued bytes if the wire counter isn't available.
         wire_bytes = sum(b for (_, b) in self._mp_wire_window)
@@ -460,10 +472,13 @@ class BWActuator:
         covered = (t - self._mp_t0 if self._mp_t0 is not None
                    else self._mp_window_s)
         win = max(0.5, min(self._mp_window_s, covered))
+        # Ends at the newest report: data after it is not reported yet.
+        rx_end = max((e[0] for e in self._mp_rx_window), default=t)
+        rx_bytes = _overlap_bytes(self._mp_rx_window, rx_end - win, rx_end)
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
-        loss_pct = (100.0 * self._mp_total_lost
-                    / max(1, self._mp_total_objs))
+        seen = self._mp_total_objs + self._mp_total_lost
+        loss_pct = 100.0 * self._mp_total_lost / seen if seen else 0.0
         shortfall = (self.state.target_mbps > 0
                      and rx_mbps
                      < self.shortfall_ratio * self.state.target_mbps)
@@ -817,10 +832,20 @@ class SubsActuator:
             p.start()
             self._workers[wid] = (p, stop_ev)
             self._spawned_t[wid] = time.monotonic()
-        # wind down
-        while len(self._workers) > workers_target:
-            wid = next(iter(self._workers))
+        for wid in self._shed_order()[:max(0, len(self._workers) - workers_target)]:
             self._kill_worker(wid)
+
+    def _shed_order(self) -> list:
+        """Workers in stop order: those still in startup grace, newest first,
+        then the rest by their worst subscriber's p90, furthest behind first."""
+        now = time.monotonic()
+
+        def key(wid):
+            t = self._spawned_t.get(wid, now)
+            if now - t < self._startup_grace:
+                return (0, -t)
+            return (1, -self._latest_batch.get(wid, {}).get('lat_p90_ms', 0.0))
+        return sorted(self._workers, key=key)
 
     async def drop_all(self) -> None:
         """Stop every worker at once so the relay sheds all their state."""
@@ -1591,16 +1616,18 @@ class HoldController(AIMDController):
 
     Steps add 10% of the level while the hold's p90 stayed under 10% of the
     threshold, 5% under 25%, else one group; never less than one group. The
-    first failure drops every subscriber, waits reset_gap_s and rejoins at
-    the last level that passed: a relay that does not shed late work
-    cannot drain a backlog under load. Once rejoined the level must run
-    clean for recover_clean_s within recover_s and then pass a confirm_s
-    hold. Once confirmed it is held, still checked, until the run ends
-    (exit_sustained ends it at once); a fault there resets one group lower
-    and confirms again. A failed recovery or confirmation does the same,
-    MAX_RETREATS step-downs in all. `sustained` is (level,
-    p90 max) of the level held to the end, or None, and `held_s` how long
-    it has held since its confirmation began.
+    first failure sheds back to the last level that passed, stopping the
+    workers furthest behind; the rest stay on and must run clean for
+    recover_clean_s within recover_s, plus the actuator's keep window for
+    the overshoot's loss flags to age out, then pass a confirm_s hold. A
+    level that does not recover gets one reset: every subscriber dropped,
+    reset_gap_s, then a rejoin, for a relay that does not shed late work.
+    A confirmed level is held, still checked, until the run ends
+    (exit_sustained ends it at once). A fault there, a failed confirmation
+    or no recovery after the reset sheds one group lower, MAX_RETREATS
+    step-downs in all. `sustained` is (level, p90 max) of the level held to
+    the end, or None, and `held_s` how long it has held since its
+    confirmation began.
     """
 
     MAX_RETREATS = 3
@@ -1665,6 +1692,7 @@ class HoldController(AIMDController):
         p90s: list = []
         lost0 = a.lost_total[0]
         recover_t = rejoin_t = 0.0
+        reset = False                 # this level has had its reset
         no_data = 0
         while not state.stop.is_set():
             try:
@@ -1728,10 +1756,15 @@ class HoldController(AIMDController):
                 if now - recover_t < self.recover_s:
                     self._emit(sig, f"recover ({why})")
                     continue
+                if not reset:
+                    await a.drop_all()
+                    self._emit(sig, f"no recovery, reset at {level:.0f}", force=True)
+                    phase, rejoin_t, reset = "reset", time.monotonic() + self.reset_gap_s, True
+                    continue
                 level = await self._retreat(sig, level, "no recovery")
                 if level is None:
                     return
-                phase, rejoin_t = "reset", time.monotonic() + self.reset_gap_s
+                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
                 continue
 
             why = self._fault(sig, p90, lost0)
@@ -1759,13 +1792,13 @@ class HoldController(AIMDController):
                     return
                 if phase == "step":
                     level = self.last_pass
-                    await a.drop_all()
-                    self._emit(sig, f"fail ({why}), reset, back to {level:.0f}", force=True)
+                    await a.apply(level)
+                    self._emit(sig, f"fail ({why}), back to {level:.0f}", force=True)
                 else:
                     level = await self._retreat(sig, level, why)
                     if level is None:
                         return
-                phase, rejoin_t = "reset", time.monotonic() + self.reset_gap_s
+                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
                 clean_since = since = None
                 continue
 
@@ -1790,14 +1823,14 @@ class HoldController(AIMDController):
             self._emit(sig, f"step to {level:.0f}", force=True)
 
     async def _retreat(self, sig: Signal, level: float, why: str) -> Optional[float]:
-        """Reset one group lower after a failed recovery or confirmation; None ends the run."""
+        """Shed one group lower; None ends the run."""
         self.retreats += 1
         if self.retreats > self.MAX_RETREATS or level - self.actuator.step_floor < self.actuator.min_level:
             self._finish(sig, f"not demonstrated: {why} after {self.retreats - 1} step(s) down")
             return None
         level -= self.actuator.step_floor
-        await self.actuator.drop_all()
-        self._emit(sig, f"fail ({why}), reset, down to {level:.0f}", force=True)
+        await self.actuator.apply(level)
+        self._emit(sig, f"fail ({why}), down to {level:.0f}", force=True)
         return level
 
 
