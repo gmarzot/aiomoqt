@@ -29,12 +29,12 @@ import sys
 import time
 from collections import deque
 from functools import partial
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from aiomoqt.client import MOQTClient, SharedTransport
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
-from aiomoqt.track import PublishedTrack, SubscribedTrack, TrackState
+from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import FilterType, MOQTRequestError
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.utils.logger import set_log_handler, set_log_level
@@ -167,6 +167,41 @@ async def retry_wait(exc, stop_ev) -> bool:
     return True
 
 
+def track_end_waiters(tracks) -> set:
+    """One wait_closed() task per track."""
+    return {asyncio.ensure_future(t.wait_closed()) for t in tracks}
+
+
+def _cancel_all(futs) -> None:
+    for f in futs:
+        if not f.done():
+            f.cancel()
+
+
+def _ended_cleanly(waiter) -> bool:
+    return (not waiter.cancelled() and waiter.exception() is None
+            and getattr(waiter.result(), 'completed', False))
+
+
+async def wait_tracks_end(tracks, stop_ev) -> Optional[str]:
+    """Wait for the tracks to end or stop_ev: 'ended' once every track
+    completed, 'died' as soon as one ends otherwise, None on stop_ev."""
+    pending = track_end_waiters(tracks)
+    stop = asyncio.ensure_future(stop_ev.wait())
+    try:
+        while pending:
+            done, _ = await asyncio.wait(pending | {stop},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if stop in done:
+                return None
+            if not all(_ended_cleanly(w) for w in done):
+                return 'died'
+            pending -= done
+        return 'ended'
+    finally:
+        _cancel_all(pending | {stop})
+
+
 def _transport_options(config: Dict[str, Any]) -> Dict[str, Any]:
     """Forward explicit transport settings, retaining None to disable a budget."""
     return {key: config[key] for key in (
@@ -261,17 +296,14 @@ async def _subscriber_task(config: Dict[str, Any], mp_stop_event,
                     _post(events_queue, snap)
 
             async def _watch_track():
-                while not stop_ev.is_set():
-                    if getattr(track, 'state', None) == TrackState.CLOSED:
-                        completed = getattr(track, 'completed', False)
-                        _post(events_queue, {
-                            'kind': 'health', 'sub_id': sub_id,
-                            'state': ('closed' if completed
-                                      else 'stream_reset'),
-                            't': time.monotonic(),
-                        })
-                        return
-                    await asyncio.sleep(STOP_POLL_S)
+                end = await track.wait_closed()
+                _post(events_queue, {
+                    'kind': 'health', 'sub_id': sub_id,
+                    'state': 'closed' if end.completed else 'stream_reset',
+                    'detail': f'{end.kind.value} code={end.code} '
+                              f'reason={end.reason!r}',
+                    't': time.monotonic(),
+                })
 
             stats_task = asyncio.create_task(_stats_loop())
             watch_task = asyncio.create_task(_watch_track())
@@ -444,23 +476,29 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
                         state['active'] = True
                         state['refusing'] = False
                         state['since'] = time.monotonic()
-                        while not stop_ev.is_set():
-                            if any(getattr(t, 'state', None) == TrackState.CLOSED
-                                   for t in tracks):
-                                break
-                            if state.get('cycle'):
-                                redial = True
-                                break
-                            if state['resubscribe']:
-                                # On this session, as a player would: its
-                                # congestion state carries over.
-                                state['resubscribe'] = False
-                                state['resubscribed'] += 1
-                                for t in tracks:
-                                    t.unsubscribe()
-                                resubscribe = True
-                                break
-                            await _poll_wait(state.get('wake'))
+                        # Any track ending, the session's close included,
+                        # reopens the slot.
+                        ends = track_end_waiters(tracks)
+                        try:
+                            while not stop_ev.is_set():
+                                if any(w.done() for w in ends):
+                                    break
+                                if state.get('cycle'):
+                                    redial = True
+                                    break
+                                if state['resubscribe']:
+                                    # On this session, as a player would:
+                                    # its congestion state carries over.
+                                    state['resubscribe'] = False
+                                    state['resubscribed'] += 1
+                                    _cancel_all(ends)
+                                    for t in tracks:
+                                        t.unsubscribe()
+                                    resubscribe = True
+                                    break
+                                await _poll_wait(state.get('wake'), ends)
+                        finally:
+                            _cancel_all(ends)
                         state['active'] = False
                 session.close()
         except Exception:
@@ -481,16 +519,23 @@ async def _slot_supervisor(config, relay, stop_ev, stats, state,
     state['active'] = False
 
 
-async def _poll_wait(wake) -> None:
-    """Sleep STOP_POLL_S, or less when the slot's wake event is set."""
-    if wake is None:
+async def _poll_wait(wake, ends=()) -> None:
+    """Sleep STOP_POLL_S, or less when the slot's wake event is set or
+    one of the `ends` futures completes."""
+    waits = set(ends)
+    woke = None if wake is None else asyncio.ensure_future(wake.wait())
+    if woke is not None:
+        waits.add(woke)
+    if not waits:
         await asyncio.sleep(STOP_POLL_S)
         return
     try:
-        await asyncio.wait_for(wake.wait(), STOP_POLL_S)
-    except asyncio.TimeoutError:
-        pass
-    wake.clear()
+        await asyncio.wait(waits, timeout=STOP_POLL_S,
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if woke is not None:
+            woke.cancel()
+            wake.clear()
 
 
 def slot_too_far_behind(state, p90_ms, now: float, limit_ms: float) -> bool:

@@ -391,10 +391,12 @@ async def test_slot_counts_a_refusal_until_it_subscribes(monkeypatch):
 
     class Track:
         calls = 0
-        state = workers.TrackState.CLOSED
 
         def __init__(self, *args, **kwargs):
             pass
+
+        async def wait_closed(self):
+            return None
 
         async def subscribe(self, **kwargs):
             Track.calls += 1
@@ -424,10 +426,12 @@ async def test_a_track_not_yet_published_is_not_a_refusal(monkeypatch):
 
     class Track:
         calls = 0
-        state = workers.TrackState.CLOSED
 
         def __init__(self, *args, **kwargs):
             pass
+
+        async def wait_closed(self):
+            return None
 
         async def subscribe(self, **kwargs):
             Track.calls += 1

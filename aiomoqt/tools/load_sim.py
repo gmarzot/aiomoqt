@@ -73,7 +73,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.track import SubscribedTrack, TrackState
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.types import FilterType
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
@@ -94,7 +94,7 @@ from aiomoqt.utils.workers import (
     retry_wait,
     SUBSCRIBE_EACH_TIMEOUT_S,
     STATS_INTERVAL_S,
-    STOP_POLL_S,
+    wait_tracks_end,
 )
 
 TICK_S = 1.0
@@ -264,16 +264,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             slot["live"] = True
             _post(events_q, {"kind": "evt", "ev": "joined",
                              "group": group, "shard": shard})
-            while not stop_ev.is_set():
-                closed = next((t for t in tracks if getattr(
-                    t, "state", None) == TrackState.CLOSED), None)
-                if closed is not None:
-                    outcome = ("ended" if getattr(closed, "completed", False)
-                               else "died")
-                    break
-                await asyncio.sleep(STOP_POLL_S)
-            else:
-                outcome = "left"
+            outcome = await wait_tracks_end(tracks, stop_ev) or "left"
             session.close()
     except Exception as e:
         if not slot["live"]:
