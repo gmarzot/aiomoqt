@@ -4147,6 +4147,11 @@ def parse_args(argv=None):
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--stall-trace", type=float, default=0, metavar="MS",
+                        help="Log the event loop thread's Python stack when "
+                             "the loop has not run for MS milliseconds, and "
+                             "the stall's length when it ends. 0 = off "
+                             "(default).")
     parser.add_argument("--catalog-probe", action="store_true",
                         help="Subscribe to each announced or published "
                              "namespace's catalog track at once, so the "
@@ -5285,7 +5290,7 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
-                 "send_late_ms",
+                 "send_late_ms", "gc_max_ms",
                  "drops", "shed_bytes")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
@@ -5326,6 +5331,7 @@ class _Status:
         self.relay = relay
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
+        self.gc = relay_status.GcTimer.shared()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -5576,6 +5582,9 @@ class _Status:
         media_in = sum(r["in_bps"] or 0 for _, r in tracks)
         media_out = sum(r["out_bps"] or 0 for _, r in tracks)
         lag = self.lag.summary()
+        gc_line, long_passes = self.gc.take()
+        for p in long_passes:
+            logger.warning(f"relay: {relay_status.format_gc_pass(*p)}")
         totals = {
             "sessions": len(sessions),
             "by_draft": dict(Counter(f"d{s['draft']}" for s in sessions)),
@@ -5617,6 +5626,7 @@ class _Status:
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
             "send_late_ms": self._send_late_ms(),
+            "gc": gc_line,
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -5641,6 +5651,7 @@ class _Status:
             "groups_per_s": totals["groups_per_s"],
             "groups_out_per_s": totals["groups_out_per_s"],
             "send_late_ms": totals["send_late_ms"],
+            "gc_max_ms": gc_line["max_ms"],
             "drops": totals["drops"],
             "shed_bytes": totals["shed_bytes"],
         })
@@ -6173,6 +6184,11 @@ async def main():
             args.watchdog, host, args.port, args.quic or args.dual,
             args.draft, handles))
         _background.add(watchdog)
+
+    if args.stall_trace > 0:
+        _background.add(asyncio.create_task(relay_status.StallSampler(
+            args.stall_trace, logger, relay_status.GcTimer.shared(),
+            prefix="relay: ").run()))
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
