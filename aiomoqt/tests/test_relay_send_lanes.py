@@ -46,10 +46,12 @@ def relay_tables():
 
 @contextlib.asynccontextmanager
 async def _relay(port, use_quic, draft):
-    """A relay; yields a coroutine that connects one more session."""
+    """A relay with its lane timer; yields a coroutine that connects one
+    more session."""
     server = relay._build_server("localhost", port, CERT, KEY,
                                  use_quic=use_quic, draft=draft)
     handle = await server.serve()
+    watch = asyncio.ensure_future(relay._watch_lanes())
     try:
         async with contextlib.AsyncExitStack() as stack:
             async def connect():
@@ -61,6 +63,7 @@ async def _relay(port, use_quic, draft):
                 return s
             yield connect
     finally:
+        watch.cancel()
         handle.close()
 
 

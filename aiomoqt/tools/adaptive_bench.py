@@ -846,10 +846,20 @@ class SubsActuator:
             p.start()
             self._workers[wid] = (p, stop_ev)
             self._spawned_t[wid] = time.monotonic()
-        # wind down
-        while len(self._workers) > workers_target:
-            wid = next(iter(self._workers))
+        for wid in self._shed_order()[:max(0, len(self._workers) - workers_target)]:
             self._kill_worker(wid)
+
+    def _shed_order(self) -> list:
+        """Workers in stop order: those still in startup grace, newest first,
+        then the rest by their worst subscriber's p90, furthest behind first."""
+        now = time.monotonic()
+
+        def key(wid):
+            t = self._spawned_t.get(wid, now)
+            if now - t < self._startup_grace:
+                return (0, -t)
+            return (1, -self._latest_batch.get(wid, {}).get('lat_p90_ms', 0.0))
+        return sorted(self._workers, key=key)
 
     async def drop_all(self) -> None:
         """Stop every worker at once so the relay sheds all their state."""
@@ -1649,16 +1659,18 @@ class HoldController(AIMDController):
 
     Steps add 10% of the level while the hold's p90 stayed under 10% of the
     threshold, 5% under 25%, else one group; never less than one group. The
-    first failure drops every subscriber, waits reset_gap_s and rejoins at
-    the last level that passed: a relay that does not shed late work
-    cannot drain a backlog under load. Once rejoined the level must run
-    clean for recover_clean_s within recover_s and then pass a confirm_s
-    hold. Once confirmed it is held, still checked, until the run ends
-    (exit_sustained ends it at once); a fault there resets one group lower
-    and confirms again. A failed recovery or confirmation does the same,
-    MAX_RETREATS step-downs in all. `sustained` is (level,
-    p90 max) of the level held to the end, or None, and `held_s` how long
-    it has held since its confirmation began.
+    first failure sheds back to the last level that passed, stopping the
+    workers furthest behind; the rest stay on and must run clean for
+    recover_clean_s within recover_s, plus the actuator's keep window for
+    the overshoot's loss flags to age out, then pass a confirm_s hold. A
+    level that does not recover gets one reset: every subscriber dropped,
+    reset_gap_s, then a rejoin, for a relay that does not shed late work.
+    A confirmed level is held, still checked, until the run ends
+    (exit_sustained ends it at once). A fault there, a failed confirmation
+    or no recovery after the reset sheds one group lower, MAX_RETREATS
+    step-downs in all. `sustained` is (level, p90 max) of the level held to
+    the end, or None, and `held_s` how long it has held since its
+    confirmation began.
     """
 
     MAX_RETREATS = 3
@@ -1724,6 +1736,7 @@ class HoldController(AIMDController):
         p90s: list = []
         lost0 = a.lost_total[0]
         recover_t = rejoin_t = 0.0
+        reset = False                 # this level has had its reset
         no_data = 0
         while not state.stop.is_set():
             try:
@@ -1788,10 +1801,15 @@ class HoldController(AIMDController):
                 if now - recover_t < self.recover_s:
                     self._emit(sig, f"recover ({why})")
                     continue
+                if not reset:
+                    await a.drop_all()
+                    self._emit(sig, f"no recovery, reset at {level:.0f}", force=True)
+                    phase, rejoin_t, reset = "reset", time.monotonic() + self.reset_gap_s, True
+                    continue
                 level = await self._retreat(sig, level, "no recovery")
                 if level is None:
                     return
-                phase, rejoin_t = "reset", time.monotonic() + self.reset_gap_s
+                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
                 continue
 
             why = self._fault(sig, p90, lost0)
@@ -1819,13 +1837,13 @@ class HoldController(AIMDController):
                     return
                 if phase == "step":
                     level = self.last_pass
-                    await a.drop_all()
-                    self._emit(sig, f"fail ({why}), reset, back to {level:.0f}", force=True)
+                    await a.apply(level)
+                    self._emit(sig, f"fail ({why}), back to {level:.0f}", force=True)
                 else:
                     level = await self._retreat(sig, level, why)
                     if level is None:
                         return
-                phase, rejoin_t = "reset", time.monotonic() + self.reset_gap_s
+                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
                 clean_since = since = None
                 continue
 
@@ -1850,14 +1868,14 @@ class HoldController(AIMDController):
             self._emit(sig, f"step to {level:.0f}", force=True)
 
     async def _retreat(self, sig: Signal, level: float, why: str) -> Optional[float]:
-        """Reset one group lower after a failed recovery or confirmation; None ends the run."""
+        """Shed one group lower; None ends the run."""
         self.retreats += 1
         if self.retreats > self.MAX_RETREATS or level - self.actuator.step_floor < self.actuator.min_level:
             self._finish(sig, f"not demonstrated: {why} after {self.retreats - 1} step(s) down")
             return None
         level -= self.actuator.step_floor
-        await self.actuator.drop_all()
-        self._emit(sig, f"fail ({why}), reset, down to {level:.0f}", force=True)
+        await self.actuator.apply(level)
+        self._emit(sig, f"fail ({why}), down to {level:.0f}", force=True)
         return level
 
 
