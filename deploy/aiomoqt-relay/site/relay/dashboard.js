@@ -74,9 +74,11 @@ function renderRelay(s, urls) {
   $('date').textContent = fmt.date(s.generated);
   const hw = [h.arch, h.cores && `${h.cores} vCPU`,
               h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`].filter(Boolean);
-  $('hw').replaceChildren(hw.join(' · ') || '—', ...(none(r.workers) ? [] : [
-    el('span', {class: 'foot', title: 'picoquic worker threads'},
-       ` · ${fmt.plural(r.workers, 'worker')}`)]));
+  // Lines break only between items.
+  const items = hw.flatMap((t, i) => [...(i ? [' · '] : []), el('span', {class: 'nw'}, t)]);
+  $('hw').replaceChildren(...(items.length ? items : ['—']), ...(none(r.workers) ? [] : [
+    ' ', el('span', {class: 'foot nw', title: 'picoquic worker threads'},
+            `· ${fmt.plural(r.workers, 'worker')}`)]));
   $('cpu-model').textContent = h.cpu_model || '—';
   $('os').textContent = h.os || '—';
 }

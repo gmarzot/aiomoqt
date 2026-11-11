@@ -62,6 +62,7 @@ code {
 }
 #badge-version { white-space: nowrap; }
 .mono .foot { color: var(--dim); }
+.mono .nw { white-space: nowrap; }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }
 .copyable {
