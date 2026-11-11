@@ -220,7 +220,9 @@ _CONFIG_PROPS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 class _Cmaf:
     """One output track's LOC frames as CMSF objects: prft + one-sample
     moof+mdat. tfdt is the LOC timestamp in track ticks, kept rising;
-    the prft carries the capture time."""
+    the prft carries the capture time. Audio tfdt steps by each frame's
+    samples and rejoins the timestamp when they differ by over half a frame;
+    an audio frame at or behind the last tfdt is dropped."""
 
     def __init__(self, track, loc_timescale: Optional[int],
                  fps: Optional[Tuple[int, int]] = None,
@@ -235,19 +237,30 @@ class _Cmaf:
                        else max(1, round(ts * fps[1] / fps[0])))
         self._samples = samples  # audio: payload -> duration in ticks
         self._last: Optional[int] = None
+        self._next = 0  # audio: last tfdt plus its sample count
         self._dur = self._frame or ts // 30
 
-    def wrap(self, frame: LocFrame) -> bytes:
+    def wrap(self, frame: LocFrame) -> Optional[bytes]:
+        """The CMSF object for `frame`; None when it is dropped."""
         ts = frame.timestamp
         dt = None if ts is None else ts * self.chunker.timescale // self._units
-        if self._last is not None:
-            if dt is not None and dt > self._last and self._frame is None:
-                self._dur = dt - self._last
-            if dt is None or dt <= self._last:
-                dt = self._last + self._dur
-        dt = dt or 0
-        dur = (self._samples(frame.payload) if self._samples is not None
-               else self._frame or self._dur)
+        if self._samples is not None:
+            dur = self._samples(frame.payload)
+            if self._last is not None:
+                if dt is None or abs(dt - self._next) <= dur // 2:
+                    dt = self._next
+                elif dt <= self._last:
+                    return None
+            dt = dt or 0
+            self._next = dt + dur
+        else:
+            if self._last is not None:
+                if dt is not None and dt > self._last and self._frame is None:
+                    self._dur = dt - self._last
+                if dt is None or dt <= self._last:
+                    dt = self._last + self._dur
+            dt = dt or 0
+            dur = self._frame or self._dur
         self._last = dt
         chunk = self.chunker.chunk(frame.payload, dur,
                                    frame.key_frame or not self.video,
@@ -327,6 +340,9 @@ class _Output:
             frame, group_id, t0 = item
             payload = (frame.payload if self.cmaf is None
                        else self.cmaf.wrap(frame))
+            if payload is None:
+                self.dropped += 1
+                continue
             await self.track.send_frame(
                 payload, key_frame=frame.key_frame,
                 timestamp=frame.timestamp, extensions=frame.extensions,

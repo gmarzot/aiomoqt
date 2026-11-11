@@ -312,6 +312,28 @@ def _cmaf_object(payload: bytes):
     return not flags & 0x10000, chunk_decode_time(payload)
 
 
+def test_cmaf_audio_tfdt_follows_samples_and_drops_late_frames():
+    """Two late AAC frames after a 3-frame gap: they are dropped, and tfdt
+    steps by 1024 again, within half a frame of each timestamp."""
+    from aiomoqt.tools import abr_ingest
+    entry = CatalogTrack(name='audio', role='audio', codec='mp4a.40.2',
+                         samplerate=48000, channelConfig='2')
+    pkg = abr_ingest._cmaf_for(entry, _ASC, 'mp4a.40.2', None, None)
+    t0 = 1_794_405_600_000_000
+
+    def us(k):
+        return t0 + k * 1024 * 1_000_000 // 48000
+
+    order = list(range(10)) + [12, 10, 11] + list(range(13, 21))
+    out = [(k, pkg.wrap(LocFrame(b'\x21' * 8, timestamp=us(k)))) for k in order]
+    assert [k for k, p in out if p is None] == [10, 11]
+    kept = [(k, _cmaf_object(p)[1]) for k, p in out if p is not None]
+    for k, tfdt in kept:
+        assert abs(tfdt - us(k) * 48000 // 1_000_000) <= 512, (k, tfdt)
+    steps = [b[1] - a[1] for a, b in zip(kept, kept[1:]) if b[0] == a[0] + 1]
+    assert len(steps) == 17 and set(steps) == {1024}, steps
+
+
 @pytest.mark.parametrize('codec', ['h264', 'av1'])
 async def test_ingester_publishes_cmaf_tracks(impl, clip, codec):
     _needs(impl, codec)
