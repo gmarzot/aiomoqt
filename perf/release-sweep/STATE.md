@@ -503,3 +503,50 @@ Next action: Phase 1e (media/churn + consolidation). Carry forward, in priority 
 deterministic 3/3; (2) clock discipline, without which no tail-latency number is publishable;
 (3) a paced relay-ceiling point (R2/R3 cannot answer it unpapered); (4) relay byte-counter
 accuracy.
+
+## Phase 1e — media + churn, consolidated report (IN PROGRESS)
+
+**Status: partial.** The consolidated report skeleton is written and the
+L/P/D/R/Ri baselines are consolidated from their canonical blocks; the Phase 1e
+media/churn block was relaunched at **02:33:51Z** (`runs/2026-11-11T02-33-51Z`)
+with `--waive stray_bench_process,clock_offset_jump` after the first attempt
+(02:28:34Z) aborted on a clock-offset jump, and had completed **M1 (2/2 reps,
+4.81 Mb/s)** when this note was written. **M2, C2, C1, C0 are not yet measured.**
+
+Delivered this pass:
+- `baselines/base-070rc2/SUMMARY.md` — headline table (L/P/D/R/Ri/M/C) + the five
+  required answers + confidence section, built from `rollup.csv` medians. §3 (M2)
+  and §4 (C0/C1/C2) carry an explicit `P1E-PENDING` marker, not placeholder numbers.
+- `baselines/base-070rc2/rollup.csv` — 79 rows, one per point x rep, non-`ok` reps
+  retained and flagged (no cherry-picking, PROGRAM.md §7).
+- `scripts/baseline_report.py` — canonical-block consolidator (median + bootstrap
+  95% CI over `ok`/`dirty` reps).
+- `scripts/ttff_probe.py` — TTFF + catch-up probe for C2 (`TTFF-JSON:` line),
+  deployed to seawolf and smoke-tested (ttff_ms 21.4, burst 308 KB/s).
+- `scenarios/c1-churn-50.json`, `scenarios/c0-steady-50.json`, `manifests/phase1e.yaml`.
+
+Corrections to previously published numbers, from the consolidated pass:
+- **D4** is tight, not noisy: CV 0.50% (CI 784.0–791.6), so direct churn −5.2% vs
+  D3 is a solid claim; it was earlier described as marginal.
+- **Ri1** is tight (CV 0.13%), not cold-start dominated; the 102.7 Mb/s outlier is
+  not in the canonical reps.
+- **P2** ("paced 20 Mb/s") reports 657.5 Mb/s — the pacer never engaged. Unit error
+  (kbit/s vs objects/s) in the manifest; point excluded from the narrative.
+- **R5** has 3/3 usable reps at 154.1 Mb/s median (CV 6.05); R5b 2/3 at 47.5.
+
+Open, for the next pass:
+1. Finish M2 (N=3), C2 (N=2, TTFF + catch-up), C1 (N=2), C0 (N=2); fill §3/§4.
+2. Check that `load_sim` still writes `churn.csv` — `--report churn.csv` was dropped
+   from its argv while `collect` reads `rep_dir/churn.csv`; per-interval rows may be
+   empty (the verdict-line summary still parses).
+3. State the waiver in SUMMARY.md (done) and confirm no rep was silently `failed`.
+
+**Next action: Phase 2a (0.6.1 comparison)**, on the released tags. Compare first,
+in this order:
+1. **D3** (direct ceiling) — the single cleanest link-limited point (829.4, and N1
+   corroborates to −2.1%); any 0.6.1 transport regression shows here first.
+2. **R2** (relay ceiling) — 764.5 vs D3's 829.4 isolates the relay tax (−7.8%),
+   the number most likely to move between releases.
+3. **R4** (relay fan-out, 5 subs) — the stream-credit eviction (`MaxStreamsUni`
+   never replenished) is the known 0.7.0 defect; if 0.6.1 evicts less, it explains
+   R4/R6/R5b in one shot.

@@ -1,0 +1,104 @@
+# Phase 1e — media and churn points, then the consolidated baseline report.
+#
+#   python3 scripts/sweep.py --manifest manifests/phase1e.yaml --resume
+#
+# Same arms/hosts/relay as baseline-v0.yaml; only the M and C points differ.
+# Rep counts are the task's: N=3 for M1/M2 (media is cheap), N=2 for the long
+# churn and late-join points (300 s and 90 s a rep).
+#
+# C0 is my control for C1, not an extra experiment: same publisher, same 50
+# subscriber slots, same 200 Mb/s offered egress, churn_rate 0. C1 - C0 is the
+# cost of churn at a fixed rate; without it the churn number has no floor.
+#
+# C2 declares expected_sub_s: the joiner arrives at +30 s into a 90 s publisher,
+# so it legitimately sees ~58 s of stream, not duration_s.
+
+arm: base-070rc2
+cc: bbr1
+gso: true
+
+hosts:
+  shenzhen:
+    local: true
+    root: /home/gmarzot/Projects/marzresearch/perf-sweep
+    python: arms/{arm}/venv/bin/python
+  seawolf:
+    ssh: seawolf
+    root: /home/gmarzot/perf-sweep
+    python: venv/bin/python
+
+relay:
+  binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx
+  config: perf/release-sweep/moqx-perf.yaml
+  addr: 10.14.25.173
+  port: 9768
+  wt_path: /moq-relay
+  pub_port: 4434
+  sub_stagger_s: 0.5
+  admin_url: "http://[::1]:9769/metrics"
+
+defaults:
+  draft: 16
+  duration_s: 60
+  interval_s: 5
+  warmup_s: 5
+  sub_delay_s: 2.0
+  reps: 3
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  pin: {relay: "0-1", pub: "2-5", sub: "0-3"}
+
+points:
+  # ---- M: media shape ---------------------------------------------------
+  - id: M1
+    topology: M
+    transport: raw
+    video: 1080p
+    duration_s: 120
+    reps: 3
+    subs: 1
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    purpose: 1080p single subscriber, 120 s
+  - id: M2
+    topology: M
+    transport: raw
+    video: 720p
+    duration_s: 120
+    reps: 3
+    subs: 5
+    config: {P: 1, s: 4096, g: 200, r: 0}
+    purpose: 720p fan-out 5, 120 s
+
+  # ---- C: client-behaviour pressure ------------------------------------
+  - id: C2
+    topology: C2
+    transport: raw
+    video: 1080p
+    duration_s: 90
+    reps: 2
+    subs: 1
+    sub_delay_s: 30.0
+    expected_sub_s: 58
+    probe: ttff
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: late join at t=30 s — TTFF and catch-up burst
+  - id: C1
+    topology: C1
+    transport: raw
+    flow: c1-churn-50.json
+    duration_s: 300
+    reps: 2
+    subs: 50
+    seed: 1
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: churn storm, 50 slots on one track at 200 Mb/s offered
+  - id: C0
+    topology: C1
+    transport: raw
+    flow: c0-steady-50.json
+    duration_s: 300
+    reps: 2
+    subs: 50
+    seed: 1
+    config: {P: 4, s: 4096, g: 200, r: 0}
+    purpose: control for C1 — same rate, no churn (not a §7 point)

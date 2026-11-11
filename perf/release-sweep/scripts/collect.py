@@ -268,6 +268,90 @@ def correction_ms(sub_minus_pub_us: float) -> float:
     return -float(sub_minus_pub_us) / 1000.0
 
 
+_LOAD_VERDICT = re.compile(
+    r"^\s+(?P<key>\S+)\s+peak\s+(?P<peak>\d+)/(?P<target>\d+)\s+"
+    r"joins=(?P<joins>\d+)\s+churn=(?P<churn>\d+)\s+exodus=(?P<exodus>\d+)\s+"
+    r"fails=(?P<fails>\d+)\s+died=(?P<died>\d+)\s+objs=(?P<objs>\d+)\s+"
+    r"expected=(?P<expected>\d+)\s+bytes=(?P<bytes>\d+)\s+rx=(?P<rx>\d+)MB")
+
+
+def parse_load_sim(log_text: str, csv_path: "str | None" = None) -> "tuple[dict, list[dict]]":
+    """Churn points (C0/C1) have no subscriber transcript.
+
+    load_sim reports what it did, not throughput ceilings: one verdict row per
+    subscriber group plus a per-interval CSV. Parse both into the same summary
+    keys the bench points use, so a churn point still lands in the rollup with
+    numbers instead of "no parsed summary".  Keys that only make sense for a
+    single subscriber stream (lat_min etc.) stay absent.
+    """
+    summary: dict = {}
+    groups = []
+    for line in log_text.splitlines():
+        m = _LOAD_VERDICT.match(line)
+        if not m:
+            continue
+        g = {k: (int(v) if k != "key" else v) for k, v in m.groupdict().items()}
+        groups.append(g)
+    if groups:
+        peak = sum(g["peak"] for g in groups)
+        target = sum(g["target"] for g in groups)
+        summary.update({
+            "peak_subs": peak,
+            "target_subs": target,
+            "joins": sum(g["joins"] for g in groups),
+            "churns": sum(g["churn"] for g in groups),
+            "exodus": sum(g["exodus"] for g in groups),
+            "fails": sum(g["fails"] for g in groups),
+            "died": sum(g["died"] for g in groups),
+            "objects": sum(g["objs"] for g in groups),
+            "expected_objects": sum(g["expected"] for g in groups),
+            "bytes": sum(g["bytes"] for g in groups),
+            "groups": groups,
+        })
+        if summary["target_subs"]:
+            summary["peak_frac"] = round(peak / summary["target_subs"], 4)
+        if summary["expected_objects"]:
+            summary["delivery_frac"] = round(
+                summary["objects"] / summary["expected_objects"], 4)
+    if "RESULT: OK" in log_text:
+        summary["result"] = "ok"
+    elif "RESULT: FAIL" in log_text:
+        summary["result"] = "fail"
+
+    rows: list[dict] = []
+    if csv_path and Path(csv_path).exists():
+        with open(csv_path, newline="") as fh:
+            for r in csv.DictReader(fh):
+                try:
+                    rows.append({
+                        "t_s": float(r["t"]),
+                        "live": int(r["live"]),
+                        "target": int(r["target"]),
+                        "mbps": float(r["rx_mbps"]),
+                        "p90": float(r["p90_ms"]) if r["p90_ms"] else None,
+                        "joins": int(r["joins"]),
+                        "leaves": int(r["leaves"]),
+                        "fails": int(r["fails"]),
+                        "track": f"{r['namespace']}/{r['track']}",
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if rows:
+            mbps = [r["mbps"] for r in rows]
+            p90 = [r["p90"] for r in rows if r["p90"] is not None]
+            summary["elapsed_s"] = round(max(r["t_s"] for r in rows), 1)
+            summary["mbps_mean"] = round(sum(mbps) / len(mbps), 2)
+            summary["mbps_max"] = round(max(mbps), 2)
+            summary["live_max"] = max(r["live"] for r in rows)
+            summary["live_min_after_fill"] = min(
+                r["live"] for r in rows if r["t_s"] >= 10) if any(
+                    r["t_s"] >= 10 for r in rows) else None
+            if p90:
+                summary["p90_median_ms"] = round(sorted(p90)[len(p90) // 2], 1)
+                summary["p90_max_ms"] = round(max(p90), 1)
+    return summary, rows
+
+
 def sample_rows(parsed: dict) -> list[dict]:
     """Appendix A `samples` block: one row per interval."""
     rows = []
@@ -301,6 +385,11 @@ FIELDS = (
     "started_utc", "duration_s", "mbps", "obj_s", "grp_s", "p50", "p95", "p99",
     "jitter_ms", "lost", "ooo", "interval_cv", "cpu_pub", "cpu_sub",
     "rss_max_mb", "clock_offset_us",
+    # Late-join and churn points measure things a single subscriber stream
+    # does not have. Empty for every L/P/D/R/Ri/M point.
+    "ttff_ms", "burst_bytes_1s", "burst_groups_1s", "first_group",
+    "peak_subs", "target_subs", "joins", "churns", "exodus", "fails", "died",
+    "delivery_frac", "peak_frac",
 )
 
 
@@ -336,6 +425,19 @@ def build_csv(rows: list[dict]) -> list[dict]:
                 "cpu_sub": s.get("cpu_sub", ""),
                 "rss_max_mb": s.get("rss_max_mb", ""),
                 "clock_offset_us": (r.get("env") or {}).get("clock_offset_us", ""),
+                "ttff_ms": s.get("ttff_ms", ""),
+                "burst_bytes_1s": (s.get("ttff") or {}).get("burst_bytes_1s", ""),
+                "burst_groups_1s": (s.get("ttff") or {}).get("burst_groups_1s", ""),
+                "first_group": (s.get("ttff") or {}).get("first_group", ""),
+                "peak_subs": s.get("peak_subs", ""),
+                "target_subs": s.get("target_subs", ""),
+                "joins": s.get("joins", ""),
+                "churns": s.get("churns", ""),
+                "exodus": s.get("exodus", ""),
+                "fails": s.get("fails", ""),
+                "died": s.get("died", ""),
+                "delivery_frac": s.get("delivery_frac", ""),
+                "peak_frac": s.get("peak_frac", ""),
             }
         )
     return out

@@ -504,6 +504,17 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
         for i in range(nsubs):
             st = common_sub(url_for(relay_addr, relay_port, tr, wt_path), "seawolf",
                             role=f"sub{i + 1}")
+            if p.get("probe") == "ttff":
+                # Late-join points need the time from SUBSCRIBE to first object,
+                # which sub_bench does not record. ttff_probe is the same
+                # subscriber with that instrumented; it prints the same summary
+                # block (so this point's throughput/latency stay comparable),
+                # plus one TTFF-JSON line that lands in sub.log.
+                st["argv"] = ["{python}", "-P", "{root}/scripts/ttff_probe.py",
+                              url_for(relay_addr, relay_port, tr, wt_path),
+                              "-N", ns, "-T", trk, "--draft", str(draft), "-k",
+                              "-t", str(dur), "-i", str(iv)]
+                st["probe"] = "ttff"
             st["delay_s"] = float(p["sub_delay_s"]) + i * stag
             st["join_index"] = i
             steps.append(st)
@@ -516,13 +527,21 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
         return steps
 
     if topo == "C1":
+        # load_sim is the only tool that produces churn: -f takes a packaged
+        # name or a path, and the Phase 1e points ship their own scenario so the
+        # offered rate and the churn schedule are pinned in the manifest rather
+        # than inherited from whatever the package ships today.
+        flow = str(p.get("flow", "churn-storm"))
+        if flow.endswith(".json"):
+            fp = Path(flow)
+            flow = str(fp if fp.is_absolute() else (RS / "scenarios" / fp))
         steps.append(relay_step("shenzhen"))
         steps.append({
             "role": "load", "host": "shenzhen", "bg": False, "delay_s": 0.0, "kind": "bench",
             "argv": ["{python}", "-P", "-m", "aiomoqt.tools.load_sim",
                      url_for(relay_addr, relay_port, tr, wt_path),
-                     "-f", p.get("flow", "churn-storm"), "--draft", str(draft), "-k",
-                     "--report", "churn.csv"],
+                     "-f", flow, "--draft", str(draft), "-k",
+                     "-i", str(iv), "--seed", str(p.get("seed", 1))],
         })
         return steps
 
@@ -532,6 +551,25 @@ def build_steps(p: dict, hosts: dict[str, Host], relay: dict) -> list[dict]:
 # --------------------------------------------------------------------------
 # hostcheck
 # --------------------------------------------------------------------------
+def _ttff_from_log(log_path: Path) -> dict | None:
+    """Pull the `TTFF-JSON: {...}` line out of a late-join subscriber log.
+
+    Only ttff_probe writes it; a plain sub_bench point returns None so the
+    rollup stays honest about what was and was not measured.
+    """
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if line.startswith("TTFF-JSON: "):
+            try:
+                return json.loads(line[len("TTFF-JSON: "):])
+            except ValueError:
+                return None
+    return None
+
+
 def run_hostcheck(host: Host, *, samples: int, require: bool, guard_llama: bool,
                   peer: str | None, iface: str | None) -> dict:
     args = ["--json", "--samples", str(samples)]
@@ -1098,6 +1136,16 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
     summary = {}
     if parsed_sub:
         summary = dict(parsed_sub["summary"])
+    load_log = rep_dir / "load.log"
+    if not parsed_sub and load_log.exists():
+        # C0/C1: the churn points are load_sim runs, not a subscriber pair.
+        summary = _collect.parse_load_sim(
+            load_log.read_text(errors="replace"),
+            str(rep_dir / "churn.csv"))[0]
+    ttff = _ttff_from_log(local_sub) if local_sub.exists() else None
+    if ttff:
+        summary["ttff"] = ttff
+        summary["ttff_ms"] = ttff.get("ttff_ms")
     if parsed_pub:
         for k, v in parsed_pub["summary"].items():
             summary.setdefault(k, v)
@@ -1143,7 +1191,11 @@ def run_point(p: dict, *, hosts: dict[str, Host], relay: dict, arm: str, arm_dir
     if summary["cpu_relay"] is None:
         summary.pop("cpu_relay")
     summary["not_measured"] = nm
-    exp_s = float(p["duration_s"])
+    # A late-join point opens its measurement window *after* the publisher has
+    # already been running, so the subscriber legitimately measures less than
+    # duration_s (C2: joins at +30 s into a 90 s publisher). Points declare the
+    # window they are expected to see; the guard stays otherwise identical.
+    exp_s = float(p.get("expected_sub_s") or p["duration_s"])
     el_s = summary.get("elapsed_s")
     if status in ("ok", "dirty") and el_s is not None and float(el_s) < 0.8 * exp_s:
         if "short_run" in args.waive:

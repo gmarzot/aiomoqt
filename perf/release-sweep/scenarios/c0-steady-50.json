@@ -1,0 +1,13 @@
+{
+  "_comment": "Phase 1e C0 control for C1: identical publisher, identical 50 subscriber slots and offered egress (200 Mb/s), no churn and no exodus. C1 - C0 is the cost of churn at a fixed rate.",
+  "relay": "moqt://10.14.25.173:9768",
+  "publishers": [
+    {"namespace": "aiomoqt", "track": "churn", "bitrate_kbps": 4000, "fps": 30,
+     "object_size": 16667, "start_delay": 0, "duration": 300, "streams": 1}
+  ],
+  "subscribers": [
+    {"namespace": "aiomoqt", "track": "churn", "subs": 50,
+     "join_rate": 10, "join_delay": 0, "churn_rate": 0.0,
+     "leave_early": 0, "leave_rate": 0}
+  ]
+}

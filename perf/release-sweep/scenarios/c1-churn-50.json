@@ -1,0 +1,13 @@
+{
+  "_comment": "Phase 1e C1: churn storm, 50 subscriber slots on one track at a fixed 4 Mb/s each (200 Mb/s relay egress). Joins fill in ~5 s, churn escalates with stream age, and a 20 s exodus drains the group at the end. Deliberately the same offered egress as C0 (c1-steady-50.json, churn_rate 0) so C1 - C0 isolates churn at a fixed rate.",
+  "relay": "moqt://10.14.25.173:9768",
+  "publishers": [
+    {"namespace": "aiomoqt", "track": "churn", "bitrate_kbps": 4000, "fps": 30,
+     "object_size": 16667, "start_delay": 0, "duration": 300, "streams": 1}
+  ],
+  "subscribers": [
+    {"namespace": "aiomoqt", "track": "churn", "subs": 50,
+     "join_rate": 10, "join_delay": 0, "churn_rate": 0.05,
+     "leave_early": 20, "leave_rate": 10}
+  ]
+}
