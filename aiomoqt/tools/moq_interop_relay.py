@@ -97,9 +97,11 @@ import contextlib
 import datetime
 import faulthandler
 from functools import lru_cache
+import heapq
 import itertools
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 import random
@@ -268,11 +270,10 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A lane's time behind is checked LANE_TIME_CHECKS times per deadline,
-# LANE_TIME_MIN_S to LANE_TIME_MAX_S apart.
-LANE_TIME_CHECKS = 20
-LANE_TIME_MIN_S = 0.05
-LANE_TIME_MAX_S = 0.25
+# A send lane notes its bytes written once per LANE_MARK_S of its track's
+# arrivals, at most LANE_MARKS times per deadline.
+LANE_MARK_S = 0.05
+LANE_MARKS = 100
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -532,32 +533,60 @@ def _check_lanes() -> None:
         lane.check(now, LANE_STALL_S)
 
 
-def _time_lanes(now) -> float:
-    """Every lane's time-behind check that is due; seconds to the next."""
-    step = LANE_TIME_MAX_S
-    for lane in list(_lanes):
-        s = lane.check_time(now)
-        if s is not None and s < step:
-            step = s
-    return step
+def _due_lane(lane, at) -> None:
+    """Run `lane`'s time check at `at`, in place of any earlier one set."""
+    lane._time_due = at
+    heapq.heappush(_lane_due, (at, next(_lane_seq), lane))
+    wake = _lane_wake
+    if wake is not None and at < wake[0] and not wake[1].done():
+        wake[1].set_result(None)
+
+
+def _time_lanes(now) -> None:
+    """Run the lane time checks due by `now`."""
+    due = _lane_due
+    while due and due[0][0] <= now:
+        at, _n, lane = heapq.heappop(due)
+        if at != lane._time_due or lane not in _lanes:
+            continue
+        try:
+            nxt = lane.check_time(now)
+        except Exception:
+            logger.debug("relay: lane time check failed", exc_info=True)
+            nxt = now + LANE_STALL_S
+        if nxt is not None:
+            _due_lane(lane, nxt)
+
+
+def _wake_lanes(fut) -> None:
+    if not fut.done():
+        fut.set_result(None)
 
 
 async def _watch_lanes() -> None:
-    """Check each send lane's time behind when due, and every lane for a
-    stall a few times per LANE_STALL_S."""
-    step = LANE_TIME_MAX_S
-    stall_at = time.monotonic() + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+    """Run each send lane's time check when due, and every lane's stall
+    check a few times per LANE_STALL_S."""
+    global _lane_wake
+    loop = asyncio.get_running_loop()
+    every = min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+    stall_at = time.monotonic() + every
     while True:
-        await asyncio.sleep(step)
         now = time.monotonic()
-        try:
-            step = _time_lanes(now)
-        except Exception:
-            step = LANE_TIME_MAX_S
-            logger.debug("relay: lane time check failed", exc_info=True)
+        at = min(_lane_due[0][0], stall_at) if _lane_due else stall_at
+        if at > now:
+            fut = loop.create_future()
+            _lane_wake = (at, fut)
+            timer = loop.call_later(at - now, _wake_lanes, fut)
+            try:
+                await fut
+            finally:
+                timer.cancel()
+                _lane_wake = None
+            now = time.monotonic()
+        _time_lanes(now)
         if now < stall_at:
             continue
-        stall_at = now + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+        stall_at = now + every
         try:
             _check_lanes()
         except Exception:
@@ -715,6 +744,12 @@ _budget = _CacheBudget()
 
 # Send lanes still running, including those draining past their track.
 _lanes: set = set()
+# (time, n, lane): lane time checks, soonest first; stale once the lane's
+# _time_due differs.
+_lane_due: list = []
+_lane_seq = itertools.count()
+# (time, future) the lane timer sleeps to, None while it runs.
+_lane_wake = None
 # What the lanes hold, and whether that has put them all back on LANE_BYTES.
 _lane_bytes = 0
 _lanes_over_budget = False
@@ -843,10 +878,11 @@ class _RelayLane(SendLane):
     """One subscriber's SendLane, registered for the lane checks and the
     status page. It sheds once the oldest live object its subscriber has
     not been sent is more than `deadline` old, counting what the
-    transport still holds of the track's streams: check_time() marks it
-    late, the next object offered confirms. By bytes, past LANE_BYTES,
-    only without a deadline or while the lanes are over budget. A failed
-    write drops the subscriber."""
+    transport still holds of the track's streams: check_time(), run when
+    that object reaches the deadline, marks it late, the next object
+    offered confirms. By bytes, past LANE_BYTES, only without a deadline
+    or while the lanes are over budget. A failed write drops the
+    subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -855,13 +891,17 @@ class _RelayLane(SendLane):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
         # (bytes written to the session's streams of the track, arrival
-        # time of the newest object among them), one per probe.
+        # time of the newest object among them), from mark() and probes.
         self._marks = deque()
         # Arrival time of the newest object handed to the writer.
         self._wborn = None
         # Arrival time of the oldest live object held, as last read.
         self._oldest = None
-        self._time_due = 0.0
+        # When check_time() is due, None for never.
+        self._time_due = None
+        # mark() notes every _mark_every-th call.
+        self._mark_every = 1
+        self._mark_n = 0
         # The last shed's cause: byte cap, else seconds behind; bytes held.
         self._capped = False
         self._behind = 0.0
@@ -879,8 +919,31 @@ class _RelayLane(SendLane):
         self.bound = (LANE_BYTES if _lanes_over_budget
                       or self._deadline is None else 0)
 
+    @SendLane.deadline.setter
+    def deadline(self, value) -> None:
+        SendLane.deadline.fset(self, value)
+        if self._deadline is not None:
+            self._mark_every = max(1, round(
+                self._deadline / LANE_MARKS / LANE_MARK_S))
+        # The crossing may come sooner.
+        _due_lane(self, time.monotonic())
+
     def _written(self) -> int:
         return self.track._tx_written.get(id(self.d.session), 0)
+
+    def mark(self) -> None:
+        """Note the bytes written so far and the arrival time of the newest
+        object among them."""
+        if self._deadline is None or self._wborn is None:
+            return
+        self._mark_n += 1
+        if self._mark_n < self._mark_every:
+            return
+        self._mark_n = 0
+        written = self._written()
+        marks = self._marks
+        if not marks or marks[-1][0] < written:
+            marks.append((written, self._wborn))
 
     def _probe(self, floor) -> None:
         super()._probe(floor)
@@ -891,7 +954,7 @@ class _RelayLane(SendLane):
         """Arrival time of the oldest live object not yet sent. The
         transport sends a session's streams of the track oldest first, so
         its oldest unsent byte is `tx_bytes` before the end of what was
-        written; the first mark past it gives its time, at most one probe
+        written; the first mark past it gives its time, at most one mark
         late. Else the oldest queued, None for none."""
         written = self._written()
         marks = self._marks
@@ -915,21 +978,24 @@ class _RelayLane(SendLane):
                 and born - oldest > self._deadline)
 
     def check_time(self, now) -> float | None:
-        """Mark the lane late, once due, if the oldest live object it holds
-        arrived more than `deadline` before `now`. The seconds between
-        checks, None without a deadline."""
+        """Mark the lane late if the oldest live object it holds arrived
+        more than `deadline` before `now`. When to check next: when that
+        object reaches the deadline, else a deadline from now; None
+        without a deadline."""
         deadline = self._deadline
         if deadline is None or self.stopped:
             self.late = False
             return None
-        step = min(max(deadline / LANE_TIME_CHECKS, LANE_TIME_MIN_S),
-                   LANE_TIME_MAX_S)
-        if now >= self._time_due:
-            self._time_due = now + step
-            self._probe(self.floor)
-            oldest = self._oldest
-            self.late = oldest is not None and now - oldest > deadline
-        return step
+        self._probe(self.floor)
+        oldest = self._oldest
+        if oldest is None:
+            return now + deadline
+        at = oldest + deadline
+        if now > at:
+            # The next object offered reschedules.
+            self.late = True
+            return now + deadline
+        return at if at > now else math.nextafter(now, math.inf)
 
     def _over(self, item) -> bool:
         held = self.bytes + self.tx_bytes
@@ -942,7 +1008,12 @@ class _RelayLane(SendLane):
         self._probe(self.floor)
         self.late = False
         if not self._late(item):
+            oldest = self._oldest
+            _due_lane(self, (item[3] if oldest is None else oldest)
+                      + self._deadline)
             return False
+        # Once shed, what is held is newer.
+        _due_lane(self, item[3])
         self._capped, self._held = False, self.bytes + self.tx_bytes
         self._behind = item[3] - self._oldest
         # Past the deadline the expiry path enforces (§8).
@@ -967,6 +1038,7 @@ class _RelayLane(SendLane):
 
     def _exit(self) -> None:
         _lanes.discard(self)
+        self._time_due = None
         # stop() and the task's exit both land here: transfer once.
         if self in self.track._lanes:
             self.track._lanes.discard(self)
@@ -1128,6 +1200,8 @@ class _RelayedTrack:
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
+        # Arrival time of the next object that marks the lanes.
+        self._mark_at = 0.0
         self.queue = asyncio.Queue()
         # (group, subgroup) -> stream ends queued for the forward loop.
         self._ends_due: dict = {}
@@ -1901,6 +1975,15 @@ class _RelayedTrack:
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
+            if born is not None and born >= self._mark_at:
+                self.mark_lanes(born)
+
+    def mark_lanes(self, born) -> None:
+        """Each lane notes what it has written, LANE_MARK_S of arrivals
+        apart."""
+        self._mark_at = born + LANE_MARK_S
+        for lane in self._lanes:
+            lane.mark()
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
                   shape=None, cost=None, born=None) -> None:
