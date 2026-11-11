@@ -1065,6 +1065,9 @@ class _RelayedTrack:
         self._floor = 0
         # Copies dropped as already taken from another publisher.
         self._copies = 0
+        # Location of the End of Track taken: nothing past it is forwarded
+        # and no standby takes over.
+        self._end_at = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
         # Upstream Forward State is 0: answered so in PUBLISH_OK, or
@@ -1275,6 +1278,12 @@ class _RelayedTrack:
                 self.upstream):
             return False
         live = [f for f in self.standby if _session_live(f.session)]
+        if self._end_at is not None:
+            if live:
+                logger.info(f"relay: upstream {key} ended after End of "
+                            f"Track {self._end_at}; {len(live)} standby "
+                            f"not taken over, ending the track")
+            return False
         nxt = next((f for f in live if self._in_step(f)), None)
         if nxt is None:
             if live:
@@ -1669,9 +1678,13 @@ class _RelayedTrack:
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
         dgram = isinstance(msg, (ObjectDatagram, ObjectDatagramStatus))
+        if self._end_at is not None and (gid, msg.object_id) > self._end_at:
+            return
         if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
             self._copies += 1
             return
+        if getattr(msg, "status", None) == ObjectStatus.END_OF_TRACK:
+            self._end_at = (gid, msg.object_id)
         self._objects_in += 1
         payload = bytes(msg.payload)
         self._bytes_in += len(payload)

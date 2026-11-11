@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay ends a track that has forwarded its End of Track when the serving publisher ends, instead of failing over to another publisher of it: viewers got objects past the End of Track and marked the track malformed.
 - `abr_ingest --packaging cmaf` publishes the source and the ladder as CMSF tracks: one CMAF chunk per object led by a `prft`, CMAF headers in the catalog.
 - abr_ingest's ladder drops a source frame that arrives after a newer group has started, instead of decoding it. A group's last object landing behind the next group's first ones stalled the decoder until the next key frame, about 2 s with no rung output. The final `ladder:` line counts them as late.
 - `pub_media --ts` and `--h264` keep filler data and end-of-sequence or end-of-stream NAL units in their access unit, for H.264 and H.265. A CBR source (NVENC or x264 `nal-hrd=cbr`) had each filler NAL published as a frame of its own, which decoders reject.
