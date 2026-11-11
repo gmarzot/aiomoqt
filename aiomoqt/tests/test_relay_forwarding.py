@@ -1634,3 +1634,83 @@ async def test_datagram_track_is_relayed_as_datagrams(draft, use_quic):
         n: len(v) for n, v in got.items()}
     assert all(isinstance(m, ObjectDatagram) for m in got["dg"])
     assert not any(isinstance(m, ObjectDatagram) for m in got["st"])
+
+
+class _Holding(PublishedTrack):
+    """Writes two objects on one subgroup stream and holds it open."""
+
+    async def generate(self, session, track_alias):
+        from aiomoqt.messages import SubgroupHeader
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(
+            track_alias=track_alias, group_id=0, subgroup_id=0,
+            publisher_priority=200, extensions_present=True,
+            prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        for i in range(2):
+            buf = hdr.next_object(payload=b"h%d" % i, extensions=None,
+                                  object_id=i)
+            await session.stream_write_drain(sid, buf.data)
+        self._largest = (0, 1)
+        await asyncio.Event().wait()
+
+
+_CANCEL_DRAFTS = (16, 18, 22)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", _CANCEL_DRAFTS)
+@_TRANSPORTS
+async def test_a_cancelled_subscription_has_its_open_streams_reset(
+        draft, use_quic):
+    # The subscriber leaves without STOP_SENDING its data streams; the
+    # relay still resets them, so none stays open until the session ends.
+    port = (_BASE_PORT + 200 + 2 * _CANCEL_DRAFTS.index(draft)
+            + (not use_quic))
+    names = ("video", "audio")
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                assert s._is_wt is (not use_quic)
+                return s
+
+            pub = await _session()
+            for name in names:
+                _Holding(pub, "relay/hold", name).attach()
+            await pub.publish_namespace(namespace="relay/hold",
+                                        wait_response=True)
+            await asyncio.sleep(0.1)
+            rx = await _session()
+            stop = rx.stream_stop_sending
+            rx.stream_stop_sending = lambda sid, *a, **k: (
+                None if sid in rx._data_streams else stop(sid, *a, **k))
+            got = {n: [] for n in names}
+            oks = [await rx.subscribe(
+                "relay/hold", name, wait_response=True,
+                on_object=lambda m, *a, n=name: got[n].append(m))
+                for name in names]
+            assert await _until(lambda: all(len(v) == 2
+                                            for v in got.values())), got
+            assert len(rx._data_streams) == 2, rx._data_streams
+            for ok in oks:
+                rx.unsubscribe(ok.request_id)
+            assert await _until(lambda: not rx._data_streams), \
+                rx._data_streams
+            for name in names:
+                track = relay._tracks.get(
+                    ((b"relay", b"hold"), name.encode()))
+                assert track is None or not track._streams, track._streams
+            assert rx._close_err is None
+    finally:
+        handle.close()
+        _reset_relay_state()
