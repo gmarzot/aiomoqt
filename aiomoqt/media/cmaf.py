@@ -1,5 +1,6 @@
 """CMAF packaging for CMSF (draft-ietf-moq-cmsf) — init segments and
-moof+mdat chunks built from progressive-mp4 sample tables.
+moof+mdat chunks built from progressive-mp4 sample tables or from
+decoder config.
 
 Mapping (cmsf §3.3/§3.4): each MOQT Object is one CMAF chunk
 (moof+mdat, single track, one sample — lowest latency); Groups begin
@@ -13,8 +14,8 @@ import struct
 from typing import Optional
 
 from .sources import (
-    Mp4Error, _boxes, _find, av1c_codec_string, avcc_codec_string, esds_asc,
-    hvcc_codec_string,
+    _ADTS_FREQ, Mp4Error, _boxes, _find, av1c_codec_string, avcc_codec_string,
+    esds_asc, hvcc_codec_string,
 )
 
 
@@ -39,8 +40,9 @@ _FLAG_NON_SYNC = 0x01010000  # depends_on=1, is_non_sync_sample=1
 class CmafChunker:
     """Builds the CMAF header and per-sample chunks for one track.
 
-    `track` is an Mp4VideoTrack/Mp4AudioTrack; the source sample entry
-    (avc1/av01/mp4a box) is embedded verbatim in the header's stsd.
+    `track` is an Mp4VideoTrack/Mp4AudioTrack or a ConfigTrack; its
+    sample entry (avc1/av01/mp4a box) is embedded verbatim in the
+    header's stsd.
     """
 
     TRACK_ID = 1
@@ -142,6 +144,100 @@ class CmafChunker:
         assert len(moof) == 100
         self._dts += duration
         return moof + _box(b'mdat', payload)
+
+
+# -- sample entries from decoder config ------------------------------
+
+_CONFIG_BOX = {'avc1': b'avcC', 'hvc1': b'hvcC', 'av01': b'av1C'}
+
+
+class ConfigTrack:
+    """A CmafChunker track built from decoder config instead of an mp4
+    file; width/height None for audio."""
+
+    def __init__(self, sample_entry_bytes: bytes, timescale: int,
+                 width: Optional[int] = None, height: Optional[int] = None):
+        self.sample_entry_bytes = sample_entry_bytes
+        self.timescale = timescale
+        self.width = width
+        self.height = height
+
+
+def visual_sample_entry(fourcc: str, config: bytes, width: int,
+                        height: int) -> bytes:
+    """avc1 (avcC), hvc1 (hvcC) or av01 (av1C) VisualSampleEntry."""
+    body = struct.pack('>6xH2x2x12xHHIIIH32xHh', 1, width, height,
+                       0x00480000, 0x00480000, 0, 1, 0x0018, -1)
+    return _box(fourcc.encode(), body, _box(_CONFIG_BOX[fourcc], config))
+
+
+def _descriptor(tag: int, payload: bytes) -> bytes:
+    """MPEG-4 descriptor with a 7-bit-continued length."""
+    n, size = len(payload), [len(payload) & 0x7F]
+    while n > 0x7F:
+        n >>= 7
+        size.insert(0, 0x80 | (n & 0x7F))
+    return bytes([tag, *size]) + payload
+
+
+def esds_box(asc: bytes) -> bytes:
+    """esds for MPEG-4 Audio carrying an AudioSpecificConfig."""
+    dcd = _descriptor(0x04, struct.pack('>BB3xII', 0x40, 0x15, 0, 0)
+                      + _descriptor(0x05, asc))
+    es = _descriptor(0x03, struct.pack('>HB', 0, 0) + dcd
+                     + _descriptor(0x06, b'\x02'))
+    return _full(b'esds', 0, 0, es)
+
+
+def dops_box(channels: int, pre_skip: int = 0,
+             input_samplerate: int = 48000) -> bytes:
+    """dOps (Opus in ISOBMFF §4.3.2), channel mapping family 0."""
+    return _box(b'dOps', struct.pack('>BBHIhB', 0, channels, pre_skip,
+                                     input_samplerate, 0, 0))
+
+
+def audio_sample_entry(fourcc: str, channels: int, samplerate: int,
+                       config_box: bytes) -> bytes:
+    """AudioSampleEntry (mp4a + esds, Opus + dOps)."""
+    body = struct.pack('>6xH8xHH4xI', 1, channels, 16,
+                       min(samplerate, 0xFFFF) << 16)
+    return _box(fourcc.encode(), body, config_box)
+
+
+def asc_info(asc: bytes) -> tuple:
+    """(samplerate, channels, samples per frame) of a simple
+    AudioSpecificConfig; 0 where it does not say."""
+    sfi = ((asc[0] & 7) << 1) | (asc[1] >> 7)
+    if sfi == 15:
+        rate = int.from_bytes(asc[1:5], 'big') >> 7 & 0xFFFFFF
+        bits = int.from_bytes(asc[4:6].ljust(2, b'\0'), 'big') >> 7
+        channels, frame_length = (bits >> 4) & 0xF, (bits >> 3) & 1
+    else:
+        rate = _ADTS_FREQ[sfi] if sfi < len(_ADTS_FREQ) else 0
+        channels, frame_length = (asc[1] >> 3) & 0xF, (asc[1] >> 2) & 1
+    return rate, channels, 960 if frame_length else 1024
+
+
+def video_track(fourcc: str, config: bytes, width: int, height: int,
+                timescale: int = 90000) -> ConfigTrack:
+    return ConfigTrack(visual_sample_entry(fourcc, config, width, height),
+                       timescale, width, height)
+
+
+def aac_track(asc: bytes, samplerate: Optional[int] = None,
+              channels: Optional[int] = None) -> ConfigTrack:
+    """An AAC track at `samplerate` (default: the ASC's) ticks/s."""
+    rate, ch, _ = asc_info(asc)
+    samplerate = samplerate or rate
+    return ConfigTrack(audio_sample_entry('mp4a', channels or ch or 2,
+                                          samplerate, esds_box(asc)),
+                       samplerate)
+
+
+def opus_track(channels: int) -> ConfigTrack:
+    """An Opus track at 48 kHz."""
+    return ConfigTrack(audio_sample_entry('Opus', channels, 48000,
+                                          dops_box(channels)), 48000)
 
 
 # ProducerReferenceTimeBox flags (ISO 14496-12 §8.16.5): the NTP time is

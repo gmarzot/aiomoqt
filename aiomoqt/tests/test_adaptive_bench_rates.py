@@ -42,6 +42,68 @@ async def test_rate_window_caps_at_five_seconds(monkeypatch):
     assert abs(sig.rx_mbps - 10.0) < 0.01, sig.rx_mbps
 
 
+
+async def test_late_report_is_prorated_to_the_window(monkeypatch):
+    act, events = _actuator()
+    clock = [100.0]
+    monkeypatch.setattr(ab.time, "monotonic", lambda: clock[0])
+    await act.apply(10.0)
+    clock[0] = 110.0
+    events.put({"kind": "stats", "t": 110.0, "dt": 10.0,
+                "rx_bytes": 12_500_000, "rx_objs": 12_500})
+    sig = await act.observe()
+    assert abs(sig.rx_mbps - 10.0) < 0.01, sig.rx_mbps
+
+
+
+async def test_steady_reports_read_the_full_rate(monkeypatch):
+    act, events = _actuator()
+    clock = [1000.0]
+    monkeypatch.setattr(ab.time, "monotonic", lambda: clock[0])
+    await act.apply(10.0)
+    clock[0] = 1010.5
+    for t in range(1006, 1011):
+        events.put({"kind": "stats", "t": float(t), "dt": 1.0,
+                    "rx_bytes": 1_250_000})
+    sig = await act.observe()
+    assert abs(sig.rx_mbps - 10.0) < 0.01, sig.rx_mbps
+
+
+async def test_empty_reports_after_a_burst_lower_the_rate(monkeypatch):
+    act, events = _actuator()
+    clock = [1000.0]
+    monkeypatch.setattr(ab.time, "monotonic", lambda: clock[0])
+    await act.apply(10.0)
+    clock[0] = 1010.0
+    for t in range(1003, 1011):
+        events.put({"kind": "stats", "t": float(t), "dt": 1.0,
+                    "rx_bytes": 1_250_000 if t <= 1007 else 0})
+    sig = await act.observe()
+    assert abs(sig.rx_mbps - 4.0) < 0.01, sig.rx_mbps
+
+async def test_loss_is_a_share_of_received_plus_lost():
+    act, events = _actuator()
+    events.put({"kind": "stats", "rx_objs": 10, "iv_lost": 20})
+    sig = await act.observe()
+    assert abs(sig.loss_pct - 100 * 20 / 30) < 1e-9, sig.loss_pct
+
+
+def test_silence_after_a_burst_lowers_the_rate(monkeypatch):
+    live = ab.LiveStats(1000)
+    clock = [100.0]
+    monkeypatch.setattr(ab.time, "monotonic", lambda: clock[0])
+    for t, oid in ((100.0, 0), (100.1, 1)):
+        clock[0] = t
+        live.on_object(SimpleNamespace(group_id=0, object_id=oid,
+                                       subgroup_id=0, extensions=None),
+                       1000, int(time.time() * 1e6))
+    burst = live.sample(0.1).rx_bitrate_mbps
+    clock[0] = 104.9
+    after = live.sample(0.1).rx_bitrate_mbps
+    assert abs(burst - 0.16) < 1e-6, burst
+    assert abs(after - 2000 * 8 / (4.9 * 1e6)) < 1e-9, after
+
+
 async def test_no_latency_samples_print_as_na(monkeypatch, capsys):
     act, events = _actuator()
     await act.apply(10.0)

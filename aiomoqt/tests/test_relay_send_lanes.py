@@ -2,6 +2,7 @@
 lane, so a slow subscriber holds up only itself and sheds whole groups
 once past its deadline; its truncated subgroups are reset, never FINed."""
 import asyncio
+import time
 import contextlib
 import logging
 from collections import defaultdict
@@ -46,10 +47,12 @@ def relay_tables():
 
 @contextlib.asynccontextmanager
 async def _relay(port, use_quic, draft):
-    """A relay; yields a coroutine that connects one more session."""
+    """A relay with its lane timer; yields a coroutine that connects one
+    more session."""
     server = relay._build_server("localhost", port, CERT, KEY,
                                  use_quic=use_quic, draft=draft)
     handle = await server.serve()
+    watch = asyncio.ensure_future(relay._watch_lanes())
     try:
         async with contextlib.AsyncExitStack() as stack:
             async def connect():
@@ -61,6 +64,7 @@ async def _relay(port, use_quic, draft):
                 return s
             yield connect
     finally:
+        watch.cancel()
         handle.close()
 
 
@@ -298,6 +302,48 @@ async def test_a_blocked_lane_holds_up_neither_the_track_nor_its_peers(
         assert lane.idle and not lane.shedding
     finally:
         track.close()
+
+
+@pytest.mark.parametrize("ending", ["subscriber_close", "track_close", "stop"])
+@pytest.mark.parametrize("deadline", [0, 0.05], ids=["bytes", "time"])
+async def test_an_ended_lane_counts_its_shed_bytes_once(monkeypatch, deadline,
+                                                        ending):
+    monkeypatch.setattr(relay, "_lanes", set())
+    monkeypatch.setattr(relay, "_lanes_over_budget", False)
+    monkeypatch.setattr(relay, "LANE_BYTES", 10_000)
+    monkeypatch.setattr(relay, "_lag_limit", deadline)
+    peer = _Fake(blocked=True)
+    tracks = [relay._RelayedTrack(((b"shed",), n)) for n in (b"a", b"v")]
+    lanes = []
+    try:
+        for track in tracks:
+            d = track.add_downstream(peer, len(lanes) + 1, len(lanes) + 1)
+            for gid in range(4):
+                for oid in range(4):
+                    track.on_object(_obj(gid, oid), 1000, 0, gid, 0)
+                    await _settle(5)
+                await asyncio.sleep(deadline)
+                # The lanes' timer marks them late; the next object sheds.
+                relay._time_lanes(time.monotonic())
+            lanes.append(d.lane)
+        before = [track.shed_bytes() for track in tracks]
+        assert all(before), before
+        for track, lane in zip(tracks, lanes):
+            if ending == "subscriber_close":
+                track.drop_session(peer)
+            elif ending == "track_close":
+                track.close()
+            else:
+                lane.stop()
+        await asyncio.gather(*(ln.task for ln in lanes),
+                             return_exceptions=True)
+        assert [track.shed_bytes() for track in tracks] == before
+        assert not relay._lanes
+    finally:
+        for track in tracks:
+            track.close()
+        await asyncio.gather(*(ln.task for ln in lanes),
+                             return_exceptions=True)
 
 
 async def test_publish_done_follows_each_lane(monkeypatch):

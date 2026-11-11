@@ -139,6 +139,8 @@ class Signal:
     # keep window, or their p90 is over the threshold.
     lossy_subs: int = 0
     late_subs: int = 0
+    # subs-mode: slots with a continuous track that stopped advancing.
+    starved_subs: int = 0
 
 
 @dataclass
@@ -182,6 +184,7 @@ class LiveStats:
         self._stride: dict = {}
         self._newest_gid = -1
         self._prune_at = 0
+        self._key_floor = -1
         # Jitter (RFC 3550)
         self._last_recv_ms = 0
         self._last_send_ms = 0
@@ -220,8 +223,9 @@ class LiveStats:
                 self._last_send_ms = send_us
 
         lost = 0
-        if not is_status:
-            gid = getattr(msg, 'group_id', group_id)
+        gid = getattr(msg, 'group_id', group_id)
+        # Groups below the pruned floor stay counted but get no loss keys.
+        if not is_status and (gid is None or gid >= self._key_floor):
             sid = subgroup_id if subgroup_id is not None else 0
             oid = msg.object_id
             key = (gid, sid)
@@ -253,6 +257,7 @@ class LiveStats:
             self._events.popleft()
 
     def _prune(self, floor: int) -> None:
+        self._key_floor = max(self._key_floor, floor)
         for d in (self._last_seen, self._stride):
             for k in [k for k in d if k[0] is not None and k[0] < floor]:
                 del d[k]
@@ -269,7 +274,8 @@ class LiveStats:
                           loss_pct=0.0, jitter_ms=self._jitter,
                           latency_known=False)
 
-        window_t = max(0.01, self._events[-1][0] - self._events[0][0])
+        # Through now, so silence after the last arrival lowers the rate.
+        window_t = max(0.01, t - max(self._events[0][0], cutoff))
         n = len(self._events)
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
@@ -295,6 +301,18 @@ class LiveStats:
 # ---------------------------------------------------------------------------
 # LoadActuator: the "how do we apply a load level" abstraction
 # ---------------------------------------------------------------------------
+
+def _overlap_bytes(window, lo: float, hi: float) -> float:
+    """Bytes of (t, bytes, dt) reports, each prorated by the share of its
+    interval [t - dt, t] inside [lo, hi]; dt 0 counts whole."""
+    total = 0.0
+    for t, b, dt in window:
+        if dt > 0:
+            total += b * max(0.0, min(t, hi) - max(t - dt, lo)) / dt
+        else:
+            total += b
+    return total
+
 
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
@@ -333,7 +351,7 @@ class BWActuator:
         self._events_q = mp_events_queue
         self._stop_ev = mp_stop_event
         # rolling stats aggregated from sub-worker events
-        self._mp_rx_window = []   # (t, rx_bytes)
+        self._mp_rx_window = []   # (t, rx_bytes, dt)
         # The one subscriber worker's latest windowed latency (its
         # TrackStats window matches _mp_window_s): (n, mean, p90).
         self._mp_lat = (0, 0.0, 0.0)
@@ -398,9 +416,8 @@ class BWActuator:
                 self._mp_tx_ring_streams = ev.get(
                     'tx_ring_streams', 0)
             elif kind == 'stats':
-                rx_bytes = ev.get('rx_bytes', 0)
-                if rx_bytes:
-                    self._mp_rx_window.append((t, rx_bytes))
+                self._mp_rx_window.append(
+                    (t, ev.get('rx_bytes', 0), ev.get('dt', 0.0)))
                 self._mp_lat = (ev.get('lat_n', 0),
                                 ev.get('lat_mean_ms', 0.0),
                                 ev.get('lat_p90_ms', 0.0))
@@ -415,9 +432,7 @@ class BWActuator:
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
-        self._mp_rx_window = [
-            (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
-        ]
+        self._mp_rx_window = [e for e in self._mp_rx_window if e[0] >= cutoff]
         self._mp_tx_window = [
             (t, b) for (t, b) in self._mp_tx_window if t >= cutoff
         ]
@@ -449,7 +464,6 @@ class BWActuator:
         self._drain_events()
         t = time.monotonic()
         lat_n, mean, p90 = self._mp_lat
-        rx_bytes = sum(b for (_, b) in self._mp_rx_window)
         # tx column reports wire-bytes (picoquic ground truth); falls
         # back to queued bytes if the wire counter isn't available.
         wire_bytes = sum(b for (_, b) in self._mp_wire_window)
@@ -460,10 +474,13 @@ class BWActuator:
         covered = (t - self._mp_t0 if self._mp_t0 is not None
                    else self._mp_window_s)
         win = max(0.5, min(self._mp_window_s, covered))
+        # Ends at the newest report: data after it is not reported yet.
+        rx_end = max((e[0] for e in self._mp_rx_window), default=t)
+        rx_bytes = _overlap_bytes(self._mp_rx_window, rx_end - win, rx_end)
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
-        loss_pct = (100.0 * self._mp_total_lost
-                    / max(1, self._mp_total_objs))
+        seen = self._mp_total_objs + self._mp_total_lost
+        loss_pct = 100.0 * self._mp_total_lost / seen if seen else 0.0
         shortfall = (self.state.target_mbps > 0
                      and rx_mbps
                      < self.shortfall_ratio * self.state.target_mbps)
@@ -515,6 +532,8 @@ def _hold_label(sig: Signal, default: str) -> str:
         return "hold (subs losing objects)"
     if sig.late_subs:
         return "hold (subs over threshold)"
+    if sig.starved_subs:
+        return "hold (subs missing a track)"
     return default
 
 
@@ -585,8 +604,14 @@ class SubsActuator:
                  too_far_behind: float = 0.0,
                  slot_latency_ms: float = 0.0,
                  join_burst: bool = False,
-                 watchers: float = 0.25):
+                 watchers: float = 0.25,
+                 sparse_tracks: tuple = (),
+                 lat_min_us: Optional[int] = None):
         self.too_far_behind = too_far_behind
+        # Tracks exempt from the per-track progress check (catalogs).
+        self.sparse_tracks = tuple(sparse_tracks)
+        # Most negative latency a slot keeps (us); None = TrackStats' own.
+        self.lat_min_us = lat_min_us
         # Workers get a shared trial Array (start time, joiners); see
         # start_trial(). They judge health on watchers once one starts.
         self.join_burst = join_burst
@@ -643,6 +668,8 @@ class SubsActuator:
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
         self._workers: dict = {}    # worker_id -> (Process, stop_event)
+        # Starved workers told to stop, terminated if still up next observe.
+        self._reaping: list = []
         self._next_worker_id = 0
         # Targeted setpoint, in SUBS — the count the controller aims for.
         # Distinct from hosted capacity (workers x K): reaping a dead
@@ -803,6 +830,8 @@ class SubsActuator:
                 keep_window=self.keep_window,
                 too_far_behind=self.too_far_behind,
                 slot_latency_ms=self.slot_latency_ms,
+                sparse_tracks=self.sparse_tracks,
+                lat_min_us=self.lat_min_us,
                 **self.transport_options,
             )
             if self.join_burst:
@@ -817,10 +846,20 @@ class SubsActuator:
             p.start()
             self._workers[wid] = (p, stop_ev)
             self._spawned_t[wid] = time.monotonic()
-        # wind down
-        while len(self._workers) > workers_target:
-            wid = next(iter(self._workers))
+        for wid in self._shed_order()[:max(0, len(self._workers) - workers_target)]:
             self._kill_worker(wid)
+
+    def _shed_order(self) -> list:
+        """Workers in stop order: those still in startup grace, newest first,
+        then the rest by their worst subscriber's p90, furthest behind first."""
+        now = time.monotonic()
+
+        def key(wid):
+            t = self._spawned_t.get(wid, now)
+            if now - t < self._startup_grace:
+                return (0, -t)
+            return (1, -self._latest_batch.get(wid, {}).get('lat_p90_ms', 0.0))
+        return sorted(self._workers, key=key)
 
     async def drop_all(self) -> None:
         """Stop every worker at once so the relay sheds all their state."""
@@ -894,6 +933,7 @@ class SubsActuator:
                   f"{self._oldest_report_s:.0f}s old; figures are late")
         self._oldest_report_s = 0.0
         failed_this_window = 0
+        self._finish_reaping()
 
         # A worker reports how many of its K slots are subscribed
         # ('active') and how many of those receive their rate
@@ -927,7 +967,7 @@ class SubsActuator:
             self._trial_arrays.pop(wid, None)
             if proc is not None:
                 stop_ev.set()
-                proc.join(timeout=0.5)
+                self._reaping.append(proc)
             self._latest_batch.pop(wid, None)
             self._last_batch_t.pop(wid, None)
             self._last_bytes_t.pop(wid, None)
@@ -1054,7 +1094,21 @@ class SubsActuator:
                            for wid in self._workers),
             late_subs=sum(self._latest_batch.get(wid, {}).get('late', 0)
                           for wid in self._workers),
+            starved_subs=sum(
+                self._latest_batch.get(wid, {}).get('track_starved', 0)
+                for wid in self._workers),
         )
+
+    def _finish_reaping(self) -> None:
+        """Terminate reaped workers still running since the last observe."""
+        left = []
+        for proc in self._reaping:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=0.1)
+            if proc.is_alive():
+                left.append(proc)
+        self._reaping = left
 
     async def shutdown(self) -> None:
         if self._drain_task is not None:
@@ -1070,14 +1124,16 @@ class SubsActuator:
         self._workers.clear()
         for _sid, (_p, stop_ev) in items:
             stop_ev.set()
+        procs = [proc for _sid, (proc, _ev) in items] + self._reaping
+        self._reaping = []
         deadline = time.monotonic() + 2.0
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             remaining = max(0.0, deadline - time.monotonic())
             proc.join(timeout=remaining)
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             if proc.is_alive():
                 proc.terminate()
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             proc.join(timeout=1.0)
         self._latest_batch.clear()
         self._last_batch_t.clear()
@@ -1098,6 +1154,9 @@ class SubsActuator:
 
 # --too-far-behind: back off once this share of viewers is past the limit.
 BEHIND_SHARE = 0.05
+# Split hosts: negative latency kept down to this (us), so the skew-safe
+# baseline can cancel a clock offset instead of every sample being dropped.
+SKEW_LAT_MIN_US = -60_000_000
 
 
 class AIMDController:
@@ -1143,7 +1202,9 @@ class AIMDController:
                  too_far_behind: bool = False):
         self.too_far_behind = too_far_behind
         self.peak_behind = (0, 0)  # most viewers past it, of how many
-        self.peak_lossy = self.peak_late = (0, 0)
+        self.peak_lossy = self.peak_late = self.peak_starved = (0, 0)
+        # Whether any observed interval carried a latency sample.
+        self.latency_measured = False
         self.delivered_mbps = self.wanted_mbps = 0.0
         self.actuator = actuator
         self.state = state
@@ -1214,6 +1275,7 @@ class AIMDController:
             sig = await a.observe()
             self.samples += 1
             state.received_data |= sig.rx_mbps > 0
+            self.latency_measured |= sig.latency_known
 
             if self.samples < 2:
                 self._emit(sig, "warming")
@@ -1420,6 +1482,8 @@ class AIMDController:
             self.peak_lossy = (sig.lossy_subs, sig.active_subs)
         if sig.late_subs > self.peak_late[0]:
             self.peak_late = (sig.late_subs, sig.active_subs)
+        if sig.starved_subs > self.peak_starved[0]:
+            self.peak_starved = (sig.starved_subs, sig.active_subs)
         per_sub = getattr(self.actuator, 'per_sub_mbps', None)
         if per_sub:
             self.delivered_mbps += sig.rx_mbps
@@ -1457,16 +1521,20 @@ class AIMDController:
             return
         self._last_report_t = now
         if self.writer:
+            # Without a latency sample the cells are blank.
+            def ms(v):
+                return f"{v:.2f}" if sig.latency_known else ""
             self.writer.writerow([
                 f"{sig.t:.3f}",
                 f"{sig.target_mbps:.2f}",
                 f"{sig.tx_mbps:.2f}",
                 f"{sig.rx_mbps:.2f}",
-                f"{sig.latency_mean_ms:.2f}",
-                f"{(sig.latency_p90_ms if sig.latest_p90_ms is None else sig.latest_p90_ms):.2f}",
+                ms(sig.latency_mean_ms),
+                ms(sig.latency_p90_ms if sig.latest_p90_ms is None
+                   else sig.latest_p90_ms),
                 f"{sig.loss_pct:.3f}",
                 *self._cpu,
-                *([] if sig.latest_p90_ms is None else [f"{sig.latency_p90_ms:.2f}"]),
+                *([] if sig.latest_p90_ms is None else [ms(sig.latency_p90_ms)]),
             ])
         self._print_row(sig, action)
 
@@ -1591,16 +1659,18 @@ class HoldController(AIMDController):
 
     Steps add 10% of the level while the hold's p90 stayed under 10% of the
     threshold, 5% under 25%, else one group; never less than one group. The
-    first failure drops every subscriber, waits reset_gap_s and rejoins at
-    the last level that passed: a relay that does not shed late work
-    cannot drain a backlog under load. Once rejoined the level must run
-    clean for recover_clean_s within recover_s and then pass a confirm_s
-    hold. Once confirmed it is held, still checked, until the run ends
-    (exit_sustained ends it at once); a fault there resets one group lower
-    and confirms again. A failed recovery or confirmation does the same,
-    MAX_RETREATS step-downs in all. `sustained` is (level,
-    p90 max) of the level held to the end, or None, and `held_s` how long
-    it has held since its confirmation began.
+    first failure sheds back to the last level that passed, stopping the
+    workers furthest behind; the rest stay on and must run clean for
+    recover_clean_s within recover_s, plus the actuator's keep window for
+    the overshoot's loss flags to age out, then pass a confirm_s hold. A
+    level that does not recover gets one reset: every subscriber dropped,
+    reset_gap_s, then a rejoin, for a relay that does not shed late work.
+    A confirmed level is held, still checked, until the run ends
+    (exit_sustained ends it at once). A fault there, a failed confirmation
+    or no recovery after the reset sheds one group lower, MAX_RETREATS
+    step-downs in all. `sustained` is (level, p90 max) of the level held to
+    the end, or None, and `held_s` how long it has held since its
+    confirmation began.
     """
 
     MAX_RETREATS = 3
@@ -1635,7 +1705,8 @@ class HoldController(AIMDController):
         for n, why in ((sig.failed_subs, "subscribers failed"),
                        (sig.refusing_subs, "relay refusing"),
                        (sig.lossy_subs, "subscribers losing objects"),
-                       (sig.late_subs, "subscribers over the threshold")):
+                       (sig.late_subs, "subscribers over the threshold"),
+                       (sig.starved_subs, "subscribers missing a track")):
             if n:
                 return why
         if sig.shortfall:
@@ -1665,6 +1736,7 @@ class HoldController(AIMDController):
         p90s: list = []
         lost0 = a.lost_total[0]
         recover_t = rejoin_t = 0.0
+        reset = False                 # this level has had its reset
         no_data = 0
         while not state.stop.is_set():
             try:
@@ -1690,6 +1762,7 @@ class HoldController(AIMDController):
                 self._emit(sig, f"rejoin to {level:.0f}", force=True)
                 continue
             state.received_data |= sig.rx_mbps > 0
+            self.latency_measured |= sig.latency_known
             if sig.rx_mbps <= 0:
                 no_data += 1
                 if no_data >= 3 * self._tpr:
@@ -1728,10 +1801,15 @@ class HoldController(AIMDController):
                 if now - recover_t < self.recover_s:
                     self._emit(sig, f"recover ({why})")
                     continue
+                if not reset:
+                    await a.drop_all()
+                    self._emit(sig, f"no recovery, reset at {level:.0f}", force=True)
+                    phase, rejoin_t, reset = "reset", time.monotonic() + self.reset_gap_s, True
+                    continue
                 level = await self._retreat(sig, level, "no recovery")
                 if level is None:
                     return
-                phase, rejoin_t = "reset", time.monotonic() + self.reset_gap_s
+                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
                 continue
 
             why = self._fault(sig, p90, lost0)
@@ -1759,13 +1837,13 @@ class HoldController(AIMDController):
                     return
                 if phase == "step":
                     level = self.last_pass
-                    await a.drop_all()
-                    self._emit(sig, f"fail ({why}), reset, back to {level:.0f}", force=True)
+                    await a.apply(level)
+                    self._emit(sig, f"fail ({why}), back to {level:.0f}", force=True)
                 else:
                     level = await self._retreat(sig, level, why)
                     if level is None:
                         return
-                phase, rejoin_t = "reset", time.monotonic() + self.reset_gap_s
+                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
                 clean_since = since = None
                 continue
 
@@ -1790,14 +1868,14 @@ class HoldController(AIMDController):
             self._emit(sig, f"step to {level:.0f}", force=True)
 
     async def _retreat(self, sig: Signal, level: float, why: str) -> Optional[float]:
-        """Reset one group lower after a failed recovery or confirmation; None ends the run."""
+        """Shed one group lower; None ends the run."""
         self.retreats += 1
         if self.retreats > self.MAX_RETREATS or level - self.actuator.step_floor < self.actuator.min_level:
             self._finish(sig, f"not demonstrated: {why} after {self.retreats - 1} step(s) down")
             return None
         level -= self.actuator.step_floor
-        await self.actuator.drop_all()
-        self._emit(sig, f"fail ({why}), reset, down to {level:.0f}", force=True)
+        await self.actuator.apply(level)
+        self._emit(sig, f"fail ({why}), down to {level:.0f}", force=True)
         return level
 
 
@@ -1894,6 +1972,7 @@ class JoinSearchController(HoldController):
         sig = self._sig = await a.observe()
         self.samples += 1
         state.received_data |= sig.rx_mbps > 0
+        self.latency_measured |= sig.latency_known
         self._no_data = self._no_data + 1 if sig.rx_mbps <= 0 else 0
         if self._no_data >= 3 * self._tpr:
             state.failed = True
@@ -2526,16 +2605,27 @@ def _print_banner(args):
     print()
 
 
+def latency_unmeasured(state: BenchState, controller) -> bool:
+    """Data flowed but no interval had a latency sample, so no level the
+    controller reached is latency-qualified."""
+    return state.received_data and not controller.latency_measured
+
+
 def _print_summary(state: BenchState, controller, samples: int, args):
     unit = controller.actuator.unit
+    unmeasured = latency_unmeasured(state, controller)
+    qual = " — throughput only, latency unmeasured" if unmeasured else ""
     print()
     print("═" * 68)
     if unit == "Mbps":
         from aiomoqt.utils.format import fmt_bps
         print(f"  High-water:  {fmt_bps(controller.high_water * 1e6)} "
-              f"(rx delivered)")
+              f"(rx delivered){qual}")
     elif not isinstance(controller, HoldController):
-        print(f"  High-water:  {controller.high_water:.1f} {unit}")
+        print(f"  High-water:  {controller.high_water:.1f} {unit}{qual}")
+    if unmeasured:
+        print("  Latency:     unmeasured — no object carried a usable "
+              "send timestamp")
     if isinstance(controller, JoinSearchController):
         for trial in controller.trials:
             print(trial.line())
@@ -2578,7 +2668,8 @@ def _print_summary(state: BenchState, controller, samples: int, args):
         print(f"  Lost:        {lost} objects ({pct:.2f}%), whole groups "
               f"included")
         for what, (n, of) in (("losing objects", controller.peak_lossy),
-                              ("over the threshold", controller.peak_late)):
+                              ("over the threshold", controller.peak_late),
+                              ("missing a track", controller.peak_starved)):
             if n:
                 print(f"  Not counted: peak {n} of {of} subscribers {what}")
     if controller.wanted_mbps:
@@ -2746,6 +2837,8 @@ async def main():
                              or args.latency_threshold),
             join_burst=args.join_burst is not None,
             watchers=args.watchers,
+            sparse_tracks=('catalog',) if args.catalog else (),
+            lat_min_us=SKEW_LAT_MIN_US if args.skew_safe_signals else None,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process

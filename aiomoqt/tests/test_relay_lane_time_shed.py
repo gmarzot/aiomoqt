@@ -1,6 +1,7 @@
 """aiomoqt-relay send lanes shed by time behind: a subscriber sheds whole
 groups once the oldest live object it has not been sent, queued or still
-in the transport, is past its deadline; never for an object's size."""
+in the transport, is past its deadline; never for an object's size. The
+lane check runs on a timer (relay._time_lanes), never per object."""
 import asyncio
 import contextlib
 import logging
@@ -20,7 +21,9 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 _DEADLINE = 5.0
 _FPS = 30
-_PROBE_S = relay.LANE_TX_PROBE / _FPS   # one mark interval at _FPS
+# Seconds between a lane's time checks at _DEADLINE.
+_STEP = min(max(_DEADLINE / relay.LANE_TIME_CHECKS, relay.LANE_TIME_MIN_S),
+            relay.LANE_TIME_MAX_S)
 _BASE_PORT = 25200
 
 
@@ -109,6 +112,11 @@ async def _settle(n=20):
         await asyncio.sleep(0)
 
 
+def _tick(now):
+    """The relay's lane timer at `now`, the test's clock."""
+    relay._time_lanes(now)
+
+
 @pytest.fixture
 def lanes(monkeypatch):
     """Relay tracks with one lane each to a viewer, isolated from the
@@ -138,6 +146,7 @@ async def test_a_quiet_tail_then_a_large_keyframe_sheds_nothing(lanes):
     # 90 s of a quiet scene: 2 KB keyframes, 300-byte frames.
     for gid in range(45):
         for oid in range(60):
+            _tick(t)
             lane.offer(_obj(gid, oid, 2000 if oid == 0 else 300, t))
             t += 1 / _FPS
             sent += 1
@@ -150,6 +159,7 @@ async def test_a_quiet_tail_then_a_large_keyframe_sheds_nothing(lanes):
     # takes a third of a second to read them.
     for gid in range(45, 48):
         for oid in range(60):
+            _tick(t)
             lane.offer(_obj(gid, oid, 256_000 if oid == 0 else 30_000, t))
             t += 1 / _FPS
             sent += 1
@@ -173,6 +183,7 @@ async def test_a_stalled_reader_sheds_whole_groups_and_resumes_newer(lanes):
     shed_at = None
     for gid in range(8):
         for oid in range(_FPS):
+            _tick(t)
             lane.offer(_obj(gid, oid, 10_000, t))
             if lane.sheds and shed_at is None:
                 shed_at = t - t0
@@ -181,13 +192,14 @@ async def test_a_stalled_reader_sheds_whole_groups_and_resumes_newer(lanes):
                 await _settle(5)
         lane.offer(_end(gid))
     assert lane.sheds >= 1 and lane.floor is not None, lane.floor
-    # Shed at the deadline, not before.
-    assert _DEADLINE < shed_at < _DEADLINE + 0.2, shed_at
+    # Shed past the deadline, within one check.
+    assert _DEADLINE < shed_at <= _DEADLINE + _STEP + 1 / _FPS, shed_at
     floor = lane.floor
     viewer.take = True
     viewer.gate.set()
     for gid in range(8, 10):
         for oid in range(_FPS):
+            _tick(t)
             lane.offer(_obj(gid, oid, 10_000, t))
             t += 1 / _FPS
             if oid == 0:
@@ -223,6 +235,7 @@ async def test_audio_and_video_on_a_stalled_session_shed_together(lanes):
             lane, item = video, _obj(i // _FPS, i % _FPS, 20_000, t0 + at)
         else:
             lane, item = audio, _obj(i, 0, 340, t0 + at)
+        _tick(t0 + at)
         lane.offer(item)
         if kind == "a":
             lane.offer(_end(i))
@@ -232,9 +245,9 @@ async def test_audio_and_video_on_a_stalled_session_shed_together(lanes):
             await _settle(5)
     assert set(first) == {"v", "a"}, first
     for kind, at in first.items():
-        assert _DEADLINE < at < _DEADLINE + 0.2, (kind, at)
-    # Within one video frame plus one audio group of each other.
-    assert abs(first["v"] - first["a"]) <= 1 / _FPS + 1 / 50, first
+        assert _DEADLINE < at <= _DEADLINE + _STEP + 1 / _FPS, (kind, at)
+    # Within one check plus one video frame of each other.
+    assert abs(first["v"] - first["a"]) <= _STEP + 1 / _FPS, first
 
 
 async def test_bytes_held_by_the_transport_count_toward_time_behind(lanes):
@@ -249,6 +262,7 @@ async def test_bytes_held_by_the_transport_count_toward_time_behind(lanes):
     for gid in range(4):
         for oid in range(_FPS):
             starts.append((written(), t))
+            _tick(t)
             lane.offer(_obj(gid, oid, 4000, t))
             t += 1 / _FPS
             if oid == 0:
@@ -259,16 +273,17 @@ async def test_bytes_held_by_the_transport_count_toward_time_behind(lanes):
         lane.offer(_end(gid))
     assert lane.sheds == 0 and viewer.held
     # The oldest byte the transport holds maps to its object's arrival,
-    # at most one mark interval late.
+    # at most one check late.
     lane._probe(lane.floor)
     unsent = written() - viewer.held
     oldest = max(b for at, b in starts if at <= unsent)
-    assert oldest <= lane._oldest <= oldest + _PROBE_S + 1e-6, (
+    assert oldest <= lane._oldest <= oldest + _STEP + 1 / _FPS + 1e-6, (
         oldest - t0, lane._oldest - t0)
     # Past the deadline with the queue still empty, the lane sheds.
     gid = 4
     while not lane.sheds and gid < 12:
         for oid in range(_FPS):
+            _tick(t)
             lane.offer(_obj(gid, oid, 4000, t))
             t += 1 / _FPS
             if oid == 0:
@@ -296,12 +311,14 @@ async def test_a_catalog_lane_never_sheds_its_newest_group(lanes, name, keeps):
     t = time.monotonic()
     # Updates every two seconds, then one group spanning 8 s.
     for gid in range(4):
+        _tick(t)
         lane.offer(_obj(gid, 0, 500, t))
         lane.offer(_end(gid))
         t += 2.0
         await _settle(5)
         assert lane.floor is None or lane.floor <= gid
     for oid in range(8):
+        _tick(t)
         lane.offer(_obj(4, oid, 500, t))
         t += 1.0
     assert lane.sheds >= 1
@@ -353,6 +370,7 @@ async def test_the_shed_warning_states_the_time_behind(lanes, caplog):
     t = time.monotonic()
     for gid in range(7):
         for oid in range(_FPS):
+            _tick(t)
             lane.offer(_obj(gid, oid, 1000, t))
             t += 1 / _FPS
         await _settle(2)
@@ -365,6 +383,50 @@ async def test_the_shed_warning_states_the_time_behind(lanes, caplog):
     assert " s behind (deadline 5.0 s), " in warn[0], warn[0]
     assert "bytes held: resetting groups below " in warn[0], warn[0]
     assert warn[0].startswith("relay: sub "), warn[0]
+
+
+async def test_a_viewer_keeping_up_costs_no_lane_check_per_object(
+        lanes, monkeypatch):
+    calls = []
+    tx_queued = relay._RelayedTrack._tx_queued
+
+    def counted(self, session, floor=None):
+        calls.append(floor)
+        return tx_queued(self, session, floor)
+    monkeypatch.setattr(relay._RelayedTrack, "_tx_queued", counted)
+    viewer = _Viewer()
+    track, lane = lanes(viewer)
+    t = time.monotonic()
+    for gid in range(10):
+        for oid in range(_FPS):
+            lane.offer(_obj(gid, oid, 4000, t))
+            t += 1 / _FPS
+            if oid == 0:
+                await _settle(5)
+            viewer.drain()
+        lane.offer(_end(gid))
+    await _settle()
+    assert track._objects_out == 10 * _FPS and lane.sheds == 0
+    # Objects alone neither probe the transport nor mark the lane.
+    assert not calls and not lane._marks and not lane.late, calls
+    _tick(t)
+    assert len(calls) == 1 and not lane.late
+    _tick(t + _STEP / 2)
+    assert len(calls) == 1
+
+
+async def test_the_late_mark_clears_without_a_deadline(lanes):
+    viewer = _Viewer(take=False)
+    _track, lane = lanes(viewer)
+    t = time.monotonic()
+    for oid in range(3):
+        lane.offer(_obj(0, oid, 1000, t))
+    await _settle(5)
+    _tick(t + _DEADLINE + 1)
+    assert lane.late
+    lane.deadline = None
+    _tick(t + _DEADLINE + 2)
+    assert not lane.late and lane.sheds == 0
 
 
 # -- through the relay, two tracks on one session --------------------------
@@ -418,6 +480,7 @@ async def test_a_viewer_keeping_up_on_two_tracks_sheds_neither(
                                  use_quic=use_quic, draft=22)
     handle = await server.serve()
     subs = {n: _Sub() for n in sizes}
+    watch = asyncio.ensure_future(relay._watch_lanes())
     try:
         async with contextlib.AsyncExitStack() as stack:
             async def connect():
@@ -442,10 +505,13 @@ async def test_a_viewer_keeping_up_on_two_tracks_sheds_neither(
             lane_of = {n: t.downstream[0].lane for n, t in tracks.items()}
             sheds = {n: (ln.sheds, ln.shed, ln.expired)
                      for n, ln in lane_of.items()}
+            checked = {n: ln._time_due > 0 for n, ln in lane_of.items()}
             groups = {n: t._groups_in for n, t in tracks.items()}
     finally:
+        watch.cancel()
         handle.close()
         _clear_relay()
+    assert checked == {n: True for n in sizes}, checked
     assert sheds == {n: (0, 0, 0) for n in sizes}, sheds
     for name, sub in subs.items():
         size, group, rate = sizes[name]
