@@ -2,6 +2,7 @@
 lane, so a slow subscriber holds up only itself and sheds whole groups
 once past its deadline; its truncated subgroups are reset, never FINed."""
 import asyncio
+import time
 import contextlib
 import logging
 from collections import defaultdict
@@ -322,6 +323,8 @@ async def test_an_ended_lane_counts_its_shed_bytes_once(monkeypatch, deadline,
                     track.on_object(_obj(gid, oid), 1000, 0, gid, 0)
                     await _settle(5)
                 await asyncio.sleep(deadline)
+                # The lanes' timer marks them late; the next object sheds.
+                relay._time_lanes(time.monotonic())
             lanes.append(d.lane)
         before = [track.shed_bytes() for track in tracks]
         assert all(before), before
