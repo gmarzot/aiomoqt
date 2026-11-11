@@ -967,8 +967,10 @@ class _RelayLane(SendLane):
 
     def _exit(self) -> None:
         _lanes.discard(self)
-        self.track._lanes.discard(self)
-        self.track._shed_done += self.shed_bytes
+        # stop() and the task's exit both land here: transfer once.
+        if self in self.track._lanes:
+            self.track._lanes.discard(self)
+            self.track._shed_done += self.shed_bytes
         super()._exit()
 
     def _who(self) -> str:
@@ -1088,12 +1090,17 @@ class _RelayedTrack:
         self._subgroups: dict = {}
         # (group, subgroup) reset downstream.
         self._reset = set()
-        # (group, object) of datagrams taken from several publishers.
+        # (group, object) of datagrams taken; with one publisher, only the
+        # newest two groups', for a standby joining later.
         self._dgrams = set()
+        self._dgram_gid = -1
         # Groups below this are pruned: another copy of them is dropped.
         self._floor = 0
         # Copies dropped as already taken from another publisher.
         self._copies = 0
+        # Location of the End of Track taken: nothing past it is forwarded
+        # and no standby takes over.
+        self._end_at = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
         # Upstream Forward State is 0: answered so in PUBLISH_OK, or
@@ -1304,6 +1311,12 @@ class _RelayedTrack:
                 self.upstream):
             return False
         live = [f for f in self.standby if _session_live(f.session)]
+        if self._end_at is not None:
+            if live:
+                logger.info(f"relay: upstream {key} ended after End of "
+                            f"Track {self._end_at}; {len(live)} standby "
+                            f"not taken over, ending the track")
+            return False
         nxt = next((f for f in live if self._in_step(f)), None)
         if nxt is None:
             if live:
@@ -1669,11 +1682,14 @@ class _RelayedTrack:
         # another track.
         far = feed is not self.feed and not self._near(gid)
         if dgram:
-            if not self._multi:
-                return False
-            if far or (gid, oid) in self._dgrams:
+            if self._multi and far:
                 return True
+            if (gid, oid) in self._dgrams:
+                return self._multi
             self._dgrams.add((gid, oid))
+            if not self._multi and gid > self._dgram_gid:
+                self._dgram_gid = gid
+                self._dgrams = {k for k in self._dgrams if k[0] >= gid - 1}
             return False
         k = (gid, sgid)
         if self._multi and (gid < self._floor or k in self._ended
@@ -1698,9 +1714,13 @@ class _RelayedTrack:
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
         dgram = isinstance(msg, (ObjectDatagram, ObjectDatagramStatus))
+        if self._end_at is not None and (gid, msg.object_id) > self._end_at:
+            return
         if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
             self._copies += 1
             return
+        if getattr(msg, "status", None) == ObjectStatus.END_OF_TRACK:
+            self._end_at = (gid, msg.object_id)
         self._objects_in += 1
         payload = bytes(msg.payload)
         self._bytes_in += len(payload)
