@@ -14,6 +14,7 @@
 - aiomoqt-relay writes a datagram, or an object on a stream already open to the viewer, straight from the forward loop when the viewer's send lane is empty, instead of waking the lane's task for every object. New streams and cache replays still go through the lane.
 - aiomoqt-relay sheds a subscriber's groups once its oldest unsent live object, queued or still in the transport, is past the deadline (`--lag-limit` or the §8 delivery timeout), the same allowance on every track, instead of at a byte bound from the track's input rate, resetting the shed groups' streams with DELIVERY_TIMEOUT; a quiet scene no longer shrinks the lane below the next keyframe, small-object audio no longer sheds before video, and a catalog track keeps its newest group. The 4 MiB cap applies once the lanes together pass `--cache-bytes`. The shed WARNING states the time behind, the deadline and the bytes held.
 - load_sim prints the worst subscriber's p99 latency next to p90 on each report line, and `--report` gains a last `p99_ms` column.
+- A finished FETCH's request stream is now closed by both ends: the requester FINs its half once the FETCH data stream ends and, once FETCH_OK or REQUEST_ERROR is in, sends STOP_SENDING on the other half; the publisher (or aiomoqt-relay) FINs its half after the data stream's FIN. Before, every finished FETCH kept a bidi stream open on d18 and later, so a session making many FETCHes ran out of stream credit.
 
 ## v0.15.0rc1
 
