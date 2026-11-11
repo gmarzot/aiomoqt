@@ -1357,11 +1357,14 @@ class _RelayedTrack:
 
     def _release_downstream(self) -> None:
         """Forget the subscribers; lanes draining to their PUBLISH_DONE
-        keep their streams, the rest stop."""
+        keep their streams, the rest stop and their open streams reset."""
         for lane in list(self._lanes):
             if not lane.final:
                 lane.stop()
         draining = {id(lane.d.session) for lane in self._lanes}
+        for d in self.downstream:
+            if id(d.session) not in draining and _session_live(d.session):
+                self._close_streams(d.session, StreamResetCode.CANCELLED)
         self.downstream.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
@@ -1822,6 +1825,9 @@ class _RelayedTrack:
                     task.cancel()
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
+        # A cancelled subscription's open streams must be reset.
+        if _session_live(session):
+            self._reset_streams(session, float("inf"))
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
