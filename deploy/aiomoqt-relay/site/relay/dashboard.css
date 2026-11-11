@@ -83,6 +83,7 @@ code {
 .gauge svg { display: block; width: 120px; height: 104px; }
 .gauge figcaption {
   margin-top: -6px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
+  white-space: nowrap;
 }
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
@@ -90,7 +91,7 @@ code {
 .gauge .g-ring-track, .gauge .g-ring { fill: none; stroke-width: 3; stroke-linecap: round; }
 .gauge .g-ring-track { stroke: var(--track); }
 .gauge .g-ring { stroke: var(--gold); }
-.gauge .g-sub { font: 600 10px Inter, system-ui, sans-serif; fill: var(--gold); }
+.gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--gold); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
 .gauge path.warn-level { stroke: var(--amber); }
@@ -359,6 +360,7 @@ footer [data-versions]:empty { display: none; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
   .gauge, .gauge svg { width: 20vw; max-width: 120px; }
+  .gauge figcaption { font-size: 11px; letter-spacing: .03em; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
   /* Phones hide namespaces' Origin, Tracks, Peak and tracks' Peak, Groups/s, Latency. */

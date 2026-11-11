@@ -124,7 +124,7 @@ function drawGauge(svg, pct, bands = true, ring, ringLabel) {
     const f = Math.min(Math.max(ring, 0), 100) / 100;
     svg.append(svgEl('path', {class: 'g-ring', d: arc(G.tick - 4, 0, Math.max(f, 0.004))}));
   }
-  const label = svgEl('text', {class: 'g-sub', x: G.cx, y: G.cy + 34, 'text-anchor': 'middle',
+  const label = svgEl('text', {class: 'g-sub', x: G.cx, y: G.cy + 22, 'text-anchor': 'middle',
                                stroke: 'none'});
   label.textContent = ringLabel;
   svg.append(label);
