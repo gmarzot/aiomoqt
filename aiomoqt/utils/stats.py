@@ -481,6 +481,8 @@ class TrackStats:
                 grp_rx[gid] = n + 1
             else:
                 self._group_object(gid, oid, sg)
+        if gid < self._key_floor:
+            return              # pruned: counted, no loss keys
         if gid == self._lk_g and sg == self._lk_s:
             prev = self._lk_prev
         else:

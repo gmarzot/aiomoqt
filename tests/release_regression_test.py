@@ -122,12 +122,13 @@ def _run_rc(cmd: list[str], log: Path, timeout: int) -> int | None:
         return None
 
 
-def _run(cmd: list[str], log: Path, timeout: int) -> tuple[bool, str]:
-    """Run a command, capture to log, return (ok, tail)."""
-    if _run_rc(cmd, log, timeout) is None:
-        return False, "timeout"
+def _run(cmd: list[str], log: Path, timeout: int) -> tuple[int | None, str]:
+    """Run a command, capture to log, return (rc, tail); rc is None on timeout."""
+    rc = _run_rc(cmd, log, timeout)
+    if rc is None:
+        return None, "timeout"
     tail = log.read_text().splitlines()[-6:]
-    return True, "\n".join(tail)
+    return rc, "\n".join(tail)
 
 
 # ---------------------------------------------------------------------------
@@ -142,17 +143,19 @@ def _pytest_file(test_file: str, log: Path,
     # to their own __file__ (e.g. CERT_DIR = ../../certs) will resolve
     # to the wheel location which has no neighbouring certs/. Result:
     # tests that should run get silently skipped.
-    ok, _ = _run([sys.executable, "-m", "pytest", "-q", test_file, *extra],
+    rc, _ = _run([sys.executable, "-m", "pytest", "-q", test_file, *extra],
                  log, timeout)
-    if not ok:
+    if rc is None:
         return "FAIL", "timeout"
-    # Search for the pytest summary line anywhere in the captured
-    # output, not just the last line. Stray output from atexit /
-    # connection-cleanup ("Received a connection close request") often
-    # follows the summary on stderr and would otherwise mask a passing
-    # run. The line is "N word[, N word ...] in T.TTs" in pytest's own
-    # order, e.g. "1 failed, 1063 passed, 9 skipped, 1 xfailed in 18.7s".
-    text = log.read_text()
+    return _pytest_verdict(log.read_text(), rc)
+
+
+def _pytest_verdict(text: str, rc: int) -> tuple[str, str]:
+    """PASS iff pytest exited 0 and its summary has passes and no failures.
+    Exit 5 (no tests collected) fails."""
+    # Search the whole output: atexit and connection-cleanup lines often
+    # follow the summary. The line is "N word[, N word ...] in T.TTs",
+    # e.g. "1 failed, 1063 passed, 9 skipped, 1 xfailed in 18.7s".
     summary_re = re.compile(r"^\d+ \w+(?:, \d+ \w+)* in [\d.]+s",
                             re.MULTILINE)
     lines = summary_re.findall(text)
@@ -163,6 +166,8 @@ def _pytest_file(test_file: str, log: Path,
               re.findall(r"(\d+) (\w+)", summary_line.rsplit(" in ", 1)[0])}
     bad = counts.get("failed", 0) + counts.get("error", 0) \
         + counts.get("errors", 0)
+    if rc != 0:
+        return "FAIL", f"{summary_line}, exit {rc}"
     ok = bad == 0 and counts.get("passed", 0) > 0
     return ("PASS" if ok else "FAIL"), summary_line
 
@@ -194,12 +199,8 @@ def _loopback_pub_sub(log_dir: Path) -> tuple[str, str]:
         sys.executable, "-m", "aiomoqt.tools.loopback_bench",
         "-P", "4", "-s", "16384", "-r", "60", "-t", "10",
     ]
-    ok, _ = _run(cmd, log, 40)
-    text = log.read_text()
-    m = re.search(r"Throughput:\s+([\d.]+)\s*Mbps", text)
-    no_loss = "Lost:        0 (0.00%)" in text
-    tput = m.group(1) if m else "?"
-    return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
+    rc, _ = _run(cmd, log, 40)
+    return _loopback_verdict(log.read_text(), rc)
 
 
 def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
@@ -210,12 +211,34 @@ def _loopback_pub_sub_variant(log_dir: Path, slug: str, flags: list[str],
         sys.executable, "-m", "aiomoqt.tools.loopback_bench",
         *flags,
     ]
-    ok, _ = _run(cmd, log, timeout)
-    text = log.read_text()
-    m = re.search(r"Throughput:\s+([\d.]+)\s*Mbps", text)
-    no_loss = "Lost:        0 (0.00%)" in text
-    tput = m.group(1) if m else "?"
-    return ("PASS" if ok and no_loss else "FAIL"), f"{tput} Mbps"
+    rc, _ = _run(cmd, log, timeout)
+    return _loopback_verdict(log.read_text(), rc)
+
+
+def _loopback_verdict(text: str, rc: int | None) -> tuple[str, str]:
+    """PASS iff loopback_bench exited 0 (it exits 1 on no objects or a bad
+    payload) and its summary shows objects, a throughput and no loss."""
+    if rc is None:
+        return "FAIL", "timeout"
+    om = re.search(r"^\s*Objects:\s+([\d,]+)\s*$", text, re.MULTILINE)
+    tm = re.search(r"^\s*Throughput:\s+([\d.]+)\s*Mbps", text, re.MULTILINE)
+    if om is None or tm is None:
+        return "FAIL", f"(no summary), exit {rc}"
+    objects = int(om.group(1).replace(",", ""))
+    detail = f"{tm.group(1)} Mbps"
+    if objects == 0:
+        return "FAIL", f"{detail}, 0 objects"
+    lm = re.search(r"^\s*Lost:\s+(\d+) \(", text, re.MULTILINE)
+    if lm is None:
+        return "FAIL", f"{detail}, no loss count"
+    if int(lm.group(1)):
+        return "FAIL", f"{detail}, {lm.group(1)} lost"
+    pm = re.search(r"^\s*Payload:.*, (\d+) bad$", text, re.MULTILINE)
+    if pm and int(pm.group(1)):
+        return "FAIL", f"{detail}, {pm.group(1)} bad payloads"
+    if rc != 0:
+        return "FAIL", f"{detail}, exit {rc}"
+    return "PASS", detail
 
 
 def _loopback_pub_sub_tiny(log_dir: Path) -> tuple[str, str]:
@@ -286,18 +309,24 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
            "-P", "1", "-s", "4096", "--start-mbps", "20",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
            "-t", "20", "-k"]
-    _run(cmd, log, 45)
-    return _adaptive_verdict(log.read_text())
+    rc, _ = _run(cmd, log, 45)
+    return _adaptive_verdict(log.read_text(), rc)
 
 
-def _adaptive_verdict(text: str) -> tuple[str, str]:
+def _adaptive_verdict(text: str, rc: int | None) -> tuple[str, str]:
+    """PASS iff adaptive_bench exited 0 with a High-water above 0."""
+    if rc is None:
+        return "FAIL", "timeout"
     if "Traceback" in text:
         return "FAIL", "traceback"
     m = re.search(r"High-water:\s+([\d.]+)\s*([KMGT]?bps)", text)
     if m is None:
-        return "FAIL", "no High-water summary (crash or timeout)"
+        return "FAIL", f"no High-water summary, exit {rc}"
+    hw = f"high-water {m.group(1)} {m.group(2)}"
+    if rc != 0:
+        return "FAIL", f"exit {rc}, {hw}"
     if float(m.group(1)) > 0:
-        return "PASS", f"high-water {m.group(1)} {m.group(2)}"
+        return "PASS", hw
     return "FAIL", "no interval without shortfall (high-water 0)"
 
 
@@ -329,8 +358,8 @@ def _loopback_adaptive_relay_quic(log_dir: Path, draft: int) -> tuple[str, str]:
                "-P", "1", "-s", "4096", "--start-mbps", "20",
                "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
                "-t", "20", "-k"]
-        _run(cmd, log, 45)
-        return _adaptive_verdict(log.read_text())
+        rc, _ = _run(cmd, log, 45)
+        return _adaptive_verdict(log.read_text(), rc)
     finally:
         relay.terminate()
         try:
@@ -358,8 +387,9 @@ def _relay_ctrl_msg(url: str, draft: int, insecure: bool,
         cmd.append("--tls-disable-verify")
     if compat:
         cmd += ["--compat", compat]
-    ok, _ = _run(cmd, log, 90)
-    if not ok:
+    # Exit 1 also means a data-plane case failed, which relay-data gates.
+    rc, _ = _run(cmd, log, 90)
+    if rc is None:
         return "FAIL", "timeout"
     text = log.read_text()
     passed = set(re.findall(r"^ok \d+ - (\S+)", text, re.MULTILINE))
@@ -417,16 +447,18 @@ def _relay_tap_case(url: str, draft: int, case: str, insecure: bool,
         cmd.append("--tls-disable-verify")
     if compat:
         cmd += ["--compat", compat]
-    ok, _ = _run(cmd, log, 90)
-    if not ok:
+    rc, _ = _run(cmd, log, 90)
+    if rc is None:
         return "FAIL", "timeout"
-    return _tap_case_verdict(log.read_text(), case)
+    return _tap_case_verdict(log.read_text(), case, rc)
 
 
-def _tap_case_verdict(text: str, case: str) -> tuple[str, str]:
-    """A single-case TAP run: "ok 1 - <case>" passes, with a SKIP directive
-    it is a SKIP and its reason; anything else fails with its message."""
+def _tap_case_verdict(text: str, case: str, rc: int = 0) -> tuple[str, str]:
+    """A single-case TAP run: "ok 1 - <case>" with exit 0 passes, with a SKIP
+    directive it is a SKIP and its reason; anything else fails."""
     m = re.search(rf"^ok 1 - {re.escape(case)}(.*)$", text, re.MULTILINE)
+    if m and rc != 0:
+        return "FAIL", f"ok, exit {rc}"
     if m:
         skip = re.search(r"# SKIP\s*(.*)", m.group(1), re.IGNORECASE)
         return ("SKIP", skip.group(1) or "skipped") if skip else ("PASS", "ok")
@@ -481,10 +513,10 @@ def _media_locmaf(url: str, namespace: str, log: Path) -> tuple[str, str]:
            "-N", namespace, "--packaging", "locmaf", "--draft", "18",
            "-t", "12", "--out", out]
     try:
-        ok, _ = _run(cmd, log, 60)
+        rc, _ = _run(cmd, log, 60)
     finally:
         shutil.rmtree(out, ignore_errors=True)
-    if not ok:
+    if rc is None:
         return "FAIL", "timeout"
     tracks = _LOCMAF_TRACK_LINE.findall(log.read_text())
     if not tracks:
@@ -493,6 +525,8 @@ def _media_locmaf(url: str, namespace: str, log: Path) -> tuple[str, str]:
            if int(f) == 0 or int(r)]
     if bad:
         return "FAIL", "; ".join(bad)
+    if rc != 0:
+        return "FAIL", f"exit {rc}"
     frames = sum(int(f) for _, f, _ in tracks)
     return "PASS", f"{len(tracks)} tracks, {frames} frames, 0 rejected"
 

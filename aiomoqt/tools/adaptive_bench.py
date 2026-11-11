@@ -184,6 +184,7 @@ class LiveStats:
         self._stride: dict = {}
         self._newest_gid = -1
         self._prune_at = 0
+        self._key_floor = -1
         # Jitter (RFC 3550)
         self._last_recv_ms = 0
         self._last_send_ms = 0
@@ -222,8 +223,9 @@ class LiveStats:
                 self._last_send_ms = send_us
 
         lost = 0
-        if not is_status:
-            gid = getattr(msg, 'group_id', group_id)
+        gid = getattr(msg, 'group_id', group_id)
+        # Groups below the pruned floor stay counted but get no loss keys.
+        if not is_status and (gid is None or gid >= self._key_floor):
             sid = subgroup_id if subgroup_id is not None else 0
             oid = msg.object_id
             key = (gid, sid)
@@ -255,6 +257,7 @@ class LiveStats:
             self._events.popleft()
 
     def _prune(self, floor: int) -> None:
+        self._key_floor = max(self._key_floor, floor)
         for d in (self._last_seen, self._stride):
             for k in [k for k in d if k[0] is not None and k[0] < floor]:
                 del d[k]
@@ -271,7 +274,8 @@ class LiveStats:
                           loss_pct=0.0, jitter_ms=self._jitter,
                           latency_known=False)
 
-        window_t = max(0.01, self._events[-1][0] - self._events[0][0])
+        # Through now, so silence after the last arrival lowers the rate.
+        window_t = max(0.01, t - max(self._events[0][0], cutoff))
         n = len(self._events)
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
@@ -297,6 +301,18 @@ class LiveStats:
 # ---------------------------------------------------------------------------
 # LoadActuator: the "how do we apply a load level" abstraction
 # ---------------------------------------------------------------------------
+
+def _overlap_bytes(window, lo: float, hi: float) -> float:
+    """Bytes of (t, bytes, dt) reports, each prorated by the share of its
+    interval [t - dt, t] inside [lo, hi]; dt 0 counts whole."""
+    total = 0.0
+    for t, b, dt in window:
+        if dt > 0:
+            total += b * max(0.0, min(t, hi) - max(t - dt, lo)) / dt
+        else:
+            total += b
+    return total
+
 
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
@@ -335,7 +351,7 @@ class BWActuator:
         self._events_q = mp_events_queue
         self._stop_ev = mp_stop_event
         # rolling stats aggregated from sub-worker events
-        self._mp_rx_window = []   # (t, rx_bytes)
+        self._mp_rx_window = []   # (t, rx_bytes, dt)
         # The one subscriber worker's latest windowed latency (its
         # TrackStats window matches _mp_window_s): (n, mean, p90).
         self._mp_lat = (0, 0.0, 0.0)
@@ -400,9 +416,8 @@ class BWActuator:
                 self._mp_tx_ring_streams = ev.get(
                     'tx_ring_streams', 0)
             elif kind == 'stats':
-                rx_bytes = ev.get('rx_bytes', 0)
-                if rx_bytes:
-                    self._mp_rx_window.append((t, rx_bytes))
+                self._mp_rx_window.append(
+                    (t, ev.get('rx_bytes', 0), ev.get('dt', 0.0)))
                 self._mp_lat = (ev.get('lat_n', 0),
                                 ev.get('lat_mean_ms', 0.0),
                                 ev.get('lat_p90_ms', 0.0))
@@ -417,9 +432,7 @@ class BWActuator:
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
-        self._mp_rx_window = [
-            (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
-        ]
+        self._mp_rx_window = [e for e in self._mp_rx_window if e[0] >= cutoff]
         self._mp_tx_window = [
             (t, b) for (t, b) in self._mp_tx_window if t >= cutoff
         ]
@@ -451,7 +464,6 @@ class BWActuator:
         self._drain_events()
         t = time.monotonic()
         lat_n, mean, p90 = self._mp_lat
-        rx_bytes = sum(b for (_, b) in self._mp_rx_window)
         # tx column reports wire-bytes (picoquic ground truth); falls
         # back to queued bytes if the wire counter isn't available.
         wire_bytes = sum(b for (_, b) in self._mp_wire_window)
@@ -462,10 +474,13 @@ class BWActuator:
         covered = (t - self._mp_t0 if self._mp_t0 is not None
                    else self._mp_window_s)
         win = max(0.5, min(self._mp_window_s, covered))
+        # Ends at the newest report: data after it is not reported yet.
+        rx_end = max((e[0] for e in self._mp_rx_window), default=t)
+        rx_bytes = _overlap_bytes(self._mp_rx_window, rx_end - win, rx_end)
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
-        loss_pct = (100.0 * self._mp_total_lost
-                    / max(1, self._mp_total_objs))
+        seen = self._mp_total_objs + self._mp_total_lost
+        loss_pct = 100.0 * self._mp_total_lost / seen if seen else 0.0
         shortfall = (self.state.target_mbps > 0
                      and rx_mbps
                      < self.shortfall_ratio * self.state.target_mbps)
