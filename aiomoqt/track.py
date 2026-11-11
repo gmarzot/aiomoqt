@@ -26,7 +26,8 @@ Usage:
 """
 import asyncio
 import time
-from enum import IntEnum
+from dataclasses import dataclass
+from enum import Enum, IntEnum
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from .types import (
@@ -147,6 +148,31 @@ class TrackState(IntEnum):
     PUBLISHED = 2       # publish (track) sent/received
     SUBSCRIBED = 3      # subscribe active, data flowing
     CLOSED = 4
+
+
+class TrackEndKind(str, Enum):
+    """What ended a subscribed track."""
+    DONE = 'done'                       # PUBLISH_DONE received
+    CANCELLED = 'cancelled'             # unsubscribe()
+    MALFORMED = 'malformed'             # cancelled as malformed (§12.1)
+    SESSION_CLOSED = 'session_closed'   # session closed without PUBLISH_DONE
+
+
+@dataclass(frozen=True)
+class TrackEnd:
+    """How a subscribed track ended. code and reason: the PUBLISH_DONE's
+    status code and reason, the malformed reason, or the session close's
+    error code and reason phrase."""
+    kind: TrackEndKind
+    code: Optional[int] = None
+    reason: Optional[str] = None
+
+    @property
+    def completed(self) -> bool:
+        """Ended by PUBLISH_DONE with TRACK_ENDED or SUBSCRIPTION_ENDED."""
+        return (self.kind is TrackEndKind.DONE
+                and self.code in (SubscribeDoneCode.TRACK_ENDED,
+                                  SubscribeDoneCode.SUBSCRIPTION_ENDED))
 
 
 class Track:
@@ -2185,7 +2211,8 @@ class SubscribedTrack(Track):
         self.report_interval = report_interval
         self.auth_token = auth_token
         self.publish_done: Optional[object] = None  # received PUBLISH_DONE
-        self.completed = False  # True if track ended cleanly
+        self.end: Optional[TrackEnd] = None  # set once the track ends
+        self.completed = False  # end.completed, once ended
         self.cancelled = False  # True once unsubscribe() ended it
         # Largest Location the publisher reported in SUBSCRIBE_OK or
         # PUBLISH, as (group, object); None when it reported none.
@@ -2280,7 +2307,7 @@ class SubscribedTrack(Track):
         self.malformed = reason
         self.session._timing_watch.pop(self.track_alias, None)
         self.session._malformed_track(self.track_alias, reason)
-        self._done_event.set()
+        self._ended(TrackEnd(TrackEndKind.MALFORMED, reason=reason))
 
     async def subscribe(self, timeout: float = 30.0,
                         forward: int = 1,
@@ -2518,7 +2545,12 @@ class SubscribedTrack(Track):
         def _done(msg):
             self.session._timing_watch.pop(self.track_alias, None)
             self.publish_done = msg
-            self._done_event.set()
+            code = getattr(msg, 'status_code', None)
+            reason = getattr(msg, 'reason', None)
+            if isinstance(reason, bytes):
+                reason = reason.decode('utf-8', 'replace')
+            self._ended(TrackEnd(TrackEndKind.DONE,
+                                 None if code is None else int(code), reason))
             if self.on_done is not None:
                 self.on_done(msg)
         return _done
@@ -2539,14 +2571,20 @@ class SubscribedTrack(Track):
         if self.request_id is not None and self.publish_done is None:
             self.session._timing_watch.pop(self.track_alias, None)
             self.session.unsubscribe(self.request_id)
+        self._ended(TrackEnd(TrackEndKind.CANCELLED))
+
+    def _ended(self, end: TrackEnd) -> None:
+        """Record the first end and release wait_closed()."""
+        if self.end is None:
+            self.end = end
+            self.completed = end.completed
         self._done_event.set()
 
-    async def wait_closed(self) -> None:
+    async def wait_closed(self) -> TrackEnd:
         """Wait for this track to end: its PUBLISH_DONE, unsubscribe(),
-        or the session closing under it.
-
-        Sets self.completed if the track ended cleanly (no StreamReset).
-        """
+        a malformed cancel, or the session closing under it. Returns
+        `end`; `completed` is True only for a PUBLISH_DONE with
+        TRACK_ENDED or SUBSCRIPTION_ENDED."""
         closed = asyncio.ensure_future(self.session.async_closed())
         done_wait = asyncio.ensure_future(self._done_event.wait())
         try:
@@ -2557,24 +2595,15 @@ class SubscribedTrack(Track):
                 if not fut.done():
                     fut.cancel()
         self.state = TrackState.CLOSED
-        if self.malformed is not None or self.cancelled:
-            self.completed = False
-            return
-        if self.publish_done is not None:
-            code = getattr(self.publish_done, 'status_code', 0)
-            self.completed = code in (SubscribeDoneCode.TRACK_ENDED,
-                                      SubscribeDoneCode.SUBSCRIPTION_ENDED)
-            return
-
-        if hasattr(self.session, '_close_err') and self.session._close_err:
-            code, reason = self.session._close_err
-            if reason and 'StreamReset' in str(reason):
-                self.completed = False
-                logger.warning(f"Track: {self.fqtn} ended with "
-                               f"StreamReset")
-                return
-        self.completed = True
-
+        if self.end is None:
+            err = getattr(self.session, '_close_err', None)
+            code, reason = err if err else (None, None)
+            self._ended(TrackEnd(TrackEndKind.SESSION_CLOSED,
+                                 None if code is None else int(code),
+                                 None if reason is None else str(reason)))
+            logger.info(f"Track: {self.fqtn} ended by session close "
+                        f"(code={code} reason={reason!r})")
+        return self.end
 
 
 class VideoTrack(PublishedTrack):

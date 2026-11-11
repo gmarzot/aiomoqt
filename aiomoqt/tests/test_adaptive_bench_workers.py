@@ -391,10 +391,12 @@ async def test_slot_counts_a_refusal_until_it_subscribes(monkeypatch):
 
     class Track:
         calls = 0
-        state = workers.TrackState.CLOSED
 
         def __init__(self, *args, **kwargs):
             pass
+
+        async def wait_closed(self):
+            return None
 
         async def subscribe(self, **kwargs):
             Track.calls += 1
@@ -424,10 +426,12 @@ async def test_a_track_not_yet_published_is_not_a_refusal(monkeypatch):
 
     class Track:
         calls = 0
-        state = workers.TrackState.CLOSED
 
         def __init__(self, *args, **kwargs):
             pass
+
+        async def wait_closed(self):
+            return None
 
         async def subscribe(self, **kwargs):
             Track.calls += 1
@@ -568,18 +572,18 @@ def _judged():
 
 def test_a_slot_is_lossy_for_a_window_after_its_last_loss():
     state, snap = _judged(), {'loss': 0, 'lat_n': 0, 'lat_p90_ms': 0.0}
-    assert workers.judge_slot(state, snap, 10.0, 3.0, 0, 0) == (True, False, False)
+    assert workers.judge_slot(state, snap, 10.0, 3.0, 0, 0) == (True, False, False, False)
     snap['loss'] = 2
-    assert workers.judge_slot(state, snap, 11.0, 3.0, 0, 0) == (False, True, False)
-    assert workers.judge_slot(state, snap, 13.5, 3.0, 0, 0) == (False, True, False)
-    assert workers.judge_slot(state, snap, 14.5, 3.0, 0, 0) == (True, False, False)
+    assert workers.judge_slot(state, snap, 11.0, 3.0, 0, 0) == (False, True, False, False)
+    assert workers.judge_slot(state, snap, 13.5, 3.0, 0, 0) == (False, True, False, False)
+    assert workers.judge_slot(state, snap, 14.5, 3.0, 0, 0) == (True, False, False, False)
 
 
 @pytest.mark.parametrize('late_ms, p90, late', [(500, 501.0, True), (500, 499.0, False),
                                                 (0, 5000.0, False)])
 def test_a_slot_over_the_threshold_is_not_delivering(late_ms, p90, late):
     snap = {'loss': 0, 'lat_n': 30, 'lat_p90_ms': p90}
-    assert workers.judge_slot(_judged(), snap, 10.0, 3.0, 0, late_ms) == (not late, False, late)
+    assert workers.judge_slot(_judged(), snap, 10.0, 3.0, 0, late_ms) == (not late, False, late, False)
 
 
 async def test_actuator_reports_lossy_and_late_slots(monkeypatch):
@@ -613,7 +617,8 @@ def test_summary_reports_the_loss(capsys):
     controller = SimpleNamespace(actuator=actuator, high_water=10.0, pivots=[],
                                  held_at_max=False, eq_level=0.0, wanted_mbps=0.0,
                                  too_far_behind=False, peak_lossy=(2, 10),
-                                 peak_late=(0, 0))
+                                 peak_late=(0, 0), peak_starved=(0, 0),
+                                 latency_measured=True)
     ab._print_summary(state, controller, 1, None)
     out = capsys.readouterr().out
     assert 'Lost:        8 objects (2.00%), whole groups included' in out

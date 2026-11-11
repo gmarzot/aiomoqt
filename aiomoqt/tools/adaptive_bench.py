@@ -139,6 +139,8 @@ class Signal:
     # keep window, or their p90 is over the threshold.
     lossy_subs: int = 0
     late_subs: int = 0
+    # subs-mode: slots with a continuous track that stopped advancing.
+    starved_subs: int = 0
 
 
 @dataclass
@@ -530,6 +532,8 @@ def _hold_label(sig: Signal, default: str) -> str:
         return "hold (subs losing objects)"
     if sig.late_subs:
         return "hold (subs over threshold)"
+    if sig.starved_subs:
+        return "hold (subs missing a track)"
     return default
 
 
@@ -600,8 +604,14 @@ class SubsActuator:
                  too_far_behind: float = 0.0,
                  slot_latency_ms: float = 0.0,
                  join_burst: bool = False,
-                 watchers: float = 0.25):
+                 watchers: float = 0.25,
+                 sparse_tracks: tuple = (),
+                 lat_min_us: Optional[int] = None):
         self.too_far_behind = too_far_behind
+        # Tracks exempt from the per-track progress check (catalogs).
+        self.sparse_tracks = tuple(sparse_tracks)
+        # Most negative latency a slot keeps (us); None = TrackStats' own.
+        self.lat_min_us = lat_min_us
         # Workers get a shared trial Array (start time, joiners); see
         # start_trial(). They judge health on watchers once one starts.
         self.join_burst = join_burst
@@ -658,6 +668,8 @@ class SubsActuator:
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
         self._workers: dict = {}    # worker_id -> (Process, stop_event)
+        # Starved workers told to stop, terminated if still up next observe.
+        self._reaping: list = []
         self._next_worker_id = 0
         # Targeted setpoint, in SUBS — the count the controller aims for.
         # Distinct from hosted capacity (workers x K): reaping a dead
@@ -818,6 +830,8 @@ class SubsActuator:
                 keep_window=self.keep_window,
                 too_far_behind=self.too_far_behind,
                 slot_latency_ms=self.slot_latency_ms,
+                sparse_tracks=self.sparse_tracks,
+                lat_min_us=self.lat_min_us,
                 **self.transport_options,
             )
             if self.join_burst:
@@ -919,6 +933,7 @@ class SubsActuator:
                   f"{self._oldest_report_s:.0f}s old; figures are late")
         self._oldest_report_s = 0.0
         failed_this_window = 0
+        self._finish_reaping()
 
         # A worker reports how many of its K slots are subscribed
         # ('active') and how many of those receive their rate
@@ -952,7 +967,7 @@ class SubsActuator:
             self._trial_arrays.pop(wid, None)
             if proc is not None:
                 stop_ev.set()
-                proc.join(timeout=0.5)
+                self._reaping.append(proc)
             self._latest_batch.pop(wid, None)
             self._last_batch_t.pop(wid, None)
             self._last_bytes_t.pop(wid, None)
@@ -1079,7 +1094,21 @@ class SubsActuator:
                            for wid in self._workers),
             late_subs=sum(self._latest_batch.get(wid, {}).get('late', 0)
                           for wid in self._workers),
+            starved_subs=sum(
+                self._latest_batch.get(wid, {}).get('track_starved', 0)
+                for wid in self._workers),
         )
+
+    def _finish_reaping(self) -> None:
+        """Terminate reaped workers still running since the last observe."""
+        left = []
+        for proc in self._reaping:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=0.1)
+            if proc.is_alive():
+                left.append(proc)
+        self._reaping = left
 
     async def shutdown(self) -> None:
         if self._drain_task is not None:
@@ -1095,14 +1124,16 @@ class SubsActuator:
         self._workers.clear()
         for _sid, (_p, stop_ev) in items:
             stop_ev.set()
+        procs = [proc for _sid, (proc, _ev) in items] + self._reaping
+        self._reaping = []
         deadline = time.monotonic() + 2.0
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             remaining = max(0.0, deadline - time.monotonic())
             proc.join(timeout=remaining)
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             if proc.is_alive():
                 proc.terminate()
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             proc.join(timeout=1.0)
         self._latest_batch.clear()
         self._last_batch_t.clear()
@@ -1123,6 +1154,9 @@ class SubsActuator:
 
 # --too-far-behind: back off once this share of viewers is past the limit.
 BEHIND_SHARE = 0.05
+# Split hosts: negative latency kept down to this (us), so the skew-safe
+# baseline can cancel a clock offset instead of every sample being dropped.
+SKEW_LAT_MIN_US = -60_000_000
 
 
 class AIMDController:
@@ -1168,7 +1202,9 @@ class AIMDController:
                  too_far_behind: bool = False):
         self.too_far_behind = too_far_behind
         self.peak_behind = (0, 0)  # most viewers past it, of how many
-        self.peak_lossy = self.peak_late = (0, 0)
+        self.peak_lossy = self.peak_late = self.peak_starved = (0, 0)
+        # Whether any observed interval carried a latency sample.
+        self.latency_measured = False
         self.delivered_mbps = self.wanted_mbps = 0.0
         self.actuator = actuator
         self.state = state
@@ -1239,6 +1275,7 @@ class AIMDController:
             sig = await a.observe()
             self.samples += 1
             state.received_data |= sig.rx_mbps > 0
+            self.latency_measured |= sig.latency_known
 
             if self.samples < 2:
                 self._emit(sig, "warming")
@@ -1445,6 +1482,8 @@ class AIMDController:
             self.peak_lossy = (sig.lossy_subs, sig.active_subs)
         if sig.late_subs > self.peak_late[0]:
             self.peak_late = (sig.late_subs, sig.active_subs)
+        if sig.starved_subs > self.peak_starved[0]:
+            self.peak_starved = (sig.starved_subs, sig.active_subs)
         per_sub = getattr(self.actuator, 'per_sub_mbps', None)
         if per_sub:
             self.delivered_mbps += sig.rx_mbps
@@ -1482,16 +1521,20 @@ class AIMDController:
             return
         self._last_report_t = now
         if self.writer:
+            # Without a latency sample the cells are blank.
+            def ms(v):
+                return f"{v:.2f}" if sig.latency_known else ""
             self.writer.writerow([
                 f"{sig.t:.3f}",
                 f"{sig.target_mbps:.2f}",
                 f"{sig.tx_mbps:.2f}",
                 f"{sig.rx_mbps:.2f}",
-                f"{sig.latency_mean_ms:.2f}",
-                f"{(sig.latency_p90_ms if sig.latest_p90_ms is None else sig.latest_p90_ms):.2f}",
+                ms(sig.latency_mean_ms),
+                ms(sig.latency_p90_ms if sig.latest_p90_ms is None
+                   else sig.latest_p90_ms),
                 f"{sig.loss_pct:.3f}",
                 *self._cpu,
-                *([] if sig.latest_p90_ms is None else [f"{sig.latency_p90_ms:.2f}"]),
+                *([] if sig.latest_p90_ms is None else [ms(sig.latency_p90_ms)]),
             ])
         self._print_row(sig, action)
 
@@ -1662,7 +1705,8 @@ class HoldController(AIMDController):
         for n, why in ((sig.failed_subs, "subscribers failed"),
                        (sig.refusing_subs, "relay refusing"),
                        (sig.lossy_subs, "subscribers losing objects"),
-                       (sig.late_subs, "subscribers over the threshold")):
+                       (sig.late_subs, "subscribers over the threshold"),
+                       (sig.starved_subs, "subscribers missing a track")):
             if n:
                 return why
         if sig.shortfall:
@@ -1718,6 +1762,7 @@ class HoldController(AIMDController):
                 self._emit(sig, f"rejoin to {level:.0f}", force=True)
                 continue
             state.received_data |= sig.rx_mbps > 0
+            self.latency_measured |= sig.latency_known
             if sig.rx_mbps <= 0:
                 no_data += 1
                 if no_data >= 3 * self._tpr:
@@ -1927,6 +1972,7 @@ class JoinSearchController(HoldController):
         sig = self._sig = await a.observe()
         self.samples += 1
         state.received_data |= sig.rx_mbps > 0
+        self.latency_measured |= sig.latency_known
         self._no_data = self._no_data + 1 if sig.rx_mbps <= 0 else 0
         if self._no_data >= 3 * self._tpr:
             state.failed = True
@@ -2559,16 +2605,27 @@ def _print_banner(args):
     print()
 
 
+def latency_unmeasured(state: BenchState, controller) -> bool:
+    """Data flowed but no interval had a latency sample, so no level the
+    controller reached is latency-qualified."""
+    return state.received_data and not controller.latency_measured
+
+
 def _print_summary(state: BenchState, controller, samples: int, args):
     unit = controller.actuator.unit
+    unmeasured = latency_unmeasured(state, controller)
+    qual = " — throughput only, latency unmeasured" if unmeasured else ""
     print()
     print("═" * 68)
     if unit == "Mbps":
         from aiomoqt.utils.format import fmt_bps
         print(f"  High-water:  {fmt_bps(controller.high_water * 1e6)} "
-              f"(rx delivered)")
+              f"(rx delivered){qual}")
     elif not isinstance(controller, HoldController):
-        print(f"  High-water:  {controller.high_water:.1f} {unit}")
+        print(f"  High-water:  {controller.high_water:.1f} {unit}{qual}")
+    if unmeasured:
+        print("  Latency:     unmeasured — no object carried a usable "
+              "send timestamp")
     if isinstance(controller, JoinSearchController):
         for trial in controller.trials:
             print(trial.line())
@@ -2611,7 +2668,8 @@ def _print_summary(state: BenchState, controller, samples: int, args):
         print(f"  Lost:        {lost} objects ({pct:.2f}%), whole groups "
               f"included")
         for what, (n, of) in (("losing objects", controller.peak_lossy),
-                              ("over the threshold", controller.peak_late)):
+                              ("over the threshold", controller.peak_late),
+                              ("missing a track", controller.peak_starved)):
             if n:
                 print(f"  Not counted: peak {n} of {of} subscribers {what}")
     if controller.wanted_mbps:
@@ -2779,6 +2837,8 @@ async def main():
                              or args.latency_threshold),
             join_burst=args.join_burst is not None,
             watchers=args.watchers,
+            sparse_tracks=('catalog',) if args.catalog else (),
+            lat_min_us=SKEW_LAT_MIN_US if args.skew_safe_signals else None,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
