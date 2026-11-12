@@ -2,6 +2,8 @@
 upstream, per track and relay-wide."""
 import asyncio
 import contextlib
+import logging
+import re
 import time
 
 import pytest
@@ -35,6 +37,7 @@ def _clear():
     relay._track_subs.clear()
     for k in relay._fetch_bytes:
         relay._fetch_bytes[k] = 0
+    relay._fetch_count = 0
 
 
 @pytest.fixture
@@ -120,7 +123,8 @@ async def _until(cond, what, tries=150):
 
 @requires_certs
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_fetch_bytes_by_source_in_status(use_quic, relay_tables):
+async def test_fetch_bytes_by_source_in_status(use_quic, relay_tables, caplog):
+    caplog.set_level(logging.INFO, logger="aiomoqt.relay")
     port = _PORT + (not use_quic)
     got = {}
     async with _relay(port, use_quic) as connect:
@@ -181,6 +185,9 @@ async def test_fetch_bytes_by_source_in_status(use_quic, relay_tables):
         await _until(lambda: relay._fetch_bytes["upstream"]
                      == hist_bytes + unknown_bytes, "upstream bytes")
         snap = _snapshot()
+        # A track that ends keeps its FETCHes in the relay-wide count.
+        relay._tracks.pop((ns, _LIVE.encode()))
+        after = _snapshot()
 
     assert cache_bytes > 0
     assert hist_bytes == _GROUP * 60 and unknown_bytes == _GROUP * 40
@@ -197,3 +204,12 @@ async def test_fetch_bytes_by_source_in_status(use_quic, relay_tables):
         r["fetch_upstream_bytes"] for r in tracks.values()) + unknown_bytes
     total = cache_bytes + hist_bytes + unknown_bytes
     assert totals["cache_efficiency"] == round(cache_bytes / total, 4)
+    assert totals["fetches"] == after["totals"]["fetches"] == 3
+    # One INFO line per FETCH: objects, from cache, upstream, payload bytes.
+    served = {m[1]: tuple(map(int, m.groups()[1:])) for m in (
+        re.search(r"track=b'(\w+)' served (\d+) object\(s\) .*: (\d+) from cache, "
+                  r"(\d+) upstream, (\d+) B", r.getMessage()) for r in caplog.records) if m}
+    n, cached, upstream, size = served[_LIVE]
+    assert n == cached > 0 and (upstream, size) == (0, cache_bytes), served
+    assert served[_HIST] == (_GROUP, 0, _GROUP, hist_bytes), served
+    assert served[_UNKNOWN] == (_GROUP, 0, _GROUP, unknown_bytes), served
