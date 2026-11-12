@@ -363,7 +363,7 @@ class SourceInput:
         self.src = src
         self.tracks: Dict[str, InputTrack] = {
             'video': InputTrack(v.extradata, avcc_codec_string(v.extradata))}
-        self.catalog: Optional[Catalog] = None
+        self.catalog: Catalog  # set by open()
         self.ended: asyncio.Future = asyncio.get_running_loop().create_future()
         self._audio = a.codec if a is not None and a.codec in ('aac', 'opus') else None
         if a is not None and self._audio is None:
@@ -378,7 +378,7 @@ class SourceInput:
         self._t0: Optional[int] = None
         self._keyed = False
         self._primed = asyncio.Event()
-        self._held: Optional[list] = []
+        self._held: list = []
         self.on_frame: Optional[Callable] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -410,8 +410,8 @@ class SourceInput:
 
     def start(self, on_frame: Callable) -> None:
         """Deliver the frames read so far, then each as it is read."""
+        held, self._held = self._held, []
         self.on_frame = on_frame
-        held, self._held = self._held, None
         for frame in held:
             on_frame(*frame)
 
@@ -436,10 +436,11 @@ class SourceInput:
 
     def _emit(self, name: str, frame: LocFrame, group_id: int,
               object_id: int) -> None:
-        if self._held is not None:
+        on_frame = self.on_frame
+        if on_frame is None:
             self._held.append((name, frame, group_id, object_id))
         else:
-            self.on_frame(name, frame, group_id, object_id)
+            on_frame(name, frame, group_id, object_id)
 
     def _drain(self) -> None:
         for p in self.src.read(0):

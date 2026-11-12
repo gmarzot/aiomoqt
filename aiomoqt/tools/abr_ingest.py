@@ -42,7 +42,7 @@ import importlib
 import signal
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
@@ -379,7 +379,8 @@ class _Output:
 
 
 class _Ingest:
-    def __init__(self, args, sub: MediaSubscriber, catalog: Catalog):
+    def __init__(self, args, sub: Union[MediaSubscriber, SourceInput],
+                 catalog: Catalog):
         self.args = args
         self.sub = sub
         self.catalog = catalog
