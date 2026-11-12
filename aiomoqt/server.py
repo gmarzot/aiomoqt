@@ -10,6 +10,7 @@ from aiopquic.asyncio.dispatch import serve_dispatch
 from aiopquic.asyncio.webtransport import serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
+from .cat import CatAuth
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer, USER_AGENT)
 from .messages.data import DEFAULT_MAX_OBJECT_BYTES
@@ -101,6 +102,7 @@ class MOQTServer(MOQTPeer):
         quiet_peers: Iterable[str] = (),
         max_filter_ranges: int = 0,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        auth: Optional[CatAuth] = None,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
                          implementation=implementation,
@@ -153,6 +155,9 @@ class MOQTServer(MOQTPeer):
         # with one of these log below WARNING at DEBUG (a health probe's
         # sessions, say).
         self.quiet_peers = tuple(quiet_peers)
+        # Requires a token in SETUP and checks requests against it; None
+        # admits everything.
+        self.auth = auth
         # MAX_FILTER_RANGES sent at d20+ (§9.1.6). Nonzero only where the
         # application applies Range Filters; 0 refuses them all.
         self.max_filter_ranges = int(max_filter_ranges)

@@ -44,17 +44,60 @@ function relayUrls(relay) {
 
 const mib = (b) => b / 2 ** 20;
 
-// Cache held of its budget, in one unit: "48.9/256 MiB".
-function cacheShort(held, budget) {
-  const h = mib(held || 0);
-  return `${h < 100 ? h.toFixed(1) : Math.round(h)}/${Math.round(mib(budget))} MiB`;
+// MiB with one decimal below 100.
+const mibText = (b) => { const m = mib(b || 0); return m < 100 ? m.toFixed(1) : `${Math.round(m)}`; };
+
+// FETCH totals from each new snapshot over the last WIN_S, for the cache ring.
+const WIN_S = 600;
+const fetchWin = [];
+
+function trackFetches(s) {
+  const T = s.totals || {};
+  const p = {t: s.generated, r: (s.relay || {}).started, n: T.fetches || 0,
+             c: T.fetch_cache_bytes || 0, u: T.fetch_upstream_bytes || 0, k: 0};
+  let last = fetchWin[fetchWin.length - 1];
+  if (last && p.t === last.t) return;
+  if (last && (p.r !== last.r || p.t < last.t)) fetchWin.length = 0;  // relay restarted
+  last = fetchWin[fetchWin.length - 1];
+  // T.fetches sums open tracks only and falls when one ends: count its rises.
+  if (last) p.k = last.k + Math.max(0, p.n - last.n);
+  fetchWin.push(p);
+  while (fetchWin.length > 1 && p.t - fetchWin[0].t > WIN_S) fetchWin.shift();
 }
 
-// The per-track bound, a group count or bytes, and evictions.
-function cacheDetail(c, T) {
+// Over the window: hit % of FETCH bytes, FETCH count, span in minutes. Under a minute of
+// snapshots, the byte share since start, with n and min null.
+function fetchWindow(T) {
+  const a = fetchWin[0], b = fetchWin[fetchWin.length - 1];
+  if (!a || b.t - a.t < 60) {
+    return {hit: none(T.cache_efficiency) ? null : 100 * T.cache_efficiency, n: null, min: null};
+  }
+  const c = b.c - a.c, all = c + b.u - a.u;
+  return {hit: all > 0 ? 100 * c / all : null, n: b.k - a.k, min: Math.round((b.t - a.t) / 60)};
+}
+
+// Ring tone: high hit is good; under 10 FETCHes it says too little to colour.
+const hitTone = (w) => none(w.hit) || none(w.n) || w.n < 10 ? 'dim'
+  : w.hit >= 80 ? 'ok' : w.hit >= 50 ? 'warn-level' : 'high';
+
+const count = (n) => n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
+
+// The cache gauge's hover: held of budget, FETCH sources over the window and since start,
+// per-track bound, evictions.
+function cacheDetail(c, T, w) {
   const track = none(c.track_bytes) ? `${fmt.num(c.groups)} groups / ${Math.round(mib(c.bytes))} MiB`
     : `${Math.round(mib(c.track_bytes))} MiB` + (none(c.floor_s) ? '' : `, newest ${c.floor_s} s kept`);
-  return `cache per track ${track} · ${fmt.plural(T.cache_evictions, 'eviction')}`;
+  const recent = none(w.min) ? null
+    : `last ${w.min} min: ${fmt.plural(w.n, 'fetch', 'fetches')}`
+      + (none(w.hit) ? '' : `, ${Math.round(w.hit)}% of their bytes from cache`);
+  const since = none(T.cache_efficiency) ? 'no FETCH yet'
+    : `FETCH ${Math.round(100 * T.cache_efficiency)}% from cache (${fmt.bytes(T.fetch_cache_bytes)}`
+      + ` of ${fmt.bytes((T.fetch_cache_bytes || 0) + (T.fetch_upstream_bytes || 0))})`
+      + ' since start';
+  return [`${mibText(T.cache_bytes)} of ${Math.round(mib(c.budget))} MiB held;`
+            + ' at the budget it drops the oldest group of the least recently used track',
+          recent, since, `per track ${track}`, fmt.plural(T.cache_evictions, 'eviction')]
+    .filter(Boolean).join('\n');
 }
 
 function renderRelay(s, urls) {
@@ -69,18 +112,15 @@ function renderRelay(s, urls) {
     .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
   $('uptime').textContent = fmt.uptime(r.uptime_s)
     + (r.watchdog_s ? ` · watchdog ${r.watchdog_s}s` : '');
-  const workers = $('badge-workers'), cache = $('badge-cache'), c = r.cache;
+  $('date').textContent = fmt.date(s.generated);
+  const hw = [h.arch, h.cores && `${h.cores} vCPU`,
+              h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`].filter(Boolean);
+  // Lines break only between items.
+  const items = hw.flatMap((t, i) => [...(i ? [' · '] : []), el('span', {class: 'nw'}, t)]);
+  $('hw').replaceChildren(...(items.length ? items : ['—']));
+  const workers = $('badge-workers');
   workers.hidden = none(r.workers);
   if (!workers.hidden) workers.textContent = fmt.plural(r.workers, 'worker');
-  cache.hidden = !c || none(c.budget);
-  if (!cache.hidden) {
-    cache.textContent = cacheShort((s.totals || {}).cache_bytes, c.budget);
-    cache.title = cacheDetail(c, s.totals || {});
-  }
-  $('date').textContent = fmt.date(s.generated);
-  $('hw').textContent = [h.arch, h.cores && `${h.cores} vCPU`,
-                         h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`]
-    .filter(Boolean).join(' · ') || '—';
   $('cpu-model').textContent = h.cpu_model || '—';
   $('os').textContent = h.os || '—';
 }
@@ -99,31 +139,55 @@ function arc(r, f0, f1) {
   return `M${polar(r, a0)}A${r},${r} 0 ${large} 1 ${polar(r, a1)}`;
 }
 
-const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
+const level = (pct) => pct >= 90 ? 'high' : pct >= 75 ? 'warn-level' : 'ok';
 
-// `bands`: amber and red past 70% and 90%; without, high is good and stays green.
-function drawGauge(svg, pct, bands = true) {
-  const tone = (v) => bands ? level(v) : 'ok';
-  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}));
-  if (bands) {
-    svg.append(svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.7, 0.9)}),
-               svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
-  }
-  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : tone(pct)}`, x: G.cx,
+// Amber and red past 75% and 90%. `ring`: {pct, tone, lines} for a thin outer ring inside
+// the band ticks, its lines under the value; that dial is drawn smaller to keep the scale.
+function drawGauge(svg, pct, ring) {
+  const r = ring ? G.r - 4 : G.r;
+  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(r, 0, 1)}),
+                      svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.75, 0.9)}),
+                      svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
+  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : level(pct)}`, x: G.cx,
                               y: G.cy + 8, 'text-anchor': 'middle', stroke: 'none'});
   text.textContent = none(pct) ? '—' : `${Math.round(pct)}%`;
   if (!none(pct)) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
-    svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
+    svg.append(svgEl('path', {class: `g-arc ${level(pct)}`, d: arc(r, 0, Math.max(f, 0.004))}));
   }
   svg.append(text);
+  if (!ring) return;
+  svg.append(svgEl('path', {class: 'g-ring-track', d: arc(G.tick - 4, 0, 1)}));
+  if (!none(ring.pct)) {
+    const f = Math.min(Math.max(ring.pct, 0), 100) / 100;
+    svg.append(svgEl('path', {class: `g-ring ${ring.tone}`,
+                              d: arc(G.tick - 4, 0, Math.max(f, 0.004))}));
+  }
+  ring.lines.forEach((t, i) => {
+    const line = svgEl('text', {class: `g-sub ${ring.tone === 'dim' ? 'dim' : ''}`, x: G.cx,
+                                y: G.cy + 20 + 9 * i, 'text-anchor': 'middle', stroke: 'none'});
+    line.textContent = t;
+    svg.append(line);
+  });
 }
 
-function renderGauges(h) {
+// Cache: held of its budget, and the share of FETCH bytes served from it lately on the outer ring.
+function renderGauges(s) {
+  const h = s.host || {}, T = s.totals || {}, c = s.relay.cache;
   const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
   drawGauge($('gauge-cpu'), h.cpu);
   drawGauge($('gauge-ram'), pct(h.mem_used, h.mem_total));
   drawGauge($('gauge-disk'), pct(h.disk_used, h.disk_total));
+  const fig = $('fig-cache');
+  fig.hidden = !c || none(c.budget);
+  if (fig.hidden) return;
+  trackFetches(s);
+  const w = fetchWindow(T);
+  drawGauge($('gauge-cache'), pct(T.cache_bytes, c.budget), {
+    pct: w.hit, tone: hitTone(w),
+    lines: [none(w.hit) ? 'hit —' : `hit ${Math.round(w.hit)}%`,
+            none(w.min) ? 'uptime' : `${count(w.n)}/${w.min}m`]});
+  fig.title = cacheDetail(c, T, w);
 }
 
 // -- tiles ----------------------------------------------------------------------
@@ -374,7 +438,7 @@ function render(s) {
   latest = s;
   const urls = relayUrls(s.relay);
   renderRelay(s, urls);
-  renderGauges(s.host || {});
+  renderGauges(s);
   renderTiles(s);
   if (!s.namespaces.some((r) => r.namespace === scope)) {
     scope = s.namespaces.length ? s.namespaces[0].namespace : null;

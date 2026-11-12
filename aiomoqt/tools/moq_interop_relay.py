@@ -8,7 +8,8 @@ carries less traffic than the Rust and C++ relays.
 
 Limits:
 
-  * No authentication, authorization or rate limiting.
+  * Authorization only with --auth-key: SETUP and, from d16, each request
+    are checked against CAT grants. No rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
     subscriber holding what its deadline covers at the track's input
     rate, or LANE_BYTES with no rate or deadline yet or while the lanes
@@ -103,10 +104,12 @@ import contextlib
 import datetime
 import faulthandler
 from functools import lru_cache
+import heapq
 import itertools
 import json
 import logging
 import marshal
+import math
 from operator import itemgetter
 from logging.handlers import RotatingFileHandler
 import os
@@ -160,7 +163,8 @@ from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
 from aiomoqt.utils.buffer import Buffer, BufferReadError
-from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth, add_help,
+                               add_logging, apply_logging, auth_from_args)
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -279,11 +283,10 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A lane's time behind is checked LANE_TIME_CHECKS times per deadline,
-# LANE_TIME_MIN_S to LANE_TIME_MAX_S apart.
-LANE_TIME_CHECKS = 20
-LANE_TIME_MIN_S = 0.05
-LANE_TIME_MAX_S = 0.25
+# A track marks each session's bytes written once per LANE_MARK_S of its
+# arrivals, wider apart when LANE_MARKS have to span a longer deadline.
+LANE_MARK_S = 0.05
+LANE_MARKS = 100
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -548,32 +551,60 @@ def _check_lanes() -> None:
         lane.check(now, LANE_STALL_S)
 
 
-def _time_lanes(now) -> float:
-    """Every lane's time-behind check that is due; seconds to the next."""
-    step = LANE_TIME_MAX_S
-    for lane in list(_lanes):
-        s = lane.check_time(now)
-        if s is not None and s < step:
-            step = s
-    return step
+def _due_lane(lane, at) -> None:
+    """Run `lane`'s time check at `at`, in place of any earlier one set."""
+    lane._time_due = at
+    heapq.heappush(_lane_due, (at, next(_lane_seq), lane))
+    wake = _lane_wake
+    if wake is not None and at < wake[0] and not wake[1].done():
+        wake[1].set_result(None)
+
+
+def _time_lanes(now) -> None:
+    """Run the lane time checks due by `now`."""
+    due = _lane_due
+    while due and due[0][0] <= now:
+        at, _n, lane = heapq.heappop(due)
+        if at != lane._time_due or lane not in _lanes:
+            continue
+        try:
+            nxt = lane.check_time(now)
+        except Exception:
+            logger.debug("relay: lane time check failed", exc_info=True)
+            nxt = now + LANE_STALL_S
+        if nxt is not None:
+            _due_lane(lane, nxt)
+
+
+def _wake_lanes(fut) -> None:
+    if not fut.done():
+        fut.set_result(None)
 
 
 async def _watch_lanes() -> None:
-    """Check each send lane's time behind when due, and every lane for a
-    stall a few times per LANE_STALL_S."""
-    step = LANE_TIME_MAX_S
-    stall_at = time.monotonic() + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+    """Run each send lane's time check when due, and every lane's stall
+    check a few times per LANE_STALL_S."""
+    global _lane_wake
+    loop = asyncio.get_running_loop()
+    every = min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+    stall_at = time.monotonic() + every
     while True:
-        await asyncio.sleep(step)
         now = time.monotonic()
-        try:
-            step = _time_lanes(now)
-        except Exception:
-            step = LANE_TIME_MAX_S
-            logger.debug("relay: lane time check failed", exc_info=True)
+        at = min(_lane_due[0][0], stall_at) if _lane_due else stall_at
+        if at > now:
+            fut = loop.create_future()
+            _lane_wake = (at, fut)
+            timer = loop.call_later(at - now, _wake_lanes, fut)
+            try:
+                await fut
+            finally:
+                timer.cancel()
+                _lane_wake = None
+            now = time.monotonic()
+        _time_lanes(now)
         if now < stall_at:
             continue
-        stall_at = now + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+        stall_at = now + every
         try:
             _check_lanes()
         except Exception:
@@ -1369,6 +1400,12 @@ _budget = _CacheBudget()
 
 # Send lanes still running, including those draining past their track.
 _lanes: set = set()
+# (time, n, lane): lane time checks, soonest first; stale once the lane's
+# _time_due differs.
+_lane_due: list = []
+_lane_seq = itertools.count()
+# (time, future) the lane timer sleeps to, None while it runs.
+_lane_wake = None
 # What the lanes hold, and whether that has put them all back on LANE_BYTES.
 _lane_bytes = 0
 _lanes_over_budget = False
@@ -1395,12 +1432,13 @@ class _RelayDelivery:
     """A subscriber's side of a relayed track, written by its SendLane:
     streams keep the upstream (group, subgroup) structure."""
 
-    __slots__ = ("track", "d", "session", "lane")
+    __slots__ = ("track", "d", "session", "sid", "lane")
 
     def __init__(self, track, d):
         self.track = track
         self.d = d
         self.session = d.session
+        self.sid = id(d.session)
         self.lane = None
 
     def send(self, item, end=None):
@@ -1411,8 +1449,8 @@ class _RelayDelivery:
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
-            if _born is not None and self.lane is not None:
-                self.lane._wborn = _born
+            if _born is not None:
+                track._tx_born[self.sid] = _born
         if end is not None and end[5] is not None:
             track._objects_out += 1
         rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
@@ -1444,7 +1482,7 @@ class _RelayDelivery:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
             if _born is not None:
-                self.lane._wborn = _born
+                track._tx_born[self.sid] = _born
         return True
 
     @staticmethod
@@ -1497,10 +1535,11 @@ class _RelayLane(SendLane):
     """One subscriber's SendLane, registered for the lane checks and the
     status page. It sheds once the oldest live object its subscriber has
     not been sent is more than `deadline` old, counting what the
-    transport still holds of the track's streams: check_time() marks it
-    late, the next object offered confirms. By bytes, past LANE_BYTES,
-    only without a deadline or while the lanes are over budget. A failed
-    write drops the subscriber."""
+    transport still holds of the track's streams: check_time(), run when
+    that object reaches the deadline, marks it late, the next object
+    offered confirms. By bytes, past LANE_BYTES, only without a deadline
+    or while the lanes are over budget. A failed write drops the
+    subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -1508,14 +1547,13 @@ class _RelayLane(SendLane):
     def __init__(self, track, d):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
-        # (bytes written to the session's streams of the track, arrival
-        # time of the newest object among them), one per probe.
-        self._marks = deque()
-        # Arrival time of the newest object handed to the writer.
-        self._wborn = None
+        self._sid = id(d.session)
+        # The track's marks from this one on are the lane's own.
+        self._mark0 = track._marks_n
         # Arrival time of the oldest live object held, as last read.
         self._oldest = None
-        self._time_due = 0.0
+        # When check_time() is due, None for never.
+        self._time_due = None
         # The last shed's cause: byte cap, else seconds behind; bytes held.
         self._capped = False
         self._behind = 0.0
@@ -1533,8 +1571,14 @@ class _RelayLane(SendLane):
         self.bound = (LANE_BYTES if _lanes_over_budget
                       or self._deadline is None else 0)
 
-    def _written(self) -> int:
-        return self.track._tx_written.get(id(self.d.session), 0)
+    @SendLane.deadline.setter
+    def deadline(self, value) -> None:
+        SendLane.deadline.fset(self, value)
+        if self._deadline is not None:
+            track = self.track
+            track._mark_s = max(track._mark_s, self._deadline / LANE_MARKS)
+        # The crossing may come sooner.
+        _due_lane(self, time.monotonic())
 
     def _probe(self, floor) -> None:
         super()._probe(floor)
@@ -1545,17 +1589,20 @@ class _RelayLane(SendLane):
         """Arrival time of the oldest live object not yet sent. The
         transport sends a session's streams of the track oldest first, so
         its oldest unsent byte is `tx_bytes` before the end of what was
-        written; the first mark past it gives its time, at most one probe
-        late. Else the oldest queued, None for none."""
-        written = self._written()
-        marks = self._marks
-        if self._wborn is not None and (not marks or marks[-1][0] < written):
-            marks.append((written, self._wborn))
-        unsent = written - self.tx_bytes
-        while marks and marks[0][0] <= unsent:
-            marks.popleft()
-        if self.tx_bytes and marks:
-            return marks[0][1]
+        written; the first of the track's marks past it gives its time, at
+        most one mark late. Else the oldest queued, None for none."""
+        if self.tx_bytes:
+            track, sid = self.track, self._sid
+            unsent = track._tx_written.get(sid, 0) - self.tx_bytes
+            marks = track._marks
+            # Older marks may hold another session's count under a reused id.
+            lo = max(0, self._mark0 - track._marks_n + len(marks))
+            i = bisect_right(marks, unsent, lo,
+                             key=lambda m: m[0].get(sid, 0))
+            born = (marks[i][1] if i < len(marks)
+                    else track._tx_born).get(sid)
+            if born is not None:
+                return born
         for it in self.items:
             if it[0].__class__ is not str and it[3] is not None and it[2]:
                 return it[3]
@@ -1569,21 +1616,24 @@ class _RelayLane(SendLane):
                 and born - oldest > self._deadline)
 
     def check_time(self, now) -> float | None:
-        """Mark the lane late, once due, if the oldest live object it holds
-        arrived more than `deadline` before `now`. The seconds between
-        checks, None without a deadline."""
+        """Mark the lane late if the oldest live object it holds arrived
+        more than `deadline` before `now`. When to check next: when that
+        object reaches the deadline, else a deadline from now; None
+        without a deadline."""
         deadline = self._deadline
         if deadline is None or self.stopped:
             self.late = False
             return None
-        step = min(max(deadline / LANE_TIME_CHECKS, LANE_TIME_MIN_S),
-                   LANE_TIME_MAX_S)
-        if now >= self._time_due:
-            self._time_due = now + step
-            self._probe(self.floor)
-            oldest = self._oldest
-            self.late = oldest is not None and now - oldest > deadline
-        return step
+        self._probe(self.floor)
+        oldest = self._oldest
+        if oldest is None:
+            return now + deadline
+        at = oldest + deadline
+        if now > at:
+            # The next object offered reschedules.
+            self.late = True
+            return now + deadline
+        return at if at > now else math.nextafter(now, math.inf)
 
     def _over(self, item) -> bool:
         held = self.bytes + self.tx_bytes
@@ -1596,7 +1646,12 @@ class _RelayLane(SendLane):
         self._probe(self.floor)
         self.late = False
         if not self._late(item):
+            oldest = self._oldest
+            _due_lane(self, (item[3] if oldest is None else oldest)
+                      + self._deadline)
             return False
+        # Once shed, what is held is newer.
+        _due_lane(self, item[3])
         self._capped, self._held = False, self.bytes + self.tx_bytes
         self._behind = item[3] - self._oldest
         # Past the deadline the expiry path enforces (§8).
@@ -1621,6 +1676,7 @@ class _RelayLane(SendLane):
 
     def _exit(self) -> None:
         _lanes.discard(self)
+        self._time_due = None
         # stop() and the task's exit both land here: transfer once.
         if self in self.track._lanes:
             self.track._lanes.discard(self)
@@ -1782,6 +1838,10 @@ class _RelayedTrack:
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
+        # Arrival time of the next object that marks.
+        self._mark_at = 0.0
+        # Seconds of arrivals between marks.
+        self._mark_s = LANE_MARK_S
         self.queue = asyncio.Queue()
         # (group, subgroup) -> stream ends queued for the forward loop.
         self._ends_due: dict = {}
@@ -1796,6 +1856,12 @@ class _RelayedTrack:
         self._tx_streams: dict = {}
         # id(session) -> bytes written to its streams of the track.
         self._tx_written: dict = {}
+        # id(session) -> arrival time of the newest object among them.
+        self._tx_born: dict = {}
+        # Copies of (_tx_written, _tx_born), oldest first; _marks[0] is
+        # mark number _marks_n - len(_marks).
+        self._marks: list = []
+        self._marks_n = 0
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -2017,11 +2083,14 @@ class _RelayedTrack:
 
     def _release_downstream(self) -> None:
         """Forget the subscribers; lanes draining to their PUBLISH_DONE
-        keep their streams, the rest stop."""
+        keep their streams, the rest stop and their open streams reset."""
         for lane in list(self._lanes):
             if not lane.final:
                 lane.stop()
         draining = {id(lane.d.session) for lane in self._lanes}
+        for d in self.downstream:
+            if id(d.session) not in draining and _session_live(d.session):
+                self._close_streams(d.session, StreamResetCode.CANCELLED)
         self.downstream.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
@@ -2029,6 +2098,8 @@ class _RelayedTrack:
             del self._tx_streams[k]
         for k in [k for k in self._tx_written if k not in draining]:
             del self._tx_written[k]
+        for k in [k for k in self._tx_born if k not in draining]:
+            del self._tx_born[k]
 
     def _lane(self, d) -> "_RelayLane":
         if d.lane is None:
@@ -2472,12 +2543,16 @@ class _RelayedTrack:
                     task.cancel()
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
+        # A cancelled subscription's open streams must be reset.
+        if _session_live(session):
+            self._reset_streams(session, float("inf"))
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
         self._tx_written.pop(id(session), None)
+        self._tx_born.pop(id(session), None)
 
     def _end_due(self, k, n) -> None:
         n += self._ends_due.get(k, 0)
@@ -2551,6 +2626,21 @@ class _RelayedTrack:
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
+            if born is not None and born >= self._mark_at:
+                self.mark_lanes(born)
+
+    def mark_lanes(self, born) -> None:
+        """Mark each session's bytes written and the newest arrival among
+        them, _mark_s of arrivals apart."""
+        self._mark_at = born + self._mark_s
+        if not self._lanes:
+            return
+        marks = self._marks
+        marks.append((self._tx_written.copy(), self._tx_born.copy()))
+        self._marks_n += 1
+        # LANE_MARKS span the longest deadline.
+        if len(marks) > LANE_MARKS + 2:
+            del marks[0]
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
                   shape=None, cost=None, born=None) -> None:
@@ -4770,7 +4860,8 @@ def transport_settings(args) -> dict:
             "max_connections": args.max_connections,
             "workers": args.workers,
             "stream_ring_cap": args.stream_ring_cap,
-            "tx_max_inflight_bytes": args.max_inflight_bytes}
+            "tx_max_inflight_bytes": args.max_inflight_bytes,
+            "auth": auth_from_args(args)}
 
 
 def parse_args(argv=None):
@@ -4826,6 +4917,11 @@ def parse_args(argv=None):
                              f"{WATCHDOG_MISSES} self-probes in a row fail "
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
+                             "(default).")
+    parser.add_argument("--stall-trace", type=float, default=0, metavar="MS",
+                        help="Log the event loop thread's Python stack when "
+                             "the loop has not run for MS milliseconds, and "
+                             "the stall's length when it ends. 0 = off "
                              "(default).")
     parser.add_argument("--catalog-probe", action="store_true",
                         help="Subscribe to each announced or published "
@@ -4950,6 +5046,7 @@ def parse_args(argv=None):
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
                              "DEBUG, TRACE, INFO")
+    add_auth(parser)
     add_logging(parser)
     add_help(parser)
     args = _parse_with_config(parser, argv)
@@ -5725,7 +5822,8 @@ async def _self_probe(host, port, use_quic, draft, timeout,
             for _ in range(2 if full else 1):
                 client = MOQTClient(host, port, path="/", use_quic=use_quic,
                                     verify_tls=False, supported_drafts=draft,
-                                    implementation=impl)
+                                    implementation=impl,
+                                    auth=auth_from_args(argparse.Namespace()))
                 s = await stack.enter_async_context(client.connect())
                 await s.client_session_init()
                 sessions.append(s)
@@ -5760,13 +5858,17 @@ _PROBE_CHILD = (
 
 
 async def _probe_in_child(host, port, use_quic, draft, timeout,
-                          full=True) -> bool:
+                          full=True, auth=None) -> bool:
     """Run one self-probe in a child process, so a crash in the probe's
-    client transport cannot take the relay down."""
+    client transport cannot take the relay down. `auth` reaches it in the
+    environment, off the command line."""
+    env = None if auth is None else {
+        **os.environ, AUTH_KEY_ENV: auth.spec,
+        AUTH_TYPE_ENV: str(auth.token_type)}
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _PROBE_CHILD, host, str(port),
         "1" if use_quic else "0", str(draft), str(timeout),
-        "1" if full else "0",
+        "1" if full else "0", env=env,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     try:
         _, err = await asyncio.wait_for(proc.communicate(), timeout + 15)
@@ -5853,7 +5955,7 @@ async def _diagnose_probe_miss(handles) -> None:
 
 
 async def _watchdog(period, host, port, use_quic, draft,
-                    handles=()) -> None:
+                    handles=(), auth=None) -> None:
     """Exit so the supervisor restarts the relay when it hangs or stops
     relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
     in a row, on the newest draft, that deliver no object. Each failed
@@ -5868,7 +5970,8 @@ async def _watchdog(period, host, port, use_quic, draft,
         full = ticks % WATCHDOG_FULL_EVERY == 0
         ticks += 1
         passed = await _probe_in_child(host, port, use_quic, newest,
-                                       min(period, WATCHDOG_PROBE_S), full)
+                                       min(period, WATCHDOG_PROBE_S), full,
+                                       auth)
         ok += passed
         if time.monotonic() >= report_at:
             logger.info(f"relay: watchdog: {ok}/{ticks} probes ok in the "
@@ -5967,7 +6070,7 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
-                 "send_late_ms",
+                 "send_late_ms", "gc_max_ms",
                  "drops", "shed_bytes")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
@@ -6008,6 +6111,7 @@ class _Status:
         self.relay = relay
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
+        self.gc = relay_status.GcTimer.shared()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -6250,6 +6354,9 @@ class _Status:
                 "lost_packets": pq.get("lost"),
                 "timer_losses": pq.get("timer_losses"),
                 "spurious_losses": pq.get("spurious_losses"),
+                # The congestion controller's own report (aiopquic path_quality()).
+                "cc_state": pq.get("cc_state"),
+                "cc_param": pq.get("cc_param"),
                 "namespaces": _session_namespaces(s),
                 "subscriptions": held_subs[id(s)],
                 "dgram_drops": _dgram_drops.get(id(s), 0),
@@ -6259,6 +6366,9 @@ class _Status:
         media_in = sum(r["in_bps"] or 0 for _, r in tracks)
         media_out = sum(r["out_bps"] or 0 for _, r in tracks)
         lag = self.lag.summary()
+        gc_line, long_passes = self.gc.take()
+        for p in long_passes:
+            logger.warning(f"relay: {relay_status.format_gc_pass(*p)}")
         totals = {
             "sessions": len(sessions),
             "by_draft": dict(Counter(f"d{s['draft']}" for s in sessions)),
@@ -6300,6 +6410,7 @@ class _Status:
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
             "send_late_ms": self._send_late_ms(),
+            "gc": gc_line,
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -6324,6 +6435,7 @@ class _Status:
             "groups_per_s": totals["groups_per_s"],
             "groups_out_per_s": totals["groups_out_per_s"],
             "send_late_ms": totals["send_late_ms"],
+            "gc_max_ms": gc_line["max_ms"],
             "drops": totals["drops"],
             "shed_bytes": totals["shed_bytes"],
         })
@@ -6556,7 +6668,8 @@ def _sent_fields(d) -> dict:
 # bytes/s, packets).
 _PATH_QUALITY_KEYS = ("rtt", "rtt_min", "rtt_max", "cwin", "bytes_in_transit",
                       "pacing_rate", "sent", "lost", "timer_losses",
-                      "spurious_losses", "bytes_sent", "bytes_received")
+                      "spurious_losses", "bytes_sent", "bytes_received",
+                      "cc_state", "cc_param")
 
 
 def _sessions_report() -> dict:
@@ -6855,8 +6968,13 @@ async def main():
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
         watchdog = asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft, handles))
+            args.draft, handles, transport["auth"]))
         _background.add(watchdog)
+
+    if args.stall_trace > 0:
+        _background.add(asyncio.create_task(relay_status.StallSampler(
+            args.stall_trace, logger, relay_status.GcTimer.shared(),
+            prefix="relay: ").run()))
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -6881,7 +6999,7 @@ async def main():
     print(
         "=" * 64
         + "\n aiomoqt-relay: a MoQT relay in Python.\n"
-        " No authentication or rate limiting.\n"
+        " CAT authorization with --auth-key; no rate limiting.\n"
         + "=" * 64,
         file=sys.stderr,
     )

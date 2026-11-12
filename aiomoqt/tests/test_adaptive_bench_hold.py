@@ -1,10 +1,30 @@
 """adaptive_bench --hold: step and hold to a confirmed equilibrium."""
+import asyncio
 import sys
 import time
 
 import pytest
 
 from aiomoqt.tools import adaptive_bench as ab
+
+
+class Clock:
+    """Virtual time, advanced one tick per controller tick."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def _on_virtual_time(ctl, clock):
+    """Run ctl's ticks on clock, so decisions do not depend on the host's speed."""
+    async def tick():
+        clock.t += ctl.tick_s
+        await asyncio.sleep(0)
+        return ctl.state.stop.is_set()
+    ctl._wait_tick = tick
 
 
 class FakeRelay:
@@ -16,18 +36,19 @@ class FakeRelay:
 
     def __init__(self, p90, start=100, max_level=10_000, lost=lambda level, t: 0):
         self.p90, self.lost_fn = p90, lost
+        self.clock = Clock()
         self.initial_level, self.max_level = float(start), float(max_level)
-        self.level, self.since, self.lost = float(start), time.monotonic(), 0
+        self.level, self.since, self.lost = float(start), self.clock(), 0
         self.applied = []
         self.drops = 0
 
     async def drop_all(self):
-        self.level, self.since = 0.0, time.monotonic()
+        self.level, self.since = 0.0, self.clock()
         self.drops += 1
 
     async def apply(self, level):
         if level != self.level:
-            self.level, self.since = float(level), time.monotonic()
+            self.level, self.since = float(level), self.clock()
         self.applied.append(float(level))
 
     def settled(self):
@@ -38,10 +59,10 @@ class FakeRelay:
         return self.lost, 1000
 
     async def observe(self):
-        t = time.monotonic() - self.since
+        t = self.clock() - self.since
         self.lost += self.lost_fn(self.level, t)
         p90 = self.p90(self.level, t)
-        return ab.Signal(t=time.monotonic(), level=self.level, latency_mean_ms=p90,
+        return ab.Signal(t=self.clock(), level=self.level, latency_mean_ms=p90,
                          latency_p90_ms=p90, loss_pct=0, shortfall=False,
                          target_mbps=1, tx_mbps=1, rx_mbps=1 if self.level else 0)
 
@@ -63,7 +84,8 @@ def _hold(relay, exit_sustained=True, duration_s=30, recover_s=15.0):
                             recover_clean_s=0.005, reset_gap_s=0.005,
                             exit_sustained=exit_sustained,
                             interval_s=0.001, latency_threshold_ms=500,
-                            duration_s=duration_s)
+                            duration_s=duration_s, clock=relay.clock)
+    _on_virtual_time(ctl, relay.clock)
     actions = []
     ctl._emit = lambda sig, action, force=False: actions.append(action)
     return ctl, state, actions
@@ -81,11 +103,20 @@ async def test_ends_at_the_last_level_that_held():
 
 
 async def test_a_rising_p90_fails_the_step_under_the_threshold():
-    relay = FakeRelay(lambda level, t: 20 if level < 300 else 20 + 10_000 * t)
+    relay = FakeRelay(lambda level, t: 20 if level < 300 else 100 if t < 0.01 else 400)
     ctl, state, actions = _hold(relay)
     await ctl.run()
     assert 'fail (p90 still rising), back to 250' in actions
     assert ctl.sustained == (250, 20)
+
+
+async def test_a_p90_swing_under_half_the_threshold_is_not_rising():
+    relay = FakeRelay(lambda level, t: 600 if level > 300 else 60 if t < 0.01 else 160)
+    ctl, state, actions = _hold(relay)
+    await ctl.run()
+    assert not any('rising' in action for action in actions)
+    assert 'fail (p90 over), back to 300' in actions
+    assert ctl.sustained == (300, 160)
 
 
 async def test_lost_objects_fail_the_step():

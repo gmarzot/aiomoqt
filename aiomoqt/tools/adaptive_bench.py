@@ -36,7 +36,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
@@ -1199,7 +1199,8 @@ class AIMDController:
                  exit_at_max: bool = False,
                  tick_s: float | None = None,
                  skew_safe: bool = False,
-                 too_far_behind: bool = False):
+                 too_far_behind: bool = False,
+                 clock: Callable[[], float] = time.monotonic):
         self.too_far_behind = too_far_behind
         self.peak_behind = (0, 0)  # most viewers past it, of how many
         self.peak_lossy = self.peak_late = self.peak_starved = (0, 0)
@@ -1241,13 +1242,22 @@ class AIMDController:
         self.high_water = 0.0
         self.samples = 0
         self.draining = False
-        self.t0 = time.monotonic()
+        self._now = clock
+        self.t0 = clock()
         # Equilibrium learning: record every direction flip (ramp↔back-off)
         # as a pivot. Step size shrinks with pivot count, and eq_level is an
         # EWMA of pivots so later steps converge around the true ceiling.
         self.pivots: list[float] = []
         self.eq_level: float = actuator.initial_level
         self.direction: int = +1   # +1 ramping, -1 backed-off
+
+    async def _wait_tick(self) -> bool:
+        """Wait one tick; True once the run is stopped."""
+        try:
+            await asyncio.wait_for(self.state.stop.wait(), timeout=self.tick_s)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def run(self):
         state = self.state
@@ -1256,17 +1266,13 @@ class AIMDController:
         await a.apply(a.initial_level)
 
         while not state.stop.is_set():
-            try:
-                await asyncio.wait_for(state.stop.wait(),
-                                       timeout=self.tick_s)
+            if await self._wait_tick():
                 break
-            except asyncio.TimeoutError:
-                pass
 
-            # Hard wall-clock cap. Checked at tick boundaries so the
+            # Duration cap, checked at tick boundaries so the
             # in-progress sample completes and gets reported.
             if (self.duration_s is not None
-                    and time.monotonic() - self.t0 >= self.duration_s):
+                    and self._now() - self.t0 >= self.duration_s):
                 state.ceiling_reason = (
                     f"duration cap reached ({self.duration_s:.0f}s)")
                 state.stop.set()
@@ -1516,7 +1522,7 @@ class AIMDController:
         ticks at tick_s (the group interval in subs mode), but rows print at
         --interval; force=True always emits (terminal + back-off rows
         the user must not miss)."""
-        now = time.monotonic()
+        now = self._now()
         if not (force or (now - self._last_report_t) >= self.report_s):
             return
         self._last_report_t = now
@@ -1654,8 +1660,8 @@ class HoldController(AIMDController):
     a tick fails it when p90 is over the threshold, delivery falls short, a
     subscriber fails, is refused, runs late or loses an object, or the lost
     object count grows. A held step also fails while p90 is still rising:
-    the mean of its last half over RISE_RATIO x its first half plus
-    RISE_FLOOR x the threshold.
+    the mean of its last half over RISE_MIN x the threshold and over
+    RISE_RATIO x its first half plus RISE_FLOOR x the threshold.
 
     Steps add 10% of the level while the hold's p90 stayed under 10% of the
     threshold, 5% under 25%, else one group; never less than one group. The
@@ -1674,6 +1680,7 @@ class HoldController(AIMDController):
     """
 
     MAX_RETREATS = 3
+    RISE_MIN = 0.5
     RISE_RATIO = 1.25
     RISE_FLOOR = 0.05
 
@@ -1720,7 +1727,8 @@ class HoldController(AIMDController):
         if half < 2:
             return False
         first, last = sum(p90s[:half]) / half, sum(p90s[-half:]) / half
-        return last > self.RISE_RATIO * first + self.RISE_FLOOR * self.latency_threshold_ms
+        thr = self.latency_threshold_ms
+        return last > self.RISE_MIN * thr and last > self.RISE_RATIO * first + self.RISE_FLOOR * thr
 
     def _finish(self, sig: Signal, reason: str) -> None:
         self.state.ceiling_reason = reason
@@ -1739,12 +1747,9 @@ class HoldController(AIMDController):
         reset = False                 # this level has had its reset
         no_data = 0
         while not state.stop.is_set():
-            try:
-                await asyncio.wait_for(state.stop.wait(), timeout=self.tick_s)
+            if await self._wait_tick():
                 break
-            except asyncio.TimeoutError:
-                pass
-            now = time.monotonic()
+            now = self._now()
             if self.duration_s is not None and now - self.t0 >= self.duration_s:
                 state.ceiling_reason = (
                     f"held {self.sustained[0]:.0f} {a.unit} to the end" if self.sustained
@@ -1804,12 +1809,12 @@ class HoldController(AIMDController):
                 if not reset:
                     await a.drop_all()
                     self._emit(sig, f"no recovery, reset at {level:.0f}", force=True)
-                    phase, rejoin_t, reset = "reset", time.monotonic() + self.reset_gap_s, True
+                    phase, rejoin_t, reset = "reset", self._now() + self.reset_gap_s, True
                     continue
                 level = await self._retreat(sig, level, "no recovery")
                 if level is None:
                     return
-                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
+                phase, recover_t, reset = "recover", self._now() + a.keep_window, False
                 continue
 
             why = self._fault(sig, p90, lost0)
@@ -1843,7 +1848,7 @@ class HoldController(AIMDController):
                     level = await self._retreat(sig, level, why)
                     if level is None:
                         return
-                phase, recover_t, reset = "recover", time.monotonic() + a.keep_window, False
+                phase, recover_t, reset = "recover", self._now() + a.keep_window, False
                 clean_since = since = None
                 continue
 
@@ -1960,12 +1965,9 @@ class JoinSearchController(HoldController):
     async def _tick(self) -> Optional[Signal]:
         """Wait a tick and observe; None once the run ends."""
         state, a = self.state, self.actuator
-        try:
-            await asyncio.wait_for(state.stop.wait(), timeout=self.tick_s)
+        if await self._wait_tick():
             return None
-        except asyncio.TimeoutError:
-            pass
-        if self.duration_s is not None and time.monotonic() - self.t0 >= self.duration_s:
+        if self.duration_s is not None and self._now() - self.t0 >= self.duration_s:
             state.ceiling_reason = f"duration cap reached ({self.duration_s:.0f}s)"
             state.stop.set()
             return None
@@ -2020,8 +2022,8 @@ class JoinSearchController(HoldController):
                 self.not_demonstrated = f"base audience did not hold: {why}"
                 self._finish(sig, f"not demonstrated: base audience did not hold ({why})")
                 return False
-            since = since or time.monotonic()
-            if time.monotonic() - since >= self.base_s:
+            since = since or self._now()
+            if self._now() - since >= self.base_s:
                 return True
             self._emit(sig, "base")
 
@@ -2042,7 +2044,7 @@ class JoinSearchController(HoldController):
                 return tr
             tr.fault = tr.fault or self._why(sig, lost0)
             view = a.trial_view()
-            if view['resolved'] or time.monotonic() >= deadline:
+            if view['resolved'] or self._now() >= deadline:
                 break
             self._emit(sig, f"trial B={b}")
         tr.judge(view['joins'], self.JOIN_OK_SHARE)
@@ -2053,14 +2055,14 @@ class JoinSearchController(HoldController):
 
     async def _reset(self, b: int) -> None:
         """Wait for the watchers to run clean for trial_gap_s."""
-        a, start, clean = self.actuator, time.monotonic(), None
+        a, start, clean = self.actuator, self._now(), None
         lost0 = a.lost_total[0]
         while True:
             sig = await self._tick()
             if sig is None:
                 self._ended = True
                 return
-            now = time.monotonic()
+            now = self._now()
             if self._why(sig, lost0):
                 clean, lost0 = None, a.lost_total[0]
             else:

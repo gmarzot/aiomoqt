@@ -279,6 +279,7 @@ async def run(args):
         packet_train_mode=bool(args.pacing_trains),
         flow_control_window=args.fc_window,
         tx_max_queued_bytes=args.max_queued_bytes,
+        auth=_cli.auth_from_args(args),
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
              else args.max_inflight_bytes)}

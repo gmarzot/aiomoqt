@@ -12,6 +12,13 @@ dials (bump in the wire). pub_media announces with --pub-ns:
 the setup timeout for it to be published; publishing back to that same
 relay needs another namespace (--out-ns).
 
+--input URL reads the source with cymedia: a file, or a live SRT, RTMP,
+RTSP or HLS input, as tracks video and audio. --input-option passes
+libavformat options; the ingester ends when the input does:
+
+  python -m aiomoqt.tools.abr_ingest -N live/x moqt://relay:4433 \\
+      --input 'srt://0.0.0.0:9000?mode=listener'
+
 The video track (-T; default the catalog's first LOC video track) must be
 H.264. Every LOC track passes through unchanged. The rungs, H.264 or AV1
 (--codec), are encoded from the video by cymedia (uv pip install 'aiomoqt[abr]'), keep its group and
@@ -27,6 +34,10 @@ encoder's share. --no-ladder measures the hand-off alone.
 
 --packaging cmaf publishes every output track as CMSF: one CMAF chunk
 per object, led by a prft, with the CMAF header in the catalog.
+
+--head-trace logs, per relay, each video group's first object: when it
+was written, its stream opened and its bytes went into packets, with the
+connection's cwin, bytes in flight, pacing rate, RTT and losses.
 """
 import argparse
 import asyncio
@@ -35,13 +46,13 @@ import importlib
 import signal
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media.abr import (
-    CODECS, DEFAULT_RUNGS, AbrLadder, DelayMeter, Rung, frame_rate, ladder_catalog,
-    quantiles_ms, rungs_below,
+    CODECS, DEFAULT_RUNGS, AbrLadder, DelayMeter, Rung, SourceInput, frame_rate,
+    ladder_catalog, quantiles_ms, rungs_below,
 )
 from aiomoqt.media.broadcast import MediaSubscriber
 from aiomoqt.media.catalog import (
@@ -76,6 +87,13 @@ _SHUTDOWN_DRAIN_S = 2.0
 EXIT_UNAVAILABLE = 69
 
 
+def _option(value: str) -> Tuple[str, str]:
+    key, sep, val = value.partition('=')
+    if not key or not sep:
+        raise argparse.ArgumentTypeError(f"{value!r}: KEY=VALUE")
+    return key, val
+
+
 def _rung(value: str) -> Rung:
     try:
         return Rung.parse(value)
@@ -92,6 +110,13 @@ def parse_args(argv=None):
     parser.add_argument('--source', metavar='URL', type=_cli.endpoint_url,
                         help='Subscribe the source from this relay instead '
                              'of listening for its publisher')
+    parser.add_argument('--input', metavar='URL',
+                        help='Read the source with cymedia instead: a file, '
+                             'or a live SRT, RTMP, RTSP or HLS input')
+    parser.add_argument('--input-option', metavar='KEY=VALUE', type=_option,
+                        action='append',
+                        help='A libavformat option for --input, e.g. listen=1 '
+                             'for an RTMP server; repeat for each')
     _cli.add_identity(parser, namespace='live/abr')
     parser.add_argument('--out-ns', metavar='NS',
                         help='Namespace to publish under (default: -N)')
@@ -113,6 +138,12 @@ def parse_args(argv=None):
                         default=PACKAGING_LOC,
                         help='Output packaging (default: loc); cmaf = CMSF, '
                              'one CMAF chunk per object')
+    parser.add_argument('--head-trace', action='store_true',
+                        help="Log each video group's first object per relay: "
+                             "when it was written, its stream opened and its "
+                             "bytes went into packets, with the connection's "
+                             "cwin, bytes in flight, pacing rate, RTT and "
+                             "losses (INFO on aiomoqt.data)")
     parser.add_argument('--cert', default=CERT,
                         help='TLS certificate for the listener')
     parser.add_argument('--key', default=KEY,
@@ -129,11 +160,15 @@ def parse_args(argv=None):
     if args.source and (args.quic or args.wt):
         parser.error('--source dials the source and -Q/-W listen for it: '
                      'pick one')
+    if args.input and (args.source or args.quic or args.wt):
+        parser.error('--input reads the source itself: no --source or -Q/-W')
+    if args.input_option and not args.input:
+        parser.error('--input-option needs --input')
     if args.no_ladder and args.rung:
         parser.error('--no-ladder takes no --rung')
     if args.rung and len({r.name for r in args.rung}) < len(args.rung):
         parser.error('two rungs of one height would share a track name')
-    if not args.source and not (args.cert and args.key):
+    if not (args.source or args.input) and not (args.cert and args.key):
         parser.error('listening needs --cert and --key, or certs/')
     return args
 
@@ -182,25 +217,28 @@ async def _accept(args, stack: contextlib.AsyncExitStack):
 
 
 _NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
-_SOURCE_POLL_S = 0.2
+_SOURCE_RETRY_S = (0.2, 5.0)  # first and longest wait between tries
 
 
 async def _subscribe_source(args, session, on_frame, on_catalog):
     """The source's MediaSubscriber and catalog. With --source, waits up
-    to the setup timeout for a source not yet published on the relay."""
+    to the setup timeout for a source not yet published on the relay,
+    retrying at doubling intervals."""
     timeout = _cli.setup_timeout(args)
     deadline = time.monotonic() + timeout
     sub = MediaSubscriber(
         session, args.namespace, on_frame=on_frame, on_catalog=on_catalog,
         track_filter=lambda t: t.packaging == PACKAGING_LOC)
+    wait, longest = _SOURCE_RETRY_S
     while True:
         try:
             return sub, await sub.start(timeout=timeout)
         except MOQTRequestError as e:
             if (not args.source or e.error_code not in _NO_SOURCE
-                    or time.monotonic() > deadline):
+                    or time.monotonic() >= deadline):
                 raise
-        await asyncio.sleep(_SOURCE_POLL_S)
+        await asyncio.sleep(min(wait, max(0.0, deadline - time.monotonic())))
+        wait = min(wait * 2, longest)
 
 
 def _video_entry(catalog: Catalog, name: Optional[str]) -> CatalogTrack:
@@ -220,7 +258,9 @@ _CONFIG_PROPS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 class _Cmaf:
     """One output track's LOC frames as CMSF objects: prft + one-sample
     moof+mdat. tfdt is the LOC timestamp in track ticks, kept rising;
-    the prft carries the capture time."""
+    the prft carries the capture time. Audio tfdt steps by each frame's
+    samples and rejoins the timestamp when they differ by over half a frame;
+    an audio frame at or behind the last tfdt is dropped."""
 
     def __init__(self, track, loc_timescale: Optional[int],
                  fps: Optional[Tuple[int, int]] = None,
@@ -235,19 +275,30 @@ class _Cmaf:
                        else max(1, round(ts * fps[1] / fps[0])))
         self._samples = samples  # audio: payload -> duration in ticks
         self._last: Optional[int] = None
+        self._next = 0  # audio: last tfdt plus its sample count
         self._dur = self._frame or ts // 30
 
-    def wrap(self, frame: LocFrame) -> bytes:
+    def wrap(self, frame: LocFrame) -> Optional[bytes]:
+        """The CMSF object for `frame`; None when it is dropped."""
         ts = frame.timestamp
         dt = None if ts is None else ts * self.chunker.timescale // self._units
-        if self._last is not None:
-            if dt is not None and dt > self._last and self._frame is None:
-                self._dur = dt - self._last
-            if dt is None or dt <= self._last:
-                dt = self._last + self._dur
-        dt = dt or 0
-        dur = (self._samples(frame.payload) if self._samples is not None
-               else self._frame or self._dur)
+        if self._samples is not None:
+            dur = self._samples(frame.payload)
+            if self._last is not None:
+                if dt is None or abs(dt - self._next) <= dur // 2:
+                    dt = self._next
+                elif dt <= self._last:
+                    return None
+            dt = dt or 0
+            self._next = dt + dur
+        else:
+            if self._last is not None:
+                if dt is not None and dt > self._last and self._frame is None:
+                    self._dur = dt - self._last
+                if dt is None or dt <= self._last:
+                    dt = self._last + self._dur
+            dt = dt or 0
+            dur = self._frame or self._dur
         self._last = dt
         chunk = self.chunker.chunk(frame.payload, dur,
                                    frame.key_frame or not self.video,
@@ -327,6 +378,9 @@ class _Output:
             frame, group_id, t0 = item
             payload = (frame.payload if self.cmaf is None
                        else self.cmaf.wrap(frame))
+            if payload is None:
+                self.dropped += 1
+                continue
             await self.track.send_frame(
                 payload, key_frame=frame.key_frame,
                 timestamp=frame.timestamp, extensions=frame.extensions,
@@ -338,7 +392,8 @@ class _Output:
 
 
 class _Ingest:
-    def __init__(self, args, sub: MediaSubscriber, catalog: Catalog):
+    def __init__(self, args, sub: Union[MediaSubscriber, SourceInput],
+                 catalog: Catalog):
         self.args = args
         self.sub = sub
         self.catalog = catalog
@@ -504,6 +559,8 @@ class _Ingest:
             track.track_properties = dict(props) or None
             tracks.append(track)
         for track in tracks:
+            track.trace_heads = (self.args.head_trace
+                                 and track.media_kind == 'video')
             self.pub.add_track(track)
         await self.pub.start(forward=0)
         for track in tracks:
@@ -608,6 +665,8 @@ class _Ingest:
 
 
 async def run(args) -> int:
+    if args.head_trace:
+        args.log = ['data=info', *(args.log or ())]
     _cli.apply_logging(args)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -615,11 +674,6 @@ async def run(args) -> int:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop.set)
     async with contextlib.AsyncExitStack() as stack:
-        if args.source:
-            print(f"  source: {args.source} '{args.namespace}'")
-            source = await _dial(args, args.source, stack)
-        else:
-            source = await _accept(args, stack)
         ingest: Optional[_Ingest] = None
 
         def on_frame(name, frame, group_id, object_id):
@@ -630,9 +684,28 @@ async def run(args) -> int:
             if ingest is not None:
                 ingest.on_catalog(catalog)
 
-        sub, catalog = await _subscribe_source(args, source, on_frame,
-                                               on_catalog)
+        if args.input:
+            print(f"  input: {args.input}")
+            try:
+                source = await SourceInput.open(
+                    args.input, dict(args.input_option or ()),
+                    timeout=_cli.setup_timeout(args))
+            except (OSError, ValueError, ImportError, asyncio.TimeoutError) as e:
+                print(f"  error: {args.input}: {str(e) or type(e).__name__}")
+                return EXIT_UNAVAILABLE
+            stack.callback(source.close)
+            sub, catalog = source, source.catalog
+        else:
+            if args.source:
+                print(f"  source: {args.source} '{args.namespace}'")
+                source = await _dial(args, args.source, stack)
+            else:
+                source = await _accept(args, stack)
+            sub, catalog = await _subscribe_source(args, source, on_frame,
+                                                   on_catalog)
         ingest = _Ingest(args, sub, catalog)
+        if args.input:
+            source.start(on_frame)
         print(f"  source tracks: {', '.join(sub.tracks)}; video "
               f"'{ingest.video.name}' {ingest.video.width}x"
               f"{ingest.video.height}")
@@ -662,7 +735,9 @@ async def run(args) -> int:
                 ingest.report()
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-            if any(c.done() for c in closed):
+            if args.input and closed[0].done():
+                print("  the input ended; stopping")
+            elif any(c.done() for c in closed):
                 print("  a session closed; stopping")
             for w in waiters:
                 w.cancel()

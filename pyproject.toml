@@ -72,7 +72,7 @@ media = [
     "av>=19",
 ]
 abr = [
-    "cymedia>=0.1.0a3,<0.2",
+    "cymedia>=0.1.2,<0.2",
 ]
 examples = [
     "argparse",

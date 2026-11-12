@@ -36,7 +36,13 @@ code {
 }
 .facts.first { display: flex; flex-direction: column; align-self: stretch; }
 /* Boxed text starts on the labels' edge; border and padding sit outside it. */
-.facts .badge-version { align-self: flex-start; margin: 0 0 8px -9px; }
+.badge-row {
+  display: flex; flex-wrap: wrap; align-items: baseline; row-gap: 2px; margin: 0 0 8px -9px;
+}
+/* Indent by the badge's border and padding: beside it a gap, wrapped under it level with its text. */
+.badge-row .foot {
+  padding-left: 9.5px; font: 13px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
 .facts.first .mono { grid-template-columns: 9ch minmax(0, 1fr); }
 .badge-version {
   background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
@@ -45,12 +51,14 @@ code {
 }
 
 .hero-grid {
-  display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content auto;
+  display: grid; grid-template-columns: max-content minmax(0, 1fr) auto;
   gap: 16px 32px; align-items: start;
 }
 /* UPTIME level with the last URL line. */
 .hero-grid > .facts:not(.first) { align-self: end; padding-bottom: 5px; }
-.hero-links { align-self: end; padding-bottom: 5px; }
+/* Above the top-right corner of the facts text (the block hugs it), taking no grid space. */
+.facts.side { position: relative; justify-self: start; }
+.hero-links { position: absolute; right: 0; bottom: 100%; line-height: 1.2; white-space: nowrap; }
 .mono {
   display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 1px 12px; margin: 0;
   font: 13px/1.45 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
@@ -61,8 +69,8 @@ code {
   margin: auto 0 0 -9px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
 #badge-version { white-space: nowrap; }
-.badge-extra { font-weight: 400; font-size: 13px; color: var(--text); white-space: nowrap; }
-.badge-extra::before { content: " · "; color: var(--faint); }
+.foot { color: var(--dim); white-space: nowrap; }
+.mono .nw { white-space: nowrap; }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }
 .copyable {
@@ -83,10 +91,17 @@ code {
 .gauge svg { display: block; width: 120px; height: 104px; }
 .gauge figcaption {
   margin-top: -6px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
+  white-space: nowrap;
 }
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
 .gauge .g-tick { fill: none; stroke-width: 3; }
+.gauge .g-ring-track, .gauge .g-ring { fill: none; stroke-width: 3; stroke-linecap: round; }
+.gauge .g-ring-track { stroke: var(--track); }
+.gauge .g-ring { stroke: var(--gold); }
+.gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--gold); }
+.gauge path.g-ring.dim { stroke: var(--faint); }
+.gauge text.g-sub.dim { fill: var(--dim); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
 .gauge path.warn-level { stroke: var(--amber); }
@@ -354,7 +369,8 @@ footer [data-versions]:empty { display: none; }
   .kv dt { margin-top: 6px; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
-  .gauge, .gauge svg { width: 22vw; max-width: 120px; }
+  .gauge, .gauge svg { width: 20vw; max-width: 120px; }
+  .gauge figcaption { font-size: 11px; letter-spacing: .03em; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
   /* Phones hide namespaces' Origin, Tracks, Peak and tracks' Peak, Groups/s, Latency. */

@@ -531,6 +531,10 @@
   ".history.egress_bps[]": [
    "int"
   ],
+  ".history.gc_max_ms": [
+   "array"
+  ],
+  ".history.gc_max_ms[]": [],
   ".history.groups_out_per_s": [
    "array"
   ],
@@ -738,6 +742,8 @@
   ".sessions[].addr": [
    "string"
   ],
+  ".sessions[].cc_param": [],
+  ".sessions[].cc_state": [],
   ".sessions[].cwin_bytes": [
    "int"
   ],
@@ -858,6 +864,20 @@
   ],
   ".totals.fetches": [
    "int"
+  ],
+  ".totals.gc": [
+   "object"
+  ],
+  ".totals.gc.max_gen": [],
+  ".totals.gc.max_ms": [],
+  ".totals.gc.passes": [
+   "array"
+  ],
+  ".totals.gc.passes[]": [
+   "int"
+  ],
+  ".totals.gc.total_ms": [
+   "float"
   ],
   ".totals.groups_out_per_s": [
    "float"
