@@ -100,6 +100,8 @@ code {
 .gauge .g-ring-track { stroke: var(--track); }
 .gauge .g-ring { stroke: var(--gold); }
 .gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--gold); }
+.gauge path.g-ring.dim { stroke: var(--faint); }
+.gauge text.g-sub.dim { fill: var(--dim); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
 .gauge path.warn-level { stroke: var(--amber); }
