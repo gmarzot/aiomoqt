@@ -550,3 +550,110 @@ async def test_ingester_follows_source_catalog_updates(impl, clip, monkeypatch, 
     else:
         assert rates == [(25, 1)]
         assert catalog.find('video').bitrate is None
+
+
+@pytest.fixture
+def input_url(impl, tmp_path):
+    """A source for --input: the fake Source's clip, or an MPEG-TS file (ADTS AAC)."""
+    if impl is _fake_cymedia:
+        return 'fake:clip'
+    path = tmp_path / 'clip.ts'
+    made = subprocess.run(
+        ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', f'testsrc2=size=320x240:rate={FPS}',
+         '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+         '-t', str(_fake_cymedia.SOURCE_S), '-c:v', 'libx264', '-g', str(GOP),
+         '-keyint_min', str(GOP), '-sc_threshold', '0', '-bf', '0', '-pix_fmt', 'yuv420p',
+         '-c:a', 'aac', '-ac', '2', str(path)], capture_output=True)
+    if made.returncode != 0:
+        pytest.skip(f'ffmpeg cannot make the clip: {made.stderr.decode()[-200:]}')
+    return str(path)
+
+
+async def test_source_input_reads_video_and_adts_audio(impl, input_url):
+    from aiomoqt.media.abr import SourceInput
+    start_us = time.time_ns() // 1000
+    inp = await SourceInput.open(input_url, timeout=10)
+    got = defaultdict(list)
+    try:
+        inp.start(lambda name, frame, g, o: got[name].append((frame, g, o)))
+        await asyncio.wait_for(inp.async_closed(), 15)
+    finally:
+        inp.close()
+    assert [(t.name, t.role) for t in inp.catalog.tracks] == [('video', 'video'),
+                                                             ('audio', 'audio')]
+    audio = inp.catalog.find('audio')
+    assert audio.codec == 'mp4a.40.2' and audio.samplerate == 48000
+    assert audio.channelConfig == '2'
+    assert inp.tracks["audio"].config[:2] == _ASC
+    video = got['video']
+    assert len(video) >= _fake_cymedia.SOURCE_S * FPS - GOP
+    assert video[0][0].key_frame and video[0][2] == 0
+    assert all(f.key_frame == (o == 0) for f, _, o in video)
+    assert [g for _, g, o in video if o == 0] == sorted({g for _, g, _ in video})
+    assert all(f.payload[:4] != b'\x00\x00\x00\x01' for f, _, _ in video)
+    sound = got['audio']
+    assert len(sound) >= _fake_cymedia.SOURCE_S * 46 - 10
+    assert [g for _, g, _ in sound] == list(range(len(sound)))
+    assert all(f.payload[:2] != b'\xff\xf1' for f, _, _ in sound)
+    stamps = [f.timestamp for f, _, _ in video]
+    assert stamps == sorted(stamps) and start_us <= stamps[0] < start_us + 5_000_000
+
+
+async def test_source_input_refuses_a_missing_input(impl):
+    from aiomoqt.media.abr import SourceInput
+    with pytest.raises(OSError):
+        await SourceInput.open('/nonexistent/clip.ts', timeout=2)
+
+
+@pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
+async def test_input_url_publishes_the_input_and_its_ladder(impl, input_url, use_quic):
+    _needs(impl, 'h264')
+    from aiomoqt.tools import abr_ingest
+    from aiomoqt.tools import moq_interop_relay as relay
+    relay._announced.clear()
+    relay._tracks.clear()
+    ns = 'abr/input'
+    port = free_udp_port()
+    scheme = 'moqt' if use_quic else 'https'
+    server = relay._build_server('localhost', port, CERT, KEY, use_quic=use_quic, draft=18)
+    handle = await server.serve()
+    args = abr_ingest.parse_args([
+        '--input', input_url, '-N', ns, '--profile', 'cpu',
+        '--rung', '160x120:200k', '--rung', '96x72:100k',
+        '-k', '--draft', '18', '-t', '30', '-i', '1', f'{scheme}://localhost:{port}/'])
+    ingest = asyncio.ensure_future(abr_ingest.run(args))
+    got = defaultdict(int)
+    try:
+        await until_published(ns, ['catalog', 'video', 'audio', 'video_120p', 'video_72p'],
+                              timeout=15)
+        client = MOQTClient('localhost', port, path='/', use_quic=use_quic,
+                            verify_tls=False, supported_drafts=18)
+        async with client.connect() as session:
+            await session.client_session_init()
+
+            def on_frame(name, frame, group_id, object_id):
+                got[name] += 1
+            sub = MediaSubscriber(session, ns, on_frame=on_frame)
+            catalog = await sub.start(timeout=5)
+            rc = await asyncio.wait_for(ingest, 20)
+    finally:
+        if not ingest.done():
+            ingest.cancel()
+        handle.close()
+    assert rc == 0
+    assert [t.name for t in catalog.tracks] == ['video', 'video_120p', 'video_72p', 'audio']
+    assert catalog.find('audio').codec == 'mp4a.40.2'
+    for name in ('video', 'audio', 'video_120p', 'video_72p'):
+        assert got[name] > 0, dict(got)
+
+
+def test_input_excludes_other_sources():
+    from aiomoqt.tools import abr_ingest
+    for extra in (['--source', 'moqt://localhost:4433/'], ['-Q']):
+        with pytest.raises(SystemExit):
+            abr_ingest.parse_args(['--input', 'x.ts', *extra, 'moqt://localhost:4433/'])
+    with pytest.raises(SystemExit):
+        abr_ingest.parse_args(['--input-option', 'listen=1', 'moqt://localhost:4433/'])
+    args = abr_ingest.parse_args(['--input', 'rtmp://0.0.0.0/live/x', '--input-option',
+                                  'listen=1', 'moqt://localhost:4433/'])
+    assert args.input_option == [('listen', '1')]
