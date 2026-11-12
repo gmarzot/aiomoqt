@@ -657,3 +657,45 @@ def test_input_excludes_other_sources():
     args = abr_ingest.parse_args(['--input', 'rtmp://0.0.0.0/live/x', '--input-option',
                                   'listen=1', 'moqt://localhost:4433/'])
     assert args.input_option == [('listen', '1')]
+
+
+@pytest.mark.parametrize('duration', [None, 1])
+async def test_source_wait_backs_off(monkeypatch, duration):
+    """--source retries a source not yet published at doubling intervals up
+    to 5 s, and never sleeps past the setup timeout."""
+    from types import SimpleNamespace
+
+    from aiomoqt.tools import abr_ingest
+    from aiomoqt.types import MOQTRequestError, RequestErrorCode
+    misses = 8 if duration is None else 100
+    clock = [0.0]
+    waits = []
+
+    class Sub:
+        def __init__(self, *a, **kw):
+            self.tries = 0
+
+        async def start(self, timeout):
+            self.tries += 1
+            if self.tries <= misses:
+                raise MOQTRequestError(RequestErrorCode.DOES_NOT_EXIST)
+            return 'catalog'
+
+    async def sleep(s):
+        waits.append(s)
+        clock[0] += s
+
+    monkeypatch.setattr(abr_ingest, 'MediaSubscriber', Sub)
+    monkeypatch.setattr(abr_ingest, 'asyncio', SimpleNamespace(sleep=sleep))
+    monkeypatch.setattr(abr_ingest, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    url = 'moqt://localhost:4433/'
+    args = abr_ingest.parse_args(['--source', url, url, *(['-t', '1'] if duration else [])])
+    if duration is None:
+        sub, catalog = await abr_ingest._subscribe_source(args, None, None, None)
+        assert catalog == 'catalog' and sub.tries == misses + 1
+        assert waits == [0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0, 5.0]
+    else:
+        with pytest.raises(MOQTRequestError):
+            await abr_ingest._subscribe_source(args, None, None, None)
+        assert waits[:2] == [0.2, 0.4] and len(waits) == 3
+        assert sum(waits) == pytest.approx(1.0)
