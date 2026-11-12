@@ -8,6 +8,7 @@ from aiopquic.asyncio.client import connect as aiopquic_connect
 from aiopquic._binding._transport import TransportContext
 from aiopquic.quic.configuration import QuicConfiguration
 
+from .cat import CatAuth
 from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
     DEFAULT_TX_MAX_INFLIGHT_BYTES, USER_AGENT,
@@ -79,6 +80,7 @@ class MOQTClient(MOQTPeer):
         implementation: Optional[str] = USER_AGENT,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
         shared_transport: Optional[SharedTransport] = None,
+        auth: Optional[CatAuth] = None,
     ):
         super().__init__(libquicr_compat=libquicr_compat,
                          tx_max_inflight_bytes=tx_max_inflight_bytes,
@@ -140,6 +142,8 @@ class MOQTClient(MOQTPeer):
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
         self.shared_transport = shared_transport
+        # Presents a token in SETUP.
+        self.auth = auth
 
         logger.debug(
             f"MOQT: client session: {self} use_quic={use_quic} path={path}")

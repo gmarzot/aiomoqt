@@ -397,7 +397,7 @@ async def test_awaiting_after_close_fails_at_once():
     s._pending_requests[2] = s._loop.create_future()
     s._close_err = (3, "gone")
     t0 = asyncio.get_running_loop().time()
-    with pytest.raises(MOQTRequestError, match="session closed: gone"):
+    with pytest.raises(MOQTRequestError, match="session closed: PROTOCOL_VIOLATION: gone"):
         await s._await_response(2, timeout=5.0)
     assert asyncio.get_running_loop().time() - t0 < 1.0
     assert 2 not in s._pending_requests
