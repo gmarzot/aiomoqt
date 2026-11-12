@@ -73,7 +73,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.track import SubscribedTrack, TrackState
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.types import FilterType
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
@@ -94,7 +94,7 @@ from aiomoqt.utils.workers import (
     retry_wait,
     SUBSCRIBE_EACH_TIMEOUT_S,
     STATS_INTERVAL_S,
-    STOP_POLL_S,
+    wait_tracks_end,
 )
 
 TICK_S = 1.0
@@ -103,6 +103,10 @@ TICK_S = 1.0
 SUBS_DRAIN_GRACE_S = 5.0
 # A group fails below this fraction of rate x live-subscriber-seconds.
 EXPECTED_FLOOR = 0.5
+# Each track must also reach EXPECTED_FLOOR over every RECENT_S window
+# that owed at least RECENT_MIN_OBJS objects, so one that stops mid-run fails.
+RECENT_S = 10.0
+RECENT_MIN_OBJS = 5
 CMD_POLL_S = 0.1
 # Join commands in flight count against the group target until the host
 # reports an outcome; expire unanswered ones so a wedged shard can't
@@ -171,7 +175,8 @@ EXAMPLE_SCENARIO = {
 # Events on events_queue (all tagged group/shard):
 #   {'kind':'evt','ev': 'joined'|'join_failed'|'left'|'ended'|'died', ...}
 #   {'kind':'group_stats', 'live', 'dt', 'rx_bytes', 'rx_objs' (over dt),
-#    'lat_p90_ms', 'total_bytes', 'total_objs', ...}   every STATS_INTERVAL_S
+#    'lat_p90_ms', 'lat_p99_ms', 'total_bytes', 'total_objs', ...}
+#   every STATS_INTERVAL_S
 # ---------------------------------------------------------------------------
 
 async def _slot_task(cfg, relay, slot, events_q, group, shard,
@@ -263,16 +268,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             slot["live"] = True
             _post(events_q, {"kind": "evt", "ev": "joined",
                              "group": group, "shard": shard})
-            while not stop_ev.is_set():
-                closed = next((t for t in tracks if getattr(
-                    t, "state", None) == TrackState.CLOSED), None)
-                if closed is not None:
-                    outcome = ("ended" if getattr(closed, "completed", False)
-                               else "died")
-                    break
-                await asyncio.sleep(STOP_POLL_S)
-            else:
-                outcome = "left"
+            outcome = await wait_tracks_end(tracks, stop_ev) or "left"
             session.close()
     except Exception as e:
         if not slot["live"]:
@@ -362,7 +358,7 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
             total_bytes = reaped_bytes
             total_objs = reaped_objs
             track_objs = dict(reaped_track_objs)
-            worst_p90 = 0.0
+            worst_p90 = worst_p99 = 0.0
             for s in slots.values():
                 for name, st in s["stats"].items():
                     snap = st.snapshot()
@@ -372,13 +368,15 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
                     total_objs += snap["total_objs"]
                     track_objs[name] += snap["total_objs"]
                     worst_p90 = max(worst_p90, snap["lat_p90_ms"])
+                    worst_p99 = max(worst_p99, snap["lat_p99_ms"])
                 if s["live"]:
                     live += 1
             _post(events_q, {
                 "kind": "group_stats", "group": group, "shard": shard,
                 "live": live, "dt": dt,
                 "rx_bytes": rx_bytes, "rx_objs": rx_objs,
-                "lat_p90_ms": worst_p90, "total_bytes": total_bytes,
+                "lat_p90_ms": worst_p90, "lat_p99_ms": worst_p99,
+                "total_bytes": total_bytes,
                 "total_objs": total_objs, "track_objs": track_objs,
                 "t": time.monotonic(),
             })
@@ -523,6 +521,10 @@ class GroupRT:
         self.max_live = 0
         self.expected_objs = 0.0
         self.expected_track = {p.track: 0.0 for p in spec.pubs}
+        # Per track: (now, delivered, owed) samples over RECENT_S, and the
+        # worst window below the floor as (delivered, owed, scenario t).
+        self.track_hist: Dict[str, deque] = {}
+        self.track_short: Dict[str, tuple] = {}
 
     def live(self) -> int:
         return sum(s.live for s in self.shards)
@@ -696,6 +698,38 @@ def _accrue_expected(groups: Dict[int, GroupRT], pubs: Dict[str, PubRT],
             owed = live * pub.fps * dt
             g.expected_objs += owed
             g.expected_track[pub.track] += owed
+
+
+def _note_recent(groups: Dict[int, GroupRT], t: float, now: float):
+    """Sample each track's delivered and owed objects; keep its worst full
+    RECENT_S window below EXPECTED_FLOOR in track_short."""
+    for g in groups.values():
+        for pub in g.spec.pubs:
+            name = pub.track
+            n = sum(s.stats.get("track_objs", {}).get(name, 0)
+                    for s in g.shards)
+            hist = g.track_hist.setdefault(name, deque())
+            hist.append((now, n, g.expected_track[name]))
+            while len(hist) > 1 and hist[1][0] <= now - RECENT_S:
+                hist.popleft()
+            t0, n0, e0 = hist[0]
+            if now - t0 < RECENT_S:
+                continue
+            got, owed = n - n0, g.expected_track[name] - e0
+            if owed < RECENT_MIN_OBJS or got >= owed * EXPECTED_FLOOR:
+                continue
+            worst = g.track_short.get(name)
+            if worst is None or got / owed < worst[0] / worst[1]:
+                g.track_short[name] = (got, owed, t)
+
+
+def _short_note(grt: "GroupRT", track: str) -> str:
+    short = grt.track_short.get(track)
+    if short is None:
+        return ""
+    got, owed, t = short
+    return (f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED over "
+            f"{RECENT_S:.0f}s at T+{t:.0f}s ({got}/{owed:.0f})")
 
 
 def _predict_egress(pubs: List[PubSpec], groups: List[GroupSpec]):
@@ -927,7 +961,7 @@ def main():
     if args.report:
         csv_f = open(args.report, "w")
         csv_f.write("t,namespace,track,live,target,rx_mbps,p90_ms,"
-                    f"joins,leaves,fails,{','.join(CPU_FIELDS)}\n")
+                    f"joins,leaves,fails,{','.join(CPU_FIELDS)},p99_ms\n")
         cpu_csv = _csv_line(cpu_fields())
 
     start = time.monotonic()
@@ -990,6 +1024,7 @@ def main():
             _accrue_expected(groups, pubs, t, now - last_tick)
             last_tick = now
             if not stopping:
+                _note_recent(groups, t, now)
                 for grt in groups.values():
                     _tick_group(grt, t, rng)
 
@@ -1002,6 +1037,9 @@ def main():
                 p90 = max((s.stats.get("lat_p90_ms", 0.0)
                            for g in groups.values() for s in g.shards),
                           default=0.0)
+                p99 = max((s.stats.get("lat_p99_ms", 0.0)
+                           for g in groups.values() for s in g.shards),
+                          default=0.0)
                 pubs_up = sum(1 for prt in pubs.values()
                               if prt.proc is not None and not prt.ended)
                 iv = {"join": 0, "leave": 0, "fail": 0}
@@ -1012,7 +1050,7 @@ def main():
                 line = (f"  T+{t:>5.0f}s  subs={live_total:<5} "
                         f"(+{iv['join']}/-{iv['leave']}"
                         f"/x{iv['fail']})  rx={fmt_bps(rx_bps):<10} "
-                        f"p90={p90:.0f}ms")
+                        f"p90={p90:.0f}ms p99={p99:.0f}ms")
                 if pubs:
                     line += f"  pubs={pubs_up}/{len(pubs)}"
                 print(line)
@@ -1020,7 +1058,7 @@ def main():
                     per_track: Dict[str, list] = {}
                     for g in groups.values():
                         row = per_track.setdefault(
-                            g.spec.key, [0, 0, 0, 0.0])
+                            g.spec.key, [0, 0, 0, 0.0, 0.0])
                         row[0] += g.live()
                         row[1] += g.spec.max_subs
                         row[2] += sum(_rx_Bps(s.stats)
@@ -1028,11 +1066,15 @@ def main():
                         row[3] = max(row[3],
                                      max((s.stats.get("lat_p90_ms", 0.0)
                                           for s in g.shards), default=0.0))
+                        row[4] = max(row[4],
+                                     max((s.stats.get("lat_p99_ms", 0.0)
+                                          for s in g.shards), default=0.0))
                     for key, row in per_track.items():
                         ns, tr = key.split("/", 1)
                         csv_f.write(f"{t:.0f},{ns},{tr},{row[0]},{row[1]},"
                                     f"{row[2] * 8 / 1e6:.2f},"
-                                    f"{row[3]:.1f},,,,{cpu_csv}\n")
+                                    f"{row[3]:.1f},,,,{cpu_csv},"
+                                    f"{row[4]:.1f}\n")
                     csv_f.flush()
 
             # --- end conditions ---
@@ -1126,6 +1168,9 @@ def _verdict(groups: Dict[int, "GroupRT"],
         elif total_objs < expected * EXPECTED_FLOOR:
             note = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
             failed = True
+        elif not gs.multi and _short_note(grt, gs.pubs[0].track):
+            note = _short_note(grt, gs.pubs[0].track)
+            failed = True
         track_lines = []
         if gs.multi:
             for ps in gs.pubs:
@@ -1137,6 +1182,8 @@ def _verdict(groups: Dict[int, "GroupRT"],
                     tnote = "  << NO OBJECTS"
                 elif grt.max_live and n < exp * EXPECTED_FLOOR:
                     tnote = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
+                elif grt.max_live:
+                    tnote = _short_note(grt, ps.track)
                 if tnote:
                     failed = True
                     note = note or f"  << {ps.track}: {tnote[5:]}"

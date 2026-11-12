@@ -239,7 +239,8 @@ class TrackStats:
                  windowed: bool = True,
                  minimal: bool = False,
                  latency_every: int = 1,
-                 group_loss: bool = False):
+                 group_loss: bool = False,
+                 lat_min_us: int = _LAT_MIN_US):
         # windowed=False skips the rolling-window upkeep that only
         # snapshot() reads — table-printing consumers (interval_row /
         # summary) never touch it, and this runs per object on the
@@ -254,6 +255,9 @@ class TrackStats:
         # 30k obj/s even N=16 leaves ~2k samples/s for a percentile.
         self.latency_every = max(1, int(latency_every))
         self._lat_tick = 0
+        # Most negative latency kept (us); lower one to keep a known clock
+        # offset that a baseline cancels.
+        self.lat_min_us = lat_min_us
         self.window_s = window_s
         self.start_time = 0.0
         self.first_object_time = 0.0
@@ -418,7 +422,7 @@ class TrackStats:
                 send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
-            if _LAT_MIN_US <= raw <= _LAT_MAX_US:
+            if self.lat_min_us <= raw <= _LAT_MAX_US:
                 lat = raw / 1000.0
                 self.lat_count += 1
                 self.lat_sum += lat
@@ -477,6 +481,8 @@ class TrackStats:
                 grp_rx[gid] = n + 1
             else:
                 self._group_object(gid, oid, sg)
+        if gid < self._key_floor:
+            return              # pruned: counted, no loss keys
         if gid == self._lk_g and sg == self._lk_s:
             prev = self._lk_prev
         else:
@@ -742,7 +748,8 @@ class TrackStats:
 
 class ViewerStats:
     """One viewer's TrackStats per track, merged for the slot checks:
-    bytes, objects and loss sum; latency is the worst track's."""
+    bytes, objects and loss sum; latency is the worst track's. 'tracks'
+    holds each track's cumulative (objects, bytes)."""
 
     _SUMMED = ('rx_objs', 'rx_bytes', 'iv_lost', 'lat_n', 'loss', 'groups',
                'total_objs', 'total_bytes')
@@ -773,4 +780,6 @@ class ViewerStats:
         merged['lat_mean_ms'] = (sum(s['lat_mean_ms'] * s['lat_n'] for s in timed)
                                  / merged['lat_n']) if merged['lat_n'] else 0.0
         merged['jitter_ms'] = max(s['jitter_ms'] for s in snaps)
+        merged['tracks'] = {name: (s['total_objs'], s['total_bytes'])
+                            for name, s in zip(self.tracks, snaps)}
         return merged

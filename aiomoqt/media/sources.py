@@ -724,6 +724,10 @@ class AnnexBAssembler:
             self._au.append(nal)
             self._au_has_vcl = True
             return
+        if t in (10, 11, 12):  # end of sequence/stream, filler: trail their access unit
+            if self._au_has_vcl:
+                self._au.append(nal)
+            return
         # SEI and other non-VCL NALs precede their access unit's slices
         if self._au_has_vcl:
             self._flush(out)
@@ -904,6 +908,7 @@ class IvfWriter:
 
 _HEVC_VPS, _HEVC_SPS, _HEVC_PPS, _HEVC_AUD = 32, 33, 34, 35
 _HEVC_SEI_SUFFIX = 40
+_HEVC_AU_TAIL = (36, 37, 38)  # EOS, EOB, FD: trail their access unit
 
 
 def _hevc_type(nal: bytes) -> int:
@@ -992,6 +997,10 @@ class HevcAnnexBAssembler(AnnexBAssembler):
             return
         if t == _HEVC_SEI_SUFFIX:
             self._au.append(nal)
+            return
+        if t in _HEVC_AU_TAIL:
+            if self._au_has_vcl:
+                self._au.append(nal)
             return
         if self._au_has_vcl:
             self._flush(out)

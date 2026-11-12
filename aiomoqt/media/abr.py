@@ -181,7 +181,10 @@ class AbrLadder:
     extensions, and a key frame at each group start. pushed_ns is the
     source frame's monotonic push time, or None. configs[i] is rung i's
     avcC or av1C; wait[i] meters it from push to on_frame. A lagging rung skips the
-    rest of a group, and a full engine drops whole input groups.
+    rest of a group, and a full engine drops whole input groups. A frame of a group
+    older than one already pushed is dropped (late_dropped): decoding it would stall
+    the decoder until the next key frame. A group start more than one group back is
+    a restarted source and is taken.
     """
 
     def __init__(self, rungs: Sequence[Rung], *, config: Optional[bytes],
@@ -205,6 +208,7 @@ class AbrLadder:
         self.wait = [DelayMeter() for _ in self.rungs]
         self.frames_in = 0
         self.input_dropped = 0
+        self.late_dropped = 0
         self._graph = cymedia.ladder(
             [cymedia.Rung(r.width, r.height, r.bit_rate) for r in self.rungs],
             profile=profile, fps=fps, extradata=config, realtime=realtime,
@@ -234,10 +238,16 @@ class AbrLadder:
         self._loop.add_reader(self._graph.fileno(), self._drain)
 
     def push(self, frame: LocFrame, group_id: int, object_id: int) -> bool:
-        """Queue one source frame; False when the engine dropped it or is
-        flushing."""
+        """Queue one source frame; False when it is late, the engine dropped
+        it or the ladder is flushing."""
         if self._flushing:
             return False
+        if group_id < self._group:
+            if object_id != 0 or group_id + 1 == self._group:
+                self.late_dropped += 1
+                return False
+            self._group = group_id - 1
+            self._pending.clear()
         ts = frame.timestamp
         pts = (0 if ts is None
                else ts * 1_000_000 // self.timescale if self.timescale

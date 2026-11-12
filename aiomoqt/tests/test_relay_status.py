@@ -2,7 +2,9 @@
 classification, and the relay's status snapshot end to end."""
 import asyncio
 import contextlib
+import gc
 import json
+import logging
 import os
 import sys
 import time
@@ -916,3 +918,64 @@ def test_send_lateness_is_null_on_an_aiopquic_without_it(tmp_path, monkeypatch):
     monkeypatch.setattr(relay, "transport_counters", lambda handles: [
         {"loop_late_checks": None, "loop_late_us": None}])
     assert status._send_late_ms() is None
+
+
+# -- GC timing and --stall-trace -------------------------------------------
+
+def test_gc_timer_counts_a_forced_collection():
+    timer = relay_status.GcTimer(warn_ms=0)
+    try:
+        timer.take()
+        gc.collect()
+        line, long = timer.take()
+    finally:
+        timer.close()
+    assert timer._callback not in gc.callbacks
+    assert line["passes"][2] >= 1 and line["max_gen"] is not None
+    assert 0 <= line["max_ms"] <= line["total_ms"]
+    gen2 = [p for p in long if p[1] == 2]
+    assert gen2, long
+    assert relay_status.format_gc_pass(*gen2[-1]).startswith("GC gen2 pass ")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="the host sampler's fields come from /proc")
+def test_status_carries_the_gc_passes_since_the_last_snapshot(
+        relay_tables, tmp_path):
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    status.snapshot(time.monotonic(), time.time())
+    gc.collect()
+    snap = status.snapshot(time.monotonic(), time.time())
+    line = snap["totals"]["gc"]
+    assert line["passes"][2] >= 1 and line["max_ms"] is not None, line
+    assert snap["history"]["gc_max_ms"][-1] == line["max_ms"]
+
+
+def _block_the_loop(seconds):
+    time.sleep(seconds)
+
+
+async def test_stall_trace_logs_the_stalled_stack(caplog):
+    log = logging.getLogger("stall_trace_test")
+    caplog.set_level(logging.WARNING, logger=log.name)
+    sampler = relay_status.StallSampler(100, log)
+    task = asyncio.create_task(sampler.run())
+    try:
+        await asyncio.sleep(0.1)
+        _block_the_loop(0.4)
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    lines = [r.getMessage() for r in caplog.records if r.name == log.name]
+    at = [i for i, m in enumerate(lines) if "_block_the_loop" in m]
+    assert len(at) == 1 and lines[at[0]].startswith("loop stalled "), lines
+    assert any(m.startswith("loop stall ended after ")
+               for m in lines[at[0] + 1:]), lines
+
+
+def test_stall_trace_is_off_by_default():
+    assert relay.parse_args([]).stall_trace == 0
+    assert relay.parse_args(["--stall-trace", "150"]).stall_trace == 150

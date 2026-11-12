@@ -121,9 +121,13 @@ class _Open:
 
     def __init__(self):
         self.writes = []
+        self.resets = []
 
     def set_stream_priority(self, _sid, _band):
         return True
+
+    def stream_reset(self, sid, _code=0):
+        self.resets.append(sid)
 
     async def open_uni_stream(self, initial=b"", priority=None,
                               end_stream=False):

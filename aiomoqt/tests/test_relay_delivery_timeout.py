@@ -229,15 +229,20 @@ async def test_a_lagging_viewer_expires_while_a_healthy_one_gets_all(
         expired = {n: d.lane.expired for n, d in lanes.items()}
         sheds = {n: d.lane.sheds for n, d in lanes.items()}
         await asyncio.sleep(0.3)
+        # Teardown cancels the subscriptions, which resets with CANCELLED.
+        resets = {n: list(lagging[n].resets) for n in lagging}
 
     for name in ("video", "audio"):
         assert healthy[name].count >= sent[name] - _RATE, (
             name, healthy[name].count, sent[name])
         assert lagging[name].count, name
-        # Dropped by the deadline, not the byte bound.
-        assert expired[name] > 0 and sheds[name] == 0, (expired, sheds)
-        assert StreamResetCode.DELIVERY_TIMEOUT in lagging[name].resets, (
-            name, lagging[name].resets)
+        # Dropped by the deadline: expired at its send, or shed by its
+        # lane at the same time behind.
+        assert expired[name] + sheds[name] > 0, (expired, sheds)
+        assert StreamResetCode.DELIVERY_TIMEOUT in resets[name], (
+            name, resets[name])
+        assert StreamResetCode.CANCELLED not in resets[name], (
+            name, resets[name])
 
 
 @requires_certs
@@ -265,7 +270,7 @@ async def test_subscribe_and_update_set_the_timeout(
         assert (video.deadline, audio.deadline) == (60.0, 0.5)
         # The session is slow on both tracks; only audio has 0.5 s.
         assert video.expired == 0 and video.sheds == 0
-        assert audio.expired > 0, audio.expired
+        assert audio.expired + audio.sheds > 0, audio.expired
         reply = viewer.request_update(
             rid, parameters={ParamType.DELIVERY_TIMEOUT: 200},
             wait_response=True)
@@ -273,7 +278,10 @@ async def test_subscribe_and_update_set_the_timeout(
             await asyncio.wait_for(reply, 2)
         assert ds["video"].timeout == 200 and video.deadline == 0.2
         await asyncio.sleep(1.5)
-        assert video.expired > 0 and video.sheds == 0, video.expired
+        assert video.expired + video.sheds > 0, video.expired
+        # Teardown cancels the subscriptions, which resets with CANCELLED.
+        resets = list(subs["video"].resets)
 
     assert subs["video"].count and subs["audio"].count
-    assert StreamResetCode.DELIVERY_TIMEOUT in subs["video"].resets
+    assert StreamResetCode.DELIVERY_TIMEOUT in resets, resets
+    assert StreamResetCode.CANCELLED not in resets, resets
