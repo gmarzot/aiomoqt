@@ -1,10 +1,30 @@
 """adaptive_bench --hold: step and hold to a confirmed equilibrium."""
+import asyncio
 import sys
 import time
 
 import pytest
 
 from aiomoqt.tools import adaptive_bench as ab
+
+
+class Clock:
+    """Virtual time, advanced one tick per controller tick."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def _on_virtual_time(ctl, clock):
+    """Run ctl's ticks on clock, so decisions do not depend on the host's speed."""
+    async def tick():
+        clock.t += ctl.tick_s
+        await asyncio.sleep(0)
+        return ctl.state.stop.is_set()
+    ctl._wait_tick = tick
 
 
 class FakeRelay:
@@ -16,18 +36,19 @@ class FakeRelay:
 
     def __init__(self, p90, start=100, max_level=10_000, lost=lambda level, t: 0):
         self.p90, self.lost_fn = p90, lost
+        self.clock = Clock()
         self.initial_level, self.max_level = float(start), float(max_level)
-        self.level, self.since, self.lost = float(start), time.monotonic(), 0
+        self.level, self.since, self.lost = float(start), self.clock(), 0
         self.applied = []
         self.drops = 0
 
     async def drop_all(self):
-        self.level, self.since = 0.0, time.monotonic()
+        self.level, self.since = 0.0, self.clock()
         self.drops += 1
 
     async def apply(self, level):
         if level != self.level:
-            self.level, self.since = float(level), time.monotonic()
+            self.level, self.since = float(level), self.clock()
         self.applied.append(float(level))
 
     def settled(self):
@@ -38,10 +59,10 @@ class FakeRelay:
         return self.lost, 1000
 
     async def observe(self):
-        t = time.monotonic() - self.since
+        t = self.clock() - self.since
         self.lost += self.lost_fn(self.level, t)
         p90 = self.p90(self.level, t)
-        return ab.Signal(t=time.monotonic(), level=self.level, latency_mean_ms=p90,
+        return ab.Signal(t=self.clock(), level=self.level, latency_mean_ms=p90,
                          latency_p90_ms=p90, loss_pct=0, shortfall=False,
                          target_mbps=1, tx_mbps=1, rx_mbps=1 if self.level else 0)
 
@@ -63,7 +84,8 @@ def _hold(relay, exit_sustained=True, duration_s=30, recover_s=15.0):
                             recover_clean_s=0.005, reset_gap_s=0.005,
                             exit_sustained=exit_sustained,
                             interval_s=0.001, latency_threshold_ms=500,
-                            duration_s=duration_s)
+                            duration_s=duration_s, clock=relay.clock)
+    _on_virtual_time(ctl, relay.clock)
     actions = []
     ctl._emit = lambda sig, action, force=False: actions.append(action)
     return ctl, state, actions
