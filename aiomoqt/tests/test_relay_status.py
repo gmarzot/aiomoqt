@@ -597,6 +597,36 @@ async def test_viewer_loss_excludes_spurious(relay_tables, tmp_path, monkeypatch
 
 
 @requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("report", [{"cc_state": 0x10003, "cc_param": 2_240_000}, {}],
+                         ids=["reported", "absent"])
+async def test_sessions_carry_the_congestion_controllers_report(
+        relay_tables, tmp_path, monkeypatch, use_quic, report):
+    # aiopquic's path_quality() cc_state and cc_param, null on a build without them.
+    real = relay._path_quality
+
+    def observed(session):
+        pq = {k: v for k, v in real(session).items() if k not in ("cc_state", "cc_param")}
+        return {**pq, **report}
+    monkeypatch.setattr(relay, "_path_quality", observed)
+    async with _relay(free_udp_port(), use_quic, 22) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        snap = await _delivery_window(status)
+        rows = relay._sessions_report()["sessions"]
+    want = (report.get("cc_state"), report.get("cc_param"))
+    assert len(snap["sessions"]) == 2 and len(rows) == 2, (snap["sessions"], rows)
+    for row in (*snap["sessions"], *rows):
+        assert (row["cc_state"], row["cc_param"]) == want, row
+
+
+@requires_certs
 async def test_publishing_subscriber_reports_no_loss(relay_tables, tmp_path,
                                                      monkeypatch):
     # One loss count per connection: a session that publishes and subscribes
