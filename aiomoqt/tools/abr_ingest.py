@@ -217,25 +217,28 @@ async def _accept(args, stack: contextlib.AsyncExitStack):
 
 
 _NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
-_SOURCE_POLL_S = 0.2
+_SOURCE_RETRY_S = (0.2, 5.0)  # first and longest wait between tries
 
 
 async def _subscribe_source(args, session, on_frame, on_catalog):
     """The source's MediaSubscriber and catalog. With --source, waits up
-    to the setup timeout for a source not yet published on the relay."""
+    to the setup timeout for a source not yet published on the relay,
+    retrying at doubling intervals."""
     timeout = _cli.setup_timeout(args)
     deadline = time.monotonic() + timeout
     sub = MediaSubscriber(
         session, args.namespace, on_frame=on_frame, on_catalog=on_catalog,
         track_filter=lambda t: t.packaging == PACKAGING_LOC)
+    wait, longest = _SOURCE_RETRY_S
     while True:
         try:
             return sub, await sub.start(timeout=timeout)
         except MOQTRequestError as e:
             if (not args.source or e.error_code not in _NO_SOURCE
-                    or time.monotonic() > deadline):
+                    or time.monotonic() >= deadline):
                 raise
-        await asyncio.sleep(_SOURCE_POLL_S)
+        await asyncio.sleep(min(wait, max(0.0, deadline - time.monotonic())))
+        wait = min(wait * 2, longest)
 
 
 def _video_entry(catalog: Catalog, name: Optional[str]) -> CatalogTrack:

@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `abr_ingest --source` retries a source not yet published on the relay at doubling intervals, from 0.2 s up to 5 s, instead of every 0.2 s; a ladder waiting on a missing source sent about five SUBSCRIBEs a second.
 - `abr_ingest --input URL` reads the source with cymedia instead of from a MoQT session: a file, or a live SRT, RTMP, RTSP or HLS input, published as tracks `video` and `audio` with the ladder. `--input-option KEY=VALUE` passes libavformat options. The `abr` extra takes cymedia 0.1.2 or later, which added `Source`.
 - `abr_ingest --head-trace` logs, per relay, each video group's first object: when it was written, when its stream opened and when its bytes went into packets, with the connection's cwin, bytes in flight, pacing rate, RTT and losses. `PublishedTrack.trace_heads` turns it on for any track.
 - Session admission with Common Access Tokens: `--auth-key KID:SECRET` makes a tool present a broad, non-expiring CAT in SETUP and makes aiomoqt-relay require one and, from d16, check each request against its scopes; the format is the one moqx verifies.
