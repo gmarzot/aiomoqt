@@ -4613,6 +4613,8 @@ def _install_fetch_sink(pub) -> None:
 
 # Relay-wide FETCH payload bytes by source, including tracks with no state.
 _fetch_bytes = {"cache": 0, "upstream": 0}
+# Relay-wide FETCHes served, ended tracks and tracks with no state included.
+_fetch_count = 0
 
 
 def _counted_fetch(objs, track, source):
@@ -4702,6 +4704,7 @@ async def _on_fetch(session, msg):
     """FETCH (§10.12) served from the track's recent-object cache, or
     from the publisher when the range predates it. A joining FETCH is
     resolved against its subscription and served the same way."""
+    global _fetch_count
     # A joining FETCH names no track: both come from its subscription.
     ns, track_name = _ns_tuple(msg.namespace), msg.track_name
     _watch_session(session, ns or None)
@@ -4757,6 +4760,7 @@ async def _on_fetch(session, msg):
     have_cache = live and track.cache_covers(start) and not gapped
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
+    up_keys: set = set()
     props = track.properties if track is not None else {}
     end_of_track = 0
     if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
@@ -4791,11 +4795,13 @@ async def _on_fetch(session, msg):
             objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                      o.extensions, o.publisher_priority, o.status)
                     for o in upstream]
+            up_keys = {(o[0], o[2]) for o in objs}
             if gapped and track.cache_covers(start):
                 objs = _merged(objs, track.cached_range(start, end))
             end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
             props = dict(getattr(up_ok, "track_extensions", None) or {})
             source = "upstream"
+    _fetch_count += 1
     if track is not None:
         track._fetches += 1
     if track_name == CATALOG_TRACK:
@@ -4833,8 +4839,11 @@ async def _on_fetch(session, msg):
         msg.request_id, _counted_fetch(objs, track, source),
         group_order=int(order),
         stream_priority=_stream_band(session, objs[0][5] if objs else None))
+    n_up = sum((o[0], o[2]) in up_keys for o in objs) if up_keys else 0
+    size = sum(len(o[3] or b"") for o in objs)
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
-                f"{len(objs)} object(s) {start}..{last} from {source}")
+                f"{len(objs)} object(s) {start}..{last}: {len(objs) - n_up} "
+                f"from cache, {n_up} upstream, {size} B")
 
 
 async def _on_subscribe_namespace(session, msg):
@@ -5708,7 +5717,7 @@ class _Status:
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
             "shed_bytes": self._shed, "lane_bytes": _lane_bytes,
-            "fetches": sum(r["fetches"] for _, r in tracks),
+            "fetches": _fetch_count,
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
             "cache_efficiency": _cache_efficiency(),
