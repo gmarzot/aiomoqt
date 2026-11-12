@@ -14,6 +14,25 @@ from aiomoqt.utils import workers
 from aiomoqt.utils.stats import TrackStats
 
 
+class Clock:
+    """Virtual time, advanced one tick per controller tick."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def _on_virtual_time(ctl, clock):
+    """Run ctl's ticks on clock, so decisions do not depend on the host's speed."""
+    async def tick():
+        clock.t += ctl.tick_s
+        await asyncio.sleep(0)
+        return ctl.state.stop.is_set()
+    ctl._wait_tick = tick
+
+
 class FakeRelay:
     """A subs actuator whose bursts pass per ok(b, i) for the i-th trial,
     with watcher p90 per p90(b, ticks since the burst)."""
@@ -28,6 +47,7 @@ class FakeRelay:
         self.eligible_total = pool
         self.max_level, self.level = 20.0, 0.0
         self.tried, self.ticks = [], 0
+        self.clock = Clock()
 
     async def apply(self, level):
         self.level = float(level)
@@ -42,7 +62,7 @@ class FakeRelay:
     def start_trial(self, b):
         self.tried.append(b)
         self.ticks = 0
-        return time.monotonic()
+        return self.clock()
 
     def trial_view(self):
         b = self.tried[-1]
@@ -52,7 +72,7 @@ class FakeRelay:
     async def observe(self):
         self.ticks += 1
         p90 = self.p90(self.tried[-1] if self.tried else 0, self.ticks)
-        return ab.Signal(t=time.monotonic(), level=self.level, latency_mean_ms=p90,
+        return ab.Signal(t=self.clock(), level=self.level, latency_mean_ms=p90,
                          latency_p90_ms=p90, loss_pct=0, shortfall=False,
                          target_mbps=1, tx_mbps=1, rx_mbps=1)
 
@@ -62,7 +82,8 @@ def _ctl(relay, b0=4, join_max=None, duration_s=30):
     ctl = ab.JoinSearchController(relay, state, b0=b0, join_max=join_max,
                                   join_bound_ms=1000, trial_gap_s=0.003, base_s=0.005,
                                   interval_s=0.001, latency_threshold_ms=500,
-                                  duration_s=duration_s)
+                                  duration_s=duration_s, clock=relay.clock)
+    _on_virtual_time(ctl, relay.clock)
     ctl.RESET_TIMEOUT_S = 0.05
     ctl._emit = lambda sig, action, force=False: None
     return ctl, state
