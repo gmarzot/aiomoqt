@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `abr_ingest --input URL` reads the source with cymedia instead of from a MoQT session: a file, or a live SRT, RTMP, RTSP or HLS input, published as tracks `video` and `audio` with the ladder. `--input-option KEY=VALUE` passes libavformat options. The `abr` extra takes cymedia 0.1.2 or later, which added `Source`.
 - `abr_ingest --packaging cmaf` keeps audio tfdt on the source timeline: it steps by each frame's samples and drops a frame that arrives behind the last one, so a late frame after a gap no longer stretches every later audio object to the gap's length.
 - The `abr` extra takes cymedia 0.1.0 or later, so installing it no longer needs pre-releases allowed.
 - adaptive_bench's BW mode reads its receive rate over the window each subscriber report covers, so a late report no longer doubles it and silence after a burst lowers it, and gives loss as lost / (received + lost) instead of lost / received. Objects from groups already pruned are counted without recreating loss state.

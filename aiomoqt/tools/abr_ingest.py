@@ -12,6 +12,13 @@ dials (bump in the wire). pub_media announces with --pub-ns:
 the setup timeout for it to be published; publishing back to that same
 relay needs another namespace (--out-ns).
 
+--input URL reads the source with cymedia: a file, or a live SRT, RTMP,
+RTSP or HLS input, as tracks video and audio. --input-option passes
+libavformat options; the ingester ends when the input does:
+
+  python -m aiomoqt.tools.abr_ingest -N live/x moqt://relay:4433 \\
+      --input 'srt://0.0.0.0:9000?mode=listener'
+
 The video track (-T; default the catalog's first LOC video track) must be
 H.264. Every LOC track passes through unchanged. The rungs, H.264 or AV1
 (--codec), are encoded from the video by cymedia (uv pip install 'aiomoqt[abr]'), keep its group and
@@ -40,8 +47,8 @@ from typing import Dict, List, Optional, Set, Tuple
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
 from aiomoqt.media.abr import (
-    CODECS, DEFAULT_RUNGS, AbrLadder, DelayMeter, Rung, frame_rate, ladder_catalog,
-    quantiles_ms, rungs_below,
+    CODECS, DEFAULT_RUNGS, AbrLadder, DelayMeter, Rung, SourceInput, frame_rate,
+    ladder_catalog, quantiles_ms, rungs_below,
 )
 from aiomoqt.media.broadcast import MediaSubscriber
 from aiomoqt.media.catalog import (
@@ -76,6 +83,13 @@ _SHUTDOWN_DRAIN_S = 2.0
 EXIT_UNAVAILABLE = 69
 
 
+def _option(value: str) -> Tuple[str, str]:
+    key, sep, val = value.partition('=')
+    if not key or not sep:
+        raise argparse.ArgumentTypeError(f"{value!r}: KEY=VALUE")
+    return key, val
+
+
 def _rung(value: str) -> Rung:
     try:
         return Rung.parse(value)
@@ -92,6 +106,13 @@ def parse_args(argv=None):
     parser.add_argument('--source', metavar='URL', type=_cli.endpoint_url,
                         help='Subscribe the source from this relay instead '
                              'of listening for its publisher')
+    parser.add_argument('--input', metavar='URL',
+                        help='Read the source with cymedia instead: a file, '
+                             'or a live SRT, RTMP, RTSP or HLS input')
+    parser.add_argument('--input-option', metavar='KEY=VALUE', type=_option,
+                        action='append',
+                        help='A libavformat option for --input, e.g. listen=1 '
+                             'for an RTMP server; repeat for each')
     _cli.add_identity(parser, namespace='live/abr')
     parser.add_argument('--out-ns', metavar='NS',
                         help='Namespace to publish under (default: -N)')
@@ -129,11 +150,15 @@ def parse_args(argv=None):
     if args.source and (args.quic or args.wt):
         parser.error('--source dials the source and -Q/-W listen for it: '
                      'pick one')
+    if args.input and (args.source or args.quic or args.wt):
+        parser.error('--input reads the source itself: no --source or -Q/-W')
+    if args.input_option and not args.input:
+        parser.error('--input-option needs --input')
     if args.no_ladder and args.rung:
         parser.error('--no-ladder takes no --rung')
     if args.rung and len({r.name for r in args.rung}) < len(args.rung):
         parser.error('two rungs of one height would share a track name')
-    if not args.source and not (args.cert and args.key):
+    if not (args.source or args.input) and not (args.cert and args.key):
         parser.error('listening needs --cert and --key, or certs/')
     return args
 
@@ -631,11 +656,6 @@ async def run(args) -> int:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop.set)
     async with contextlib.AsyncExitStack() as stack:
-        if args.source:
-            print(f"  source: {args.source} '{args.namespace}'")
-            source = await _dial(args, args.source, stack)
-        else:
-            source = await _accept(args, stack)
         ingest: Optional[_Ingest] = None
 
         def on_frame(name, frame, group_id, object_id):
@@ -646,9 +666,28 @@ async def run(args) -> int:
             if ingest is not None:
                 ingest.on_catalog(catalog)
 
-        sub, catalog = await _subscribe_source(args, source, on_frame,
-                                               on_catalog)
+        if args.input:
+            print(f"  input: {args.input}")
+            try:
+                source = await SourceInput.open(
+                    args.input, dict(args.input_option or ()),
+                    timeout=_cli.setup_timeout(args))
+            except (OSError, ValueError, ImportError, asyncio.TimeoutError) as e:
+                print(f"  error: {args.input}: {str(e) or type(e).__name__}")
+                return EXIT_UNAVAILABLE
+            stack.callback(source.close)
+            sub, catalog = source, source.catalog
+        else:
+            if args.source:
+                print(f"  source: {args.source} '{args.namespace}'")
+                source = await _dial(args, args.source, stack)
+            else:
+                source = await _accept(args, stack)
+            sub, catalog = await _subscribe_source(args, source, on_frame,
+                                                   on_catalog)
         ingest = _Ingest(args, sub, catalog)
+        if args.input:
+            source.start(on_frame)
         print(f"  source tracks: {', '.join(sub.tracks)}; video "
               f"'{ingest.video.name}' {ingest.video.width}x"
               f"{ingest.video.height}")
@@ -678,7 +717,9 @@ async def run(args) -> int:
                 ingest.report()
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-            if any(c.done() for c in closed):
+            if args.input and closed[0].done():
+                print("  the input ended; stopping")
+            elif any(c.done() for c in closed):
                 print("  a session closed; stopping")
             for w in waiters:
                 w.cancel()
