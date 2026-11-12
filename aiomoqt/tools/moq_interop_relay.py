@@ -5666,6 +5666,9 @@ class _Status:
                 "lost_packets": pq.get("lost"),
                 "timer_losses": pq.get("timer_losses"),
                 "spurious_losses": pq.get("spurious_losses"),
+                # The congestion controller's own report (aiopquic path_quality()).
+                "cc_state": pq.get("cc_state"),
+                "cc_param": pq.get("cc_param"),
                 "namespaces": _session_namespaces(s),
                 "subscriptions": held_subs[id(s)],
                 "dgram_drops": _dgram_drops.get(id(s), 0),
@@ -5977,7 +5980,8 @@ def _sent_fields(d) -> dict:
 # bytes/s, packets).
 _PATH_QUALITY_KEYS = ("rtt", "rtt_min", "rtt_max", "cwin", "bytes_in_transit",
                       "pacing_rate", "sent", "lost", "timer_losses",
-                      "spurious_losses", "bytes_sent", "bytes_received")
+                      "spurious_losses", "bytes_sent", "bytes_received",
+                      "cc_state", "cc_param")
 
 
 def _sessions_report() -> dict:

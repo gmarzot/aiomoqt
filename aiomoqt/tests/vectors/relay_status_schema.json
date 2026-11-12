@@ -742,6 +742,8 @@
   ".sessions[].addr": [
    "string"
   ],
+  ".sessions[].cc_param": [],
+  ".sessions[].cc_state": [],
   ".sessions[].cwin_bytes": [
    "int"
   ],
