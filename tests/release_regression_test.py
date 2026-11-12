@@ -302,11 +302,12 @@ def _loopback_adaptive_mp(log_dir: Path, draft: int) -> tuple[str, str]:
     log = log_dir / f"{slug}.log"
     # High-water counts only intervals past warm-up with no shortfall, so
     # -t 20 leaves several chances; one slow sample on a loaded runner must
-    # not fail the suite. _run's timeout is the backstop. No external
+    # not fail the suite. It starts low because it checks the start path,
+    # not capacity. _run's timeout is the backstop. No external
     # `timeout` binary (absent on macOS runners — it's `gtimeout` there).
     cmd = [sys.executable, "-m", "aiomoqt.tools.adaptive_bench",
            "--mp", "--draft", str(draft),
-           "-P", "1", "-s", "4096", "--start-mbps", "20",
+           "-P", "1", "-s", "4096", "--start-mbps", "5",
            "--step-mbps", "10", "--max-mbps", "60", "--interval", "2",
            "-t", "20", "-k"]
     rc, _ = _run(cmd, log, 45)
