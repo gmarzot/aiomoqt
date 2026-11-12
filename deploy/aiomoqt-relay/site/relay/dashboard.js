@@ -53,29 +53,31 @@ const fetchWin = [];
 
 function trackFetches(s) {
   const T = s.totals || {};
-  const p = {t: s.generated, n: T.fetches || 0, c: T.fetch_cache_bytes || 0,
-             u: T.fetch_upstream_bytes || 0};
-  const last = fetchWin[fetchWin.length - 1];
+  const p = {t: s.generated, r: (s.relay || {}).started, n: T.fetches || 0,
+             c: T.fetch_cache_bytes || 0, u: T.fetch_upstream_bytes || 0, k: 0};
+  let last = fetchWin[fetchWin.length - 1];
   if (last && p.t === last.t) return;
-  if (last && (p.n < last.n || p.t < last.t)) fetchWin.length = 0;  // relay restarted
+  if (last && (p.r !== last.r || p.t < last.t)) fetchWin.length = 0;  // relay restarted
+  last = fetchWin[fetchWin.length - 1];
+  // T.fetches sums open tracks only and falls when one ends: count its rises.
+  if (last) p.k = last.k + Math.max(0, p.n - last.n);
   fetchWin.push(p);
   while (fetchWin.length > 1 && p.t - fetchWin[0].t > WIN_S) fetchWin.shift();
 }
 
 // Over the window: hit % of FETCH bytes, FETCH count, span in minutes. Under a minute of
-// snapshots, since start, with min null.
+// snapshots, the byte share since start, with n and min null.
 function fetchWindow(T) {
   const a = fetchWin[0], b = fetchWin[fetchWin.length - 1];
   if (!a || b.t - a.t < 60) {
-    return {hit: none(T.cache_efficiency) ? null : 100 * T.cache_efficiency,
-            n: T.fetches || 0, min: null};
+    return {hit: none(T.cache_efficiency) ? null : 100 * T.cache_efficiency, n: null, min: null};
   }
   const c = b.c - a.c, all = c + b.u - a.u;
-  return {hit: all > 0 ? 100 * c / all : null, n: b.n - a.n, min: Math.round((b.t - a.t) / 60)};
+  return {hit: all > 0 ? 100 * c / all : null, n: b.k - a.k, min: Math.round((b.t - a.t) / 60)};
 }
 
 // Ring tone: high hit is good; under 10 FETCHes it says too little to colour.
-const hitTone = (w) => none(w.hit) || w.n < 10 ? 'dim'
+const hitTone = (w) => none(w.hit) || none(w.n) || w.n < 10 ? 'dim'
   : w.hit >= 80 ? 'ok' : w.hit >= 50 ? 'warn-level' : 'high';
 
 const count = (n) => n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
@@ -91,7 +93,7 @@ function cacheDetail(c, T, w) {
   const since = none(T.cache_efficiency) ? 'no FETCH yet'
     : `FETCH ${Math.round(100 * T.cache_efficiency)}% from cache (${fmt.bytes(T.fetch_cache_bytes)}`
       + ` of ${fmt.bytes((T.fetch_cache_bytes || 0) + (T.fetch_upstream_bytes || 0))})`
-      + `, ${fmt.plural(T.fetches, 'fetch', 'fetches')} since start`;
+      + ' since start';
   return [`${mibText(T.cache_bytes)} of ${Math.round(mib(c.budget))} MiB held;`
             + ' at the budget it drops the oldest group of the least recently used track',
           recent, since, `per track ${track}`, fmt.plural(T.cache_evictions, 'eviction')]
@@ -184,7 +186,7 @@ function renderGauges(s) {
   drawGauge($('gauge-cache'), pct(T.cache_bytes, c.budget), {
     pct: w.hit, tone: hitTone(w),
     lines: [none(w.hit) ? 'hit —' : `hit ${Math.round(w.hit)}%`,
-            none(w.min) ? `${count(w.n)} total` : `${count(w.n)}/${w.min}m`]});
+            none(w.min) ? 'uptime' : `${count(w.n)}/${w.min}m`]});
   fig.title = cacheDetail(c, T, w);
 }
 
