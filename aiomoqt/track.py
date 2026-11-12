@@ -37,8 +37,8 @@ from .types import (
     SCHEDULING, to_stream_priority,
 )
 from .delivery import (
-    PUBLISHER_LANE_BYTES, DatagramTooLarge, FanoutDelivery, ObjectHistory,
-    StreamMapping, SubgroupDelivery, properties_charge,
+    PUBLISHER_LANE_BYTES, DatagramTooLarge, FanoutDelivery, HeadTrace,
+    ObjectHistory, StreamMapping, SubgroupDelivery, properties_charge,
 )
 from .messages import (
     FetchHeader, LocationFilter, MOQTMessage, ObjectDatagram, PublishOk,
@@ -689,6 +689,9 @@ class PublishedTrack(Track):
         self.stream_scheduling = stream_scheduling
         # Bytes each peer's send lane holds before it sheds groups.
         self.lane_bytes = lane_bytes
+        # Log each group's first object per peer (delivery.HeadTrace) for
+        # produce() tracks; set before the first peer.
+        self.trace_heads = False
         self.auth_token = auth_token
         self.immutable_properties = _checked_immutable(immutable_properties)
         self.track_properties = _checked_immutable(track_properties,
@@ -822,6 +825,8 @@ class PublishedTrack(Track):
             self._out.name = self.fqtn
             self._out.on_write = self._on_produced
             self._out.on_sent = self._on_sent
+            if self.trace_heads:
+                self._out.head_trace = HeadTrace(self.trackname)
         self._out.drop_session(sub.session)
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
