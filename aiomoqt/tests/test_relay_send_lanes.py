@@ -660,17 +660,23 @@ async def test_a_viewer_past_the_lag_limit_sheds_every_track(
         ticker = asyncio.create_task(tick())
         try:
             await asyncio.sleep(3.0)
+            # A slow runner can take longer for the audio to fall behind.
+            await _until(lambda: d_audio.lane.sheds >= 1, timeout=7.0)
         finally:
             ticker.cancel()
         lane = d_slow.lane
         sent, sheds, bound = track._objects_in, lane.sheds, lane.bound
         shed_total = track.shed_bytes()
-        audio_sheds = d_audio.lane.sheds
+        a = d_audio.lane
+        audio_sheds = a.sheds
+        audio_state = dict(objects=a.objects, bytes=a.bytes, queued=len(a.items),
+                           tx_bytes=a.tx_bytes, late=a.late, done=a.done,
+                           received=slow_audio.count)
 
     assert bound == 0, bound
     assert sheds >= 1 and shed_total > 0, (sheds, shed_total)
     # The audio on the same slow session is as far behind: it sheds too.
-    assert audio_sheds >= 1
+    assert audio_sheds >= 1, audio_state
     assert slow_audio.count
     assert fast.count >= sent - _RATE, (fast.count, sent)
     assert slow.count
