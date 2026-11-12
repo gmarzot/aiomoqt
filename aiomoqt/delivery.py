@@ -58,6 +58,20 @@ def _tx_used(session):
     return getattr(quic, "tx_data_ring_used", None) or _no_tx
 
 
+def _tx_sent(session):
+    """The session's per-stream count of bytes taken into packets."""
+    quic = getattr(session, "_quic", None)
+    return getattr(quic, "tx_sent_bytes", None) or _no_tx
+
+
+def _path_quality(session) -> dict:
+    fn = getattr(getattr(session, "_quic", None), "path_quality", None)
+    try:
+        return (fn() if fn is not None else None) or {}
+    except Exception:
+        return {}
+
+
 def _cancelling() -> bool:
     """True when the running task itself is being cancelled."""
     task = asyncio.current_task()
@@ -402,6 +416,75 @@ def _cache(encoded: list, key, extensions, data: bytes) -> None:
         encoded.append((key, extensions, data))
 
 
+class HeadTrace:
+    """Logs each group's first object once per peer: when the track wrote
+    it, when its stream opened with it and when the transport took its
+    bytes into packets, with the connection's cwin, bytes in flight,
+    pacing rate, RTT and losses at the open and at that pickup. One INFO
+    line on aiomoqt.data per group and peer."""
+
+    POLL_S = 0.005
+    GIVE_UP_S = 10.0
+
+    def __init__(self, name: str):
+        self.name = name
+        self._made: Dict[int, float] = {}
+
+    def produced(self, group_id: int) -> None:
+        made = self._made
+        made[group_id] = time.monotonic()
+        if len(made) > 16:
+            del made[next(iter(made))]
+
+    def opened(self, session, group_id: int, sid: int, size: int) -> None:
+        """Stream `sid` opened with `size` bytes carrying the head."""
+        opened = time.monotonic()
+        made = self._made.get(group_id, opened)
+        before = _path_quality(session)
+        sent = _tx_sent(session)
+        loop = asyncio.get_running_loop()
+
+        def check() -> None:
+            now = time.monotonic()
+            if sent(sid) >= size:
+                self._log(session, group_id, size, made, opened, now, before,
+                          _path_quality(session))
+            elif now - opened < self.GIVE_UP_S:
+                loop.call_later(self.POLL_S, check)
+            else:
+                data_log.info(f"head {self.name} g{group_id} to "
+                              f"{_peer(session)}: {size} B not taken into "
+                              f"packets within {self.GIVE_UP_S:g} s")
+
+        check()
+
+    def _log(self, session, group_id, size, made, opened, now, before,
+             after) -> None:
+        def kb(q, key):
+            v = q.get(key)
+            return "?" if v is None else f"{v / 1024:.0f}"
+
+        wall = time.time() - (now - made)
+        stamp = (time.strftime("%H:%M:%S", time.gmtime(wall))
+                 + f".{int(wall * 1000) % 1000:03d}Z")
+        pacing, rtt = after.get("pacing_rate"), after.get("rtt")
+        data_log.info(
+            f"head {self.name} g{group_id} to {_peer(session)}: {size} B "
+            f"made {stamp}, stream open +{(opened - made) * 1e3:.1f} ms, "
+            f"in packets +{(now - made) * 1e3:.1f} ms; cwin "
+            f"{kb(before, 'cwin')}->{kb(after, 'cwin')} KB, in flight "
+            f"{kb(before, 'bytes_in_transit')}->"
+            f"{kb(after, 'bytes_in_transit')} KB, pacing "
+            f"{'?' if pacing is None else f'{pacing * 8 / 1e6:.1f}'} Mbps, "
+            f"rtt {'?' if rtt is None else f'{rtt / 1e3:.1f}'} ms, lost "
+            f"{before.get('lost', '?')}->{after.get('lost', '?')}")
+
+
+def _peer(session) -> str:
+    addr = getattr(session, "_peer_addr", None)
+    return f"{addr[0]}:{addr[1]}" if addr else "peer"
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -449,6 +532,8 @@ class SubgroupDelivery:
         # stream_id -> group_id of FINed streams the transport may still
         # hold bytes of; kept only behind a lane.
         self._tx_streams: dict = {}
+        # Told of each PER_GROUP stream opened at a group start.
+        self.head_trace: Optional[HeadTrace] = None
 
     @property
     def _prof(self):
@@ -617,6 +702,9 @@ class SubgroupDelivery:
                     if self._epoch != epoch:
                         self.session.stream_reset(sid, StreamResetCode.CANCELLED)
                         return False
+                    if group_start and self.head_trace is not None:
+                        self.head_trace.opened(self.session, group_id, sid,
+                                               len(first))
                     if end_of_group:
                         self._ended(sid, group_id)
                     else:
@@ -1389,6 +1477,8 @@ class FanoutDelivery:
         self._group: Optional[int] = None
         # Some lane has a delivery timeout: objects are stamped when made.
         self._timed = False
+        # Given to each delivery added after it is set.
+        self.head_trace: Optional[HeadTrace] = None
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -1405,6 +1495,7 @@ class FanoutDelivery:
         lane.on_fatal = self._fail
         lane.on_deadline = self._retime
         delivery.lane = lane
+        delivery.head_trace = self.head_trace
         if joining and self._group is not None:
             lane.floor = self._group + 1
         self.lanes = [*self.lanes, lane]
@@ -1465,6 +1556,8 @@ class FanoutDelivery:
             raise self.error
         if self.on_write is not None:
             self.on_write(group_id, object_id, payload, extensions)
+        if group_start and self.head_trace is not None:
+            self.head_trace.produced(group_id)
         lanes = self.lanes
         # One encoding per header state, shared by the lanes in it; it
         # lives as long as the item is queued.

@@ -27,6 +27,10 @@ encoder's share. --no-ladder measures the hand-off alone.
 
 --packaging cmaf publishes every output track as CMSF: one CMAF chunk
 per object, led by a prft, with the CMAF header in the catalog.
+
+--head-trace logs, per relay, each video group's first object: when it
+was written, its stream opened and its bytes went into packets, with the
+connection's cwin, bytes in flight, pacing rate, RTT and losses.
 """
 import argparse
 import asyncio
@@ -113,6 +117,12 @@ def parse_args(argv=None):
                         default=PACKAGING_LOC,
                         help='Output packaging (default: loc); cmaf = CMSF, '
                              'one CMAF chunk per object')
+    parser.add_argument('--head-trace', action='store_true',
+                        help="Log each video group's first object per relay: "
+                             "when it was written, its stream opened and its "
+                             "bytes went into packets, with the connection's "
+                             "cwin, bytes in flight, pacing rate, RTT and "
+                             "losses (INFO on aiomoqt.data)")
     parser.add_argument('--cert', default=CERT,
                         help='TLS certificate for the listener')
     parser.add_argument('--key', default=KEY,
@@ -520,6 +530,8 @@ class _Ingest:
             track.track_properties = dict(props) or None
             tracks.append(track)
         for track in tracks:
+            track.trace_heads = (self.args.head_trace
+                                 and track.media_kind == 'video')
             self.pub.add_track(track)
         await self.pub.start(forward=0)
         for track in tracks:
@@ -624,6 +636,8 @@ class _Ingest:
 
 
 async def run(args) -> int:
+    if args.head_trace:
+        args.log = ['data=info', *(args.log or ())]
     _cli.apply_logging(args)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
