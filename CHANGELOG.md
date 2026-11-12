@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `abr_ingest --head-trace` logs, per relay, each video group's first object: when it was written, when its stream opened and when its bytes went into packets, with the connection's cwin, bytes in flight, pacing rate, RTT and losses. `PublishedTrack.trace_heads` turns it on for any track.
 - `abr_ingest --packaging cmaf` keeps audio tfdt on the source timeline: it steps by each frame's samples and drops a frame that arrives behind the last one, so a late frame after a gap no longer stretches every later audio object to the gap's length.
 - The `abr` extra takes cymedia 0.1.0 or later, so installing it no longer needs pre-releases allowed.
 - adaptive_bench's BW mode reads its receive rate over the window each subscriber report covers, so a late report no longer doubles it and silence after a burst lowers it, and gives loss as lost / (received + lost) instead of lost / received. Objects from groups already pruned are counted without recreating loss state.
