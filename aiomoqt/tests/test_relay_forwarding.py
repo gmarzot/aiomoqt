@@ -9,16 +9,18 @@ import asyncio
 import contextlib
 import inspect
 import sys
+from types import SimpleNamespace
 
 import pytest
 from aiopquic._binding._transport import TransportContext
 from aiopquic.asyncio.server import serve as aiopquic_serve
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.delivery import SendLane
 from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.types import (
     FilterType, ForwardingPreference, MOQTMessageType, MOQTRequestError,
-    RequestErrorCode, SubscribeDoneCode,
+    ObjectStatus, RequestErrorCode, SubscribeDoneCode,
 )
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.tools import moq_interop_relay as relay
@@ -571,6 +573,44 @@ async def test_published_tracks_reach_subscribers_at_d20_and_d22(draft,
             await asyncio.sleep(0.02)
         assert all(objects[n] for n in _SIZES), objects
         assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+@pytest.mark.parametrize("write_through", [True, False],
+                         ids=["through", "queued"])
+async def test_two_tracks_on_one_session_with_and_without_write_through(
+        write_through, use_quic, monkeypatch):
+    monkeypatch.setattr(SendLane, "write_through", write_through)
+    inline = []
+    real = relay._RelayDelivery.send_nowait
+
+    def counted(self, item):
+        sent = real(self, item)
+        if sent:
+            inline.append(item[5])
+        return sent
+    monkeypatch.setattr(relay._RelayDelivery, "send_nowait", counted)
+    port = _BASE_PORT + 180 + 2 * (not write_through) + (not use_quic)
+    async with _flowing(port, use_quic) as subscriber:
+        rx, objects = await subscriber()
+        for name in _SIZES:
+            await rx.subscribe(_FLOW_NS, name, forward=1, wait_response=True)
+        for _ in range(250):
+            if all(len(objects[n]) >= 4 * _GROUP for n in _SIZES):
+                break
+            await asyncio.sleep(0.02)
+        for name in _SIZES:
+            got = objects[name]
+            assert len(got) >= 4 * _GROUP, objects
+            assert len(set(got)) == len(got), got
+            groups = {}
+            for gid, oid in got:
+                groups.setdefault(gid, []).append(oid)
+            assert all(o == sorted(o) for o in groups.values()), got
+        assert rx._close_err is None
+    assert bool(inline) is write_through, inline
 
 
 _HAS_WORKERS = (sys.platform.startswith("linux")
@@ -1351,6 +1391,162 @@ async def test_a_restarted_publisher_is_not_failed_over_to(draft, use_quic):
         _reset_relay_state()
 
 
+class _ProduceClocked(PublishedTrack):
+    """produce() on the shared clock, one object per group; `gate` holds
+    it at a group boundary. end() sends End of Track."""
+
+    def __init__(self, *args, epoch, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch = epoch
+        self.gate = asyncio.Event()
+        self.gate.set()
+        self.parked = asyncio.Event()
+
+    async def produce(self, out):
+        loop = asyncio.get_running_loop()
+        last = -1
+        while True:
+            if not self.gate.is_set():
+                self.parked.set()
+            await self.gate.wait()
+            gid = max(last + 1,
+                      int((loop.time() - self.epoch) / _MP_PERIOD) + 1)
+            await asyncio.sleep(max(0.0, self.epoch + gid * _MP_PERIOD
+                                    - loop.time()))
+            await out.write(gid, 0, b"frame", group_start=True,
+                            end_of_group=True)
+            last = gid
+
+
+async def _eot_publisher(stack, port, use_quic, draft, epoch):
+    client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=draft)
+    s = await stack.enter_async_context(client.connect())
+    await s.client_session_init()
+    tracks = {n: _ProduceClocked(s, _MP_NS, n, epoch=epoch)
+              for n in _MP_TRACKS}
+    for t in tracks.values():
+        t.attach()
+    await s.publish_namespace(namespace=_MP_NS, wait_response=True)
+    return tracks
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_no_failover_past_a_forwarded_end_of_track(draft, use_quic):
+    # The serving publisher's End of Track ends the track downstream: a
+    # standby still producing does not take over, and nothing follows it.
+    port = _BASE_PORT + 190 + 2 * (draft == 22) + (not use_quic)
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    epoch = asyncio.get_running_loop().time()
+    counts = {n: 0 for n in _MP_TRACKS}
+    ends = {n: [] for n in _MP_TRACKS}
+    done = {n: [] for n in _MP_TRACKS}
+    malformed = []
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            standby = await _eot_publisher(stack, port, use_quic, draft,
+                                           epoch)
+            primary = await _eot_publisher(stack, port, use_quic, draft,
+                                           epoch)
+            rx = await stack.enter_async_context(MOQTClient(
+                "localhost", port, path="/", use_quic=use_quic,
+                verify_tls=False, supported_drafts=draft).connect())
+            await rx.client_session_init()
+            seen_malformed = rx._malformed_track
+
+            def mark(alias, reason, stream_id=None):
+                malformed.append((alias, reason))
+                return seen_malformed(alias, reason, stream_id)
+            rx._malformed_track = mark
+            for name in _MP_TRACKS:
+                def received(obj, _size, _ts, gid, _sg, n=name):
+                    if obj.payload:
+                        counts[n] += 1
+                    if obj.status == ObjectStatus.END_OF_TRACK:
+                        ends[n].append((gid, obj.object_id))
+                await SubscribedTrack(
+                    rx, _MP_NS, name, on_object=received,
+                    on_done=lambda d, n=name: done[n].append(d),
+                ).subscribe(timeout=8.0)
+            assert await _until(lambda: all(
+                t is not None and len(t.standby) == 1 for t in _mp_tracks()))
+            assert await _until(lambda: min(counts.values()) >= 4)
+            for t in standby.values():
+                t.gate.clear()
+            await asyncio.wait_for(asyncio.gather(
+                *(t.parked.wait() for t in standby.values())), 3)
+            for t in primary.values():
+                t.end()
+            assert await _until(lambda: all(done.values())), (ends, done)
+            assert all(t is None for t in _mp_tracks())
+            before = dict(counts)
+            for t in standby.values():
+                t.gate.set()
+            await asyncio.sleep(10 * _MP_PERIOD)
+            assert counts == before
+            assert all(len(e) == 1 for e in ends.values()), ends
+            assert all(len(d) == 1 for d in done.values()), done
+            assert not malformed, malformed
+            for tracks in (primary, standby):
+                for t in tracks.values():
+                    t.end()
+    finally:
+        handle.close()
+        _reset_relay_state()
+
+
+def test_end_of_track_fences_standby_objects():
+    track = relay._RelayedTrack(((b"relay", b"multi"), b"video"))
+    track.attaching = True
+    track.upstream = SimpleNamespace(track_alias=1)
+    feed = relay._Feed()
+    feed.sub = SimpleNamespace(session=SimpleNamespace(), track_alias=2,
+                               largest=(6, 0), request_id=None)
+    track.standby.append(feed)
+    track._multi = True
+    end = _Obj(group_id=6, object_id=0)
+    end.status = ObjectStatus.END_OF_TRACK
+    track.on_object(end, 0, 0, 6, 0)
+    track.on_object(_Obj(group_id=7, object_id=0), 8, 0, 7, 0, feed=feed)
+    assert track.queue.qsize() == 1
+    assert not track.fail_over(track.key)
+    assert track.standby == [feed] and track.feed is None
+    track.close()
+
+
+def test_a_late_standby_cannot_repeat_a_datagram():
+    track = relay._RelayedTrack(((b"relay", b"multi"), b"audio"))
+    track.attaching = True
+    msg = ObjectDatagram(track_alias=1, group_id=1, object_id=0,
+                         publisher_priority=128, payload=b"x")
+    track.on_object(msg, 1, 0, 1, 0)
+    track.note_largest((1, 0))
+    feed = relay._Feed()
+    feed.sub = SimpleNamespace(session=SimpleNamespace(), track_alias=2,
+                               largest=(1, 0))
+    track._multi = True
+    track.on_object(msg, 1, 0, 1, 0, feed=feed)
+    assert track._objects_in == 1 and track._copies == 1
+    track.close()
+
+
+def test_one_publishers_datagram_record_keeps_two_groups():
+    track = relay._RelayedTrack(((b"relay", b"multi"), b"audio"))
+    track.attaching = True
+    for gid in range(50):
+        track.on_object(ObjectDatagram(
+            track_alias=1, group_id=gid, object_id=0,
+            publisher_priority=128, payload=b"x"), 1, 0, gid, 0)
+    assert track._dgrams == {(48, 0), (49, 0)}
+    track.close()
+
+
 def test_a_closed_track_takes_no_objects():
     track = relay._RelayedTrack(("ns", "t"))
     track.close()
@@ -1439,3 +1635,83 @@ async def test_datagram_track_is_relayed_as_datagrams(draft, use_quic):
         n: len(v) for n, v in got.items()}
     assert all(isinstance(m, ObjectDatagram) for m in got["dg"])
     assert not any(isinstance(m, ObjectDatagram) for m in got["st"])
+
+
+class _Holding(PublishedTrack):
+    """Writes two objects on one subgroup stream and holds it open."""
+
+    async def generate(self, session, track_alias):
+        from aiomoqt.messages import SubgroupHeader
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(
+            track_alias=track_alias, group_id=0, subgroup_id=0,
+            publisher_priority=200, extensions_present=True,
+            prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        for i in range(2):
+            buf = hdr.next_object(payload=b"h%d" % i, extensions=None,
+                                  object_id=i)
+            await session.stream_write_drain(sid, buf.data)
+        self._largest = (0, 1)
+        await asyncio.Event().wait()
+
+
+_CANCEL_DRAFTS = (16, 18, 22)
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", _CANCEL_DRAFTS)
+@_TRANSPORTS
+async def test_a_cancelled_subscription_has_its_open_streams_reset(
+        draft, use_quic):
+    # The subscriber leaves without STOP_SENDING its data streams; the
+    # relay still resets them, so none stays open until the session ends.
+    port = (_BASE_PORT + 200 + 2 * _CANCEL_DRAFTS.index(draft)
+            + (not use_quic))
+    names = ("video", "audio")
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def _session():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                assert s._is_wt is (not use_quic)
+                return s
+
+            pub = await _session()
+            for name in names:
+                _Holding(pub, "relay/hold", name).attach()
+            await pub.publish_namespace(namespace="relay/hold",
+                                        wait_response=True)
+            await asyncio.sleep(0.1)
+            rx = await _session()
+            stop = rx.stream_stop_sending
+            rx.stream_stop_sending = lambda sid, *a, **k: (
+                None if sid in rx._data_streams else stop(sid, *a, **k))
+            got = {n: [] for n in names}
+            oks = [await rx.subscribe(
+                "relay/hold", name, wait_response=True,
+                on_object=lambda m, *a, n=name: got[n].append(m))
+                for name in names]
+            assert await _until(lambda: all(len(v) == 2
+                                            for v in got.values())), got
+            assert len(rx._data_streams) == 2, rx._data_streams
+            for ok in oks:
+                rx.unsubscribe(ok.request_id)
+            assert await _until(lambda: not rx._data_streams), \
+                rx._data_streams
+            for name in names:
+                track = relay._tracks.get(
+                    ((b"relay", b"hold"), name.encode()))
+                assert track is None or not track._streams, track._streams
+            assert rx._close_err is None
+    finally:
+        handle.close()
+        _reset_relay_state()

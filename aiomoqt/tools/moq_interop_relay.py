@@ -42,9 +42,13 @@ Limits:
     OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
     and the subscriber's), else live objects past --lag-limit seconds,
     resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
-    the group. The same deadline at the track's input rate bounds what
-    the lane and its streams hold: past it, whole groups are shed. Past the track's MAX_CACHE_DURATION an object is neither
-    sent nor served from the cache: a request for it goes upstream.
+    the group. A subscriber whose oldest unsent live object, in the lane
+    or still in the transport, is past that deadline sheds whole groups,
+    also reset with DELIVERY_TIMEOUT; a catalog track keeps its newest.
+    Once the lanes together pass --cache-bytes, each is also held to
+    LANE_BYTES, shedding with CANCELLED. Past the track's
+    MAX_CACHE_DURATION an object is neither sent nor served from the
+    cache: a request for it goes upstream.
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
@@ -117,8 +121,8 @@ from aiomoqt.types import (
     SubscribeDoneCode,
     parse_draft_spec, to_stream_priority,
 )
-from aiomoqt.delivery import (LANE_BYTES, LANE_MIN_BYTES, LANE_STALL_S,
-                              SendLane, retained_object_bytes)
+from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
+                              retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -243,6 +247,8 @@ PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
+# Catalog track names: their send lanes never shed the newest group.
+CATALOG_TRACKS = frozenset((CATALOG_TRACK, b"catalog.json"))
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
 DEFAULT_GROUP_ORDER_PROPERTY = 0x22
@@ -264,8 +270,11 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
-# A track's input rate falls by at most this factor per lane check with input.
-IN_RATE_DECAY = 0.9
+# A lane's time behind is checked LANE_TIME_CHECKS times per deadline,
+# LANE_TIME_MIN_S to LANE_TIME_MAX_S apart.
+LANE_TIME_CHECKS = 20
+LANE_TIME_MIN_S = 0.05
+LANE_TIME_MAX_S = 0.25
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -521,16 +530,36 @@ def _budget_lanes() -> None:
 def _check_lanes() -> None:
     now = time.monotonic()
     _budget_lanes()
-    for track in list(_tracks.values()):
-        track.update_in_rate(now)
     for lane in list(_lanes):
         lane.check(now, LANE_STALL_S)
 
 
+def _time_lanes(now) -> float:
+    """Every lane's time-behind check that is due; seconds to the next."""
+    step = LANE_TIME_MAX_S
+    for lane in list(_lanes):
+        s = lane.check_time(now)
+        if s is not None and s < step:
+            step = s
+    return step
+
+
 async def _watch_lanes() -> None:
-    """Check every send lane for a stall, a few times per LANE_STALL_S."""
+    """Check each send lane's time behind when due, and every lane for a
+    stall a few times per LANE_STALL_S."""
+    step = LANE_TIME_MAX_S
+    stall_at = time.monotonic() + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
     while True:
-        await asyncio.sleep(min(STATUS_INTERVAL_S, LANE_STALL_S / 4))
+        await asyncio.sleep(step)
+        now = time.monotonic()
+        try:
+            step = _time_lanes(now)
+        except Exception:
+            step = LANE_TIME_MAX_S
+            logger.debug("relay: lane time check failed", exc_info=True)
+        if now < stall_at:
+            continue
+        stall_at = now + min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
         try:
             _check_lanes()
         except Exception:
@@ -730,6 +759,8 @@ class _RelayDelivery:
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
+            if _born is not None and self.lane is not None:
+                self.lane._wborn = _born
         if end is not None and end[5] is not None:
             track._objects_out += 1
         rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
@@ -737,6 +768,32 @@ class _RelayDelivery:
                                   start=d.start, lost=d.lost, lane=self.lane,
                                   end=None if end is None else (end[5], end[9]))
         return True if rest is None else rest
+
+    def send_nowait(self, item) -> bool | None:
+        """send(item) when it completes now: a live datagram, or an object
+        or stream end on an open stream that the transport takes. True
+        once written; None, nothing written, when it has to wait."""
+        (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
+         shape, encoded) = item
+        if not live:
+            return None
+        track, d, session = self.track, self.d, self.session
+        if not (shape.__class__ is tuple and shape and shape[0] == "DGRAM"
+                ) and ((id(session), gid, sgid) not in track._streams
+                       or (gid, sgid) in track._ends_due):
+            # A stream end queued behind leaves with the lane's last write.
+            return None
+        if track._forward_one(session, d.alias, gid, sgid, oid, payload,
+                              exts, prio, status, shape, encoded,
+                              start=d.start, lost=d.lost,
+                              nowait=True) is _NOT_SENT:
+            return None
+        if oid is not None:
+            track._objects_out += 1
+            track._bytes_out += len(payload or b"")
+            if _born is not None:
+                self.lane._wborn = _born
+        return True
 
     @staticmethod
     def ends_stream(item, nxt) -> bool:
@@ -748,8 +805,8 @@ class _RelayDelivery:
                 and item[9] not in _STREAM_ENDS
                 and not (shape and shape[0] == "DGRAM"))
 
-    def reset_below(self, floor) -> None:
-        self.track._reset_streams(self.session, floor)
+    def reset_below(self, floor, code=StreamResetCode.CANCELLED) -> None:
+        self.track._reset_streams(self.session, floor, code)
 
     def close_streams(self) -> None:
         self.track._close_streams(self.session)
@@ -768,6 +825,7 @@ class _TracedRelayDelivery(_RelayDelivery):
     """--trace-subscribers: also counts what the subscription is sent."""
 
     __slots__ = ()
+    send_nowait = None
 
     def send(self, item, end=None):
         rest = super().send(item, end)
@@ -784,10 +842,13 @@ class _TracedRelayDelivery(_RelayDelivery):
 
 
 class _RelayLane(SendLane):
-    """One subscriber's SendLane, bounded by its deadline at the track's
-    input rate, or LANE_BYTES without both or while the lanes are over
-    budget, and registered for the stall check and the status page. A
-    failed write drops the subscriber."""
+    """One subscriber's SendLane, registered for the lane checks and the
+    status page. It sheds once the oldest live object its subscriber has
+    not been sent is more than `deadline` old, counting what the
+    transport still holds of the track's streams: check_time() marks it
+    late, the next object offered confirms. By bytes, past LANE_BYTES,
+    only without a deadline or while the lanes are over budget. A failed
+    write drops the subscriber."""
 
     log = logger
     prefix = "relay: "
@@ -795,24 +856,123 @@ class _RelayLane(SendLane):
     def __init__(self, track, d):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
+        # (bytes written to the session's streams of the track, arrival
+        # time of the newest object among them), one per probe.
+        self._marks = deque()
+        # Arrival time of the newest object handed to the writer.
+        self._wborn = None
+        # Arrival time of the oldest live object held, as last read.
+        self._oldest = None
+        self._time_due = 0.0
+        # The last shed's cause: byte cap, else seconds behind; bytes held.
+        self._capped = False
+        self._behind = 0.0
+        self._held = 0
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
         self.d = d
-        self.rate = track._in_rate
+        self._catalog = track.key[1] in CATALOG_TRACKS
         _lanes.add(self)
         track._lanes.add(self)
 
     def _set_bound(self) -> None:
-        if _lanes_over_budget or self._deadline is None or self._rate <= 0:
-            super()._set_bound()
-        else:
-            self.bound = max(LANE_MIN_BYTES, int(self._rate * self._deadline))
+        # 0: no byte bound.
+        self.bound = (LANE_BYTES if _lanes_over_budget
+                      or self._deadline is None else 0)
+
+    def _written(self) -> int:
+        return self.track._tx_written.get(id(self.d.session), 0)
+
+    def _probe(self, floor) -> None:
+        super()._probe(floor)
+        if self._deadline is not None:
+            self._oldest = self._oldest_born()
+
+    def _oldest_born(self):
+        """Arrival time of the oldest live object not yet sent. The
+        transport sends a session's streams of the track oldest first, so
+        its oldest unsent byte is `tx_bytes` before the end of what was
+        written; the first mark past it gives its time, at most one probe
+        late. Else the oldest queued, None for none."""
+        written = self._written()
+        marks = self._marks
+        if self._wborn is not None and (not marks or marks[-1][0] < written):
+            marks.append((written, self._wborn))
+        unsent = written - self.tx_bytes
+        while marks and marks[0][0] <= unsent:
+            marks.popleft()
+        if self.tx_bytes and marks:
+            return marks[0][1]
+        for it in self.items:
+            if it[0].__class__ is not str and it[3] is not None and it[2]:
+                return it[3]
+        return None
+
+    def _late(self, item) -> bool:
+        """The oldest live object held is past the deadline at `item`'s
+        arrival."""
+        oldest, born = self._oldest, item[3]
+        return (oldest is not None and born is not None
+                and born - oldest > self._deadline)
+
+    def check_time(self, now) -> float | None:
+        """Mark the lane late, once due, if the oldest live object it holds
+        arrived more than `deadline` before `now`. The seconds between
+        checks, None without a deadline."""
+        deadline = self._deadline
+        if deadline is None or self.stopped:
+            self.late = False
+            return None
+        step = min(max(deadline / LANE_TIME_CHECKS, LANE_TIME_MIN_S),
+                   LANE_TIME_MAX_S)
+        if now >= self._time_due:
+            self._time_due = now + step
+            self._probe(self.floor)
+            oldest = self._oldest
+            self.late = oldest is not None and now - oldest > deadline
+        return step
+
+    def _over(self, item) -> bool:
+        held = self.bytes + self.tx_bytes
+        if self.bound and held > self.bound:
+            self._capped, self._held = True, held
+            self.cut_code = StreamResetCode.CANCELLED
+            return True
+        if not self.late or self._deadline is None or item[3] is None:
+            return False
+        self._probe(self.floor)
+        self.late = False
+        if not self._late(item):
+            return False
+        self._capped, self._held = False, self.bytes + self.tx_bytes
+        self._behind = item[3] - self._oldest
+        # Past the deadline the expiry path enforces (§8).
+        self.cut_code = StreamResetCode.DELIVERY_TIMEOUT
+        return True
+
+    def _keeps(self, item) -> bool:
+        if self._catalog:
+            return True
+        if self.bound and self.bytes + self.tx_bytes > self.bound:
+            return False
+        return self._deadline is None or not self._late(item)
+
+    def _shed_reason(self) -> str:
+        if self._capped:
+            why = (" (send lanes over --cache-bytes)" if _lanes_over_budget
+                   else "")
+            return (f"at its {self.bound}-byte cap{why}, {self._held} bytes "
+                    f"held")
+        return (f"{self._behind:.2f} s behind (deadline "
+                f"{self._deadline:.1f} s), {self._held} bytes held")
 
     def _exit(self) -> None:
         _lanes.discard(self)
-        self.track._lanes.discard(self)
-        self.track._shed_done += self.shed_bytes
+        # stop() and the task's exit both land here: transfer once.
+        if self in self.track._lanes:
+            self.track._lanes.discard(self)
+            self.track._shed_done += self.shed_bytes
         super()._exit()
 
     def _who(self) -> str:
@@ -932,12 +1092,17 @@ class _RelayedTrack:
         self._subgroups: dict = {}
         # (group, subgroup) reset downstream.
         self._reset = set()
-        # (group, object) of datagrams taken from several publishers.
+        # (group, object) of datagrams taken; with one publisher, only the
+        # newest two groups', for a standby joining later.
         self._dgrams = set()
+        self._dgram_gid = -1
         # Groups below this are pruned: another copy of them is dropped.
         self._floor = 0
         # Copies dropped as already taken from another publisher.
         self._copies = 0
+        # Location of the End of Track taken: nothing past it is forwarded
+        # and no standby takes over.
+        self._end_at = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
         # Upstream Forward State is 0: answered so in PUBLISH_OK, or
@@ -966,6 +1131,8 @@ class _RelayedTrack:
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
         self.queue = asyncio.Queue()
+        # (group, subgroup) -> stream ends queued for the forward loop.
+        self._ends_due: dict = {}
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
         # terminal that lands first waits in the queue for it.
@@ -975,6 +1142,8 @@ class _RelayedTrack:
         # id(session) -> {(group, subgroup): stream_id} of the streams
         # opened, kept past FIN until the transport has drained them.
         self._tx_streams: dict = {}
+        # id(session) -> bytes written to its streams of the track.
+        self._tx_written: dict = {}
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -1044,11 +1213,6 @@ class _RelayedTrack:
         # Dashboard counters: payload bytes, most subscribers at once,
         # FETCHes served, subscribers dropped on a failed write.
         self._shed_done = 0      # bytes skipped by lanes that have ended
-        # Input bytes/s, held near recent peaks so a lull doesn't tighten
-        # the lanes' time bounds before the next burst.
-        self._in_rate = 0.0
-        self._rate_mark = (time.monotonic(), 0)
-        self._rate_idle = True
         self._bytes_in = 0
         self._bytes_out = 0
         self._peak_subs = 0
@@ -1149,6 +1313,12 @@ class _RelayedTrack:
                 self.upstream):
             return False
         live = [f for f in self.standby if _session_live(f.session)]
+        if self._end_at is not None:
+            if live:
+                logger.info(f"relay: upstream {key} ended after End of "
+                            f"Track {self._end_at}; {len(live)} standby "
+                            f"not taken over, ending the track")
+            return False
         nxt = next((f for f in live if self._in_step(f)), None)
         if nxt is None:
             if live:
@@ -1189,16 +1359,21 @@ class _RelayedTrack:
 
     def _release_downstream(self) -> None:
         """Forget the subscribers; lanes draining to their PUBLISH_DONE
-        keep their streams, the rest stop."""
+        keep their streams, the rest stop and their open streams reset."""
         for lane in list(self._lanes):
             if not lane.final:
                 lane.stop()
         draining = {id(lane.d.session) for lane in self._lanes}
+        for d in self.downstream:
+            if id(d.session) not in draining and _session_live(d.session):
+                self._close_streams(d.session, StreamResetCode.CANCELLED)
         self.downstream.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
         for k in [k for k in self._tx_streams if k not in draining]:
             del self._tx_streams[k]
+        for k in [k for k in self._tx_written if k not in draining]:
+            del self._tx_written[k]
 
     def _lane(self, d) -> "_RelayLane":
         if d.lane is None:
@@ -1265,27 +1440,6 @@ class _RelayedTrack:
                 self._streams.pop(k, None)
                 streamed = True
         return streamed or not self._datagrams
-
-    def update_in_rate(self, now: float) -> None:
-        """Measure the input rate and hand it to the track's lanes. It holds
-        while nothing arrives, so a paused or silent upstream resumes under
-        the bound it had. The first tick with bytes after silence sets nothing:
-        only part of it had traffic."""
-        then, seen = self._rate_mark
-        if now <= then:
-            return
-        self._rate_mark = (now, self._bytes_in)
-        if self._bytes_in == seen:
-            self._rate_idle = True
-            return
-        if self._rate_idle:
-            self._rate_idle = False
-            return
-        rate = max((self._bytes_in - seen) / (now - then),
-                   self._in_rate * IN_RATE_DECAY)
-        self._in_rate = rate
-        for lane in self._lanes:
-            lane.rate = rate
 
     def shed_bytes(self) -> int:
         """Bytes its lanes skipped, ended lanes included."""
@@ -1366,9 +1520,10 @@ class _RelayedTrack:
                     session.stream_reset(sid, int(reset_code))
                 self._streams.pop(k, None)
 
-    def _reset_streams(self, session, below) -> None:
-        """Reset the session's streams of groups below `below`: open ones,
-        and FINed ones the transport has not yet sent out."""
+    def _reset_streams(self, session, below,
+                       code=StreamResetCode.CANCELLED) -> None:
+        """Reset the session's streams of groups below `below` with `code`:
+        open ones, and FINed ones the transport has not yet sent out."""
         sk = id(session)
         tx = self._tx_streams.get(sk) or {}
         used = _tx_used(session)
@@ -1376,10 +1531,10 @@ class _RelayedTrack:
             if k[0] < below:
                 del tx[k]
                 if (sk, *k) not in self._streams and used(sid):
-                    session.stream_reset(sid, StreamResetCode.CANCELLED)
+                    session.stream_reset(sid, code)
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == sk and k[1] < below:
-                session.stream_reset(sid, StreamResetCode.CANCELLED)
+                session.stream_reset(sid, code)
                 self._streams.pop(k, None)
 
     def _tx_queued(self, session, floor=None) -> int:
@@ -1482,6 +1637,7 @@ class _RelayedTrack:
                  "END" if clean else "RESET", reset_code))
             if clean:
                 self._ended.add(k)
+                self._end_due(k, 1)
             elif self._multi:
                 self._reset.add(k)
         self._ensure_drain()
@@ -1531,11 +1687,14 @@ class _RelayedTrack:
         # another track.
         far = feed is not self.feed and not self._near(gid)
         if dgram:
-            if not self._multi:
-                return False
-            if far or (gid, oid) in self._dgrams:
+            if self._multi and far:
                 return True
+            if (gid, oid) in self._dgrams:
+                return self._multi
             self._dgrams.add((gid, oid))
+            if not self._multi and gid > self._dgram_gid:
+                self._dgram_gid = gid
+                self._dgrams = {k for k in self._dgrams if k[0] >= gid - 1}
             return False
         k = (gid, sgid)
         if self._multi and (gid < self._floor or k in self._ended
@@ -1560,9 +1719,13 @@ class _RelayedTrack:
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
         dgram = isinstance(msg, (ObjectDatagram, ObjectDatagramStatus))
+        if self._end_at is not None and (gid, msg.object_id) > self._end_at:
+            return
         if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
             self._copies += 1
             return
+        if getattr(msg, "status", None) == ObjectStatus.END_OF_TRACK:
+            self._end_at = (gid, msg.object_id)
         self._objects_in += 1
         payload = bytes(msg.payload)
         self._bytes_in += len(payload)
@@ -1601,12 +1764,15 @@ class _RelayedTrack:
                 shape = (False,) + tuple(shape[1:])
             else:
                 self._opened.add(key)
+        status = getattr(msg, "status", None)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              payload, msg.extensions or None,
              128 if prio is None else prio,
-             getattr(msg, "status", None),
+             status,
              shape))
+        if status in _STREAM_ENDS:
+            self._end_due((gid, subgroup_id or 0), 1)
         self._ensure_drain()
 
     def _ensure_drain(self) -> None:
@@ -1661,16 +1827,29 @@ class _RelayedTrack:
                     task.cancel()
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
+        # A cancelled subscription's open streams must be reset.
+        if _session_live(session):
+            self._reset_streams(session, float("inf"))
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
+        self._tx_written.pop(id(session), None)
+
+    def _end_due(self, k, n) -> None:
+        n += self._ends_due.get(k, 0)
+        if n > 0:
+            self._ends_due[k] = n
+        else:
+            self._ends_due.pop(k, None)
 
     async def _forward_loop(self):
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
+            if status in _STREAM_ENDS:
+                self._end_due((gid, sgid), -1)
             if status == "DONE":
                 # Terminal, in queue order: each subscriber's PUBLISH_DONE
                 # follows what its lane already holds.
@@ -1933,7 +2112,7 @@ class _RelayedTrack:
     def _forward_one(self, session, alias, gid, sgid, oid,
                      payload, exts, prio, status=None, shape=None,
                      encoded=None, start=None, lost=(), lane=None,
-                     end=None):
+                     end=None, nowait=False):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
@@ -1941,7 +2120,8 @@ class _RelayedTrack:
         (§11.3.2). `end`, the (object id, status) of the stream end
         queued behind the object, ends the stream in the object's write.
         `lane` is told what each write awaits. None once written, else the
-        awaitable that finishes the write."""
+        awaitable that finishes the write; with `nowait`, _NOT_SENT instead
+        and the stream's header state as it was."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
@@ -1996,8 +2176,11 @@ class _RelayedTrack:
                 payload=b"", status=status,
                 object_id=header.next_object_id if oid is None else oid)
             session.stream_write(stream_id, buf.data, end_stream=True)
+            self._count_tx(session, len(buf.data))
             self._streams.pop(skey, None)
             return
+        if nowait:
+            last = header.next_object_id - 1
         data = _object_data(header, payload, exts, oid, encoded)
         tail = (None if end is None
                 else self._end_data(header, gid, end, start, lost))
@@ -2008,15 +2191,22 @@ class _RelayedTrack:
         try:
             if session.stream_write_nowait(stream_id, wire, ended,
                                            wait_at=_TX_YIELD_AT):
+                tx = self._tx_written
+                tx[skey[0]] = tx.get(skey[0], 0) + len(wire)
                 self._wrote(session, skey, entry, end, ended)
                 return None
         except MOQTStreamStopped:
             self._streams.pop(skey, None)
             self._stopped.add(skey)
             return None
+        if nowait:
+            header.advance(last)
+            return _NOT_SENT
         return self._write_drain(session, skey, entry, wire, end, ended)
 
     async def _write_drain(self, session, skey, entry, wire, end, ended):
+        # Counted before the wait: the transport takes it in pieces.
+        self._count_tx(session, len(wire))
         try:
             await session.stream_write_drain(entry[0], wire, end_stream=ended)
         except MOQTStreamStopped:
@@ -2026,6 +2216,10 @@ class _RelayedTrack:
             return True
         self._wrote(session, skey, entry, end, ended)
         return True
+
+    def _count_tx(self, session, n) -> None:
+        tx = self._tx_written
+        tx[id(session)] = tx.get(id(session), 0) + n
 
     def _wrote(self, session, skey, entry, end, ended) -> None:
         if end is None:
@@ -2075,6 +2269,7 @@ class _RelayedTrack:
                     initial = b"".join(parts)
                 else:
                     initial += first
+        self._count_tx(session, len(initial))
         try:
             stream_id = await session.open_uni_stream(
                 initial=initial, priority=_stream_band(session, prio),
@@ -2125,6 +2320,8 @@ class _RelayedTrack:
 
 # Statuses that end a subgroup stream instead of carrying an object.
 _STREAM_ENDS = ("END", ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)
+# _forward_one(nowait=True): the transport refused the write.
+_NOT_SENT = object()
 # TX event ring fill past which a write takes the drained path, which yields.
 _TX_YIELD_AT = 0.5
 
@@ -3953,6 +4150,11 @@ def parse_args(argv=None):
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--stall-trace", type=float, default=0, metavar="MS",
+                        help="Log the event loop thread's Python stack when "
+                             "the loop has not run for MS milliseconds, and "
+                             "the stall's length when it ends. 0 = off "
+                             "(default).")
     parser.add_argument("--catalog-probe", action="store_true",
                         help="Subscribe to each announced or published "
                              "namespace's catalog track at once, so the "
@@ -5098,7 +5300,7 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
-                 "send_late_ms",
+                 "send_late_ms", "gc_max_ms",
                  "drops", "shed_bytes")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
@@ -5139,6 +5341,7 @@ class _Status:
         self.relay = relay
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
+        self.gc = relay_status.GcTimer.shared()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -5389,6 +5592,9 @@ class _Status:
         media_in = sum(r["in_bps"] or 0 for _, r in tracks)
         media_out = sum(r["out_bps"] or 0 for _, r in tracks)
         lag = self.lag.summary()
+        gc_line, long_passes = self.gc.take()
+        for p in long_passes:
+            logger.warning(f"relay: {relay_status.format_gc_pass(*p)}")
         totals = {
             "sessions": len(sessions),
             "by_draft": dict(Counter(f"d{s['draft']}" for s in sessions)),
@@ -5430,6 +5636,7 @@ class _Status:
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
             "send_late_ms": self._send_late_ms(),
+            "gc": gc_line,
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -5454,6 +5661,7 @@ class _Status:
             "groups_per_s": totals["groups_per_s"],
             "groups_out_per_s": totals["groups_out_per_s"],
             "send_late_ms": totals["send_late_ms"],
+            "gc_max_ms": gc_line["max_ms"],
             "drops": totals["drops"],
             "shed_bytes": totals["shed_bytes"],
         })
@@ -5986,6 +6194,11 @@ async def main():
             args.watchdog, host, args.port, args.quic or args.dual,
             args.draft, handles, transport["auth"]))
         _background.add(watchdog)
+
+    if args.stall_trace > 0:
+        _background.add(asyncio.create_task(relay_status.StallSampler(
+            args.stall_trace, logger, relay_status.GcTimer.shared(),
+            prefix="relay: ").run()))
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)

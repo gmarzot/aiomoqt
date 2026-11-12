@@ -1327,14 +1327,23 @@ class _MOQTSessionMixin:
             request_id = self._bidi_stream_requests.get(stream_id)
             if request_id is None:
                 return
+            if (stream_id in (self._fetch_request_streams or ())
+                    and (self._request_stream_ends or {}).get(stream_id, 0)
+                    & self._LOCAL_HALF):
+                return  # a finished FETCH: nothing left to cancel
             self._cancelled_request_streams.add(stream_id)
             self._bidi_streams.pop(request_id, None)
             self._notify_request_cancelled(
                 request_id, f"STOP_SENDING (stream {stream_id})",
                 replies_pending=True)
             return
+        if self._fetch_closing and stream_id in self._fetch_closing:
+            # The reset answers our STOP_SENDING on a finished FETCH.
+            self._release_request_stream(stream_id)
+            return
         request_id = self._bidi_stream_requests.pop(stream_id, None)
         self._cancelled_request_streams.discard(stream_id)
+        self._forget_fetch_stream(stream_id)
         if self._request_stream_ends:
             self._request_stream_ends.pop(stream_id, None)
         if self._request_stream_updates:
@@ -1824,6 +1833,7 @@ class _MOQTSessionMixin:
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             clean = error_code == QuicErrorCode.NO_ERROR
+            self._end_fetch_request(request_id)
             if self._profile.fetch_location_filter:
                 self._fill_requests.pop(request_id, None)
             self._fetch_object_handlers.pop(request_id, None)
@@ -2807,6 +2817,8 @@ class _MOQTSessionMixin:
                     return
                 self._bidi_stream_requests[stream_id] = msg.request_id
                 self._bidi_streams[msg.request_id] = stream_id
+                if isinstance(msg, Fetch):
+                    self._note_fetch_stream(stream_id)
             # d18 §10 Table 5: only SETUP and GOAWAY ride the control
             # stream; a request there cannot own a reply stream, and
             # echoing a reply onto our control stream would mirror the
@@ -2946,6 +2958,7 @@ class _MOQTSessionMixin:
                    if self._request_stream_updates else ())
         self._control_chains.pop(stream_id, None)
         self._cancelled_request_streams.discard(stream_id)
+        self._forget_fetch_stream(stream_id)
         if request_id is None:
             return
         theirs = request_id & 1 != (0 if self._is_client else 1)
@@ -3700,9 +3713,11 @@ class _MOQTSessionMixin:
         if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
             return  # the stream's reset or FIN is queued
         if end_stream:
-            if self._served_fetch_streams:
-                self._forget_served_fetch(stream_id)
+            request_id = (self._forget_served_fetch(stream_id)
+                          if self._served_fetch_streams else None)
             self._tx_op(stream_id, 'send', 'fin', data)
+            if request_id is not None:
+                self._end_fetch_request(request_id)
             return
         try:
             self._quic.send_stream_data(stream_id, data)
@@ -3944,11 +3959,89 @@ class _MOQTSessionMixin:
     # Send streams the peer stopped; the next write raises MOQTStreamStopped.
     _stopped_streams: Set[int] = frozenset()
 
-    def _forget_served_fetch(self, stream_id: int) -> None:
+    def _forget_served_fetch(self, stream_id: int) -> Optional[int]:
+        """Unregister a served fetch stream; its request id, or None."""
         for rid, sid in self._served_fetch_streams.items():
             if sid == stream_id:
                 del self._served_fetch_streams[rid]
-                return
+                return rid
+        return None
+
+    # Request streams a FETCH opened, either direction.
+    _fetch_request_streams: Optional[Set[int]] = None
+    # Our FETCHes' request streams: stream_id -> _FETCH_* bits seen.
+    _fetch_steps: Optional[Dict[int, int]] = None
+    # Finished FETCHes' request streams we sent STOP_SENDING on.
+    _fetch_closing: Optional[Set[int]] = None
+    _FETCH_DATA_DONE, _FETCH_REPLIED = 1, 2
+
+    def _note_fetch_stream(self, sid: int) -> None:
+        if self._fetch_request_streams is None:
+            self._fetch_request_streams = set()
+        self._fetch_request_streams.add(sid)
+
+    def _forget_fetch_stream(self, sid: int) -> None:
+        for table in (self._fetch_request_streams, self._fetch_closing):
+            if table:
+                table.discard(sid)
+        if self._fetch_steps:
+            self._fetch_steps.pop(sid, None)
+
+    def _fetch_request_stream(self, request_id: int) -> Optional[int]:
+        sid = self._bidi_streams.get(request_id)
+        return sid if sid in (self._fetch_request_streams or ()) else None
+
+    def _end_fetch_request(self, request_id: int) -> None:
+        """A FETCH's data stream has ended (§5.2): FIN our half of its
+        request stream. The requester also stops the peer's half once
+        the reply is in."""
+        sid = self._fetch_request_stream(request_id)
+        if sid is None:
+            return
+        self._fin_request_half(sid)
+        if request_id & 1 == (0 if self._is_client else 1):
+            self._fetch_step(sid, self._FETCH_DATA_DONE)
+
+    def _fetch_answered(self, request_id: int, error: bool) -> None:
+        """Our FETCH got FETCH_OK or REQUEST_ERROR. After an error, or a
+        FETCH_OK with the data stream ended, close its request stream."""
+        sid = self._fetch_request_stream(request_id)
+        if sid is None or request_id & 1 != (0 if self._is_client else 1):
+            return
+        if error:
+            if self._fetch_steps:
+                self._fetch_steps.pop(sid, None)
+            self._fin_request_half(sid)
+            self._stop_request_half(sid)
+        else:
+            self._fetch_step(sid, self._FETCH_REPLIED)
+
+    def _fetch_step(self, sid: int, bit: int) -> None:
+        if self._fetch_steps is None:
+            self._fetch_steps = {}
+        state = self._fetch_steps.get(sid, 0) | bit
+        if state == self._FETCH_DATA_DONE | self._FETCH_REPLIED:
+            self._fetch_steps.pop(sid, None)
+            self._stop_request_half(sid)
+        else:
+            self._fetch_steps[sid] = state
+
+    def _fin_request_half(self, sid: int) -> None:
+        if not (self._request_stream_ends or {}).get(sid, 0) & self._LOCAL_HALF:
+            self.stream_fin(sid)
+
+    def _stop_request_half(self, sid: int) -> None:
+        """STOP_SENDING on the peer's half of a finished FETCH's request
+        stream; RFC 9000 §3.5 and §5.2 have the peer reset it. That half
+        counts as ended here: a FIN already in flight may never surface
+        once its receive side is stopped."""
+        if (self._request_stream_ends or {}).get(sid, 0) & self._PEER_HALF:
+            return
+        if self._fetch_closing is None:
+            self._fetch_closing = set()
+        self._fetch_closing.add(sid)
+        self.stream_stop_sending(sid, StreamResetCode.CANCELLED)
+        self._request_half_ended(sid, self._PEER_HALF)
 
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
@@ -4730,6 +4823,8 @@ class _MOQTSessionMixin:
                     is_unidirectional=False)
                 self._bidi_streams[request_id] = stream_id
                 self._bidi_stream_requests[stream_id] = request_id
+                if isinstance(msg, Fetch):
+                    self._note_fetch_stream(stream_id)
                 self.send_stream_message(stream_id, msg)
             else:
                 # WebTransport: bidi-stream open is async (create_stream
@@ -4761,6 +4856,8 @@ class _MOQTSessionMixin:
             raise
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id
+        if isinstance(msg, Fetch):
+            self._note_fetch_stream(stream_id)
         updates = (self._unbound_updates or {}).pop(request_id, ())
         self.send_stream_message(stream_id, msg)
         for update in updates:
@@ -6956,6 +7053,7 @@ class _MOQTSessionMixin:
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
+        self._fetch_answered(msg.request_id, error=False)
 
     async def _handle_fetch_error(self, msg: FetchError) -> None:
         """Subscriber-side: FETCH_ERROR received for a fetch we issued.
@@ -7009,6 +7107,7 @@ class _MOQTSessionMixin:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._track_status_requests.discard(msg.request_id)
         self._resolve_request(msg.request_id, msg)
+        self._fetch_answered(msg.request_id, error=True)
         kind = self._request_kinds.get(msg.request_id)
         if (msg.redirect is not None and msg.redirect[2] and kind is not None
                 and kind[1] and kind[0].__name__ in self._profile.namespace_scoped):

@@ -553,6 +553,9 @@ async def test_a_cycled_slot_redials_at_once_as_a_new_viewer(monkeypatch):
             else:
                 stop.set()
 
+        async def wait_closed(self):
+            await asyncio.Event().wait()
+
     monkeypatch.setattr(workers, 'MOQTClient', _Client)
     monkeypatch.setattr(workers, 'SubscribedTrack', Track)
     monkeypatch.setattr(workers, 'SELF_HEAL_BACKOFF_S', 30.0)
