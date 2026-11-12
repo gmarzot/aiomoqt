@@ -18,6 +18,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
 | `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
+| `aiomoqt/cat.py` | CAT credentials in the format moqx verifies: mint, verify, grants |
 | `aiomoqt/types.py`, `context.py` | draft numbers, error codes, `DraftProfile`, `profile_for()` |
 | `aiomoqt/media/` | MSF catalog, `broadcast.py` composer, LOC, CMAF, LOCMAF packaging; ingest (PyAV, DASH, MPEG-TS) and synthetic sources; `abr.py` ABR ladder on cymedia |
 | `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `abr_ingest`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (aiomoqt-relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
@@ -27,7 +28,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
 | `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
 | `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public aiomoqt-relay |
-| `docs/` | bench and demo runbooks |
+| `docs/` | bench and demo runbooks; CAT auth flows (`cat-auth.md`) |
 
 ## Setup
 

@@ -6,25 +6,31 @@ group and object IDs and timestamps and opens each group on a key frame,
 so equally numbered groups line up across the ladder (msf §4.2). Nothing
 here knows about sessions or peers.
 
-AbrLadder needs cymedia: `uv pip install 'aiomoqt[abr]'`.
+AbrLadder and SourceInput need cymedia: `uv pip install 'aiomoqt[abr]'`.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib
 import struct
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .catalog import Catalog, CatalogTrack, InitData
+from ..utils.logger import get_logger
+from .catalog import PACKAGING_LOC, Catalog, CatalogTrack, InitData
+from .cmaf import asc_info
 from .loc import LocFrame
+from .mpegts import adts_split
 from .sources import (
     av1c_codec_string, av1c_from_sequence_header, avcc_codec_string, avcc_from_sps_pps,
     obu_units, split_annexb,
 )
+
+logger = get_logger(__name__)
 
 _SPS, _PPS, _AUD, _FILLER = 7, 8, 9, 12
 _OBU_SEQUENCE_HEADER, _OBU_TEMPORAL_DELIMITER, _OBU_PADDING = 1, 2, 15
@@ -191,11 +197,7 @@ class AbrLadder:
                  fps: Tuple[int, int], on_frame: Callable,
                  profile: str = 'nvenc', codec: str = 'h264',
                  timescale: Optional[int] = None, realtime: bool = True):
-        try:
-            cymedia = importlib.import_module("cymedia")
-        except ImportError as e:
-            raise ImportError("the ABR ladder needs cymedia: "
-                              "uv pip install 'aiomoqt[abr]'") from e
+        cymedia = _cymedia("the ABR ladder")
         if not rungs:
             raise ValueError("no rungs")
         if codec not in CODECS:
@@ -322,3 +324,172 @@ class AbrLadder:
             self._loop.remove_reader(self._graph.fileno())
             self._loop = None
         self._graph.close()
+
+
+def _cymedia(what: str):
+    try:
+        return importlib.import_module("cymedia")
+    except ImportError as e:
+        raise ImportError(f"{what} needs cymedia: "
+                          "uv pip install 'aiomoqt[abr]'") from e
+
+
+@dataclass
+class InputTrack:
+    """A SourceInput track: decoder config (avcC, AudioSpecificConfig or
+    None), codec string and timescale (None: microseconds)."""
+    config: Optional[bytes]
+    codec_string: str
+    timescale: Optional[int] = None
+    properties: Dict[int, Any] = field(default_factory=dict)
+
+
+class SourceInput:
+    """What cymedia's Source reads (a file, or a live SRT, RTMP, RTSP or
+    HLS input) as a LOC broadcast: `catalog` of its H.264 video and AAC or
+    Opus audio, `tracks`, and after start(on_frame), on_frame(name, frame,
+    group_id, object_id) per frame. Video keeps cymedia's group and object
+    numbers; each audio frame is a group. Timestamps are the input's, in
+    microseconds since the Unix epoch from the time its first packet was
+    read. AAC loses ADTS headers. open() returns once the first video key
+    frame and the audio's decoder config have been read."""
+
+    def __init__(self, src):
+        v, a = src.video, src.audio
+        if v is None:
+            raise ValueError(f"{src.url}: no video stream")
+        if v.codec != 'h264' or not v.extradata:
+            raise ValueError(f"{src.url}: video is {v.codec}, not H.264")
+        self.src = src
+        self.tracks: Dict[str, InputTrack] = {
+            'video': InputTrack(v.extradata, avcc_codec_string(v.extradata))}
+        self.catalog: Catalog  # set by open()
+        self.ended: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._audio = a.codec if a is not None and a.codec in ('aac', 'opus') else None
+        if a is not None and self._audio is None:
+            logger.warning(f"SourceInput: {src.url}: {a.codec} audio left out")
+        self._adts = self._audio == 'aac' and not a.extradata
+        if self._audio == 'aac' and a.extradata:
+            self._set_audio(a.extradata, *asc_info(a.extradata)[:2])
+        elif self._audio == 'opus':
+            self.tracks['audio'] = InputTrack(None, 'opus')
+            self._audio_format = (a.sample_rate or 48000, a.channels)
+        self._audio_group = 0
+        self._t0: Optional[int] = None
+        self._keyed = False
+        self._primed = asyncio.Event()
+        self._held: list = []
+        self.on_frame: Optional[Callable] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    @classmethod
+    async def open(cls, url: str, options: Optional[Dict[str, str]] = None,
+                   *, timeout: float = 10.0) -> "SourceInput":
+        cymedia = _cymedia("SourceInput")
+        loop = asyncio.get_running_loop()
+        src = await loop.run_in_executor(
+            None, functools.partial(cymedia.Source, url, options, timeout=timeout))
+        inp = None
+        try:
+            inp = cls(src)
+            src.start(passthrough=True)
+            inp._loop = loop
+            loop.add_reader(src.fileno(), inp._drain)
+            await asyncio.wait_for(inp._primed.wait(), timeout)
+            if not inp._keyed:
+                raise ValueError(f"{url}: ended before a video key frame"
+                                 f"{f': {src.error}' if src.error else ''}")
+        except BaseException:
+            if inp is not None:
+                inp.close()
+            else:
+                src.close()
+            raise
+        inp.catalog = inp._catalog()
+        return inp
+
+    def start(self, on_frame: Callable) -> None:
+        """Deliver the frames read so far, then each as it is read."""
+        held, self._held = self._held, []
+        self.on_frame = on_frame
+        for frame in held:
+            on_frame(*frame)
+
+    def properties(self, name: str) -> Dict[int, Any]:
+        return {}
+
+    async def async_closed(self) -> None:
+        """Returns when the input ends or fails."""
+        await asyncio.shield(self.ended)
+
+    def close(self) -> None:
+        if self._loop is not None:
+            self._loop.remove_reader(self.src.fileno())
+            self._loop = None
+        self.src.close()
+        if not self.ended.done():
+            self.ended.set_result(None)
+
+    def _set_audio(self, asc: bytes, rate: int, channels: int) -> None:
+        self.tracks['audio'] = InputTrack(asc, f"mp4a.40.{asc[0] >> 3}")
+        self._audio_format = (rate, channels)
+
+    def _emit(self, name: str, frame: LocFrame, group_id: int,
+              object_id: int) -> None:
+        on_frame = self.on_frame
+        if on_frame is None:
+            self._held.append((name, frame, group_id, object_id))
+        else:
+            on_frame(name, frame, group_id, object_id)
+
+    def _drain(self) -> None:
+        for p in self.src.read(0):
+            if self._t0 is None:
+                self._t0 = time.time_ns() // 1000
+            ts = self._t0 + p.pts_us
+            if p.stream == 'video':
+                self._keyed = self._keyed or p.key
+                self._emit('video', LocFrame(p.data, key_frame=p.key, timestamp=ts),
+                           p.group, p.object)
+            elif self._adts:
+                for asc, rate, channels, au in adts_split(p.data):
+                    if 'audio' not in self.tracks:
+                        self._set_audio(asc, rate, channels)
+                    self._audio_frame(au, ts)
+                    ts += 1024 * 1_000_000 // (rate or 48000)
+            elif self._audio is not None:
+                self._audio_frame(p.data, ts)
+        if self.src.ended:
+            self._primed.set()
+            if not self.ended.done():
+                self.ended.set_result(self.src.error)
+        elif self._keyed and (self._audio is None or 'audio' in self.tracks):
+            self._primed.set()
+
+    def _audio_frame(self, data: bytes, ts: int) -> None:
+        self._emit('audio', LocFrame(data, key_frame=True, timestamp=ts),
+                   self._audio_group, 0)
+        self._audio_group += 1
+
+    def _catalog(self) -> Catalog:
+        v = self.src.video
+        tracks = [CatalogTrack(
+            name='video', packaging=PACKAGING_LOC, isLive=True, role='video',
+            renderGroup=1, codec=self.tracks['video'].codec_string,
+            width=v.width or None, height=v.height or None,
+            framerate=v.fps[0] / v.fps[1] if v.fps else None,
+            bitrate=v.bit_rate or None, initRef='v0')]
+        init = [InitData.from_bytes('v0', v.extradata)]
+        audio = self.tracks.get('audio')
+        if audio is not None:
+            rate, channels = self._audio_format
+            tracks.append(CatalogTrack(
+                name='audio', packaging=PACKAGING_LOC, isLive=True, role='audio',
+                renderGroup=1, codec=audio.codec_string, samplerate=rate or None,
+                channelConfig=str(channels) if channels else None,
+                bitrate=self.src.audio.bit_rate or None,
+                initRef='a0' if audio.config else None))
+            if audio.config:
+                init.append(InitData.from_bytes('a0', audio.config))
+        return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
+                       initDataList=init)
