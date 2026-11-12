@@ -43,7 +43,7 @@ _Scope = Tuple[FrozenSet[int], Tuple[_Rule, ...], Tuple[_Rule, ...]]
 class CatRefused(Exception):
     """A token that does not admit: `code` is the session close code."""
 
-    def __init__(self, code: int, reason: str):
+    def __init__(self, code: SessionCloseCode, reason: str):
         super().__init__(reason)
         self.code = code
         self.reason = reason

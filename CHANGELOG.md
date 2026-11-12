@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay's `status.json` `totals.fetches` counts every FETCH served since the relay started, including FETCHes on tracks that have since ended and on tracks it holds no state for; it summed only tracks still open. The INFO line for each served FETCH gives how many objects came from the cache and how many from upstream, and the payload bytes.
 - `abr_ingest --source` retries a source not yet published on the relay at doubling intervals, from 0.2 s up to 5 s, instead of every 0.2 s; a ladder waiting on a missing source sent about five SUBSCRIBEs a second.
 - aiomoqt-relay's `status.json` sessions and the control socket's `/sessions` carry `cc_state` and `cc_param`, the congestion controller's own report from aiopquic's `path_quality()` (bbr: state, flags and model bandwidth; cubic: state and W_max); null on an aiopquic without them.
 - `abr_ingest --input URL` reads the source with cymedia instead of from a MoQT session: a file, or a live SRT, RTMP, RTSP or HLS input, published as tracks `video` and `audio` with the ladder. `--input-option KEY=VALUE` passes libavformat options. The `abr` extra takes cymedia 0.1.2 or later, which added `Source`.

@@ -4335,7 +4335,8 @@ class _MOQTSessionMixin:
             return None
         if isinstance(msg, Fetch) and _is_joining(msg.fetch_type):
             # An unresolvable join is checked as the empty name: fails closed.
-            peer = self._peer_requests.get(msg.joining_request_id)
+            joined = msg.joining_request_id
+            peer = None if joined is None else self._peer_requests.get(joined)
             namespace, track = (peer[1] if peer and peer[0] is Subscribe
                                 else ((), b""))
         else:
@@ -4343,13 +4344,13 @@ class _MOQTSessionMixin:
                          or getattr(msg, 'namespace', None)
                          or getattr(msg, 'namespace_prefix', None) or ())
             track = getattr(msg, 'track_name', None)
-        token = (msg.parameters or {}).get(ParamType.AUTH_TOKEN)
+        token = (getattr(msg, 'parameters', None) or {}).get(ParamType.AUTH_TOKEN)
         if auth.permits(action, namespace, track, token, self._auth_grants):
             return None
         return self._refusal(msg, int(rid), RequestErrorCode.UNAUTHORIZED,
                              "authorization token does not permit action")
 
-    _CAT_ACTIONS = {
+    _CAT_ACTIONS: Dict[type, int] = {
         Subscribe: ACTION_SUBSCRIBE,
         Fetch: ACTION_FETCH,
         SubscribeNamespace: ACTION_SUBSCRIBE_NAMESPACE,
