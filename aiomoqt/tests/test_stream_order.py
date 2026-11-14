@@ -58,10 +58,10 @@ async def test_a_later_stream_waits_until_the_older_one_drains():
     order = StreamOrder(s, _BAND)
     assert _open(order, 4, held=5000) == _BAND
     assert _open(order, 8, held=900) == waiting_band(_BAND)
-    order.check(s._quic.tx_data_ring_used)
+    order.check()
     assert s.moved == {}
     s._quic.held[4] = 0
-    order.check(s._quic.tx_data_ring_used)
+    order.check()
     assert s.moved == {8: _BAND}
 
 
@@ -72,10 +72,10 @@ async def test_waiting_streams_move_up_oldest_first():
     _open(order, 8, held=100)
     _open(order, 12, held=100)
     s._quic.held[4] = 0
-    order.check(s._quic.tx_data_ring_used)
+    order.check()
     assert s.moved == {8: _BAND}
     s._quic.held[8] = 0
-    order.check(s._quic.tx_data_ring_used)
+    order.check()
     assert s.moved == {8: _BAND, 12: _BAND}
 
 
@@ -168,11 +168,10 @@ async def test_audio_keeps_its_band_while_video_is_backed_up(
     monkeypatch.setattr(StreamOrder, "opened", spy_opened)
 
     def held_by_video(session):
-        video = [o for o in _orders("video", tracks)
-                 if o.session is session] if tracks else []
-
         def held(sid):
-            return _HELD if any(sid in o._streams for o in video) else 0
+            video = _orders("video", tracks) if tracks else ()
+            return _HELD if any(o.session is session and sid in o._streams
+                                for o in video) else 0
         return held
     monkeypatch.setattr(relay, "_tx_used", held_by_video)
     monkeypatch.setattr(delivery, "_tx_used", held_by_video)
@@ -213,7 +212,8 @@ async def test_audio_keeps_its_band_while_video_is_backed_up(
                          for o in audio + video}
                 waiting = {o: set(o._waiting) for o in video}
                 for o in video:
-                    o.check(lambda _sid: 0)
+                    o._used = lambda _sid: 0
+                    o.check()
     finally:
         handle.close()
     assert len(audio) == len(video) == 2, (audio, video)

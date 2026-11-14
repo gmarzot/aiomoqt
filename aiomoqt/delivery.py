@@ -497,7 +497,7 @@ def _check_orders() -> None:
     _order_timer = None
     for order in list(_waiting_orders):
         try:
-            order.check(_tx_used(order.session))
+            order.check()
         except Exception:
             # A session gone mid-check: its streams wait no longer.
             logger.debug("stream order check failed", exc_info=True)
@@ -523,11 +523,12 @@ class StreamOrder:
     up once every older stream has drained, checked at each open and every
     ORDER_CHECK_S while any stream waits."""
 
-    __slots__ = ("session", "band", "_streams", "_waiting")
+    __slots__ = ("session", "band", "_used", "_streams", "_waiting")
 
     def __init__(self, session, band: int):
         self.session = session
         self.band = band
+        self._used = _tx_used(session)
         self._streams: list = []     # stream ids, oldest first
         self._waiting: set = set()   # those in waiting_band()
 
@@ -536,10 +537,12 @@ class StreamOrder:
         streams = self._streams
         if not streams:
             return self.band
-        used = _tx_used(self.session)
-        self.check(used)
-        waiting = self._waiting
-        streams[:] = [sid for sid in streams if sid in waiting or used(sid)]
+        if self._waiting:
+            self.check()
+            if self._waiting:
+                return waiting_band(self.band)
+        used = self._used
+        streams[:] = [sid for sid in streams if used(sid)]
         return waiting_band(self.band) if streams else self.band
 
     def opened(self, sid: int, band: int) -> None:
@@ -549,18 +552,23 @@ class StreamOrder:
             _waiting_orders.add(self)
             _schedule_order_check()
 
-    def check(self, used) -> None:
+    def check(self) -> None:
         """Move waiting streams up, oldest first, as far as the first
-        stream that still holds transport bytes."""
+        stream that still holds transport bytes; forget drained ones."""
         waiting = self._waiting
         if not waiting:
             return
-        for sid in self._streams:
+        used = self._used
+        streams = self._streams
+        drained = 0
+        for sid in streams:
             if sid in waiting:
                 waiting.discard(sid)
                 self.session.set_stream_priority(sid, self.band)
             if used(sid):
                 break
+            drained += 1
+        del streams[:drained]
 
 
 class SubgroupDelivery:

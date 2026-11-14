@@ -1630,10 +1630,12 @@ class _RelayedTrack:
     def _stream_order(self, session, band) -> "StreamOrder | None":
         """The session's per_track order of this track's streams in
         `band`; None under another scheduling."""
-        if getattr(session, 'stream_scheduling',
-                   STREAM_SCHEDULING) != "per_track":
-            return None
-        orders = self._orders.setdefault(id(session), {})
+        orders = self._orders.get(id(session))
+        if orders is None:
+            if getattr(session, 'stream_scheduling',
+                       STREAM_SCHEDULING) != "per_track":
+                return None
+            orders = self._orders[id(session)] = {}
         order = orders.get(band)
         if order is None:
             order = orders[band] = StreamOrder(session, band)
