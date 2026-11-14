@@ -91,8 +91,6 @@ code {
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
 .gauge .g-tick { fill: none; stroke-width: 3; }
-.gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--text); }
-.gauge text.g-sub.dim { fill: var(--dim); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
 .gauge path.warn-level { stroke: var(--amber); }
