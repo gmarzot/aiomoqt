@@ -258,7 +258,8 @@ _CONFIG_PROPS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 class _Cmaf:
     """One output track's LOC frames as CMSF objects: prft + one-sample
     moof+mdat. tfdt is the LOC timestamp in track ticks and the prft
-    carries the capture time; a frame at or behind the last tfdt is
+    carries the capture time. A frame at or behind the last tfdt, such as
+    a group's tail that arrives after the next group's key frame, is
     dropped. Audio tfdt steps by each frame's samples and rejoins the
     timestamp when they differ by over half a frame."""
 
