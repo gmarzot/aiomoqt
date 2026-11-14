@@ -46,9 +46,10 @@ code {
   monospace; overflow-wrap: anywhere;
 }
 
+/* The gauges take what the facts leave, shrinking to 84 px before the header stacks. */
 .hero-grid {
-  display: grid; grid-template-columns: max-content minmax(0, 1fr) auto;
-  gap: 16px 32px; align-items: start;
+  display: grid; grid-template-columns: max-content max-content minmax(0, 1fr);
+  gap: 16px 28px; align-items: start;
 }
 /* UPTIME level with the last URL line. */
 .hero-grid > .facts:not(.first) { align-self: end; padding-bottom: 5px; }
@@ -80,9 +81,12 @@ code {
 }
 .toast[hidden] { display: none; }
 
-.gauges { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
-.gauge { margin: 0; width: 120px; text-align: center; }
-.gauge svg { display: block; width: 120px; height: 104px; }
+.gauges {
+  display: grid; grid-template-columns: repeat(4, minmax(84px, 120px)); gap: 8px;
+  justify-content: end;
+}
+.gauge { margin: 0; min-width: 0; text-align: center; }
+.gauge svg { display: block; width: 100%; height: auto; }
 .gauge figcaption {
   margin-top: -6px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
   white-space: nowrap;
@@ -339,7 +343,7 @@ footer code { color: var(--dim); }
 footer [data-versions]:empty { display: none; }
 
 /* One stacked facts column: NAME, HOSTNAME, the host facts, then the URLs; gauges 2x2 beside it. */
-@media (max-width: 1299px) {
+@media (max-width: 1119px) {
   .hero-grid { grid-template-columns: max-content auto; justify-content: space-between; row-gap: 0; }
   .hero-grid .facts { display: contents; }
   .hero-grid .mono { grid-template-columns: 9ch minmax(0, 1fr); }
@@ -347,8 +351,7 @@ footer [data-versions]:empty { display: none; }
   .facts.first .mono:not(.urls) { grid-area: 2 / 1; }
   .facts.side .mono { grid-area: 3 / 1; }
   .facts .urls { grid-area: 4 / 1; margin: 8px 0 0 -9px; justify-self: start; }
-  .gauges { grid-area: 1 / 2 / span 4; align-self: center; display: grid;
-    grid-template-columns: repeat(2, 120px); }
+  .gauges { grid-area: 1 / 2 / span 4; align-self: center; grid-template-columns: repeat(2, 120px); }
 }
 @media (max-width: 1100px) {
   .warn { white-space: normal; }
@@ -358,7 +361,10 @@ footer [data-versions]:empty { display: none; }
 /* Gauges under the facts. */
 @media (max-width: 719px) {
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
-  .gauges { grid-area: 5 / 1; display: flex; justify-content: flex-start; margin-top: 12px; }
+  .gauges {
+    grid-area: 5 / 1; grid-template-columns: repeat(4, minmax(0, 120px)); justify-content: start;
+    margin-top: 12px;
+  }
 }
 @media (max-width: 820px) {
   .platform-grid { grid-template-columns: minmax(0, 1fr); }
