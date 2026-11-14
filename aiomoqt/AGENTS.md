@@ -79,6 +79,11 @@ SIGUSR1.
 - Many sessions in one process: `MOQTClient(shared_transport=SharedTransport(sockets=N))` puts them on
   one picoquic worker, far cheaper than one each. Give it one socket per session on Linux: sessions sharing
   a source port all land on one worker thread of a relay that hashes ports to threads (mvfst).
+- Priority: a track's `priority` is its MoQT publisher priority, 0 sent first. Tracks of one
+  priority on a connection share bandwidth, each track's groups in order
+  (`stream_scheduling="per_track"`, the default; `round_robin` and `fifo` remain). Declare audio
+  and catalog above video, as `MediaPublisher` does (64, 64, 128): at equal priority a video
+  backlog takes most of a congested link.
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
   refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
 - Ending a track: a `produce()` track sends End of Track after its last object, then

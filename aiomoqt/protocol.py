@@ -26,7 +26,7 @@ from .messages import *
 from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
-from .types import SCHEDULING, to_stream_priority
+from .types import SCHEDULING, to_stream_priority, waiting_band
 from .cat import (ACTION_FETCH, ACTION_PUBLISH, ACTION_PUBLISH_NAMESPACE,
                   ACTION_SUBSCRIBE, ACTION_SUBSCRIBE_NAMESPACE,
                   ACTION_TRACK_STATUS, CatRefused, Grants)
@@ -170,13 +170,14 @@ class MOQTPeer:
         # streams (both in QuicConfiguration). Pass None to opt out
         # entirely.
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
-        self._stream_scheduling = "fifo"
+        self._stream_scheduling = "per_track"
 
     @property
     def stream_scheduling(self) -> str:
-        """picoquic's tiebreak within a data stream band: "fifo" (lowest
-        stream id first, keeping a track's groups in order) or
-        "round_robin". Applies to sessions set up after the change."""
+        """Order among data streams of one band: "per_track" (tracks share
+        the band, each track's streams oldest first), "round_robin" (every
+        stream shares it) or "fifo" (lowest stream id first). Applies to
+        sessions set up after the change."""
         return self._stream_scheduling
 
     @stream_scheduling.setter
@@ -4376,7 +4377,7 @@ class _MOQTSessionMixin:
     def stream_scheduling(self) -> str:
         """The peer's MOQTPeer.stream_scheduling."""
         return getattr(getattr(self, '_session', None), 'stream_scheduling',
-                       "fifo")
+                       "per_track")
 
     def data_stream_band(self, publisher_priority: int) -> int:
         """Transport band for a data stream of this publisher priority."""
@@ -4388,7 +4389,10 @@ class _MOQTSessionMixin:
                     f"draft-{self.negotiated_draft} "
                     f"({'WT' if self._is_wt else 'raw QUIC'})")
         band = self.data_stream_band(128)
-        self.set_default_stream_priority(band)
+        # Undeclared streams are in no track's order: oldest first, as fifo.
+        self.set_default_stream_priority(
+            waiting_band(band) if self.stream_scheduling == "per_track"
+            else band)
         # Datagrams share the neutral band instead of picoquic's 9, which
         # would put datagram tracks ahead of all stream data.
         self.set_datagram_priority(band)

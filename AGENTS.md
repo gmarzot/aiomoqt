@@ -151,6 +151,20 @@ track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's 
 request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
 handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
+**Priority.** One rule for every data stream a publisher or the relay sends. Control streams sit
+in band 8, above all data. Between tracks, MoQT priority orders strictly: `to_stream_priority()`
+maps publisher priority to a transport band, lower first, and the relay forwards the
+publisher's priority, never one of its own. SUBSCRIBER_PRIORITY ranks above publisher priority
+(§5.1.2); the relay does not apply it yet. Tracks at one priority share its band round-robin, so
+no track's backlog holds up another's: §5.1.2 expects every subscription to send some data.
+Within a track, streams go oldest first: under `per_track`, the default, a stream opened while
+an older stream of its track still holds transport bytes waits in `waiting_band()` and moves up
+once that one drains (`StreamOrder` in `delivery.py`). FETCH and fill streams take the band
+directly. `generate()` and streams opened without a band stay oldest first in `waiting_band()`:
+they belong to no track's order. Publishers declare priorities, catalog and audio above video
+(`MediaPublisher`: 64, 64, 128). `test_stream_order.py` and `test_default_stream_priority.py`
+hold this.
+
 **Drafts.** 14, 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported. 14 is
 deprecated and will be removed in 0.15.0.
 Draft numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the

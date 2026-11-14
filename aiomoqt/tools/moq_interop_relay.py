@@ -125,7 +125,7 @@ from aiomoqt.types import (
     parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
-                              retained_object_bytes)
+                              StreamOrder, retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -453,7 +453,7 @@ _subscribing: Counter = Counter()
 _cap_warned: set = set()
 
 # Tiebreak within a data stream band (--stream-scheduling).
-STREAM_SCHEDULING = "fifo"
+STREAM_SCHEDULING = "per_track"
 
 
 @lru_cache(maxsize=None)
@@ -1201,6 +1201,8 @@ class _RelayedTrack:
         # id(session) -> {(group, subgroup): stream_id} of the streams
         # opened, kept past FIN until the transport has drained them.
         self._tx_streams: dict = {}
+        # id(session) -> {band: StreamOrder} under per_track.
+        self._orders: dict = {}
         # id(session) -> bytes written to its streams of the track.
         self._tx_written: dict = {}
         # id(session) -> arrival time of the newest object among them.
@@ -1437,6 +1439,8 @@ class _RelayedTrack:
             self._streams.pop(k, None)
         for k in [k for k in self._tx_streams if k not in draining]:
             del self._tx_streams[k]
+        for k in [k for k in self._orders if k not in draining]:
+            del self._orders[k]
         for k in [k for k in self._tx_written if k not in draining]:
             del self._tx_written[k]
         for k in [k for k in self._tx_born if k not in draining]:
@@ -1579,6 +1583,7 @@ class _RelayedTrack:
         `reset_code`."""
         if reset_code is not None:
             self._tx_streams.pop(id(session), None)
+            self._orders.pop(id(session), None)
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == id(session):
                 if reset_code is None:
@@ -1621,6 +1626,18 @@ class _RelayedTrack:
             elif floor is None or k[0] >= floor:
                 total += n
         return total
+
+    def _stream_order(self, session, band) -> "StreamOrder | None":
+        """The session's per_track order of this track's streams in
+        `band`; None under another scheduling."""
+        if getattr(session, 'stream_scheduling',
+                   STREAM_SCHEDULING) != "per_track":
+            return None
+        orders = self._orders.setdefault(id(session), {})
+        order = orders.get(band)
+        if order is None:
+            order = orders[band] = StreamOrder(session, band)
+        return order
 
     def _end(self, d, status_code, reset_code, reason) -> None:
         """FIN (or reset) a subscriber's open streams, then PUBLISH_DONE.
@@ -1902,6 +1919,7 @@ class _RelayedTrack:
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
+        self._orders.pop(id(session), None)
         self._tx_written.pop(id(session), None)
         self._tx_born.pop(id(session), None)
 
@@ -2353,13 +2371,18 @@ class _RelayedTrack:
                 else:
                     initial += first
         self._count_tx(session, len(initial))
+        band = _stream_band(session, prio)
+        order = self._stream_order(session, band)
+        if order is not None:
+            band = order.open_band()
         try:
             stream_id = await session.open_uni_stream(
-                initial=initial, priority=_stream_band(session, prio),
-                end_stream=whole)
+                initial=initial, priority=band, end_stream=whole)
         except MOQTStreamStopped:
             self._stopped.add(skey)
             return True
+        if order is not None:
+            order.opened(stream_id, band)
         if lane is not None:
             lane.sid = stream_id
         entry = (stream_id, header)
@@ -4353,8 +4376,11 @@ def parse_args(argv=None):
     parser.add_argument("--stream-scheduling", choices=SCHEDULING,
                         default=STREAM_SCHEDULING,
                         help="Order among data streams of one priority: "
-                             "fifo keeps each track's groups in order, "
-                             "round_robin shares the band. Default: fifo")
+                             "per_track shares the band between tracks and "
+                             "keeps each track's groups in order, "
+                             "round_robin shares it between all streams, "
+                             "fifo gives it to the oldest stream. "
+                             "Default: per_track")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
