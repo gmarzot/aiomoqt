@@ -2375,11 +2375,20 @@ class _RelayedTrack:
         self._count_tx(session, len(initial))
         band = _stream_band(session, prio)
         order = self._stream_order(session, band)
+        chained = False
         if order is not None:
             band = order.open_band()
+        else:
+            chained = getattr(session, 'stream_scheduling',
+                              STREAM_SCHEDULING) == "chain"
         try:
-            stream_id = await session.open_uni_stream(
-                initial=initial, priority=band, end_stream=whole)
+            if chained:
+                stream_id = await session.open_uni_stream(
+                    initial=initial, priority=band, end_stream=whole,
+                    chain=alias + 1, order=gid)
+            else:
+                stream_id = await session.open_uni_stream(
+                    initial=initial, priority=band, end_stream=whole)
         except MOQTStreamStopped:
             self._stopped.add(skey)
             return True
@@ -4379,8 +4388,10 @@ def parse_args(argv=None):
                         default=STREAM_SCHEDULING,
                         help="Order among data streams of one priority: "
                              "per_track shares the band between tracks and "
-                             "keeps each track's groups in order, "
-                             "round_robin shares it between all streams, "
+                             "keeps each track's groups in order, chain "
+                             "does the same in the transport's stream "
+                             "chains, round_robin shares it between all "
+                             "streams, "
                              "fifo gives it to the oldest stream. "
                              "Default: per_track")
     parser.add_argument("--debug", action="store_true",

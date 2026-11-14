@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `stream_scheduling = "chain"` (and aiomoqt-relay `--stream-scheduling chain`) keeps each track's streams to a session in one transport stream chain, ordered by group, where aiopquic has stream chains: equal-priority tracks share the band and each sends its groups in order, with no order kept in Python.
 - Tracks of one priority on a connection share bandwidth instead of the oldest stream taking it all, and each track still sends its groups in order: `stream_scheduling` (`MOQTPeer`, `PublishedTrack`, aiomoqt-relay `--stream-scheduling`) gains `per_track`, now the default; `fifo` and `round_robin` remain. Under a congestion window cap, audio published at video's priority went silent for seconds behind the open video group.
 - aiomoqt-relay's `status.json` `totals.fetches` counts every FETCH served since the relay started, including FETCHes on tracks that have since ended and on tracks it holds no state for; it summed only tracks still open. The INFO line for each served FETCH gives how many objects came from the cache and how many from upstream, and the payload bytes.
 - `abr_ingest --source` retries a source not yet published on the relay at doubling intervals, from 0.2 s up to 5 s, instead of every 0.2 s; a ladder waiting on a missing source sent about five SUBSCRIBEs a second.

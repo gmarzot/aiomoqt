@@ -686,9 +686,10 @@ STREAM_BAND_PADDING = 255
 
 # per_track: tracks of one priority share its band round-robin, and each
 # track's streams go oldest first (its later streams wait in band | 1).
-# round_robin: every stream shares the band. fifo: the band goes to its
-# lowest stream id.
-SCHEDULING = ("per_track", "round_robin", "fifo")
+# chain: the same order kept by the transport, one stream chain per track
+# per session ordered by group. round_robin: every stream shares the band.
+# fifo: the band goes to its lowest stream id.
+SCHEDULING = ("per_track", "chain", "round_robin", "fifo")
 
 
 def to_stream_priority(moqt_priority: int, *,
