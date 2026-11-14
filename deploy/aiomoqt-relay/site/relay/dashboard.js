@@ -123,20 +123,18 @@ function renderRelay(s, urls) {
   $('drafts').textContent = (r.drafts || []).join(', ');
   const badge = $('badge-version');
   badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt-relay';
-  badge.title = [['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
-    .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
+  badge.title = [none(r.workers) ? null : fmt.plural(r.workers, 'picoquic worker'),
+                 ...[['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
+                   .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`)]
+    .filter(Boolean).join(' · ');
   $('uptime').textContent = fmt.uptime(r.uptime_s)
     + (r.watchdog_s ? ` · watchdog ${r.watchdog_s}s` : '');
   $('date').textContent = fmt.date(s.generated);
-  const hw = [h.arch, h.cores && `${h.cores} vCPU`,
-              h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`].filter(Boolean);
+  const hw = [h.cpu_model || h.arch, h.cores && `${h.cores} vCPU`,
+              h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB`].filter(Boolean);
   // Lines break only between items.
   const items = hw.flatMap((t, i) => [...(i ? [' · '] : []), el('span', {class: 'nw'}, t)]);
   $('hw').replaceChildren(...(items.length ? items : ['—']));
-  const workers = $('badge-workers');
-  workers.hidden = none(r.workers);
-  if (!workers.hidden) workers.textContent = fmt.plural(r.workers, 'worker');
-  $('cpu-model').textContent = h.cpu_model || '—';
   $('os').textContent = h.os || '—';
 }
 
