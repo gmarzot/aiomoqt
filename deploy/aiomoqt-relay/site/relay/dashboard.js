@@ -44,9 +44,6 @@ function relayUrls(relay) {
 
 const mib = (b) => b / 2 ** 20;
 
-// MiB with one decimal below 100.
-const mibText = (b) => { const m = mib(b || 0); return m < 100 ? m.toFixed(1) : `${Math.round(m)}`; };
-
 // FETCH totals from each new snapshot over the last WIN_S, for the cache gauge.
 const WIN_S = 600;
 const fetchWin = [];
@@ -112,7 +109,7 @@ function cacheDetail(c, T, w, tracks) {
       + ` from cache (${fmt.bytes(T.fetch_cache_bytes)}`
       + ` of ${fmt.bytes((T.fetch_cache_bytes || 0) + (T.fetch_upstream_bytes || 0))})`;
   return [hit, since,
-          `${mibText(T.cache_bytes)} of ${Math.round(mib(c.budget))} MiB held;`
+          `${none(T.cache_bytes) ? '—' : cacheFill(T.cache_bytes, c.budget)} held;`
             + ' at the budget it drops the oldest group of the least recently used track',
           videoReach(tracks), `per track ${track}`, fmt.plural(T.cache_evictions, 'eviction')]
     .filter(Boolean).join('\n');
@@ -184,7 +181,7 @@ function drawGauge(svg, pct, lines) {
   });
 }
 
-// Cache: share of FETCH bytes served from it, FETCH count and bytes, held of its budget.
+// Cache: share of FETCH bytes served from it, with bytes from cache and FETCH count.
 function renderGauges(s) {
   const h = s.host || {}, T = s.totals || {}, c = s.relay.cache;
   const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
@@ -197,9 +194,8 @@ function renderGauges(s) {
   trackFetches(s);
   const w = fetchWindow(T);
   drawGauge($('gauge-cache'), w.hit, [
-    {t: `${count(w.n)} ${w.n === 1 ? 'fetch' : 'fetches'}`, dim: !w.n},
     {t: fmt.bytes(w.bytes), dim: !w.n},
-    {t: none(T.cache_bytes) ? '' : cacheFill(T.cache_bytes, c.budget), dim: true}]);
+    {t: `${count(w.n)} ${w.n === 1 ? 'fetch' : 'fetches'}`, dim: !w.n}]);
   fig.title = cacheDetail(c, T, w, s.tracks);
 }
 
