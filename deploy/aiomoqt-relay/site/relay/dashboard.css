@@ -52,9 +52,8 @@ code {
 }
 /* UPTIME level with the last URL line. */
 .hero-grid > .facts:not(.first) { align-self: end; padding-bottom: 5px; }
-/* Above the top-right corner of the facts text (the block hugs it), taking no grid space. */
-.facts.side { position: relative; justify-self: start; }
-.hero-links { position: absolute; right: 0; bottom: 100%; line-height: 1.2; white-space: nowrap; }
+.facts.side { justify-self: start; }
+.hero-links { margin-left: auto; white-space: nowrap; }
 .mono {
   display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 1px 12px; margin: 0;
   font: 13px/1.45 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
@@ -339,12 +338,27 @@ footer {
 footer code { color: var(--dim); }
 footer [data-versions]:empty { display: none; }
 
+/* One stacked facts column: NAME, HOSTNAME, the host facts, then the URLs; gauges 2x2 beside it. */
+@media (max-width: 1299px) {
+  .hero-grid { grid-template-columns: max-content auto; justify-content: space-between; row-gap: 0; }
+  .hero-grid .facts { display: contents; }
+  .hero-grid .mono { grid-template-columns: 9ch minmax(0, 1fr); }
+  .hero-grid .badge-row { grid-area: 1 / 1; }
+  .facts.first .mono:not(.urls) { grid-area: 2 / 1; }
+  .facts.side .mono { grid-area: 3 / 1; }
+  .facts .urls { grid-area: 4 / 1; margin: 8px 0 0 -9px; justify-self: start; }
+  .gauges { grid-area: 1 / 2 / span 4; align-self: center; display: grid;
+    grid-template-columns: repeat(2, 120px); }
+}
 @media (max-width: 1100px) {
   .warn { white-space: normal; }
   .split { grid-template-columns: minmax(0, 1fr); }
   .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .hero-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .gauges { grid-column: 1 / -1; }
+}
+/* Gauges under the facts. */
+@media (max-width: 719px) {
+  .hero-grid { grid-template-columns: minmax(0, 1fr); }
+  .gauges { grid-area: 5 / 1; display: flex; justify-content: flex-start; margin-top: 12px; }
 }
 @media (max-width: 820px) {
   .platform-grid { grid-template-columns: minmax(0, 1fr); }
