@@ -881,10 +881,12 @@ class _ObjectCache:
         self.clear()
 
     def clear(self) -> None:
-        self._cols = [array("q")]
-        self._born = [array("d")]
-        self._pay = [[]]
-        self._props = [[]]
+        # Per block; a sealed block's lists become a tuple and bytes, a
+        # freed block's entries None.
+        self._cols: list = [array("q")]
+        self._born: list = [array("d")]
+        self._pay: list = [[]]
+        self._props: list = [[]]
         # Per block: sequence number of its first record, live records.
         self._base = array("q", [0])
         self._live = array("q", [0])

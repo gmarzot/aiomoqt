@@ -34,9 +34,12 @@ def _fill(t, lo, hi):
 
 
 def _records_tracked():
-    """Tracked tuples shaped like a cache record of _fill()."""
+    """Tracked tuples shaped like a cache record of _fill(). A sealed
+    block's payload tuple is not one: before 3.14 it stays tracked until
+    a collection first sees it."""
     return sum(1 for o in gc.get_objects()
-               if type(o) is tuple and len(o) >= 9 and o[3] == b"a")
+               if type(o) is tuple and len(o) >= 9 and type(o[0]) is int
+               and o[3] == b"a")
 
 
 def test_cached_records_add_no_tracked_objects():
