@@ -39,10 +39,6 @@ code {
 .badge-row {
   display: flex; flex-wrap: wrap; align-items: baseline; row-gap: 2px; margin: 0 0 8px -9px;
 }
-/* Indent by the badge's border and padding: beside it a gap, wrapped under it level with its text. */
-.badge-row .foot {
-  padding-left: 9.5px; font: 13px "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-}
 .facts.first .mono { grid-template-columns: 9ch minmax(0, 1fr); }
 .badge-version {
   background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
@@ -69,7 +65,6 @@ code {
   margin: auto 0 0 -9px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
 #badge-version { white-space: nowrap; }
-.foot { color: var(--dim); white-space: nowrap; }
 .mono .nw { white-space: nowrap; }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }
@@ -96,11 +91,7 @@ code {
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
 .gauge .g-tick { fill: none; stroke-width: 3; }
-.gauge .g-ring-track, .gauge .g-ring { fill: none; stroke-width: 3; stroke-linecap: round; }
-.gauge .g-ring-track { stroke: var(--track); }
-.gauge .g-ring { stroke: var(--gold); }
-.gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--gold); }
-.gauge path.g-ring.dim { stroke: var(--faint); }
+.gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--text); }
 .gauge text.g-sub.dim { fill: var(--dim); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
