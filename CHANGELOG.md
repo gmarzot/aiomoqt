@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- TrackStats counts duplicate objects (an id already received on its subgroup): `dups` in `summary()`, `dups` and `iv_dups` in `snapshot()`, printed by sub_bench. A duplicate no longer counts as a received object, as out-of-order, or toward its group, where it could hide a lost object.
 - aiomoqt-relay's `status.json` `totals.fetches` counts every FETCH served since the relay started, including FETCHes on tracks that have since ended and on tracks it holds no state for; it summed only tracks still open. The INFO line for each served FETCH gives how many objects came from the cache and how many from upstream, and the payload bytes.
 - `abr_ingest --source` retries a source not yet published on the relay at doubling intervals, from 0.2 s up to 5 s, instead of every 0.2 s; a ladder waiting on a missing source sent about five SUBSCRIBEs a second.
 - aiomoqt-relay's `status.json` sessions and the control socket's `/sessions` carry `cc_state` and `cc_param`, the congestion controller's own report from aiopquic's `path_quality()` (bbr: state, flags and model bandwidth; cubic: state and W_max); null on an aiopquic without them.

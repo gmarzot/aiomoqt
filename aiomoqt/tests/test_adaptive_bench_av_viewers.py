@@ -81,7 +81,8 @@ async def test_workers_get_the_side_tracks(monkeypatch):
 def _snap(**kw):
     base = dict(t=1.0, dt=1.0, rx_objs=0, rx_bytes=0, iv_lost=0, lat_n=0,
                 lat_mean_ms=0.0, lat_p90_ms=0.0, lat_p99_ms=0.0, jitter_ms=0.0,
-                loss=0, groups=0, total_objs=0, total_bytes=0, ts_source=None)
+                loss=0, groups=0, total_objs=0, total_bytes=0, ts_source=None,
+                iv_dups=0, dups=0)
     return {**base, **kw}
 
 
@@ -90,16 +91,17 @@ def test_viewer_stats_sum_counts_and_keep_the_worst_latency():
     snaps = {
         "video": _snap(rx_objs=30, rx_bytes=9000, lat_n=30, lat_mean_ms=20.0,
                        lat_p90_ms=40.0, lat_p99_ms=50.0, jitter_ms=2.0, loss=1,
-                       total_objs=30, total_bytes=9000),
+                       total_objs=30, total_bytes=9000, dups=1),
         "audio": _snap(rx_objs=10, rx_bytes=500, lat_n=10, lat_mean_ms=60.0,
                        lat_p90_ms=90.0, lat_p99_ms=95.0, jitter_ms=5.0, loss=2,
-                       total_objs=10, total_bytes=500),
+                       total_objs=10, total_bytes=500, dups=2),
         "catalog": _snap(),
     }
     for name, t in stats.tracks.items():
         t.snapshot = partial(dict, snaps[name])
     merged = stats.snapshot()
     assert merged["rx_bytes"] == 9500 and merged["loss"] == 3
+    assert merged["dups"] == 3
     assert merged["lat_n"] == 40
     assert merged["lat_p90_ms"] == 90.0 and merged["jitter_ms"] == 5.0
     assert merged["lat_mean_ms"] == pytest.approx(30.0)

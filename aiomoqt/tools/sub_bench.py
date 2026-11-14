@@ -138,6 +138,7 @@ class BenchReporter:
             print(f"  Jitter:      {s['jitter_ms']:.2f} ms")
             print(f"  Lost:        {s['lost']} ({s['loss_pct']:.2f}%)")
             print(f"  Out-of-order:   {s['ooo']}")
+            print(f"  Duplicates:     {s['dups']}")
         check = self.payload_check
         if check is not None:
             every = f", every {check.every}" if check.every > 1 else ""
