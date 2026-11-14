@@ -57,7 +57,7 @@ async def test_expired_objects_leave_the_cache():
         assert [(o[0], o[2]) for o in track.cached_range((0, 0), None)] == [
             (1, 0), (1, 1)]
         assert track._cache_bytes == sum(
-            relay.retained_object_bytes(c[3], c[4]) for c in track._cache)
+            relay._record_cost(c) for c in track._cache)
     finally:
         track.close()
 

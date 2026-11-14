@@ -24,13 +24,17 @@ Limits:
   * At --max-subscribers, a session's first SUBSCRIBE is refused the same
     way, with a randomized Retry Interval. Sessions already subscribed may
     add tracks.
-  * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
-    oldest group dropped) under a relay-wide budget (--cache-bytes),
-    which drops the oldest group of the least recently used track, never
-    the live group of a subscribed one: enough to answer a FETCH,
-    standalone or joining, over what it still holds; a late subscriber
-    starts at the live edge. Past CACHE_BUDGET_BYTES + CACHE_BYTES the
-    largest live group is dropped and the rest of it goes uncached. A
+  * A recent-object cache bounded by memory: --cache-bytes across all
+    tracks, an eighth of it per track (CACHE_BYTES), and the publisher's
+    MAX_CACHE_DURATION. Past the budget the least recently used track
+    loses its oldest group, taken first from tracks holding more than
+    their newest CACHE_FLOOR_S seconds (at least --lag-limit plus one
+    group), never the live group of a subscribed track or the newest
+    group of a catalog whose publisher is live: enough to answer a
+    FETCH, standalone or joining, over what it still holds; a late
+    subscriber starts at the live edge. Past CACHE_BUDGET_BYTES +
+    CACHE_BYTES the largest live group is dropped and the rest of it
+    goes uncached. A
     replay owed objects the cache no longer holds resets that subgroup
     stream rather than FIN it.
     Cache and lanes charge each object its payload, its properties and
@@ -91,9 +95,10 @@ GOAWAY_TIMEOUT and exits once the closes have left. A second signal
 exits at once.
 """
 
+from array import array
 import argparse
 import asyncio
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import OrderedDict, deque
 import contextlib
 import datetime
@@ -103,7 +108,9 @@ import heapq
 import itertools
 import json
 import logging
+import marshal
 import math
+from operator import itemgetter
 from logging.handlers import RotatingFileHandler
 import os
 import random
@@ -125,6 +132,7 @@ from aiomoqt.types import (
     parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
+                              properties_charge,
                               retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
@@ -148,6 +156,7 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
+from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
                                  server_cert_dirs)
 from aiomoqt.utils.logger import (get_category_logger, get_log_level,
@@ -250,7 +259,8 @@ PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
-# Catalog track names: their send lanes never shed the newest group.
+# Catalog track names: the cache keeps their newest group while the
+# publisher is live, and their send lanes never shed it.
 CATALOG_TRACKS = frozenset((CATALOG_TRACK, b"catalog.json"))
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
@@ -431,11 +441,16 @@ def _fetch_sources(ns: tuple, track_name) -> list:
     return [owner, *pubs]
 
 
-# Recent-object cache bounds, per track: whichever is hit first.
-CACHE_GROUPS = 8
-CACHE_BYTES = 32 * 1024 * 1024
 # Relay-wide cache budget (--cache-bytes).
 CACHE_BUDGET_BYTES = 256 * 1024 * 1024
+# Per-track cache bound: an eighth of the budget.
+CACHE_BYTES = CACHE_BUDGET_BYTES // 8
+# Seconds of each track's newest objects the budget takes last.
+CACHE_FLOOR_S = 10.0
+# Groups below where upstream delivery began that a join backfills.
+BACKFILL_GROUPS = 8
+# Groups behind the newest whose copy detection and stream state is kept.
+STATE_GROUPS = 32
 
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
@@ -698,9 +713,647 @@ class _Downstream:
         return self.window[0]
 
 
+# Records per cache block; a block also seals at CACHE_BLOCK_BYTES of
+# their cost.
+CACHE_BLOCK_OBJECTS = 512
+# Per-record fields of a block's int column: group, subgroup, object,
+# priority, status, shape code, properties charge, and where its
+# properties sit in the sealed block's bytes. -1 stands for None.
+_STRIDE = 9
+_CHARGE = 6
+_PSTART = 7
+CACHE_BLOCK_BYTES = 256 * 1024
+
+_OBJECT_STATUS = {int(s): s for s in ObjectStatus}
+# Sort key of a record or fetch row: (group, object).
+_LOCATION = itemgetter(0, 2)
+# Shape codes: -1 None, 0-7 the three stream flags as bits, 8-9 a
+# datagram and its end-of-group bit, 16 and up any other shape, interned.
+_FLAG_SHAPES = tuple((bool(c & 1), bool(c & 2), bool(c & 4))
+                     for c in range(8))
+_DGRAM_SHAPES = (("DGRAM", False), ("DGRAM", True))
+_OTHER_SHAPES: list = []
+_OTHER_CODES: dict = {}
+
+
+def _shape_code(shape) -> int:
+    if shape is None:
+        return -1
+    if shape.__class__ is tuple:
+        if (len(shape) == 3 and shape[0].__class__ is bool
+                and shape[1].__class__ is bool
+                and shape[2].__class__ is bool):
+            return shape[0] | shape[1] << 1 | shape[2] << 2
+        if (len(shape) == 2 and shape[0] == "DGRAM"
+                and shape[1].__class__ is bool):
+            return 8 + shape[1]
+    # Keyed with the element types too, so True and 1 stay apart.
+    key = (shape, tuple(map(type, shape)) if isinstance(shape, tuple)
+           else type(shape))
+    code = _OTHER_CODES.get(key)
+    if code is None:
+        code = _OTHER_CODES[key] = 16 + len(_OTHER_SHAPES)
+        _OTHER_SHAPES.append(shape)
+    return code
+
+
+def _shape(code):
+    if code < 0:
+        return None
+    if code < 8:
+        return _FLAG_SHAPES[code]
+    if code < 16:
+        return _DGRAM_SHAPES[code - 8]
+    return _OTHER_SHAPES[code - 16]
+
+
+def _dump_props(exts):
+    """Object Properties as marshal bytes; a dict subclass as a dict."""
+    if isinstance(exts, dict) and exts.__class__ is not dict:
+        exts = dict(exts)
+    return marshal.dumps(exts)
+
+
+def _record_cost(c) -> int:
+    """A cache record's retained_object_bytes."""
+    return c[9]
+
+
+class _GroupKeys:
+    """A set of (group, n) int pairs in sorted array columns, which the
+    cyclic GC does not traverse."""
+
+    __slots__ = ("_g", "_k")
+
+    def __init__(self) -> None:
+        self._g = array("q")
+        self._k = array("q")
+
+    def __len__(self) -> int:
+        return len(self._g)
+
+    def __iter__(self):
+        return zip(self._g.tolist(), self._k.tolist())
+
+    def _find(self, g, k) -> int:
+        """Index of the first pair not below (g, k)."""
+        gs, ks = self._g, self._k
+        i = bisect_left(gs, g)
+        n = len(gs)
+        while i < n and gs[i] == g and ks[i] < k:
+            i += 1
+        return i
+
+    def __contains__(self, key) -> bool:
+        g, k = key
+        i = self._find(g, k)
+        return i < len(self._g) and self._g[i] == g and self._k[i] == k
+
+    def add(self, key) -> None:
+        g, k = key
+        gs, ks = self._g, self._k
+        n = len(gs)
+        if not n or g > gs[-1] or (g == gs[-1] and k > ks[-1]):
+            gs.append(g)
+            ks.append(k)
+            return
+        i = self._find(g, k)
+        if i == n or gs[i] != g or ks[i] != k:
+            gs.insert(i, g)
+            ks.insert(i, k)
+
+    def update(self, keys) -> None:
+        for key in keys:
+            self.add(key)
+
+    def drop_below(self, g) -> None:
+        """Forget the pairs of groups below `g`."""
+        i = bisect_left(self._g, g)
+        del self._g[:i]
+        del self._k[:i]
+
+
+class _GroupIds:
+    """The cached group IDs, ascending."""
+
+    __slots__ = ("_c",)
+
+    def __init__(self, cache) -> None:
+        self._c = cache
+
+    def __len__(self) -> int:
+        return self._c.group_count()
+
+    def __getitem__(self, i):
+        c = self._c
+        n = c.group_count()
+        if i < 0:
+            i += n
+        if not 0 <= i < n:
+            raise IndexError(i)
+        return c._gid[c._h + i]
+
+    def __iter__(self):
+        c = self._c
+        return iter(c._gid[c._h:].tolist())
+
+
+class _ObjectCache:
+    """A track's cached objects: group IDs ascending, each group's
+    objects in arrival order, laid out so the cyclic GC has nothing to
+    traverse per object.
+
+    Records sit in arrival order in blocks held in columns: per block an
+    int array of _STRIDE fields per record, an array of arrival times,
+    the payloads and the properties as marshal bytes: lists while the
+    block is open; once sealed, a tuple and one bytes object. A block with no
+    live record is freed. Each group is a row of array columns: its ID,
+    its record count, and the sequence number and block of its first
+    and last record. A group's records are those with its ID from its
+    first to its last; any other record with its ID is dead. Reads
+    build record tuples (_rec) as they go."""
+
+    __slots__ = ("_cols", "_born", "_pay", "_props", "_base", "_live",
+                 "bytes", "_b0", "_seq", "_nbytes", "_gid", "_cnt", "_fseq",
+                 "_fblk", "_lseq", "_lblk", "_h", "_n")
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        # Per block; a sealed block's lists become a tuple and bytes, a
+        # freed block's entries None.
+        self._cols: list = [array("q")]
+        self._born: list = [array("d")]
+        self._pay: list = [[]]
+        self._props: list = [[]]
+        # Per block: sequence number of its first record, live records.
+        self._base = array("q", [0])
+        self._live = array("q", [0])
+        # Cost of the live records.
+        self.bytes = 0
+        # Number of the first block held.
+        self._b0 = 0
+        self._seq = 0
+        # Cost of the open block's records.
+        self._nbytes = 0
+        self._gid = array("q")
+        self._cnt = array("q")
+        self._fseq = array("q")
+        self._fblk = array("q")
+        self._lseq = array("q")
+        self._lblk = array("q")
+        # Rows before this are dropped groups.
+        self._h = 0
+        self._n = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __bool__(self) -> bool:
+        return self._n > 0
+
+    def _rec(self, k, j) -> tuple:
+        """Record `j` of held block `k`: (group, subgroup, object,
+        payload, properties, priority, status, shape, arrival,
+        retained_object_bytes)."""
+        cols = self._cols[k]
+        x = j * _STRIDE
+        gid, sg, oid, pr, st, sh, charge, ps, pl = cols[x:x + _STRIDE]
+        props = self._props[k]
+        if props.__class__ is list:
+            p = props[j]
+        else:
+            p = None if pl < 0 else props[ps:ps + pl]
+        pay = self._pay[k][j]
+        return (gid, None if sg < 0 else sg, oid, pay,
+                None if p is None else marshal.loads(p),
+                None if pr < 0 else pr,
+                None if st < 0 else _OBJECT_STATUS.get(st, st), _shape(sh),
+                self._born[k][j], retained_object_bytes(pay) + charge)
+
+    def _cost(self, k, j) -> int:
+        return (retained_object_bytes(self._pay[k][j])
+                + self._cols[k][j * _STRIDE + _CHARGE])
+
+    def _at(self, b, seq):
+        """(held block, index) of a record."""
+        k = b - self._b0
+        return k, seq - self._base[k]
+
+    def _locs(self, i) -> list:
+        """(held block, index) of row `i`'s records, in arrival order."""
+        g = self._gid[i]
+        fs, ls = self._fseq[i], self._lseq[i]
+        colsl, base, b0 = self._cols, self._base, self._b0
+        out = []
+        for k in range(self._fblk[i] - b0, self._lblk[i] - b0 + 1):
+            cols = colsl[k]
+            if cols is None:
+                continue
+            s0 = base[k]
+            lo = fs - s0
+            for j in range(lo if lo > 0 else 0,
+                           min(ls - s0 + 1, len(cols) // _STRIDE)):
+                if cols[j * _STRIDE] == g:
+                    out.append((k, j))
+        return out
+
+    def _scan(self, i) -> list:
+        return [self._rec(k, j) for k, j in self._locs(i)]
+
+    def _row(self, gid) -> int:
+        g = self._gid
+        n = len(g)
+        if n > self._h and g[n - 1] == gid:
+            return n - 1
+        i = bisect_left(g, gid, self._h)
+        return i if i < n and g[i] == gid else -1
+
+    def __iter__(self):
+        for i in range(self._h, len(self._gid)):
+            yield from self._scan(i)
+
+    def __reversed__(self):
+        for i in reversed(range(self._h, len(self._gid))):
+            yield from reversed(self._scan(i))
+
+    def __getitem__(self, i):
+        """The first (0) or the last (-1) object."""
+        if self._n and i == 0:
+            return self._rec(*self._at(self._fblk[self._h],
+                                       self._fseq[self._h]))
+        if self._n and i == -1:
+            return self._rec(*self._at(self._lblk[-1], self._lseq[-1]))
+        raise IndexError(i)
+
+    def head(self):
+        """(group, object) of the first object."""
+        k, j = self._at(self._fblk[self._h], self._fseq[self._h])
+        x = j * _STRIDE
+        return self._cols[k][x], self._cols[k][x + 2]
+
+    def born(self, n):
+        """Arrival of the first object of the `n`th oldest group, or of
+        the last object for -1."""
+        if n < 0:
+            k, j = self._at(self._lblk[-1], self._lseq[-1])
+        else:
+            i = self._h + n
+            k, j = self._at(self._fblk[i], self._fseq[i])
+        return self._born[k][j]
+
+    def group_count(self) -> int:
+        return len(self._gid) - self._h
+
+    def groups(self) -> _GroupIds:
+        """Cached group IDs, ascending."""
+        return _GroupIds(self)
+
+    def group(self, gid) -> list:
+        i = self._row(gid)
+        return [] if i < 0 else self._scan(i)
+
+    def group_oids(self, gid) -> list:
+        """(object, status) of a group's objects, in arrival order;
+        status -1 for none."""
+        i = self._row(gid)
+        if i < 0:
+            return []
+        colsl = self._cols
+        return [(colsl[k][j * _STRIDE + 2], colsl[k][j * _STRIDE + 4])
+                for k, j in self._locs(i)]
+
+    def between(self, lo, hi=None) -> list:
+        """Objects of groups `lo` through `hi` (None: the newest), in no
+        set order."""
+        return [self._rec(k, j) for k, j in self._span(lo, hi)]
+
+    def fetch_rows(self, lo, hi=None) -> list:
+        """between() as (group, subgroup, object, payload, properties,
+        priority, status)."""
+        out = []
+        colsl, pays, propsl = self._cols, self._pay, self._props
+        for k, a, b in self._ranges(lo, hi):
+            props = propsl[k]
+            it = iter(colsl[k][a * _STRIDE:b * _STRIDE])
+            for j, pay, (gid, sg, oid, pr, st, _, _, ps, pl) in zip(
+                    range(a, b), pays[k][a:b], zip(*[it] * _STRIDE)):
+                p = (props[j] if props.__class__ is list
+                     else None if pl < 0 else props[ps:ps + pl])
+                out.append((gid, None if sg < 0 else sg, oid, pay,
+                            None if p is None else marshal.loads(p),
+                            None if pr < 0 else pr,
+                            None if st < 0 else _OBJECT_STATUS.get(st, st)))
+        return out
+
+    def _span(self, lo, hi) -> list:
+        """(held block, index) of the objects of groups `lo` through
+        `hi`."""
+        return [(k, x) for k, a, b in self._ranges(lo, hi)
+                for x in range(a, b)]
+
+    def _ranges(self, lo, hi) -> list:
+        """(held block, first index, end index) runs of the objects of
+        groups `lo` through `hi`."""
+        g = self._gid
+        i = bisect_left(g, lo, self._h)
+        j = len(g) if hi is None else bisect_right(g, hi, self._h)
+        if j - i < 2:
+            return [(k, x, x + 1) for k, x in self._locs(i)] if j > i else []
+        # The span the groups' records lie in: when it holds just as many
+        # records, all are theirs; else one pass keeps those of their
+        # IDs, and a count above theirs means dead ones are among them.
+        fseq, lseq = self._fseq[i:j], self._lseq[i:j]
+        a = i + fseq.index(min(fseq))
+        m = i + lseq.index(max(lseq))
+        fs, ls = self._fseq[a], self._lseq[m]
+        total = sum(self._cnt[i:j])
+        whole = ls - fs + 1 == total
+        glo, ghi = g[i], g[j - 1]
+        colsl, base, b0 = self._cols, self._base, self._b0
+        runs = []
+        n = 0
+        for k in range(self._fblk[a] - b0, self._lblk[m] - b0 + 1):
+            cols = colsl[k]
+            if cols is None:
+                continue
+            s0 = base[k]
+            first = fs - s0
+            start = first if first > 0 else 0
+            stop = min(ls - s0 + 1, len(cols) // _STRIDE)
+            if whole:
+                runs.append((k, start, stop))
+                n += stop - start
+                continue
+            for x in range(start, stop):
+                if glo <= cols[x * _STRIDE] <= ghi:
+                    runs.append((k, x, x + 1))
+                    n += 1
+        if n != total:
+            return [(k, x, x + 1) for y in range(i, j)
+                    for k, x in self._locs(y)]
+        return runs
+
+    def ids_below(self, gid, n) -> list:
+        """The newest `n` cached group IDs below `gid`, ascending."""
+        i = bisect_left(self._gid, gid, self._h)
+        return self._gid[max(self._h, i - n):i].tolist()
+
+    def append(self, gid, sgid, oid, payload, exts, prio, status, shape,
+               born, cost=None) -> int:
+        """Add an object; returns its retained_object_bytes, `cost` when
+        known."""
+        if exts is None:
+            props, charge = None, 0
+        else:
+            props = _dump_props(exts)
+            charge = (properties_charge(exts) if cost is None
+                      else cost - retained_object_bytes(payload))
+        seq = self._seq
+        self._seq = seq + 1
+        cols = self._cols[-1]
+        cols.extend((gid, -1 if sgid is None else sgid, oid,
+                     -1 if prio is None else prio,
+                     -1 if status is None else status,
+                     -1 if shape is None else _shape_code(shape),
+                     charge, 0, -1))
+        k = len(self._cols) - 1
+        self._born[k].append(born)
+        self._pay[k].append(payload)
+        self._props[k].append(props)
+        self._live[k] += 1
+        size = (_delivery.OBJECT_RECORD_BYTES
+                + (len(payload) if payload else 0) + charge)
+        self.bytes += size
+        b = self._b0 + k
+        g = self._gid
+        n = len(g)
+        if n > self._h and g[n - 1] == gid:
+            i = n - 1
+        elif n == self._h or gid > g[n - 1]:
+            i = n
+            g.append(gid)
+            self._cnt.append(0)
+            self._fseq.append(seq)
+            self._fblk.append(b)
+            self._lseq.append(seq)
+            self._lblk.append(b)
+        else:
+            i = bisect_left(g, gid, self._h)
+            if i == n or g[i] != gid:
+                g.insert(i, gid)
+                self._cnt.insert(i, 0)
+                self._fseq.insert(i, seq)
+                self._fblk.insert(i, b)
+                self._lseq.insert(i, seq)
+                self._lblk.insert(i, b)
+        self._cnt[i] += 1
+        self._lseq[i] = seq
+        self._lblk[i] = b
+        self._n += 1
+        self._nbytes += size
+        if (len(cols) >= CACHE_BLOCK_OBJECTS * _STRIDE
+                or self._nbytes >= CACHE_BLOCK_BYTES):
+            self._seal()
+        return size
+
+    def _seal(self) -> None:
+        """Close the open block, freeing it when nothing in it lives."""
+        if self._live[-1]:
+            cols, props = self._cols[-1], self._props[-1]
+            parts, pos = [], 0
+            for j, p in enumerate(props):
+                if p is not None:
+                    cols[j * _STRIDE + _PSTART] = pos
+                    cols[j * _STRIDE + _PSTART + 1] = len(p)
+                    parts.append(p)
+                    pos += len(p)
+            self._props[-1] = b"".join(parts)
+            # A tuple of untracked payloads is untracked by the first
+            # collection that sees it; a list would be walked by each.
+            self._pay[-1] = tuple(self._pay[-1])
+        else:
+            self._free(len(self._cols) - 1)
+        self._cols.append(array("q"))
+        self._born.append(array("d"))
+        self._pay.append([])
+        self._props.append([])
+        self._base.append(self._seq)
+        self._live.append(0)
+        self._nbytes = 0
+        if self._cols[0] is None:
+            self._trim()
+
+    def _free(self, k) -> None:
+        self._cols[k] = self._born[k] = self._pay[k] = self._props[k] = None
+
+    def _kill(self, k, j, cost) -> None:
+        """Record `j` of held block `k`, of `cost`, is dead: its payload
+        and properties are released, and the block once none is left."""
+        self.bytes -= cost
+        live = self._live
+        live[k] -= 1
+        if not live[k]:
+            if k == len(live) - 1:
+                self._seal()
+            else:
+                self._free(k)
+                if k == 0:
+                    self._trim()
+            return
+        pay = self._pay[k]
+        if pay.__class__ is tuple:
+            # Partly dead: sealed columns become lists again.
+            self._pay[k] = pay = list(pay)
+            self._props[k] = self._unjoin(k)
+        pay[j] = None
+        self._props[k][j] = None
+
+    def _unjoin(self, k) -> list:
+        """A sealed block's properties as one bytes object or None each."""
+        blob, cols = self._props[k], self._cols[k]
+        out = []
+        for x in range(_PSTART, len(cols), _STRIDE):
+            n = cols[x + 1]
+            out.append(None if n < 0 else blob[cols[x]:cols[x] + n])
+        return out
+
+    def _trim(self) -> None:
+        """Release the freed blocks at the front."""
+        cols = self._cols
+        k = 0
+        while cols[k] is None:
+            k += 1
+        for col in (cols, self._born, self._pay, self._props, self._base,
+                    self._live):
+            del col[:k]
+        self._b0 += k
+
+    def _drop_row(self, i) -> None:
+        cols = (self._gid, self._cnt, self._fseq, self._fblk, self._lseq,
+                self._lblk)
+        if i != self._h:
+            for c in cols:
+                del c[i]
+            return
+        h = self._h = i + 1
+        n = len(self._gid)
+        if h == n or (h >= 1024 and 2 * h >= n):
+            for c in cols:
+                del c[:h]
+            self._h = 0
+
+    def _pop_row(self, i, recs=False) -> list:
+        """Drop row `i`: its records, or (group, object, cost) of each."""
+        locs = self._locs(i)
+        colsl = self._cols
+        costs = [self._cost(k, j) for k, j in locs]
+        if recs:
+            out = [self._rec(k, j) for k, j in locs]
+        else:
+            out = [(colsl[k][j * _STRIDE], colsl[k][j * _STRIDE + 2], c)
+                   for (k, j), c in zip(locs, costs)]
+        self._n -= len(locs)
+        self._drop_row(i)
+        b0 = self._b0
+        for (k, j), c in zip(locs, costs):
+            # Killing may trim the front blocks, shifting held indexes.
+            self._kill(k + b0 - self._b0, j, c)
+        return out
+
+    def _readd(self, recs) -> None:
+        for r in recs:
+            self.append(*r[:9], cost=r[9])
+
+    def merge(self, new) -> None:
+        """Add objects, given as append() arguments, keeping each group
+        they land in in Object order."""
+        for args in new:
+            self.append(*args)
+        for gid in {args[0] for args in new}:
+            i = self._row(gid)
+            oids = [self._cols[k][j * _STRIDE + 2] for k, j in self._locs(i)]
+            if oids != sorted(oids):
+                recs = self._pop_row(i, recs=True)
+                recs.sort(key=lambda r: r[2])
+                self._readd(recs)
+
+    def popleft(self):
+        """Drop the first object; returns its (group, object, cost)."""
+        h = self._h
+        b, s = self._fblk[h], self._fseq[h]
+        k, j = self._at(b, s)
+        cols = self._cols[k]
+        x = j * _STRIDE
+        gid = cols[x]
+        cost = retained_object_bytes(self._pay[k][j]) + cols[x + _CHARGE]
+        out = (gid, cols[x + 2], cost)
+        self._n -= 1
+        left = self._cnt[h] - 1
+        if left:
+            self._cnt[h] = left
+            self._fblk[h], self._fseq[h] = self._next(gid, k, s + 1)
+        else:
+            self._drop_row(h)
+        self._kill(k, j, cost)
+        return out
+
+    def _next(self, gid, k, seq):
+        """(block number, sequence number) of the first record of `gid`
+        at or after `seq`, which starts in held block `k`."""
+        colsl, base = self._cols, self._base
+        while True:
+            cols = colsl[k]
+            if cols is not None:
+                s0 = base[k]
+                for j in range(max(seq - s0, 0), len(cols) // _STRIDE):
+                    if cols[j * _STRIDE] == gid:
+                        return self._b0 + k, s0 + j
+            k += 1
+
+    def pop_group(self, gid) -> list:
+        """Drop a group; returns (group, object, cost) of its objects."""
+        i = self._row(gid)
+        return [] if i < 0 else self._pop_row(i)
+
+    def drop_through(self, last) -> list:
+        """Drop the objects at or before Location `last`; returns their
+        (group, object, cost)."""
+        out = []
+        g = self._gid
+        while self._n and g[self._h] < last[0]:
+            out.extend(self._pop_row(self._h))
+        if self._n and g[self._h] == last[0]:
+            recs = self._scan(self._h)
+            if any(r[2] <= last[1] for r in recs):
+                self._pop_row(self._h)
+                out += [(r[0], r[2], r[9]) for r in recs if r[2] <= last[1]]
+                self._readd([r for r in recs if r[2] > last[1]])
+        return out
+
+    def expired(self, oldest):
+        """(Location of the newest object that arrived before `oldest`,
+        or None; the earliest arrival not before it, or inf)."""
+        last = None
+        floor = float("inf")
+        colsl, borns = self._cols, self._born
+        for i in range(self._h, len(self._gid)):
+            for k, j in self._locs(i):
+                t = borns[k][j]
+                if t < oldest:
+                    loc = (colsl[k][j * _STRIDE], colsl[k][j * _STRIDE + 2])
+                    if last is None or loc > last:
+                        last = loc
+                elif t < floor:
+                    floor = t
+        return last, floor
+
+
 class _CacheBudget:
     """Cache bytes across all tracks, held to CACHE_BUDGET_BYTES by
-    dropping the oldest group of the least recently used track."""
+    dropping the oldest group of the least recently used track, first
+    from tracks above their floor."""
 
     def __init__(self) -> None:
         # Tracks holding cached objects, least recently used first.
@@ -722,7 +1375,9 @@ class _CacheBudget:
 
     def enforce(self) -> None:
         while self.bytes > CACHE_BUDGET_BYTES:
-            victim = next((t for t in self.lru if t._evictable()), None)
+            victim = next((t for t in self.lru if t._evictable()
+                           and t._above_floor()), None) or next(
+                (t for t in self.lru if t._evictable()), None)
             if victim is None and self.bytes > CACHE_BUDGET_BYTES + CACHE_BYTES:
                 largest = max(self.lru, key=lambda t: t._cache_bytes,
                               default=None)
@@ -1219,14 +1874,19 @@ class _RelayedTrack:
         self._closed = False
         # Alias of the PUBLISH feeding this track, on the publisher's session.
         self.publish_alias = None
-        # Recent objects, oldest first, for standalone FETCH. Bounded by
-        # groups and bytes; a relay with no cache can serve no fetch at
-        # all, and an unbounded one is a leak.
-        self._cache = deque()
+        # Recent objects for FETCH and replay, bounded by bytes; a relay
+        # with no cache can serve no fetch at all, and an unbounded one
+        # is a leak.
+        self._cache = _ObjectCache()
         self._cache_bytes = 0
-        # Objects cached per group ID; the bound counts groups, as IDs
-        # may skip.
-        self._groups = {}
+        # No cached object arrived before this.
+        self._born_floor = float("inf")
+        # Per-group state below this group is swept on the next _prune().
+        self._pruned_to = 0
+        # Newest group due to sweep the state only live arrivals
+        # consult, and the floor of the last sweep.
+        self._state_to = 0
+        self._state_floor = 0
         # Live group dropped at the relay's hard ceiling: the rest of it
         # is not cached.
         self._uncached = None
@@ -1235,7 +1895,7 @@ class _RelayedTrack:
         self._lost = {}
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
-        self._ended = set()
+        self._ended = _GroupKeys()
         # (group, subgroup) whose first upstream object has arrived.
         self._opened = set()
         # Alias the upstream gave this track. A publisher may reuse one
@@ -1258,8 +1918,9 @@ class _RelayedTrack:
         # (value, Largest Group when sent) of the last NEW_GROUP_REQUEST
         # sent upstream.
         self.new_group_request = None
-        # Groups whose Object 0 arrived from upstream: complete from it.
-        self._heads = set()
+        # (group, 0) for groups whose Object 0 arrived from upstream:
+        # complete from it.
+        self._heads = _GroupKeys()
         # Locations a backfill FETCH cached; the live copy is dropped.
         self._backfilled = set()
         # Track Properties as last received from upstream (§8.4): sent on
@@ -1475,24 +2136,14 @@ class _RelayedTrack:
         if age is None or not self._cache:
             return
         oldest = time.monotonic() - age
-        last = max(((c[0], c[2]) for c in self._cache if c[8] < oldest),
-                   default=None)
+        if self._born_floor >= oldest:
+            return
+        last, self._born_floor = self._cache.expired(oldest)
         if last is None:
             return
-        kept = deque()
-        size = 0
-        for c in self._cache:
-            if (c[0], c[2]) > last:
-                kept.append(c)
-                continue
-            size += retained_object_bytes(c[3], c[4])
-            self._note_lost(c[0], c[2])
-            left = self._groups.pop(c[0]) - 1
-            if left:
-                self._groups[c[0]] = left
-        self._cache = kept
-        self._cache_bytes -= size
-        _budget.bytes -= size
+        for gid, oid, _ in self._cache.drop_through(last):
+            self._note_lost(gid, oid)
+        self._sync_cache()
         self._prune()
 
     def _expire(self, session, group_id) -> bool:
@@ -1522,7 +2173,7 @@ class _RelayedTrack:
         _budget.forget(self)
         self._cache.clear()
         self._cache_bytes = 0
-        self._groups.clear()
+        self._born_floor = float("inf")
 
     def _release_publish(self) -> None:
         """Drop the PUBLISH's handlers on the publisher's session, unless a
@@ -1800,7 +2451,7 @@ class _RelayedTrack:
             self._groups_in += 1
             self._last_gid = gid
         if msg.object_id == 0:
-            self._heads.add(gid)
+            self._heads.add((gid, 0))
         if self._gaps and self._gaps[-1][1] is None and not self.paused:
             self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
@@ -2005,51 +2656,72 @@ class _RelayedTrack:
                 return
             if gid > self._uncached:
                 self._uncached = None
-        self._cache.append((gid, sgid, oid, payload, exts, prio, status,
-                            shape, time.monotonic() if born is None
-                            else born))
-        size = (retained_object_bytes(payload, exts) if cost is None
-                else cost)
-        self._cache_bytes += size
-        _budget.bytes += size
-        self._groups[gid] = self._groups.get(gid, 0) + 1
+        if born is None:
+            born = time.monotonic()
+        self._cache.append(gid, sgid, oid, payload, exts, prio, status,
+                           shape, born, cost)
+        if born < self._born_floor:
+            self._born_floor = born
+        self._sync_cache()
         self.note_largest((gid, oid))
         _budget.touch(self)
         self._evict()
 
     def _evict(self) -> None:
-        """Drop the oldest objects past CACHE_GROUPS groups or
-        CACHE_BYTES, then hold the relay to its budget."""
-        while self._cache and (len(self._groups) > CACHE_GROUPS
-                               or self._cache_bytes > CACHE_BYTES):
-            dropped = self._cache.popleft()
-            size = retained_object_bytes(dropped[3], dropped[4])
-            self._note_lost(dropped[0], dropped[2])
-            self._cache_bytes -= size
-            _budget.bytes -= size
-            left = self._groups.pop(dropped[0]) - 1
-            if left:
-                self._groups[dropped[0]] = left
+        """Drop the oldest objects past CACHE_BYTES, then hold the relay
+        to its budget."""
+        cache = self._cache
+        while cache and cache.bytes > CACHE_BYTES:
+            gid, oid, _ = cache.popleft()
+            self._note_lost(gid, oid)
+        self._sync_cache()
         self._prune()
         _budget.enforce()
 
+    def _sync_cache(self) -> None:
+        """Charge the track and the budget what the cache holds."""
+        delta = self._cache.bytes - self._cache_bytes
+        self._cache_bytes += delta
+        _budget.bytes += delta
+
     def _evictable(self) -> bool:
         """Holds a group the budget may drop: anything but the newest
-        group of a track with a live subscriber."""
-        if len(self._groups) > 1:
-            return True
-        return bool(self._groups) and not any(
-            _session_live(d.session) for d in self.downstream)
+        group of a track with a live subscriber, or of a catalog whose
+        publisher is live."""
+        n = self._cache.group_count()
+        if n != 1:
+            return n > 1
+        if (self.key[1] in CATALOG_TRACKS
+                and _session_live(_upstream_session(self))):
+            return False
+        return not any(_session_live(d.session) for d in self.downstream)
+
+    def _above_floor(self) -> bool:
+        """Without its oldest group the cache still spans the floor:
+        CACHE_FLOOR_S, or --lag-limit plus one group when longer."""
+        cache = self._cache
+        n = cache.group_count()
+        if n < 2:
+            return False
+        newest, oldest = cache.born(-1), cache.born(0)
+        floor = max(CACHE_FLOOR_S, _lag_limit + (newest - oldest) / (n - 1))
+        return newest - cache.born(1) >= floor
+
+    def cache_span_s(self) -> float:
+        """Seconds between the oldest and the newest cached arrival."""
+        if not self._cache:
+            return 0.0
+        return round(max(self._cache.born(-1) - self._cache.born(0), 0.0), 1)
 
     def _drop_oldest_group(self) -> None:
         """Drop every cached object of the oldest group, so the cache
         stays a contiguous run of the newest groups."""
-        self._drop_group(min(self._groups))
+        self._drop_group(self._cache.groups()[0])
 
     def _truncate_live(self) -> None:
         """At the relay's hard ceiling: drop the newest cached group and
         cache none of the rest of it. Live delivery is unaffected."""
-        gid = max(self._groups)
+        gid = self._cache.groups()[-1]
         logger.warning(
             f"relay: cache {_budget.bytes} bytes over its "
             f"{CACHE_BUDGET_BYTES + CACHE_BYTES}-byte ceiling: dropping "
@@ -2062,39 +2734,51 @@ class _RelayedTrack:
             self._lost[gid] = oid
 
     def _drop_group(self, gid) -> None:
-        size = sum(retained_object_bytes(c[3], c[4]) for c in self._cache
-                   if c[0] == gid)
-        self._note_lost(gid, max(c[2] for c in self._cache if c[0] == gid))
-        self._cache = deque(c for c in self._cache if c[0] != gid)
-        del self._groups[gid]
-        self._cache_bytes -= size
-        _budget.bytes -= size
+        objs = self._cache.pop_group(gid)
+        self._note_lost(gid, max(c[1] for c in objs))
+        self._sync_cache()
         self._prune()
 
     def _prune(self) -> None:
-        """Forget per-group state below the oldest cached group; an
-        empty cache leaves the budget's LRU."""
-        floor = (self._cache[0][0] if self._cache
+        """Forget per-group state below the oldest cached group, and what
+        only live arrivals consult below STATE_GROUPS behind the newest;
+        an empty cache leaves the budget's LRU."""
+        head = self._cache.head() if self._cache else None
+        floor = (head[0] if head is not None
                  else self.largest[0] if self.largest else 0)
-        self._lost = {g: o for g, o in self._lost.items() if g >= floor}
-        oldest = (self._cache[0][0], self._cache[0][2]) if self._cache else None
-        self._gaps = [g for g in self._gaps if g[1] is None
-                      or (oldest is not None and g[1] > oldest)]
-        if not self._cache:
+        if self._lost:
+            self._lost = {g: o for g, o in self._lost.items() if g >= floor}
+        if self._gaps:
+            oldest = head
+            self._gaps = [g for g in self._gaps if g[1] is None
+                          or (oldest is not None and g[1] > oldest)]
+        if head is None:
             _budget.forget(self)
-        else:
-            first = self._cache[0][0]
-            self._floor = first
+            return
+        first = head[0]
+        newest = max(first, self.largest[0]) if self.largest else first
+        if newest >= self._state_to:
+            # Swept every STATE_GROUPS groups, so each holds at most
+            # twice that.
+            self._state_to = newest + STATE_GROUPS
+            low = self._state_floor = max(first, newest - STATE_GROUPS + 1)
             self._subgroups = {k: v for k, v in self._subgroups.items()
-                               if k[0] >= first}
-            self._reset = {k for k in self._reset if k[0] >= first}
-            self._dgrams = {k for k in self._dgrams if k[0] >= first}
-            self._ended = {k for k in self._ended if k[0] >= first}
-            self._opened = {k for k in self._opened if k[0] >= first}
-            self._heads = {g for g in self._heads if g >= first}
-            self._backfilled = {k for k in self._backfilled
-                                if k[0] >= first}
-            self._stopped = {k for k in self._stopped if k[1] >= first}
+                               if k[0] >= low}
+            self._reset = {k for k in self._reset if k[0] >= low}
+            self._dgrams = {k for k in self._dgrams if k[0] >= low}
+            self._opened = {k for k in self._opened if k[0] >= low}
+            self._backfilled = {k for k in self._backfilled if k[0] >= low}
+            self._stopped = {k for k in self._stopped if k[1] >= low}
+        # Copies below the swept state cannot be told apart: dropped.
+        self._floor = max(first, self._state_floor)
+        if first < self._pruned_to:
+            return
+        # Replays of cached groups need these. Swept once the floor has
+        # moved past as many groups as are cached, so the cost per
+        # object stays flat.
+        self._pruned_to = first + self._cache.group_count()
+        self._ended.drop_below(first)
+        self._heads.drop_below(first)
 
     def _replay(self, d) -> None:
         """Queue on `d`'s lane the cached objects inside its window, in
@@ -2105,8 +2789,11 @@ class _RelayedTrack:
             return
         self._expire_cache()
         d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
-        objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
-                       and d.admits(c[1], c[2], c[5], c[4])),
+        objs = sorted((c for c in self._cache.between(d.start[0],
+                                                      d.window[1])
+                       if d.passes(c[0], c[2])
+                       and (d.filters is None
+                            or d.admits(c[1], c[2], c[5], c[4]))),
                       key=lambda c: (c[0], c[1], c[2]))
         if objs:
             _budget.touch(self)
@@ -2115,9 +2802,10 @@ class _RelayedTrack:
         # never --lag-limit: stamps shift by that limit minus the deadline.
         limit = _tightest(self._timeout_s(d), self._max_age_s())
         shift = None if limit is None else limit - lane.deadline
-        for gid, sgid, oid, payload, exts, prio, status, shape, born in objs:
+        for gid, sgid, oid, payload, exts, prio, status, shape, born, cost \
+                in objs:
             lane.offer(_item(gid, False, sgid, oid, payload, exts, prio,
-                             status, shape,
+                             status, shape, cost=cost,
                              born=None if shift is None else born + shift))
         for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
             if (gid, sgid) in self._ended:
@@ -2134,16 +2822,19 @@ class _RelayedTrack:
         self._expire_cache()
         if not self._cache:
             return False
-        first = (self._cache[0][0], self._cache[0][2])
-        return start >= first
+        return start >= self._cache.head()
 
     def holds_through(self, end) -> bool:
         """The cache reaches `end`: it holds an object at or past it, the
         End of Group of `end`'s group, or End of Track."""
-        return any((c[0], c[2]) >= end
-                   or c[6] == ObjectStatus.END_OF_TRACK
-                   or (c[0] == end[0] and c[6] == ObjectStatus.END_OF_GROUP)
-                   for c in reversed(self._cache))
+        if not self._cache:
+            return False
+        newest = self._cache.groups()[-1]
+        if newest > end[0] or any(st == ObjectStatus.END_OF_TRACK for _, st
+                                  in self._cache.group_oids(newest)):
+            return True
+        return any(oid >= end[1] or st == ObjectStatus.END_OF_GROUP
+                   for oid, st in self._cache.group_oids(end[0]))
 
     def open_gap(self) -> None:
         """Note a pause: what is published from just past Largest, or
@@ -2165,7 +2856,7 @@ class _RelayedTrack:
         """The last cached Location of a group, which is its END_OF_GROUP
         when held; (group, 0) when none is held, and never before
         `start`."""
-        oids = [c[2] for c in self._cache if c[0] == group_id]
+        oids = [oid for oid, _ in self._cache.group_oids(group_id)]
         return max(start, (group_id, max(oids) if oids else 0))
 
     def cached_range(self, start, end):
@@ -2174,13 +2865,13 @@ class _RelayedTrack:
         across subgroups (§3.2.1)."""
         self._expire_cache()
         out = []
-        for gid, sgid, oid, payload, exts, prio, status, *_ in self._cache:
-            if (gid, oid) < start:
+        for o in self._cache.fetch_rows(start[0],
+                                        None if end is None else end[0]):
+            loc = (o[0], o[2])
+            if loc < start or (end is not None and loc > end):
                 continue
-            if end is not None and (gid, oid) > end:
-                continue
-            out.append((gid, sgid, oid, payload, exts, prio, status))
-        out.sort(key=lambda o: (o[0], o[2]))
+            out.append(o)
+        out.sort(key=_LOCATION)
         if out:
             _budget.touch(self)
         return out
@@ -2190,7 +2881,7 @@ class _RelayedTrack:
         `gid` from before what upstream delivered to this relay."""
         cf = self.complete_from
         return (start is not None and cf is not None
-                and max(start, (gid, 0)) < cf and gid not in self._heads)
+                and max(start, (gid, 0)) < cf and (gid, 0) not in self._heads)
 
     def _forward_one(self, session, alias, gid, sgid, oid,
                      payload, exts, prio, status=None, shape=None,
@@ -2849,11 +3540,10 @@ async def _backfill(track, msg, largest) -> None:
         return
     want = _subscription_window(msg, largest)[0]
     if want < (track.upstream_from or cf):
-        # The cache's reach: CACHE_GROUPS groups, by the IDs it has seen
-        # below cf, never short of a contiguous span.
-        seen = sorted(g for g in track._groups if g < cf[0])
-        reach = min([cf[0] - CACHE_GROUPS + 1,
-                     *seen[-(CACHE_GROUPS - 1):][:1]])
+        # BACKFILL_GROUPS groups, by the IDs cached below cf, never
+        # short of a contiguous span.
+        seen = track._cache.ids_below(cf[0], BACKFILL_GROUPS - 1)
+        reach = min([cf[0] - BACKFILL_GROUPS + 1, *seen[:1]])
         start = max(want, (max(0, reach), 0))
     else:
         start = max(want, (cf[0], 0))
@@ -2870,18 +3560,15 @@ async def _backfill(track, msg, largest) -> None:
     if (objs is None or track.complete_from != cf or track._closed
             or track.finished):
         return
-    held = {(c[0], c[2]) for c in track._cache}
+    held = {(c[0], c[2]) for c in track._cache.between(start[0], end[0])}
     now = time.monotonic()
     new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
             o.extensions or None, o.publisher_priority, o.status, None, now)
            for o in objs if (o.group_id, o.object_id) not in held]
-    track._cache = deque(sorted([*new, *track._cache],
-                                key=lambda c: (c[0], c[2])))
-    size = sum(retained_object_bytes(c[3], c[4]) for c in new)
-    track._cache_bytes += size
-    _budget.bytes += size
-    for c in new:
-        track._groups[c[0]] = track._groups.get(c[0], 0) + 1
+    track._cache.merge(new)
+    if new and now < track._born_floor:
+        track._born_floor = now
+    track._sync_cache()
     _budget.touch(track)
     track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)
@@ -2913,8 +3600,8 @@ async def _probe_catalog_head(track) -> None:
     head = SimpleNamespace(filter_type=FilterType.ABSOLUTE_START,
                            start_group=g, start_object=0, end_group=None)
     await _backfill(track, head, track.largest)
-    for c in list(track._cache):
-        if c[0] == g and c[2] == 0:
+    for c in list(track._cache.group(g)):
+        if c[2] == 0:
             _note_catalog(track.key[0], c[3])
             return
 
@@ -4330,10 +5017,12 @@ def parse_args(argv=None):
                              "--stream-ring-cap. Default: 512 KiB")
     parser.add_argument("--cache-bytes", type=int,
                         default=CACHE_BUDGET_BYTES, metavar="BYTES",
-                        help="Object cache budget across all tracks; past "
-                             "it the least recently used tracks lose their "
-                             "oldest groups. Send lanes holding more than "
-                             "this fall back to 4 MiB each. Default: 256 MiB")
+                        help="Object cache budget across all tracks, an "
+                             "eighth of it per track; past it the least "
+                             "recently used tracks lose their oldest groups, "
+                             "each keeping its newest 10 s while others hold "
+                             "more. Send lanes holding more than this fall "
+                             "back to 4 MiB each. Default: 256 MiB")
     parser.add_argument("--max-namespaces-per-session", type=int,
                         default=MAX_NAMESPACES_PER_SESSION, metavar="N",
                         help="PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and "
@@ -5580,7 +6269,8 @@ class _Status:
                 "latency_ms": (None if up is None or down is None
                                else round((up + down) / 2, 1)),
                 "largest": list(t.largest) if t.largest else None,
-                "cache_groups": len({c[0] for c in t._cache}),
+                "cache_groups": len(t._cache.groups()),
+                "cache_seconds": t.cache_span_s(),
                 "cache_bytes": t._cache_bytes,
                 "state": _track_state(t, t._bytes_in > p_in),
                 "origin": (f"{_transport(owner)} d{_draft(owner)}"
@@ -6228,8 +6918,9 @@ async def main():
     if args.drain_timeout < 0:
         print("Error: --drain-timeout must be 0 or more", file=sys.stderr)
         sys.exit(2)
-    global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
+    global CACHE_BUDGET_BYTES, CACHE_BYTES, STREAM_SCHEDULING
     CACHE_BUDGET_BYTES = args.cache_bytes
+    CACHE_BYTES = CACHE_BUDGET_BYTES // 8
     if (args.max_namespaces_per_session <= 0
             or args.max_subscriptions_per_session <= 0):
         print("Error: --max-namespaces-per-session and "
@@ -6308,7 +6999,7 @@ async def main():
             "started": time.time(),
             "watchdog_s": args.watchdog,
             "workers": args.workers,
-            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
+            "cache": {"track_bytes": CACHE_BYTES, "floor_s": CACHE_FLOOR_S,
                       "budget": CACHE_BUDGET_BYTES},
             "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
                             "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},

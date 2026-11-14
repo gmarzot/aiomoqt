@@ -50,8 +50,7 @@ def _subscribe(t):
 
 def _accounted(*tracks):
     for t in tracks:
-        assert t._cache_bytes == sum(retained_object_bytes(c[3], c[4])
-                                     for c in t._cache)
+        assert t._cache_bytes == sum(map(relay._record_cost, t._cache))
     assert relay._budget.bytes == sum(t._cache_bytes for t in tracks)
 
 
@@ -85,7 +84,7 @@ def test_the_record_charge_covers_a_cached_object(monkeypatch):
     per = _traced(lambda: [t._remember(0, 0, oid, _payload(oid), None, 128,
                                        ObjectStatus.NORMAL)
                            for oid in range(_N)]) / _N - 3
-    assert 0.75 * OBJECT_RECORD_BYTES < per <= OBJECT_RECORD_BYTES, per
+    assert 0.4 * OBJECT_RECORD_BYTES < per <= OBJECT_RECORD_BYTES, per
     t._drop_cache()
 
 
