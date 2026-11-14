@@ -634,8 +634,9 @@ class SubgroupDelivery:
         return self.stream_priority if order is None else order.open_band()
 
     def _opened(self, sid: int, band: Optional[int]) -> None:
-        if self.order is not None:
-            self.order.opened(sid, band)
+        order = self.order
+        if order is not None and band is not None:
+            order.opened(sid, band)
 
     def _note_largest(self, group_id: int, object_id: int) -> None:
         """Largest Location is a max: group send order is not guaranteed
