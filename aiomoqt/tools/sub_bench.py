@@ -138,6 +138,7 @@ class BenchReporter:
             print(f"  Jitter:      {s['jitter_ms']:.2f} ms")
             print(f"  Lost:        {s['lost']} ({s['loss_pct']:.2f}%)")
             print(f"  Out-of-order:   {s['ooo']}")
+            print(f"  Duplicates:     {s['dups']}")
         check = self.payload_check
         if check is not None:
             every = f", every {check.every}" if check.every > 1 else ""
@@ -164,7 +165,7 @@ examples:
 """)
     _cli.add_endpoint(parser)
     _cli.add_identity(parser)
-    _cli.add_run(parser, duration=0)   # 0 = run until publisher closes
+    _cli.add_run(parser)
     _cli.add_interval(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser)
@@ -188,7 +189,7 @@ def print_banner(relay, args):
     print(f"  transport:   {relay.transport_name}")
     print(f"  namespace:   {args.namespace}")
     print(f"  trackname:   {args.trackname or '(auto-discover)'}")
-    print(f"  duration:    {args.duration}s")
+    print(f"  duration:    {_cli.duration_label(args.duration)}")
     print(f"  interval:    {args.interval}s")
     if args.verify_payload:
         print(f"  payload:     checked (every {args.verify_payload})")
@@ -227,15 +228,15 @@ async def run(args):
     try:
         print("  Connecting...")
         async with contextlib.AsyncExitStack() as stack:
-            # -t bounds connecting as well as receiving.
+            limit = _cli.setup_timeout(args)
             try:
-                async with asyncio.timeout(args.duration or None):
+                async with asyncio.timeout(limit):
                     session = await stack.enter_async_context(
                         client.connect())
             except TimeoutError:
-                raise ConnectionError(f"no session within {args.duration}s")
+                raise ConnectionError(f"no session within {limit}s")
             try:
-                async with asyncio.timeout(args.duration or None):
+                async with asyncio.timeout(limit):
                     await session.client_session_init()
                     track = SubscribedTrack(
                         session,
@@ -265,7 +266,7 @@ async def run(args):
                 session.close(
                     e.error_code, e.reason_phrase)
             except TimeoutError:
-                print(f"  Error: no subscription within {args.duration}s")
+                print(f"  Error: no subscription within {limit}s")
             except Exception as e:
                 print(f"  Error: {e}")
     except Exception as e:

@@ -1,16 +1,20 @@
 """aiomoqt-relay send lanes: each subscriber's objects queue on its own
 lane, so a slow subscriber holds up only itself and sheds whole groups
-past the lane bound; its truncated subgroups are reset, never FINed."""
+once past its deadline; its truncated subgroups are reset, never FINed."""
 import asyncio
+import time
 import contextlib
 import logging
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.context import canonical_stream_reset, profile_for
+from aiomoqt.delivery import LANE_MIN_BYTES, SendLane
+from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import StreamResetCode, SubscribeDoneCode
@@ -43,10 +47,12 @@ def relay_tables():
 
 @contextlib.asynccontextmanager
 async def _relay(port, use_quic, draft):
-    """A relay; yields a coroutine that connects one more session."""
+    """A relay with its lane timer; yields a coroutine that connects one
+    more session."""
     server = relay._build_server("localhost", port, CERT, KEY,
                                  use_quic=use_quic, draft=draft)
     handle = await server.serve()
+    watch = asyncio.ensure_future(relay._watch_lanes())
     try:
         async with contextlib.AsyncExitStack() as stack:
             async def connect():
@@ -58,6 +64,7 @@ async def _relay(port, use_quic, draft):
                 return s
             yield connect
     finally:
+        watch.cancel()
         handle.close()
 
 
@@ -88,15 +95,16 @@ class _Sub:
         return track
 
 
-def _slow_down(session):
-    """Every awaited write to `session` takes _SLOW_S: a subscriber whose
+def _slow_down(session, delay=_SLOW_S):
+    """Every awaited write to `session` takes `delay`: a subscriber whose
     streams drain slowly."""
     real = session.stream_write_drain
 
-    async def slow(stream_id, data):
-        await asyncio.sleep(_SLOW_S)
-        await real(stream_id, data)
+    async def slow(stream_id, data, end_stream=False, **kw):
+        await asyncio.sleep(delay)
+        await real(stream_id, data, end_stream, **kw)
     session.stream_write_drain = slow
+    session.stream_write_nowait = lambda *_a, **_kw: False
 
 
 async def _until(pred, timeout=5.0):
@@ -115,6 +123,7 @@ async def _until(pred, timeout=5.0):
 async def test_a_slow_subscriber_sheds_groups_without_holding_up_others(
         use_quic, draft, relay_tables, monkeypatch, caplog):
     monkeypatch.setattr(relay, "LANE_BYTES", _BOUND)
+    monkeypatch.setattr(relay, "_lag_limit", 0.5)
     caplog.set_level(logging.WARNING, logger="aiomoqt.relay")
     port = _BASE_PORT + 4 * (draft == 22) + 2 * (not use_quic)
     fast, slow, late = _Sub(), _Sub(), _Sub()
@@ -169,11 +178,14 @@ async def test_a_slow_subscriber_sheds_groups_without_holding_up_others(
     assert fast_audio.count and slow_audio.count
     # The slow one shed whole groups; the first episode logs a WARNING.
     assert shed > 0 and sheds >= 1, (shed, sheds)
-    warned = [r for r in caplog.records if "send lane" in r.getMessage()]
+    warned = [r for r in caplog.records
+              if "/video request" in r.getMessage()
+              and "resetting groups below" in r.getMessage()]
     assert len(warned) == 1, [r.getMessage() for r in warned]
     resets = {k: code for k, (clean, code) in slow.ends.items() if not clean}
     assert resets, slow.ends
-    assert set(resets.values()) == {StreamResetCode.CANCELLED}, resets
+    # Past the deadline: shed or expired, either resets DELIVERY_TIMEOUT.
+    assert set(resets.values()) == {StreamResetCode.DELIVERY_TIMEOUT}, resets
     # A FINed subgroup is complete; a short one was reset.
     for k, (clean, _code) in slow.ends.items():
         if clean:
@@ -200,24 +212,40 @@ class _Fake:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
         self.log.append(("open", sid))
         self._unwritten.add(sid)
+        if initial:
+            # The header write carries the stream's first object.
+            try:
+                await self.stream_write_drain(sid, initial)
+            except BaseException:
+                self.stream_reset(sid, StreamResetCode.CANCELLED)
+                raise
+            self.log.append(("data", sid))
+        if end_stream:
+            self.log.append(("fin", sid))
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
         if end_stream:
             self.log.append(("fin", sid))
 
-    async def stream_write_drain(self, sid, data):
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
         await self.gate.wait()
         if sid in self._unwritten:
             self._unwritten.discard(sid)
             self.log.append(("hdr", sid))
         else:
             self.log.append(("data", sid))
+        if end_stream:
+            self.log.append(("fin", sid))
 
     def stream_reset(self, sid, code):
         self.log.append(("reset", sid, int(code)))
@@ -243,7 +271,9 @@ async def _settle(n=50):
 
 async def test_a_blocked_lane_holds_up_neither_the_track_nor_its_peers(
         monkeypatch):
+    # No deadline: the lane is held to LANE_BYTES.
     monkeypatch.setattr(relay, "LANE_BYTES", 10_000)
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     track = relay._RelayedTrack(("ns", "t"))
     fast, slow = _Fake(), _Fake(blocked=True)
     track.add_downstream(fast, 1, 1)
@@ -272,6 +302,48 @@ async def test_a_blocked_lane_holds_up_neither_the_track_nor_its_peers(
         assert lane.idle and not lane.shedding
     finally:
         track.close()
+
+
+@pytest.mark.parametrize("ending", ["subscriber_close", "track_close", "stop"])
+@pytest.mark.parametrize("deadline", [0, 0.05], ids=["bytes", "time"])
+async def test_an_ended_lane_counts_its_shed_bytes_once(monkeypatch, deadline,
+                                                        ending):
+    monkeypatch.setattr(relay, "_lanes", set())
+    monkeypatch.setattr(relay, "_lanes_over_budget", False)
+    monkeypatch.setattr(relay, "LANE_BYTES", 10_000)
+    monkeypatch.setattr(relay, "_lag_limit", deadline)
+    peer = _Fake(blocked=True)
+    tracks = [relay._RelayedTrack(((b"shed",), n)) for n in (b"a", b"v")]
+    lanes = []
+    try:
+        for track in tracks:
+            d = track.add_downstream(peer, len(lanes) + 1, len(lanes) + 1)
+            for gid in range(4):
+                for oid in range(4):
+                    track.on_object(_obj(gid, oid), 1000, 0, gid, 0)
+                    await _settle(5)
+                await asyncio.sleep(deadline)
+                # The lanes' timer marks them late; the next object sheds.
+                relay._time_lanes(time.monotonic())
+            lanes.append(d.lane)
+        before = [track.shed_bytes() for track in tracks]
+        assert all(before), before
+        for track, lane in zip(tracks, lanes):
+            if ending == "subscriber_close":
+                track.drop_session(peer)
+            elif ending == "track_close":
+                track.close()
+            else:
+                lane.stop()
+        await asyncio.gather(*(ln.task for ln in lanes),
+                             return_exceptions=True)
+        assert [track.shed_bytes() for track in tracks] == before
+        assert not relay._lanes
+    finally:
+        for track in tracks:
+            track.close()
+        await asyncio.gather(*(ln.task for ln in lanes),
+                             return_exceptions=True)
 
 
 async def test_publish_done_follows_each_lane(monkeypatch):
@@ -334,3 +406,525 @@ async def test_a_closed_session_stops_its_draining_lane(monkeypatch):
     await _settle()
     assert lane.stopped and lane.task.done() and lane not in relay._lanes
     assert not slow.kinds("done")
+
+
+class _Closing(_Fake):
+    """A session whose blocked write is cancelled when it closes, as a QUIC
+    close cancels its drain waiters."""
+
+    def __init__(self):
+        super().__init__(blocked=True)
+        loop = asyncio.get_running_loop()
+        self._moqt_session_closed = loop.create_future()
+        self._drain = loop.create_future()
+
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        await self._drain
+
+    def close(self):
+        self._moqt_session_closed.set_result(None)
+        self._drain.cancel()
+
+
+class _Broken(_Fake):
+    """A live session whose writes fail."""
+
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        raise ConnectionError("stream gone")
+
+
+async def test_a_session_closed_mid_write_is_not_a_drop():
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    viewer = _Closing()
+    d = track.add_downstream(viewer, 1, 1)
+    track.on_object(_obj(0, 0), 0, 0, 0, 0)
+    await _settle()
+    lane = d.lane
+    assert lane.busy
+    viewer.close()
+    await _settle()
+    assert lane.stopped and not track.downstream
+    assert track._drops == 0
+
+
+async def test_a_failed_forward_to_a_live_session_is_a_drop():
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    viewer = _Broken()
+    d = track.add_downstream(viewer, 1, 1)
+    track.on_object(_obj(0, 0), 0, 0, 0, 0)
+    await _settle()
+    assert d.lane.stopped and not track.downstream
+    assert track._drops == 1
+
+
+# -- the lane's time bound -------------------------------------------------
+class _Writer:
+    """Holds `tx` bytes in the transport, and every send waits on `gate`."""
+
+    def __init__(self):
+        self.session = SimpleNamespace()
+        self.tx = 0
+        self.resets = []
+        self.gate = asyncio.Event()
+
+    async def send(self, item):
+        await self.gate.wait()
+        return True
+
+    def tx_queued(self, floor=None):
+        return self.tx
+
+    def reset_below(self, floor):
+        self.resets.append(floor)
+
+    def reset_group(self, code=StreamResetCode.CANCELLED):
+        self.resets.append(code)
+
+    def end_group(self):
+        pass
+
+    def close_streams(self):
+        pass
+
+    def expire(self, gid):
+        return True
+
+    def final(self, *args):
+        pass
+
+
+def _item(gid, cost=1000):
+    return (gid, cost, True, None)
+
+
+@pytest.mark.parametrize("deadline,rate,expected", [
+    (None, 100_000, 4_000_000),  # no deadline: bytes alone
+    (2.0, 0.0, 4_000_000),       # rate unknown
+    (2.0, 125_000, 250_000),     # 1 Mbps for 2 s
+    (2.0, 1_000, LANE_MIN_BYTES),   # a slow track keeps the floor
+    (60.0, 125_000, 4_000_000),  # never past max_bytes
+])
+async def test_the_bound_is_the_deadline_at_the_input_rate(deadline, rate, expected):
+    lane = SendLane(_Writer(), max_bytes=4_000_000)
+    lane.deadline, lane.rate = deadline, rate
+    assert lane.bound == expected
+    lane.stop()
+    await _settle()
+
+
+async def test_transport_backlog_counts_against_the_time_bound():
+    writer = _Writer()
+    lane = SendLane(writer, max_bytes=4_000_000)
+    lane.deadline, lane.rate = 1.0, 100_000
+    writer.tx = 90_000
+    lane.offer(_item(1, 5_000))   # read tx_bytes; under the bound with this
+    assert lane.sheds == 0
+    lane.offer(_item(2, 8_000))   # a new group reads it again: 103 KB held
+    assert lane.sheds == 1 and lane.shedding
+    assert lane.floor is not None and lane.floor >= 2
+    lane.stop()
+    await _settle()
+
+
+async def test_shed_bytes_count_what_the_transport_held():
+    writer = _Writer()
+    lane = SendLane(writer, max_bytes=4_000_000)
+    lane.deadline, lane.rate = 1.0, 100_000
+    writer.tx_queued = lambda floor=None: 95_000 if floor is None else 0
+    writer.gate.set()
+    lane.offer(_item(1, 1_000))
+    lane._probe_gid = None
+    lane.tx_bytes = 95_000
+    lane.items.clear()
+    lane.bytes = 0
+    lane.offer(_item(2, 10_000))
+    assert lane.sheds == 1 and lane.shed == 0
+    assert lane.shed_bytes == 95_000, lane.shed_bytes
+    lane.stop()
+    await _settle()
+
+
+async def test_no_rate_leaves_the_byte_bound_alone():
+    writer = _Writer()
+    lane = SendLane(writer, max_bytes=4_000_000)
+    lane.deadline = 1.0
+    writer.tx = 2_000_000
+    lane.offer(_item(1))
+    lane.offer(_item(2))
+    assert lane.sheds == 0
+    lane.stop()
+    await _settle()
+
+
+def _lane(track, n=1):
+    return relay._RelayLane(track, track.add_downstream(_Fake(), n, n))
+
+
+@pytest.mark.parametrize("deadline,expected", [
+    (5.0, 0),                    # the time rule alone
+    (None, relay.LANE_BYTES),
+])
+async def test_a_relay_lane_has_a_byte_bound_only_without_a_deadline(
+        monkeypatch, deadline, expected):
+    monkeypatch.setattr(relay, "_lanes", set())
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    lane = _lane(track)
+    lane.deadline = deadline
+    assert lane.bound == expected
+    lane.stop()
+
+
+async def test_lanes_over_the_budget_go_back_to_lane_bytes_until_clear(
+        monkeypatch):
+    monkeypatch.setattr(relay, "_lanes", set())
+    monkeypatch.setattr(relay, "_lanes_over_budget", False)
+    monkeypatch.setattr(relay, "CACHE_BUDGET_BYTES", 1000)
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    lane = _lane(track)
+    lane.deadline = 5.0
+
+    lane.bytes = 1000
+    relay._budget_lanes()
+    assert lane.bound == 0
+
+    lane.bytes = 1001
+    relay._budget_lanes()
+    assert relay._lanes_over_budget and lane.bound == relay.LANE_BYTES
+    lane.deadline = 2.0
+    assert lane.bound == relay.LANE_BYTES
+
+    lane.bytes = 900                   # over 7/8 of the budget
+    relay._budget_lanes()
+    assert lane.bound == relay.LANE_BYTES
+
+    lane.bytes = 875
+    relay._budget_lanes()
+    assert not relay._lanes_over_budget and lane.bound == 0
+    assert relay._lane_bytes == 875
+    lane.stop()
+
+
+async def test_lanes_on_one_track_count_its_queue_once(monkeypatch):
+    monkeypatch.setattr(relay, "_lanes", set())
+    monkeypatch.setattr(relay, "_lanes_over_budget", False)
+    monkeypatch.setattr(relay, "CACHE_BUDGET_BYTES", 1000)
+    hot = relay._RelayedTrack(((b"ns",), b"hot"))
+    other = relay._RelayedTrack(((b"ns",), b"other"))
+    lanes = [_lane(hot, 1), _lane(hot, 2), _lane(other, 3)]
+    for lane, queued, transport in zip(lanes, (600, 400, 100), (10, 20, 30)):
+        lane.bytes, lane.tx_bytes = queued, transport
+    assert relay._held_by_lanes() == 600 + 100 + 10 + 20 + 30
+    relay._budget_lanes()
+    assert not relay._lanes_over_budget
+    for lane in lanes:
+        lane.stop()
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_viewer_past_the_lag_limit_sheds_every_track(
+        use_quic, draft, relay_tables, monkeypatch):
+    monkeypatch.setattr(relay, "_lag_limit", 0.5)
+    port = _BASE_PORT + 8 + 4 * (draft == 22) + 2 * (not use_quic)
+    fast, slow, slow_audio = _Sub(), _Sub(), _Sub()
+    async with _relay(port, use_quic, draft) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video", object_size=_OBJ,
+                       group_size=_GROUP, rate=_RATE).attach()
+        PublishedTrack(pub, namespace=_NS, trackname="audio", object_size=200,
+                       group_size=50, rate=50).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+
+        s_fast, s_slow = await connect(), await connect()
+        await fast.subscribe(s_fast, "video")
+        track = relay._tracks[(relay._ns_tuple(_NS), b"video")]
+        before = set(map(id, (d.session for d in track.downstream)))
+        await slow.subscribe(s_slow, "video")
+        (d_slow,) = [d for d in track.downstream if id(d.session) not in before]
+        _slow_down(d_slow.session)
+        await slow_audio.subscribe(s_slow, "audio")
+        audio = relay._tracks[(relay._ns_tuple(_NS), b"audio")]
+        (d_audio,) = list(audio.downstream)
+
+        async def tick():
+            while True:
+                await asyncio.sleep(0.2)
+                relay._check_lanes()
+        ticker = asyncio.create_task(tick())
+        try:
+            await asyncio.sleep(3.0)
+            # A slow runner can take longer for the audio to fall behind.
+            await _until(lambda: d_audio.lane.sheds >= 1, timeout=7.0)
+        finally:
+            ticker.cancel()
+        lane = d_slow.lane
+        sent, sheds, bound = track._objects_in, lane.sheds, lane.bound
+        shed_total = track.shed_bytes()
+        a = d_audio.lane
+        audio_sheds = a.sheds
+        audio_state = dict(objects=a.objects, bytes=a.bytes, queued=len(a.items),
+                           tx_bytes=a.tx_bytes, late=a.late, done=a.done,
+                           received=slow_audio.count)
+
+    assert bound == 0, bound
+    assert sheds >= 1 and shed_total > 0, (sheds, shed_total)
+    # The audio on the same slow session is as far behind: it sheds too.
+    assert audio_sheds >= 1, audio_state
+    assert slow_audio.count
+    assert fast.count >= sent - _RATE, (fast.count, sent)
+    assert slow.count
+    resets = {k: code for k, (clean, code) in slow.ends.items() if not clean}
+    assert resets and set(resets.values()) == {
+        StreamResetCode.DELIVERY_TIMEOUT}, slow.ends
+    for k, (clean, _code) in slow.ends.items():
+        if clean:
+            assert slow.objects[k] == set(range(_GROUP)), (k, slow.objects[k])
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_track_resumed_after_a_pause_keeps_its_first_group(
+        use_quic, draft, relay_tables, monkeypatch):
+    # The first viewer after a pause, a little slower than the track,
+    # gets its first whole group.
+    monkeypatch.setattr(relay, "_pause_after", 0.3)
+    port = _BASE_PORT + 16 + 4 * (draft == 22) + 2 * (not use_quic)
+    sizes = {"alt": _OBJ // 2, "video": _OBJ}
+    async with _relay(port, use_quic, draft) as connect:
+        pub = await connect()
+        for name, size in sizes.items():
+            PublishedTrack(pub, namespace=_NS, trackname=name, object_size=size,
+                           group_size=_GROUP, rate=_RATE).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+
+        s1 = await connect()
+        watching = [await _Sub().subscribe(s1, n) for n in sizes]
+        tracks = {n: relay._tracks[(relay._ns_tuple(_NS), n.encode())]
+                  for n in sizes}
+        for _ in range(3):
+            await asyncio.sleep(0.5)
+            relay._check_lanes()
+        assert all(t._objects_in > 0 for t in tracks.values())
+        for sub in watching:
+            sub.unsubscribe()
+        assert await _until(lambda: all(t.paused for t in tracks.values()))
+        await asyncio.sleep(0.3)
+
+        s2 = await connect()
+        subs = {n: _Sub() for n in sizes}
+        before = {n: set(map(id, (d.session for d in t.downstream)))
+                  for n, t in tracks.items()}
+
+        def joined(name):
+            (d,) = [d for d in tracks[name].downstream
+                    if id(d.session) not in before[name]]
+            return d
+        await subs["alt"].subscribe(s2, "alt")
+        _slow_down(joined("alt").session, delay=0.05)
+        await subs["video"].subscribe(s2, "video")
+
+        def first_group_ended(sub):
+            started = sorted(k for k, objs in sub.objects.items() if 0 in objs)
+            return bool(started) and started[0] in sub.ends
+
+        for name in sizes:
+            assert await _until(lambda: first_group_ended(subs[name]), 4.0), (
+                name, subs[name].objects, subs[name].ends)
+        sheds = {n: joined(n).lane.sheds for n in sizes}
+
+    assert sheds == {n: 0 for n in sizes}, sheds
+    for name, sub in subs.items():
+        k = min(k for k, objs in sub.objects.items() if 0 in objs)
+        assert sub.ends[k] == (True, None), (name, k, sub.ends[k])
+        assert sub.objects[k] == set(range(_GROUP)), (name, k, sub.objects[k])
+
+
+def test_the_deployed_relay_config_parses():
+    path = Path(relay.__file__).parents[2] / "deploy/aiomoqt-relay/relay.toml"
+    if not path.exists():
+        pytest.skip("source tree only")
+    args = relay.parse_args(["--config", str(path)])
+    assert args.lag_limit == relay.LAG_LIMIT_S
+
+
+# -- write-through from offer() -----------------------------------------
+
+class _Taking(_Fake):
+    """A session whose transport takes a write without waiting unless
+    `take` is False, recording each stream's bytes."""
+
+    def __init__(self, take=True):
+        super().__init__()
+        self.take = take
+        self.wire = defaultdict(bytes)
+        self.dgrams = []
+
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
+        sid = self._next
+        self._next += 4
+        self.log.append(("open", sid, end_stream))
+        self.wire[sid] += bytes(initial)
+        return sid
+
+    def stream_write_nowait(self, sid, data, end_stream=False, **_kw):
+        if not self.take:
+            return False
+        self.log.append(("nowait", sid))
+        self.wire[sid] += bytes(data)
+        if end_stream:
+            self.log.append(("fin", sid))
+        return True
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        self.log.append(("drain", sid))
+        self.wire[sid] += bytes(data)
+        if end_stream:
+            self.log.append(("fin", sid))
+
+    def stream_write(self, sid, data, end_stream=False):
+        self.log.append(("write", sid))
+        self.wire[sid] += bytes(data)
+        if end_stream:
+            self.log.append(("fin", sid))
+
+    def datagram_max_payload(self):
+        return 1200
+
+    def send_dgram_message(self, buf):
+        self.dgrams.append(bytes(buf.data))
+
+
+@pytest.fixture
+def lane_sends(monkeypatch):
+    """Object ids written by a lane task, not from offer()."""
+    sends = []
+    real = relay._RelayDelivery.send
+
+    def counted(self, item, end=None):
+        sends.append(item[5])
+        return real(self, item, end)
+    monkeypatch.setattr(relay._RelayDelivery, "send", counted)
+    return sends
+
+
+async def test_an_object_on_an_open_stream_is_written_from_offer(lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(4):
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_stream_end(0, 0)
+        await _settle()
+        # Only the object that opened the stream waited for the lane task.
+        assert lane_sends == [0], lane_sends
+        assert sub.kinds("open") == [("open", 3, False)]
+        assert len(sub.kinds("nowait")) == 3 and sub.kinds("fin") == [("fin", 3)]
+        assert track._objects_out == 4
+    finally:
+        track.close()
+
+
+async def test_a_last_object_queued_with_its_end_leaves_in_one_write(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(3):
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_object(_obj(0, 3), 0, 0, 0, 0)
+        track.on_stream_end(0, 0)
+        await _settle()
+        assert lane_sends == [0, 3], lane_sends
+        assert len(sub.kinds("nowait")) == 3 and not sub.kinds("write")
+        assert sub.kinds("fin") == [("fin", 3)] and not track._ends_due
+    finally:
+        track.close()
+
+
+async def test_a_refused_write_is_queued_and_sent_once_with_the_same_bytes(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    taking, refusing = _Taking(), _Taking()
+    track.add_downstream(taking, 1, 1)
+    track.add_downstream(refusing, 1, 2)
+    try:
+        for oid in range(4):
+            refusing.take = oid != 2
+            track.on_object(_obj(0, oid), 0, 0, 0, 0)
+            await _settle(5)
+        track.on_stream_end(0, 0)
+        await _settle()
+        assert refusing.kinds("drain") == [("drain", 3)]
+        assert len(refusing.kinds("nowait")) == 2
+        assert lane_sends == [0, 0, 2], lane_sends
+        assert refusing.wire == taking.wire and taking.wire[3]
+    finally:
+        track.close()
+
+
+async def test_a_new_stream_still_opens_with_its_object_and_end(lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for gid in range(3):
+            track.on_object(_obj(gid, 0), 0, 0, gid, 0)
+            track.on_stream_end(gid, 0)
+            await _settle(5)
+        await _settle()
+        assert sub.kinds("open") == [("open", sid, True) for sid in (3, 7, 11)]
+        assert not sub.kinds("nowait") and not sub.kinds("fin")
+        assert lane_sends == [0, 0, 0]
+    finally:
+        track.close()
+
+
+async def test_a_datagram_is_written_from_offer(lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    try:
+        for oid in range(3):
+            dgram = ObjectDatagram(track_alias=9, group_id=0, object_id=oid,
+                                   publisher_priority=128, extensions=None,
+                                   payload=b"x" * 100)
+            track.on_object(dgram, 100, 0, 0, 0)
+            await _settle(5)
+        assert len(sub.dgrams) == 3 and not lane_sends
+        assert not sub.kinds("open")
+    finally:
+        track.close()
+
+
+async def test_replays_and_traced_subscribers_stay_on_the_lane(monkeypatch):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    d = track.add_downstream(sub, 1, 1)
+    try:
+        track.on_object(_obj(0, 0), 0, 0, 0, 0)
+        await _settle(5)
+        replay = relay._item(0, False, 0, 1, b"x", None, 128, None, None)
+        assert d.lane.writer.send_nowait(replay) is None
+        assert not sub.kinds("nowait")
+    finally:
+        track.close()
+    monkeypatch.setattr(relay, "_trace_subscribers", True)
+    track = relay._RelayedTrack(("ns", "t2"))
+    try:
+        d = track.add_downstream(_Taking(), 1, 1)
+        assert track._lane(d)._nowait is None
+    finally:
+        track.close()

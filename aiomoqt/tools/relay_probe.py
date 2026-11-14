@@ -2,7 +2,7 @@
 """
 MOQ relay probe — determines relay liveness and supported draft versions.
 
-Each endpoint URL is probed once per draft (14, 16, 18 by default; use
+Each endpoint URL is probed once per draft (14, 16, 18, 20, 22 by default; use
 --draft to narrow), over the transport its scheme selects:
   - moqt:// URLs: raw QUIC (moqt-NN / moq-00 ALPN)
   - https:// URLs: H3/WebTransport (WT-Protocol)
@@ -78,6 +78,8 @@ DRAFT_PROBES = [
     ("draft-14", 14),
     ("draft-16", 16),
     ("draft-18", 18),
+    ("draft-20", 20),
+    ("draft-22", 22),
 ]
 
 # Set from --draft to probe a single draft instead of the full DRAFT_PROBES
@@ -359,8 +361,8 @@ def parse_args(argv=None):
         help="draft(s) to probe: a single draft (--draft 18) or a list "
              "(--draft 18,16). By default each listed draft is probed "
              "INDIVIDUALLY, in order; with --offer the whole list is offered "
-             "in ONE session. Default (no --draft) probes 14, 16, 18 each; "
-             "20 and 22 are probed only when named.")
+             "in ONE session. Default (no --draft) probes 14, 16, 18, 20 "
+             "and 22 each.")
     p.add_argument(
         "--offer", action="store_true", default=False,
         help="with a multi-draft --draft, offer the whole list in ONE "

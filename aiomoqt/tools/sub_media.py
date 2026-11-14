@@ -7,7 +7,8 @@ playable files, or pipes one track straight into a player.
 Reads the catalog track, subscribes every media track it describes
 (--packaging narrows to one packaging), and writes:
   <out>/video.h264   Annex-B elementary stream (SPS/PPS injected from
-                     the catalog/wire decoder config at keyframes)
+                     the catalog/wire decoder config at keyframes);
+                     <name>.h264 when several LOC video tracks
   <out>/audio.wav    pcm-s16 with header from the catalog track entry
   <out>/<role>.mp4   fMP4 for CMAF and LOCMAF tracks (LOCMAF objects
                      rebuilt to CMAF chunks); <name>.mp4 when several
@@ -39,6 +40,7 @@ skew are built from differences and do not.
 import asyncio
 import csv
 import functools
+import math
 import os
 import sys
 import time
@@ -81,10 +83,6 @@ def parse_args():
                         default=None,
                         help='Subscribe only catalog tracks of this '
                              'packaging (default: every media track)')
-    parser.add_argument('--loc-bare', action='store_true',
-                        help='LOC payloads without the (empty) Private '
-                             'Properties block 0x0A 0x00, from publishers '
-                             'predating loc-04 §2.2')
     parser.add_argument('--out', type=str, default='./media-out',
                         help='Output directory (default: ./media-out)')
     parser.add_argument('--pipe', choices=('video', 'audio'), default=None,
@@ -118,7 +116,7 @@ def parse_args():
     parser.add_argument('--report', type=str, default=None, metavar='PATH',
                         help='With --analyze: write interval and summary '
                              'rows as CSV to PATH (- = stdout)')
-    _cli.add_run(parser, duration=30)
+    _cli.add_run(parser)
     _cli.add_interval(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser)
@@ -141,8 +139,9 @@ _CHUNKED = (PACKAGING_CMAF, PACKAGING_LOCMAF)
 
 
 class _Writers:
-    """Per-track sinks: LOC video → Annex-B .h264, pcm audio → .wav, CMAF
-    and LOCMAF → fMP4 (<role>.mp4, or <name>.mp4 when several wanted
+    """Per-track sinks: LOC video → Annex-B .h264 (video.h264, or
+    <name>.h264 when several wanted LOC video tracks), pcm audio → .wav,
+    CMAF and LOCMAF → fMP4 (<role>.mp4, or <name>.mp4 when several wanted
     tracks share the role). One track may stream raw to stdout instead
     (pipe_role)."""
 
@@ -152,7 +151,7 @@ class _Writers:
         self.sub = subscriber
         self.pipe_role = pipe_role
         self.wanted = wanted or (lambda entry: True)
-        self.video = None
+        self.h264 = {}
         self.ivf = None
         self.wav = None
         self.aac = None
@@ -219,11 +218,13 @@ class _Writers:
             if self.pipe_role == 'video':
                 self._pipe(param_sets + as_annexb(frame.payload))
                 return
-            if self.video is None:
-                self.video = open(os.path.join(self.out, 'video.h264'),
-                                  'wb')
-            self.video.write(param_sets)
-            self.video.write(as_annexb(frame.payload))
+            fh = self.h264.get(name)
+            if fh is None:
+                fh = self.h264[name] = open(
+                    os.path.join(self.out, f'{self._h264_stem(entry)}.h264'),
+                    'wb')
+            fh.write(param_sets)
+            fh.write(as_annexb(frame.payload))
         elif role == 'audio' and (entry.codec or '').startswith('mp4a'):
             # Raw AAC AUs; the AudioSpecificConfig arrives via catalog
             # initRef. ADTS-wrapped output is directly playable.
@@ -257,10 +258,18 @@ class _Writers:
                  and self.wanted(t)]
         return entry.name if len(peers) > 1 else entry.role
 
+    def _h264_stem(self, entry) -> str:
+        catalog = self.sub.catalog
+        peers = [t for t in (catalog.tracks if catalog else ())
+                 if t.role == 'video' and t.packaging not in _CHUNKED
+                 and not (t.codec or '').startswith('av01')
+                 and self.wanted(t)]
+        return entry.name if len(peers) > 1 else 'video'
+
     def close(self):
         self.closed = True
-        if self.video:
-            self.video.close()
+        for fh in self.h264.values():
+            fh.close()
         if self.ivf:
             self.ivf.close()
         if self.wav:
@@ -358,7 +367,7 @@ async def _analyze(args, analysis: MediaAnalysis, closed, report) -> None:
     session closes."""
     _table(report, [interval_header(analysis.tracks)])
     start = time.monotonic()
-    end = start + args.duration
+    end = start + args.duration if args.duration else math.inf
     k = 0
     while not closed.done() and time.monotonic() < end:
         k += 1
@@ -446,7 +455,7 @@ async def run(args):
 
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
-            track_filter=_select, loc_bare=args.loc_bare,
+            track_filter=_select,
             timestamp_errors=_timestamp_policy(args),
             on_catalog=((lambda c: _status(c.to_json(indent=2)))
                         if args.show_catalog else None))
@@ -458,14 +467,15 @@ async def run(args):
         sub.on_arrival = _fan(inspector and inspector.on_arrival,
                               analysis and analysis.on_arrival)
         try:
-            catalog = await sub.start(timeout=args.duration)
+            catalog = await sub.start(timeout=_cli.setup_timeout(args))
         except MOQTRequestError as e:
             _status(f"  error: {e} — no publisher on "
                     f"'{args.namespace}'?")
             sys.exit(2)
         except asyncio.TimeoutError:
             _status(f"  error: no catalog received on "
-                    f"'{args.namespace}' within {args.duration}s")
+                    f"'{args.namespace}' within "
+                    f"{_cli.setup_timeout(args)}s")
             sys.exit(2)
         _status(f"  catalog: {[t.name for t in catalog.tracks]}")
         if not sub.tracks:
@@ -501,9 +511,14 @@ async def run(args):
                     rc = _finish_analysis(analysis, start_us, _now_us(),
                                           report)
             else:
-                async with asyncio.timeout(args.duration + 5):
-                    while not writers.pipe_closed and not closed.done():
-                        await asyncio.sleep(0.1)
+                try:
+                    async with asyncio.timeout(
+                            args.duration + 5 if args.duration else None):
+                        while not writers.pipe_closed and not closed.done():
+                            await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    # Ctrl-C: frame counts below still print.
+                    asyncio.current_task().uncancel()
         except asyncio.TimeoutError:
             pass
         finally:
@@ -520,10 +535,10 @@ async def run(args):
             line += f", {rejected} rejected"
         _status(line)
     if args.pipe is None:
-        files = [n for n, f in (("video.h264", writers.video),
-                                ("video.ivf", writers.ivf),
-                                ("audio.wav", writers.wav),
-                                ("audio.aac", writers.aac)) if f]
+        files = [os.path.basename(fh.name) for fh in writers.h264.values()]
+        files += [n for n, f in (("video.ivf", writers.ivf),
+                                 ("audio.wav", writers.wav),
+                                 ("audio.aac", writers.aac)) if f]
         files += [os.path.basename(fh.name)
                   for fh in writers.cmaf.values()
                   if fh is not sys.stdout.buffer]

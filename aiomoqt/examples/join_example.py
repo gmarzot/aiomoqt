@@ -24,7 +24,7 @@ def parse_args():
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=parse_draft_spec, default=None,
                         help='MoQT draft version: 14, 16, or 18')
-    parser.add_argument('-t', '--duration', type=int, default=30,
+    parser.add_argument('-t', '--duration', type=int, default=0,
                         help='Duration seconds (default: 30)')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--keylogfile', type=str, default=None, help='TLS secrets file')
@@ -43,7 +43,7 @@ def parse_args():
 
 async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, cc_algo: str = 'bbr',
-               insecure: bool = False, draft=None, duration: int = 30):
+               insecure: bool = False, draft=None, duration: int = 0):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)

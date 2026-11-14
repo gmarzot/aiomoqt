@@ -8,9 +8,12 @@ carries less traffic than the Rust and C++ relays.
 
 Limits:
 
-  * No authentication, authorization or rate limiting.
+  * Authorization only with --auth-key: SETUP and, from d16, each request
+    are checked against CAT grants. No rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
-    subscriber holding at most LANE_BYTES, counting its queued live
+    subscriber holding what its deadline covers at the track's input
+    rate, or LANE_BYTES with no rate or deadline yet or while the lanes
+    together hold more than --cache-bytes, counting its queued live
     objects and what its streams still hold in the transport: a
     subscriber that falls further behind loses whole groups, their
     streams reset.
@@ -18,13 +21,20 @@ Limits:
     (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
     --max-subscriptions-per-session SUBSCRIBEs held; past either, a
     request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
-  * A bounded recent-object cache per track (CACHE_GROUPS / CACHE_BYTES,
-    oldest group dropped) under a relay-wide budget (--cache-bytes),
-    which drops the oldest group of the least recently used track, never
-    the live group of a subscribed one: enough to answer a FETCH,
-    standalone or joining, over what it still holds; a late subscriber
-    starts at the live edge. Past CACHE_BUDGET_BYTES + CACHE_BYTES the
-    largest live group is dropped and the rest of it goes uncached. A
+  * At --max-subscribers, a session's first SUBSCRIBE is refused the same
+    way, with a randomized Retry Interval. Sessions already subscribed may
+    add tracks.
+  * A recent-object cache bounded by memory: --cache-bytes across all
+    tracks, an eighth of it per track (CACHE_BYTES), and the publisher's
+    MAX_CACHE_DURATION. Past the budget the least recently used track
+    loses its oldest group, taken first from tracks holding more than
+    their newest CACHE_FLOOR_S seconds (at least --lag-limit plus one
+    group), never the live group of a subscribed track or the newest
+    group of a catalog whose publisher is live: enough to answer a
+    FETCH, standalone or joining, over what it still holds; a late
+    subscriber starts at the live edge. Past CACHE_BUDGET_BYTES +
+    CACHE_BYTES the largest live group is dropped and the rest of it
+    goes uncached. A
     replay owed objects the cache no longer holds resets that subgroup
     stream rather than FIN it.
     Cache and lanes charge each object its payload, its properties and
@@ -36,18 +46,26 @@ Limits:
     OBJECT_DELIVERY_TIMEOUT (§8: the smaller non-zero of the publisher's
     and the subscriber's), else live objects past --lag-limit seconds,
     resetting the subgroup with DELIVERY_TIMEOUT and skipping the rest of
-    the group. Past the track's MAX_CACHE_DURATION an object is neither
-    sent nor served from the cache: a request for it goes upstream.
+    the group. A subscriber whose oldest unsent live object, in the lane
+    or still in the transport, is past that deadline sheds whole groups,
+    also reset with DELIVERY_TIMEOUT; a catalog track keeps its newest.
+    Once the lanes together pass --cache-bytes, each is also held to
+    LANE_BYTES, shedding with CANCELLED. Past the track's
+    MAX_CACHE_DURATION an object is neither sent nor served from the
+    cache: a request for it goes upstream.
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the announcing session under the
     namespace tuple, respond with the protocol's default RequestOk
-    (d16+) / PublishNamespaceOk (d14).
+    (d16+) / PublishNamespaceOk (d14), and subscribe the announcer to
+    each live track under the namespace.
   - SUBSCRIBE: find publishers that announced the namespace or a prefix
-    of it (§2.4 Namespace Prefix Matching), subscribe upstream once per
-    Full Track Name, answer SUBSCRIBE_OK and fan the objects out to
-    every downstream subscriber of that track. With no match, send
+    of it (§2.4 Namespace Prefix Matching), subscribe each upstream once
+    per Full Track Name, answer SUBSCRIBE_OK on the first to accept and
+    fan the objects out, deduplicated by Location, to every downstream
+    subscriber of that track. When the serving publisher ends, another
+    takes over. With no match, send
     SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
     0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
     rejection. For --startup-hold seconds after start, such a SUBSCRIBE
@@ -77,17 +95,25 @@ GOAWAY_TIMEOUT and exits once the closes have left. A second signal
 exits at once.
 """
 
+from array import array
 import argparse
 import asyncio
+from bisect import bisect_left, bisect_right
 from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
+from functools import lru_cache
+import heapq
 import itertools
 import json
 import logging
+import marshal
+import math
+from operator import itemgetter
 from logging.handlers import RotatingFileHandler
 import os
+import random
 import signal
 import sys
 import time
@@ -106,6 +132,7 @@ from aiomoqt.types import (
     parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
+                              properties_charge,
                               retained_object_bytes)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
@@ -129,13 +156,15 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              request_error_code)
 from aiomoqt.tools import relay_status
 from aiomoqt import __version__ as AIOMOQT_VERSION
+from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
                                  server_cert_dirs)
 from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
 from aiomoqt.utils.buffer import Buffer, BufferReadError
-from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth, add_help,
+                               add_logging, apply_logging, auth_from_args)
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -230,6 +259,9 @@ PLATFORM_INTERVAL_S = 5.0
 # MSF catalog track name (§5.2.3), and the watchdog's own namespace,
 # kept off the dashboard.
 CATALOG_TRACK = b"catalog"
+# Catalog track names: the cache keeps their newest group while the
+# publisher is live, and their send lanes never shed it.
+CATALOG_TRACKS = frozenset((CATALOG_TRACK, b"catalog.json"))
 WATCHDOG_NS = b"aiomoqt-watchdog"
 # DEFAULT_PUBLISHER_GROUP_ORDER (§10.5), decoded into group_order.
 DEFAULT_GROUP_ORDER_PROPERTY = 0x22
@@ -251,6 +283,10 @@ _hold_until = None
 # with no OBJECT_DELIVERY_TIMEOUT; 0 = none.
 LAG_LIMIT_S = 5.0
 _lag_limit = LAG_LIMIT_S
+# A track marks each session's bytes written once per LANE_MARK_S of its
+# arrivals, wider apart when LANE_MARKS have to span a longer deadline.
+LANE_MARK_S = 0.05
+LANE_MARKS = 100
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
 _pause_sweep = None
@@ -336,7 +372,8 @@ def _track_live(track) -> bool:
         return False
     if track.pending_publish is not None:
         return _session_live(track.pending_publish[0])
-    return _session_live(_upstream_session(track))
+    return (_session_live(_upstream_session(track))
+            or any(_session_live(f.session) for f in track.standby))
 
 
 def _upstream_session(track):
@@ -358,8 +395,8 @@ def _session_live(session) -> bool:
     return not (fut is not None and fut.done())
 
 
-def _publishers_for(ns: tuple) -> list:
-    """Publisher sessions that announced `ns` or a prefix of it."""
+def _announcers(ns: tuple) -> list:
+    """Live sessions that announced `ns` or a prefix of it."""
     out, seen = [], set()
     for a in _announced_match(ns):
         # Newest announcement first: a publisher that just announced is
@@ -373,6 +410,14 @@ def _publishers_for(ns: tuple) -> list:
             if id(sess) not in seen:
                 seen.add(id(sess))
                 out.append(sess)
+    return out
+
+
+def _publishers_for(ns: tuple) -> list:
+    """Publisher sessions that announced `ns` or a prefix of it, then the
+    origins we dialled."""
+    out = _announcers(ns)
+    seen = {id(s) for s in out}
     # An origin we dialled advertises nothing to us, so ask it last:
     # _establish_upstream tries candidates in turn and moves on when one
     # does not serve the track.
@@ -396,17 +441,27 @@ def _fetch_sources(ns: tuple, track_name) -> list:
     return [owner, *pubs]
 
 
-# Recent-object cache bounds, per track: whichever is hit first.
-CACHE_GROUPS = 8
-CACHE_BYTES = 32 * 1024 * 1024
 # Relay-wide cache budget (--cache-bytes).
 CACHE_BUDGET_BYTES = 256 * 1024 * 1024
+# Per-track cache bound: an eighth of the budget.
+CACHE_BYTES = CACHE_BUDGET_BYTES // 8
+# Seconds of each track's newest objects the budget takes last.
+CACHE_FLOOR_S = 10.0
+# Groups below where upstream delivery began that a join backfills.
+BACKFILL_GROUPS = 8
+# Groups behind the newest whose copy detection and stream state is kept.
+STATE_GROUPS = 32
 
 # Requests one session may hold open; see the module docstring.
 MAX_NAMESPACES_PER_SESSION = 256
 MAX_SUBSCRIPTIONS_PER_SESSION = 1024
 # Retry Interval of a cap refusal: milliseconds before a retry, plus one.
 CAP_RETRY_MS = 1000
+# --max-subscribers, 0 = no limit; a refusal's Retry Interval spans
+# ADMISSION_RETRY_MS.
+ADMISSION_RETRY_MS = (5000, 15000)
+MAX_SUBSCRIBERS = 0
+_admission_refused = 0
 # id(session) -> its SUBSCRIBE handlers still running.
 _subscribing: Counter = Counter()
 # (id(session), cap) already warned about.
@@ -416,12 +471,17 @@ _cap_warned: set = set()
 STREAM_SCHEDULING = "fifo"
 
 
+@lru_cache(maxsize=None)
+def _band_of(priority, discipline) -> int:
+    return to_stream_priority(priority, discipline=discipline)
+
+
 def _stream_band(session, priority) -> int:
     """Transport band for a downstream data stream of this publisher
     priority."""
     if priority is None or not 0 <= priority <= 255:
         priority = 128
-    return to_stream_priority(priority, discipline=getattr(
+    return _band_of(priority, getattr(
         session, 'stream_scheduling', STREAM_SCHEDULING))
 
 
@@ -451,16 +511,100 @@ def _kib(n) -> str:
     return f"{n >> 20} MiB" if n % (1 << 20) == 0 else f"{n >> 10} KiB"
 
 
+def _held_by_lanes() -> int:
+    """Bytes the send lanes hold. A track's lanes queue the same objects, so
+    each track counts its longest queue; transport backlog is per lane."""
+    queued: dict = {}
+    transport = 0
+    for lane in _lanes:
+        if lane.bytes > queued.get(lane.track, 0):
+            queued[lane.track] = lane.bytes
+        transport += lane.tx_bytes
+    return sum(queued.values()) + transport
+
+
+def _budget_lanes() -> None:
+    """Hold every lane to LANE_BYTES once the lanes are over --cache-bytes,
+    until they are back under 7/8 of it."""
+    global _lane_bytes, _lanes_over_budget
+    _lane_bytes = _held_by_lanes()
+    limit = CACHE_BUDGET_BYTES * 7 // 8 if _lanes_over_budget \
+        else CACHE_BUDGET_BYTES
+    over = _lane_bytes > limit
+    if over == _lanes_over_budget:
+        return
+    _lanes_over_budget = over
+    if over:
+        logger.warning(f"relay: send lanes hold {_lane_bytes} bytes, over "
+                       f"--cache-bytes: each is back to {LANE_BYTES} bytes")
+    else:
+        logger.info(f"relay: send lanes hold {_lane_bytes} bytes: back to "
+                    f"their deadlines")
+    for lane in _lanes:
+        lane._set_bound()
+
+
 def _check_lanes() -> None:
     now = time.monotonic()
+    _budget_lanes()
     for lane in list(_lanes):
         lane.check(now, LANE_STALL_S)
 
 
+def _due_lane(lane, at) -> None:
+    """Run `lane`'s time check at `at`, in place of any earlier one set."""
+    lane._time_due = at
+    heapq.heappush(_lane_due, (at, next(_lane_seq), lane))
+    wake = _lane_wake
+    if wake is not None and at < wake[0] and not wake[1].done():
+        wake[1].set_result(None)
+
+
+def _time_lanes(now) -> None:
+    """Run the lane time checks due by `now`."""
+    due = _lane_due
+    while due and due[0][0] <= now:
+        at, _n, lane = heapq.heappop(due)
+        if at != lane._time_due or lane not in _lanes:
+            continue
+        try:
+            nxt = lane.check_time(now)
+        except Exception:
+            logger.debug("relay: lane time check failed", exc_info=True)
+            nxt = now + LANE_STALL_S
+        if nxt is not None:
+            _due_lane(lane, nxt)
+
+
+def _wake_lanes(fut) -> None:
+    if not fut.done():
+        fut.set_result(None)
+
+
 async def _watch_lanes() -> None:
-    """Check every send lane for a stall, a few times per LANE_STALL_S."""
+    """Run each send lane's time check when due, and every lane's stall
+    check a few times per LANE_STALL_S."""
+    global _lane_wake
+    loop = asyncio.get_running_loop()
+    every = min(STATUS_INTERVAL_S, LANE_STALL_S / 4)
+    stall_at = time.monotonic() + every
     while True:
-        await asyncio.sleep(min(STATUS_INTERVAL_S, LANE_STALL_S / 4))
+        now = time.monotonic()
+        at = min(_lane_due[0][0], stall_at) if _lane_due else stall_at
+        if at > now:
+            fut = loop.create_future()
+            _lane_wake = (at, fut)
+            timer = loop.call_later(at - now, _wake_lanes, fut)
+            try:
+                await fut
+            finally:
+                timer.cancel()
+                _lane_wake = None
+            now = time.monotonic()
+        _time_lanes(now)
+        if now < stall_at:
+            continue
+        stall_at = now + every
         try:
             _check_lanes()
         except Exception:
@@ -569,9 +713,647 @@ class _Downstream:
         return self.window[0]
 
 
+# Records per cache block; a block also seals at CACHE_BLOCK_BYTES of
+# their cost.
+CACHE_BLOCK_OBJECTS = 512
+# Per-record fields of a block's int column: group, subgroup, object,
+# priority, status, shape code, properties charge, and where its
+# properties sit in the sealed block's bytes. -1 stands for None.
+_STRIDE = 9
+_CHARGE = 6
+_PSTART = 7
+CACHE_BLOCK_BYTES = 256 * 1024
+
+_OBJECT_STATUS = {int(s): s for s in ObjectStatus}
+# Sort key of a record or fetch row: (group, object).
+_LOCATION = itemgetter(0, 2)
+# Shape codes: -1 None, 0-7 the three stream flags as bits, 8-9 a
+# datagram and its end-of-group bit, 16 and up any other shape, interned.
+_FLAG_SHAPES = tuple((bool(c & 1), bool(c & 2), bool(c & 4))
+                     for c in range(8))
+_DGRAM_SHAPES = (("DGRAM", False), ("DGRAM", True))
+_OTHER_SHAPES: list = []
+_OTHER_CODES: dict = {}
+
+
+def _shape_code(shape) -> int:
+    if shape is None:
+        return -1
+    if shape.__class__ is tuple:
+        if (len(shape) == 3 and shape[0].__class__ is bool
+                and shape[1].__class__ is bool
+                and shape[2].__class__ is bool):
+            return shape[0] | shape[1] << 1 | shape[2] << 2
+        if (len(shape) == 2 and shape[0] == "DGRAM"
+                and shape[1].__class__ is bool):
+            return 8 + shape[1]
+    # Keyed with the element types too, so True and 1 stay apart.
+    key = (shape, tuple(map(type, shape)) if isinstance(shape, tuple)
+           else type(shape))
+    code = _OTHER_CODES.get(key)
+    if code is None:
+        code = _OTHER_CODES[key] = 16 + len(_OTHER_SHAPES)
+        _OTHER_SHAPES.append(shape)
+    return code
+
+
+def _shape(code):
+    if code < 0:
+        return None
+    if code < 8:
+        return _FLAG_SHAPES[code]
+    if code < 16:
+        return _DGRAM_SHAPES[code - 8]
+    return _OTHER_SHAPES[code - 16]
+
+
+def _dump_props(exts):
+    """Object Properties as marshal bytes; a dict subclass as a dict."""
+    if isinstance(exts, dict) and exts.__class__ is not dict:
+        exts = dict(exts)
+    return marshal.dumps(exts)
+
+
+def _record_cost(c) -> int:
+    """A cache record's retained_object_bytes."""
+    return c[9]
+
+
+class _GroupKeys:
+    """A set of (group, n) int pairs in sorted array columns, which the
+    cyclic GC does not traverse."""
+
+    __slots__ = ("_g", "_k")
+
+    def __init__(self) -> None:
+        self._g = array("q")
+        self._k = array("q")
+
+    def __len__(self) -> int:
+        return len(self._g)
+
+    def __iter__(self):
+        return zip(self._g.tolist(), self._k.tolist())
+
+    def _find(self, g, k) -> int:
+        """Index of the first pair not below (g, k)."""
+        gs, ks = self._g, self._k
+        i = bisect_left(gs, g)
+        n = len(gs)
+        while i < n and gs[i] == g and ks[i] < k:
+            i += 1
+        return i
+
+    def __contains__(self, key) -> bool:
+        g, k = key
+        i = self._find(g, k)
+        return i < len(self._g) and self._g[i] == g and self._k[i] == k
+
+    def add(self, key) -> None:
+        g, k = key
+        gs, ks = self._g, self._k
+        n = len(gs)
+        if not n or g > gs[-1] or (g == gs[-1] and k > ks[-1]):
+            gs.append(g)
+            ks.append(k)
+            return
+        i = self._find(g, k)
+        if i == n or gs[i] != g or ks[i] != k:
+            gs.insert(i, g)
+            ks.insert(i, k)
+
+    def update(self, keys) -> None:
+        for key in keys:
+            self.add(key)
+
+    def drop_below(self, g) -> None:
+        """Forget the pairs of groups below `g`."""
+        i = bisect_left(self._g, g)
+        del self._g[:i]
+        del self._k[:i]
+
+
+class _GroupIds:
+    """The cached group IDs, ascending."""
+
+    __slots__ = ("_c",)
+
+    def __init__(self, cache) -> None:
+        self._c = cache
+
+    def __len__(self) -> int:
+        return self._c.group_count()
+
+    def __getitem__(self, i):
+        c = self._c
+        n = c.group_count()
+        if i < 0:
+            i += n
+        if not 0 <= i < n:
+            raise IndexError(i)
+        return c._gid[c._h + i]
+
+    def __iter__(self):
+        c = self._c
+        return iter(c._gid[c._h:].tolist())
+
+
+class _ObjectCache:
+    """A track's cached objects: group IDs ascending, each group's
+    objects in arrival order, laid out so the cyclic GC has nothing to
+    traverse per object.
+
+    Records sit in arrival order in blocks held in columns: per block an
+    int array of _STRIDE fields per record, an array of arrival times,
+    the payloads and the properties as marshal bytes: lists while the
+    block is open; once sealed, a tuple and one bytes object. A block with no
+    live record is freed. Each group is a row of array columns: its ID,
+    its record count, and the sequence number and block of its first
+    and last record. A group's records are those with its ID from its
+    first to its last; any other record with its ID is dead. Reads
+    build record tuples (_rec) as they go."""
+
+    __slots__ = ("_cols", "_born", "_pay", "_props", "_base", "_live",
+                 "bytes", "_b0", "_seq", "_nbytes", "_gid", "_cnt", "_fseq",
+                 "_fblk", "_lseq", "_lblk", "_h", "_n")
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        # Per block; a sealed block's lists become a tuple and bytes, a
+        # freed block's entries None.
+        self._cols: list = [array("q")]
+        self._born: list = [array("d")]
+        self._pay: list = [[]]
+        self._props: list = [[]]
+        # Per block: sequence number of its first record, live records.
+        self._base = array("q", [0])
+        self._live = array("q", [0])
+        # Cost of the live records.
+        self.bytes = 0
+        # Number of the first block held.
+        self._b0 = 0
+        self._seq = 0
+        # Cost of the open block's records.
+        self._nbytes = 0
+        self._gid = array("q")
+        self._cnt = array("q")
+        self._fseq = array("q")
+        self._fblk = array("q")
+        self._lseq = array("q")
+        self._lblk = array("q")
+        # Rows before this are dropped groups.
+        self._h = 0
+        self._n = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __bool__(self) -> bool:
+        return self._n > 0
+
+    def _rec(self, k, j) -> tuple:
+        """Record `j` of held block `k`: (group, subgroup, object,
+        payload, properties, priority, status, shape, arrival,
+        retained_object_bytes)."""
+        cols = self._cols[k]
+        x = j * _STRIDE
+        gid, sg, oid, pr, st, sh, charge, ps, pl = cols[x:x + _STRIDE]
+        props = self._props[k]
+        if props.__class__ is list:
+            p = props[j]
+        else:
+            p = None if pl < 0 else props[ps:ps + pl]
+        pay = self._pay[k][j]
+        return (gid, None if sg < 0 else sg, oid, pay,
+                None if p is None else marshal.loads(p),
+                None if pr < 0 else pr,
+                None if st < 0 else _OBJECT_STATUS.get(st, st), _shape(sh),
+                self._born[k][j], retained_object_bytes(pay) + charge)
+
+    def _cost(self, k, j) -> int:
+        return (retained_object_bytes(self._pay[k][j])
+                + self._cols[k][j * _STRIDE + _CHARGE])
+
+    def _at(self, b, seq):
+        """(held block, index) of a record."""
+        k = b - self._b0
+        return k, seq - self._base[k]
+
+    def _locs(self, i) -> list:
+        """(held block, index) of row `i`'s records, in arrival order."""
+        g = self._gid[i]
+        fs, ls = self._fseq[i], self._lseq[i]
+        colsl, base, b0 = self._cols, self._base, self._b0
+        out = []
+        for k in range(self._fblk[i] - b0, self._lblk[i] - b0 + 1):
+            cols = colsl[k]
+            if cols is None:
+                continue
+            s0 = base[k]
+            lo = fs - s0
+            for j in range(lo if lo > 0 else 0,
+                           min(ls - s0 + 1, len(cols) // _STRIDE)):
+                if cols[j * _STRIDE] == g:
+                    out.append((k, j))
+        return out
+
+    def _scan(self, i) -> list:
+        return [self._rec(k, j) for k, j in self._locs(i)]
+
+    def _row(self, gid) -> int:
+        g = self._gid
+        n = len(g)
+        if n > self._h and g[n - 1] == gid:
+            return n - 1
+        i = bisect_left(g, gid, self._h)
+        return i if i < n and g[i] == gid else -1
+
+    def __iter__(self):
+        for i in range(self._h, len(self._gid)):
+            yield from self._scan(i)
+
+    def __reversed__(self):
+        for i in reversed(range(self._h, len(self._gid))):
+            yield from reversed(self._scan(i))
+
+    def __getitem__(self, i):
+        """The first (0) or the last (-1) object."""
+        if self._n and i == 0:
+            return self._rec(*self._at(self._fblk[self._h],
+                                       self._fseq[self._h]))
+        if self._n and i == -1:
+            return self._rec(*self._at(self._lblk[-1], self._lseq[-1]))
+        raise IndexError(i)
+
+    def head(self):
+        """(group, object) of the first object."""
+        k, j = self._at(self._fblk[self._h], self._fseq[self._h])
+        x = j * _STRIDE
+        return self._cols[k][x], self._cols[k][x + 2]
+
+    def born(self, n):
+        """Arrival of the first object of the `n`th oldest group, or of
+        the last object for -1."""
+        if n < 0:
+            k, j = self._at(self._lblk[-1], self._lseq[-1])
+        else:
+            i = self._h + n
+            k, j = self._at(self._fblk[i], self._fseq[i])
+        return self._born[k][j]
+
+    def group_count(self) -> int:
+        return len(self._gid) - self._h
+
+    def groups(self) -> _GroupIds:
+        """Cached group IDs, ascending."""
+        return _GroupIds(self)
+
+    def group(self, gid) -> list:
+        i = self._row(gid)
+        return [] if i < 0 else self._scan(i)
+
+    def group_oids(self, gid) -> list:
+        """(object, status) of a group's objects, in arrival order;
+        status -1 for none."""
+        i = self._row(gid)
+        if i < 0:
+            return []
+        colsl = self._cols
+        return [(colsl[k][j * _STRIDE + 2], colsl[k][j * _STRIDE + 4])
+                for k, j in self._locs(i)]
+
+    def between(self, lo, hi=None) -> list:
+        """Objects of groups `lo` through `hi` (None: the newest), in no
+        set order."""
+        return [self._rec(k, j) for k, j in self._span(lo, hi)]
+
+    def fetch_rows(self, lo, hi=None) -> list:
+        """between() as (group, subgroup, object, payload, properties,
+        priority, status)."""
+        out = []
+        colsl, pays, propsl = self._cols, self._pay, self._props
+        for k, a, b in self._ranges(lo, hi):
+            props = propsl[k]
+            it = iter(colsl[k][a * _STRIDE:b * _STRIDE])
+            for j, pay, (gid, sg, oid, pr, st, _, _, ps, pl) in zip(
+                    range(a, b), pays[k][a:b], zip(*[it] * _STRIDE)):
+                p = (props[j] if props.__class__ is list
+                     else None if pl < 0 else props[ps:ps + pl])
+                out.append((gid, None if sg < 0 else sg, oid, pay,
+                            None if p is None else marshal.loads(p),
+                            None if pr < 0 else pr,
+                            None if st < 0 else _OBJECT_STATUS.get(st, st)))
+        return out
+
+    def _span(self, lo, hi) -> list:
+        """(held block, index) of the objects of groups `lo` through
+        `hi`."""
+        return [(k, x) for k, a, b in self._ranges(lo, hi)
+                for x in range(a, b)]
+
+    def _ranges(self, lo, hi) -> list:
+        """(held block, first index, end index) runs of the objects of
+        groups `lo` through `hi`."""
+        g = self._gid
+        i = bisect_left(g, lo, self._h)
+        j = len(g) if hi is None else bisect_right(g, hi, self._h)
+        if j - i < 2:
+            return [(k, x, x + 1) for k, x in self._locs(i)] if j > i else []
+        # The span the groups' records lie in: when it holds just as many
+        # records, all are theirs; else one pass keeps those of their
+        # IDs, and a count above theirs means dead ones are among them.
+        fseq, lseq = self._fseq[i:j], self._lseq[i:j]
+        a = i + fseq.index(min(fseq))
+        m = i + lseq.index(max(lseq))
+        fs, ls = self._fseq[a], self._lseq[m]
+        total = sum(self._cnt[i:j])
+        whole = ls - fs + 1 == total
+        glo, ghi = g[i], g[j - 1]
+        colsl, base, b0 = self._cols, self._base, self._b0
+        runs = []
+        n = 0
+        for k in range(self._fblk[a] - b0, self._lblk[m] - b0 + 1):
+            cols = colsl[k]
+            if cols is None:
+                continue
+            s0 = base[k]
+            first = fs - s0
+            start = first if first > 0 else 0
+            stop = min(ls - s0 + 1, len(cols) // _STRIDE)
+            if whole:
+                runs.append((k, start, stop))
+                n += stop - start
+                continue
+            for x in range(start, stop):
+                if glo <= cols[x * _STRIDE] <= ghi:
+                    runs.append((k, x, x + 1))
+                    n += 1
+        if n != total:
+            return [(k, x, x + 1) for y in range(i, j)
+                    for k, x in self._locs(y)]
+        return runs
+
+    def ids_below(self, gid, n) -> list:
+        """The newest `n` cached group IDs below `gid`, ascending."""
+        i = bisect_left(self._gid, gid, self._h)
+        return self._gid[max(self._h, i - n):i].tolist()
+
+    def append(self, gid, sgid, oid, payload, exts, prio, status, shape,
+               born, cost=None) -> int:
+        """Add an object; returns its retained_object_bytes, `cost` when
+        known."""
+        if exts is None:
+            props, charge = None, 0
+        else:
+            props = _dump_props(exts)
+            charge = (properties_charge(exts) if cost is None
+                      else cost - retained_object_bytes(payload))
+        seq = self._seq
+        self._seq = seq + 1
+        cols = self._cols[-1]
+        cols.extend((gid, -1 if sgid is None else sgid, oid,
+                     -1 if prio is None else prio,
+                     -1 if status is None else status,
+                     -1 if shape is None else _shape_code(shape),
+                     charge, 0, -1))
+        k = len(self._cols) - 1
+        self._born[k].append(born)
+        self._pay[k].append(payload)
+        self._props[k].append(props)
+        self._live[k] += 1
+        size = (_delivery.OBJECT_RECORD_BYTES
+                + (len(payload) if payload else 0) + charge)
+        self.bytes += size
+        b = self._b0 + k
+        g = self._gid
+        n = len(g)
+        if n > self._h and g[n - 1] == gid:
+            i = n - 1
+        elif n == self._h or gid > g[n - 1]:
+            i = n
+            g.append(gid)
+            self._cnt.append(0)
+            self._fseq.append(seq)
+            self._fblk.append(b)
+            self._lseq.append(seq)
+            self._lblk.append(b)
+        else:
+            i = bisect_left(g, gid, self._h)
+            if i == n or g[i] != gid:
+                g.insert(i, gid)
+                self._cnt.insert(i, 0)
+                self._fseq.insert(i, seq)
+                self._fblk.insert(i, b)
+                self._lseq.insert(i, seq)
+                self._lblk.insert(i, b)
+        self._cnt[i] += 1
+        self._lseq[i] = seq
+        self._lblk[i] = b
+        self._n += 1
+        self._nbytes += size
+        if (len(cols) >= CACHE_BLOCK_OBJECTS * _STRIDE
+                or self._nbytes >= CACHE_BLOCK_BYTES):
+            self._seal()
+        return size
+
+    def _seal(self) -> None:
+        """Close the open block, freeing it when nothing in it lives."""
+        if self._live[-1]:
+            cols, props = self._cols[-1], self._props[-1]
+            parts, pos = [], 0
+            for j, p in enumerate(props):
+                if p is not None:
+                    cols[j * _STRIDE + _PSTART] = pos
+                    cols[j * _STRIDE + _PSTART + 1] = len(p)
+                    parts.append(p)
+                    pos += len(p)
+            self._props[-1] = b"".join(parts)
+            # A tuple of untracked payloads is untracked by the first
+            # collection that sees it; a list would be walked by each.
+            self._pay[-1] = tuple(self._pay[-1])
+        else:
+            self._free(len(self._cols) - 1)
+        self._cols.append(array("q"))
+        self._born.append(array("d"))
+        self._pay.append([])
+        self._props.append([])
+        self._base.append(self._seq)
+        self._live.append(0)
+        self._nbytes = 0
+        if self._cols[0] is None:
+            self._trim()
+
+    def _free(self, k) -> None:
+        self._cols[k] = self._born[k] = self._pay[k] = self._props[k] = None
+
+    def _kill(self, k, j, cost) -> None:
+        """Record `j` of held block `k`, of `cost`, is dead: its payload
+        and properties are released, and the block once none is left."""
+        self.bytes -= cost
+        live = self._live
+        live[k] -= 1
+        if not live[k]:
+            if k == len(live) - 1:
+                self._seal()
+            else:
+                self._free(k)
+                if k == 0:
+                    self._trim()
+            return
+        pay = self._pay[k]
+        if pay.__class__ is tuple:
+            # Partly dead: sealed columns become lists again.
+            self._pay[k] = pay = list(pay)
+            self._props[k] = self._unjoin(k)
+        pay[j] = None
+        self._props[k][j] = None
+
+    def _unjoin(self, k) -> list:
+        """A sealed block's properties as one bytes object or None each."""
+        blob, cols = self._props[k], self._cols[k]
+        out = []
+        for x in range(_PSTART, len(cols), _STRIDE):
+            n = cols[x + 1]
+            out.append(None if n < 0 else blob[cols[x]:cols[x] + n])
+        return out
+
+    def _trim(self) -> None:
+        """Release the freed blocks at the front."""
+        cols = self._cols
+        k = 0
+        while cols[k] is None:
+            k += 1
+        for col in (cols, self._born, self._pay, self._props, self._base,
+                    self._live):
+            del col[:k]
+        self._b0 += k
+
+    def _drop_row(self, i) -> None:
+        cols = (self._gid, self._cnt, self._fseq, self._fblk, self._lseq,
+                self._lblk)
+        if i != self._h:
+            for c in cols:
+                del c[i]
+            return
+        h = self._h = i + 1
+        n = len(self._gid)
+        if h == n or (h >= 1024 and 2 * h >= n):
+            for c in cols:
+                del c[:h]
+            self._h = 0
+
+    def _pop_row(self, i, recs=False) -> list:
+        """Drop row `i`: its records, or (group, object, cost) of each."""
+        locs = self._locs(i)
+        colsl = self._cols
+        costs = [self._cost(k, j) for k, j in locs]
+        if recs:
+            out = [self._rec(k, j) for k, j in locs]
+        else:
+            out = [(colsl[k][j * _STRIDE], colsl[k][j * _STRIDE + 2], c)
+                   for (k, j), c in zip(locs, costs)]
+        self._n -= len(locs)
+        self._drop_row(i)
+        b0 = self._b0
+        for (k, j), c in zip(locs, costs):
+            # Killing may trim the front blocks, shifting held indexes.
+            self._kill(k + b0 - self._b0, j, c)
+        return out
+
+    def _readd(self, recs) -> None:
+        for r in recs:
+            self.append(*r[:9], cost=r[9])
+
+    def merge(self, new) -> None:
+        """Add objects, given as append() arguments, keeping each group
+        they land in in Object order."""
+        for args in new:
+            self.append(*args)
+        for gid in {args[0] for args in new}:
+            i = self._row(gid)
+            oids = [self._cols[k][j * _STRIDE + 2] for k, j in self._locs(i)]
+            if oids != sorted(oids):
+                recs = self._pop_row(i, recs=True)
+                recs.sort(key=lambda r: r[2])
+                self._readd(recs)
+
+    def popleft(self):
+        """Drop the first object; returns its (group, object, cost)."""
+        h = self._h
+        b, s = self._fblk[h], self._fseq[h]
+        k, j = self._at(b, s)
+        cols = self._cols[k]
+        x = j * _STRIDE
+        gid = cols[x]
+        cost = retained_object_bytes(self._pay[k][j]) + cols[x + _CHARGE]
+        out = (gid, cols[x + 2], cost)
+        self._n -= 1
+        left = self._cnt[h] - 1
+        if left:
+            self._cnt[h] = left
+            self._fblk[h], self._fseq[h] = self._next(gid, k, s + 1)
+        else:
+            self._drop_row(h)
+        self._kill(k, j, cost)
+        return out
+
+    def _next(self, gid, k, seq):
+        """(block number, sequence number) of the first record of `gid`
+        at or after `seq`, which starts in held block `k`."""
+        colsl, base = self._cols, self._base
+        while True:
+            cols = colsl[k]
+            if cols is not None:
+                s0 = base[k]
+                for j in range(max(seq - s0, 0), len(cols) // _STRIDE):
+                    if cols[j * _STRIDE] == gid:
+                        return self._b0 + k, s0 + j
+            k += 1
+
+    def pop_group(self, gid) -> list:
+        """Drop a group; returns (group, object, cost) of its objects."""
+        i = self._row(gid)
+        return [] if i < 0 else self._pop_row(i)
+
+    def drop_through(self, last) -> list:
+        """Drop the objects at or before Location `last`; returns their
+        (group, object, cost)."""
+        out = []
+        g = self._gid
+        while self._n and g[self._h] < last[0]:
+            out.extend(self._pop_row(self._h))
+        if self._n and g[self._h] == last[0]:
+            recs = self._scan(self._h)
+            if any(r[2] <= last[1] for r in recs):
+                self._pop_row(self._h)
+                out += [(r[0], r[2], r[9]) for r in recs if r[2] <= last[1]]
+                self._readd([r for r in recs if r[2] > last[1]])
+        return out
+
+    def expired(self, oldest):
+        """(Location of the newest object that arrived before `oldest`,
+        or None; the earliest arrival not before it, or inf)."""
+        last = None
+        floor = float("inf")
+        colsl, borns = self._cols, self._born
+        for i in range(self._h, len(self._gid)):
+            for k, j in self._locs(i):
+                t = borns[k][j]
+                if t < oldest:
+                    loc = (colsl[k][j * _STRIDE], colsl[k][j * _STRIDE + 2])
+                    if last is None or loc > last:
+                        last = loc
+                elif t < floor:
+                    floor = t
+        return last, floor
+
+
 class _CacheBudget:
     """Cache bytes across all tracks, held to CACHE_BUDGET_BYTES by
-    dropping the oldest group of the least recently used track."""
+    dropping the oldest group of the least recently used track, first
+    from tracks above their floor."""
 
     def __init__(self) -> None:
         # Tracks holding cached objects, least recently used first.
@@ -593,7 +1375,9 @@ class _CacheBudget:
 
     def enforce(self) -> None:
         while self.bytes > CACHE_BUDGET_BYTES:
-            victim = next((t for t in self.lru if t._evictable()), None)
+            victim = next((t for t in self.lru if t._evictable()
+                           and t._above_floor()), None) or next(
+                (t for t in self.lru if t._evictable()), None)
             if victim is None and self.bytes > CACHE_BUDGET_BYTES + CACHE_BYTES:
                 largest = max(self.lru, key=lambda t: t._cache_bytes,
                               default=None)
@@ -618,6 +1402,15 @@ _budget = _CacheBudget()
 
 # Send lanes still running, including those draining past their track.
 _lanes: set = set()
+# (time, n, lane): lane time checks, soonest first; stale once the lane's
+# _time_due differs.
+_lane_due: list = []
+_lane_seq = itertools.count()
+# (time, future) the lane timer sleeps to, None while it runs.
+_lane_wake = None
+# What the lanes hold, and whether that has put them all back on LANE_BYTES.
+_lane_bytes = 0
+_lanes_over_budget = False
 
 
 def _tightest(*limits):
@@ -641,28 +1434,71 @@ class _RelayDelivery:
     """A subscriber's side of a relayed track, written by its SendLane:
     streams keep the upstream (group, subgroup) structure."""
 
-    __slots__ = ("track", "d", "session", "lane")
+    __slots__ = ("track", "d", "session", "sid", "lane")
 
     def __init__(self, track, d):
         self.track = track
         self.d = d
         self.session = d.session
+        self.sid = id(d.session)
         self.lane = None
 
-    async def send(self, item) -> bool:
+    def send(self, item, end=None):
+        """True once written, else the awaitable that finishes the write."""
         (gid, _cost, _live, _born, sgid, oid, payload, exts, prio, status,
          shape, encoded) = item
         track, d = self.track, self.d
-        await track._forward_one(self.session, d.alias, gid, sgid, oid,
-                                 payload, exts, prio, status, shape, encoded,
-                                 start=d.start, lost=d.lost, lane=self.lane)
         if oid is not None:
             track._objects_out += 1
             track._bytes_out += len(payload or b"")
+            if _born is not None:
+                track._tx_born[self.sid] = _born
+        if end is not None and end[5] is not None:
+            track._objects_out += 1
+        rest = track._forward_one(self.session, d.alias, gid, sgid, oid,
+                                  payload, exts, prio, status, shape, encoded,
+                                  start=d.start, lost=d.lost, lane=self.lane,
+                                  end=None if end is None else (end[5], end[9]))
+        return True if rest is None else rest
+
+    def send_nowait(self, item) -> bool | None:
+        """send(item) when it completes now: a live datagram, or an object
+        or stream end on an open stream that the transport takes. True
+        once written; None, nothing written, when it has to wait."""
+        (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
+         shape, encoded) = item
+        if not live:
+            return None
+        track, d, session = self.track, self.d, self.session
+        if not (shape.__class__ is tuple and shape and shape[0] == "DGRAM"
+                ) and ((id(session), gid, sgid) not in track._streams
+                       or (gid, sgid) in track._ends_due):
+            # A stream end queued behind leaves with the lane's last write.
+            return None
+        if track._forward_one(session, d.alias, gid, sgid, oid, payload,
+                              exts, prio, status, shape, encoded,
+                              start=d.start, lost=d.lost,
+                              nowait=True) is _NOT_SENT:
+            return None
+        if oid is not None:
+            track._objects_out += 1
+            track._bytes_out += len(payload or b"")
+            if _born is not None:
+                track._tx_born[self.sid] = _born
         return True
 
-    def reset_below(self, floor) -> None:
-        self.track._reset_streams(self.session, floor)
+    @staticmethod
+    def ends_stream(item, nxt) -> bool:
+        """`nxt`, queued behind object `item`, ends the subgroup stream
+        `item` is written on."""
+        shape = item[10]
+        return (nxt[0] == item[0] and item[5] is not None
+                and nxt[9] in _STREAM_ENDS and nxt[4] == item[4]
+                and item[9] not in _STREAM_ENDS
+                and not (shape and shape[0] == "DGRAM"))
+
+    def reset_below(self, floor, code=StreamResetCode.CANCELLED) -> None:
+        self.track._reset_streams(self.session, floor, code)
 
     def close_streams(self) -> None:
         self.track._close_streams(self.session)
@@ -681,23 +1517,30 @@ class _TracedRelayDelivery(_RelayDelivery):
     """--trace-subscribers: also counts what the subscription is sent."""
 
     __slots__ = ()
+    send_nowait = None
 
-    async def send(self, item) -> bool:
-        await super().send(item)
-        oid = item[5]
-        if oid is not None:
-            d = self.d
-            d.objects_sent += 1
-            d.bytes_sent += len(item[6] or b"")
-            loc = (item[0], oid)
-            if d.largest_sent is None or loc > d.largest_sent:
-                d.largest_sent = loc
-        return True
+    def send(self, item, end=None):
+        rest = super().send(item, end)
+        for it in (item,) if end is None else (item, end):
+            oid = it[5]
+            if oid is not None:
+                d = self.d
+                d.objects_sent += 1
+                d.bytes_sent += len(it[6] or b"")
+                loc = (it[0], oid)
+                if d.largest_sent is None or loc > d.largest_sent:
+                    d.largest_sent = loc
+        return rest
 
 
 class _RelayLane(SendLane):
-    """One subscriber's SendLane, bounded by LANE_BYTES and registered
-    for the stall check and the status page. A failed write drops the
+    """One subscriber's SendLane, registered for the lane checks and the
+    status page. It sheds once the oldest live object its subscriber has
+    not been sent is more than `deadline` old, counting what the
+    transport still holds of the track's streams: check_time(), run when
+    that object reaches the deadline, marks it late, the next object
+    offered confirms. By bytes, past LANE_BYTES, only without a deadline
+    or while the lanes are over budget. A failed write drops the
     subscriber."""
 
     log = logger
@@ -706,16 +1549,140 @@ class _RelayLane(SendLane):
     def __init__(self, track, d):
         writer = (_TracedRelayDelivery if _trace_subscribers
                   else _RelayDelivery)(track, d)
+        self._sid = id(d.session)
+        # The track's marks from this one on are the lane's own.
+        self._mark0 = track._marks_n
+        # Arrival time of the oldest live object held, as last read.
+        self._oldest = None
+        # When check_time() is due, None for never.
+        self._time_due = None
+        # The last shed's cause: byte cap, else seconds behind; bytes held.
+        self._capped = False
+        self._behind = 0.0
+        self._held = 0
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
         self.d = d
+        self._catalog = track.key[1] in CATALOG_TRACKS
         _lanes.add(self)
         track._lanes.add(self)
 
+    def _set_bound(self) -> None:
+        # 0: no byte bound.
+        self.bound = (LANE_BYTES if _lanes_over_budget
+                      or self._deadline is None else 0)
+
+    @SendLane.deadline.setter
+    def deadline(self, value) -> None:
+        SendLane.deadline.fset(self, value)
+        if self._deadline is not None:
+            track = self.track
+            track._mark_s = max(track._mark_s, self._deadline / LANE_MARKS)
+        # The crossing may come sooner.
+        _due_lane(self, time.monotonic())
+
+    def _probe(self, floor) -> None:
+        super()._probe(floor)
+        if self._deadline is not None:
+            self._oldest = self._oldest_born()
+
+    def _oldest_born(self):
+        """Arrival time of the oldest live object not yet sent. The
+        transport sends a session's streams of the track oldest first, so
+        its oldest unsent byte is `tx_bytes` before the end of what was
+        written; the first of the track's marks past it gives its time, at
+        most one mark late. Else the oldest queued, None for none."""
+        if self.tx_bytes:
+            track, sid = self.track, self._sid
+            unsent = track._tx_written.get(sid, 0) - self.tx_bytes
+            marks = track._marks
+            # Older marks may hold another session's count under a reused id.
+            lo = max(0, self._mark0 - track._marks_n + len(marks))
+            i = bisect_right(marks, unsent, lo,
+                             key=lambda m: m[0].get(sid, 0))
+            born = (marks[i][1] if i < len(marks)
+                    else track._tx_born).get(sid)
+            if born is not None:
+                return born
+        for it in self.items:
+            if it[0].__class__ is not str and it[3] is not None and it[2]:
+                return it[3]
+        return None
+
+    def _late(self, item) -> bool:
+        """The oldest live object held is past the deadline at `item`'s
+        arrival."""
+        oldest, born = self._oldest, item[3]
+        return (oldest is not None and born is not None
+                and born - oldest > self._deadline)
+
+    def check_time(self, now) -> float | None:
+        """Mark the lane late if the oldest live object it holds arrived
+        more than `deadline` before `now`. When to check next: when that
+        object reaches the deadline, else a deadline from now; None
+        without a deadline."""
+        deadline = self._deadline
+        if deadline is None or self.stopped:
+            self.late = False
+            return None
+        self._probe(self.floor)
+        oldest = self._oldest
+        if oldest is None:
+            return now + deadline
+        at = oldest + deadline
+        if now > at:
+            # The next object offered reschedules.
+            self.late = True
+            return now + deadline
+        return at if at > now else math.nextafter(now, math.inf)
+
+    def _over(self, item) -> bool:
+        held = self.bytes + self.tx_bytes
+        if self.bound and held > self.bound:
+            self._capped, self._held = True, held
+            self.cut_code = StreamResetCode.CANCELLED
+            return True
+        if not self.late or self._deadline is None or item[3] is None:
+            return False
+        self._probe(self.floor)
+        self.late = False
+        if not self._late(item):
+            oldest = self._oldest
+            _due_lane(self, (item[3] if oldest is None else oldest)
+                      + self._deadline)
+            return False
+        # Once shed, what is held is newer.
+        _due_lane(self, item[3])
+        self._capped, self._held = False, self.bytes + self.tx_bytes
+        self._behind = item[3] - self._oldest
+        # Past the deadline the expiry path enforces (§8).
+        self.cut_code = StreamResetCode.DELIVERY_TIMEOUT
+        return True
+
+    def _keeps(self, item) -> bool:
+        if self._catalog:
+            return True
+        if self.bound and self.bytes + self.tx_bytes > self.bound:
+            return False
+        return self._deadline is None or not self._late(item)
+
+    def _shed_reason(self) -> str:
+        if self._capped:
+            why = (" (send lanes over --cache-bytes)" if _lanes_over_budget
+                   else "")
+            return (f"at its {self.bound}-byte cap{why}, {self._held} bytes "
+                    f"held")
+        return (f"{self._behind:.2f} s behind (deadline "
+                f"{self._deadline:.1f} s), {self._held} bytes held")
+
     def _exit(self) -> None:
         _lanes.discard(self)
-        self.track._lanes.discard(self)
+        self._time_due = None
+        # stop() and the task's exit both land here: transfer once.
+        if self in self.track._lanes:
+            self.track._lanes.discard(self)
+            self.track._shed_done += self.shed_bytes
         super()._exit()
 
     def _who(self) -> str:
@@ -743,15 +1710,69 @@ class _RelayLane(SendLane):
         return False
 
     def _failed(self, item, error) -> bool:
-        logger.debug("relay: forward failed, dropping subscriber",
-                     exc_info=error)
-        self.track._drops += 1
+        # CancelledError here is a session that ended mid-write.
+        log = (logger.debug if isinstance(error, asyncio.CancelledError)
+               else logger.warning)
+        log(f"relay: forward to {self._who()} failed, dropping the "
+            f"subscriber: {error!r}")
+        logger.debug("relay: forward failure", exc_info=error)
+        # A session that closed left on its own: not a drop.
+        if _session_live(self.d.session):
+            self.track._drops += 1
         self.track.drop_session(self.d.session)
         return False
 
 
+class _Feed:
+    """A further publisher's subscription to a relayed track (§7.6)."""
+
+    __slots__ = ("sub", "ended", "props", "bound", "at")
+
+    def __init__(self):
+        self.sub = None
+        # Accepted: the handlers under its alias are its own.
+        self.bound = False
+        # Largest Location it delivered, copies included.
+        self.at = None
+        # Its subgroup streams ended, against its PUBLISH_DONE Stream Count.
+        self.ended = 0
+        self.props: dict = {}
+
+    @property
+    def session(self):
+        return getattr(self.sub, "session", None)
+
+    def update(self, forward) -> None:
+        """REQUEST_UPDATE its Forward State, no reply awaited."""
+        session, rid = self.session, getattr(self.sub, "request_id", None)
+        if rid is None or not _session_live(session):
+            return
+        try:
+            session.request_update(rid, forward=forward)
+        except Exception:
+            logger.debug("relay: updating a standby upstream failed",
+                         exc_info=True)
+
+    def release(self, cancel=False) -> None:
+        """Drop its handlers, once; with `cancel`, its request too."""
+        session = self.session
+        alias = getattr(self.sub, "track_alias", None)
+        if not self.bound or session is None or alias is None:
+            return
+        self.bound = False
+        if cancel and _session_live(session):
+            _cancel_request(session, self.sub.request_id)
+        try:
+            session.unregister_object_handler(alias)
+            session.unregister_stream_end_handler(alias)
+        except Exception:
+            logger.debug("relay: releasing standby handlers failed",
+                         exc_info=True)
+
+
 class _RelayedTrack:
-    """One upstream subscription fanned out to N downstream subscribers.
+    """Upstream subscriptions to a track, one per publisher, fanned out
+    to N downstream subscribers.
 
     Transport §"Relays": a Full Track Name is matched exactly against
     existing upstream subscriptions, so a second downstream subscriber
@@ -766,6 +1787,32 @@ class _RelayedTrack:
     def __init__(self, key):
         self.key = key
         self.upstream = None
+        # Other publishers' subscriptions (§7.6): all forward objects, and
+        # one takes over when the primary upstream ends.
+        self.standby: list[_Feed] = []
+        # The standby now serving as primary; None while the first
+        # upstream does.
+        self.feed = None
+        # A standby has been asked: objects are deduplicated by Location.
+        self._multi = False
+        # Sessions a standby SUBSCRIBE is outstanding on.
+        self._joining: set = set()
+        # (group, subgroup) -> [largest Object ID taken, feeds carrying
+        # it]; None stands for the first upstream.
+        self._subgroups: dict = {}
+        # (group, subgroup) reset downstream.
+        self._reset = set()
+        # (group, object) of datagrams taken; with one publisher, only the
+        # newest two groups', for a standby joining later.
+        self._dgrams = set()
+        self._dgram_gid = -1
+        # Groups below this are pruned: another copy of them is dropped.
+        self._floor = 0
+        # Copies dropped as already taken from another publisher.
+        self._copies = 0
+        # Location of the End of Track taken: nothing past it is forwarded
+        # and no standby takes over.
+        self._end_at = None
         # Flow B: the publisher's PUBLISH, held until someone subscribes.
         self.pending_publish = None   # (session, Publish msg)
         # Upstream Forward State is 0: answered so in PUBLISH_OK, or
@@ -793,7 +1840,13 @@ class _RelayedTrack:
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
         self._lanes: set = set()
+        # Arrival time of the next object that marks.
+        self._mark_at = 0.0
+        # Seconds of arrivals between marks.
+        self._mark_s = LANE_MARK_S
         self.queue = asyncio.Queue()
+        # (group, subgroup) -> stream ends queued for the forward loop.
+        self._ends_due: dict = {}
         self.task = None
         # A downstream SUBSCRIBE is establishing this track: an upstream
         # terminal that lands first waits in the queue for it.
@@ -803,6 +1856,14 @@ class _RelayedTrack:
         # id(session) -> {(group, subgroup): stream_id} of the streams
         # opened, kept past FIN until the transport has drained them.
         self._tx_streams: dict = {}
+        # id(session) -> bytes written to its streams of the track.
+        self._tx_written: dict = {}
+        # id(session) -> arrival time of the newest object among them.
+        self._tx_born: dict = {}
+        # Copies of (_tx_written, _tx_born), oldest first; _marks[0] is
+        # mark number _marks_n - len(_marks).
+        self._marks: list = []
+        self._marks_n = 0
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
         # (id(session), group, subgroup) whose stream the subscriber
@@ -813,14 +1874,19 @@ class _RelayedTrack:
         self._closed = False
         # Alias of the PUBLISH feeding this track, on the publisher's session.
         self.publish_alias = None
-        # Recent objects, oldest first, for standalone FETCH. Bounded by
-        # groups and bytes; a relay with no cache can serve no fetch at
-        # all, and an unbounded one is a leak.
-        self._cache = deque()
+        # Recent objects for FETCH and replay, bounded by bytes; a relay
+        # with no cache can serve no fetch at all, and an unbounded one
+        # is a leak.
+        self._cache = _ObjectCache()
         self._cache_bytes = 0
-        # Objects cached per group ID; the bound counts groups, as IDs
-        # may skip.
-        self._groups = {}
+        # No cached object arrived before this.
+        self._born_floor = float("inf")
+        # Per-group state below this group is swept on the next _prune().
+        self._pruned_to = 0
+        # Newest group due to sweep the state only live arrivals
+        # consult, and the floor of the last sweep.
+        self._state_to = 0
+        self._state_floor = 0
         # Live group dropped at the relay's hard ceiling: the rest of it
         # is not cached.
         self._uncached = None
@@ -829,7 +1895,7 @@ class _RelayedTrack:
         self._lost = {}
         # (group, subgroup) whose upstream stream ended cleanly; a replay
         # FINs them on the subscriber it serves.
-        self._ended = set()
+        self._ended = _GroupKeys()
         # (group, subgroup) whose first upstream object has arrived.
         self._opened = set()
         # Alias the upstream gave this track. A publisher may reuse one
@@ -852,8 +1918,9 @@ class _RelayedTrack:
         # (value, Largest Group when sent) of the last NEW_GROUP_REQUEST
         # sent upstream.
         self.new_group_request = None
-        # Groups whose Object 0 arrived from upstream: complete from it.
-        self._heads = set()
+        # (group, 0) for groups whose Object 0 arrived from upstream:
+        # complete from it.
+        self._heads = _GroupKeys()
         # Locations a backfill FETCH cached; the live copy is dropped.
         self._backfilled = set()
         # Track Properties as last received from upstream (§8.4): sent on
@@ -871,6 +1938,7 @@ class _RelayedTrack:
         self._objects_out = 0
         # Dashboard counters: payload bytes, most subscribers at once,
         # FETCHes served, subscribers dropped on a failed write.
+        self._shed_done = 0      # bytes skipped by lanes that have ended
         self._bytes_in = 0
         self._bytes_out = 0
         self._peak_subs = 0
@@ -901,10 +1969,113 @@ class _RelayedTrack:
                          exc_info=True)
         self.upstream_alias = None
 
+    def _release_standby(self) -> None:
+        for f in self.standby:
+            f.release(cancel=True)
+        self.standby.clear()
+
+    def feeds_from(self, session) -> bool:
+        """`session` feeds this track, or a standby SUBSCRIBE is
+        outstanding on it."""
+        return (_upstream_session(self) is session
+                or id(session) in self._joining
+                or any(f.session is session for f in self.standby))
+
+    def add_standby(self, feed) -> None:
+        self.standby.append(feed)
+        self._multi = True
+        feed.session.register_stream_end_handler(
+            feed.sub.track_alias,
+            lambda g, sg, clean=True, code=0, f=feed: self.on_stream_end(
+                g, sg, clean, code, feed=f))
+        largest = feed.sub.largest
+        if largest is not None and self._near(largest[0]):
+            self.note_largest(largest)
+
+    def _carried(self, feed) -> bool:
+        """`feed` (None: the first upstream) still feeds the track."""
+        if feed is None:
+            return self.feed is None and _session_live(_upstream_session(self))
+        return ((feed is self.feed or feed in self.standby)
+                and _session_live(feed.session))
+
+    def _uncarry(self, feed) -> None:
+        """`feed` has gone: reset downstream each open subgroup no other
+        publisher carries."""
+        for k, st in list(self._subgroups.items()):
+            if feed not in st[1]:
+                continue
+            st[1].discard(feed)
+            if st[1] or k in self._ended or k in self._reset:
+                continue
+            self._reset.add(k)
+            self.queue.put_nowait((k[0], k[1], None, None, None, None,
+                                   "RESET", StreamResetCode.CANCELLED))
+        self._ensure_drain()
+
+    def drop_feed(self, feed) -> bool:
+        """A standby's subscription ended or its session closed."""
+        if feed not in self.standby:
+            return False
+        self.standby.remove(feed)
+        feed.release()
+        self._uncarry(feed)
+        return True
+
+    def _near(self, gid) -> bool:
+        """Group `gid` is within one of Largest's, once Largest is known."""
+        return self.largest is not None and abs(gid - self.largest[0]) <= 1
+
+    def _in_step(self, feed) -> bool:
+        """`feed` is near Largest: a copy of the track, not a publisher
+        that restarted its numbering."""
+        at = feed.at or feed.sub.largest
+        return self.largest is None or (at is not None and self._near(at[0]))
+
+    def fail_over(self, key) -> bool:
+        """The primary upstream ended: a live standby takes its place.
+        False when there is none."""
+        if self._closed or self.pending_publish is not None or _is_session(
+                self.upstream):
+            return False
+        live = [f for f in self.standby if _session_live(f.session)]
+        if self._end_at is not None:
+            if live:
+                logger.info(f"relay: upstream {key} ended after End of "
+                            f"Track {self._end_at}; {len(live)} standby "
+                            f"not taken over, ending the track")
+            return False
+        nxt = next((f for f in live if self._in_step(f)), None)
+        if nxt is None:
+            if live:
+                logger.info(f"relay: upstream {key} ended; {len(live)} "
+                            f"standby not at Largest {self.largest}, "
+                            f"ending the track")
+            return False
+        self.standby.remove(nxt)
+        old = self.feed
+        self.release_upstream()
+        self.upstream = nxt.sub
+        self.upstream_alias = nxt.sub.track_alias
+        self.feed = nxt
+        self._upstream_ended = nxt.ended
+        self.properties = nxt.props
+        if self._done_timer is not None:
+            self._done_timer.cancel()
+            self._done_timer = None
+        self._pending_done = None
+        self._uncarry(old)
+        logger.info(f"relay: upstream {key} failed over to another "
+                    f"publisher, alias={self.upstream_alias}, "
+                    f"{len(self.standby)} standby, {self._copies} copies "
+                    f"dropped")
+        return True
+
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
         self._closed = True
         self.release_upstream()
+        self._release_standby()
         self._release_publish()
         if self.task is not None:
             self.task.cancel()
@@ -914,16 +2085,23 @@ class _RelayedTrack:
 
     def _release_downstream(self) -> None:
         """Forget the subscribers; lanes draining to their PUBLISH_DONE
-        keep their streams, the rest stop."""
+        keep their streams, the rest stop and their open streams reset."""
         for lane in list(self._lanes):
             if not lane.final:
                 lane.stop()
         draining = {id(lane.d.session) for lane in self._lanes}
+        for d in self.downstream:
+            if id(d.session) not in draining and _session_live(d.session):
+                self._close_streams(d.session, StreamResetCode.CANCELLED)
         self.downstream.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
         for k in [k for k in self._tx_streams if k not in draining]:
             del self._tx_streams[k]
+        for k in [k for k in self._tx_written if k not in draining]:
+            del self._tx_written[k]
+        for k in [k for k in self._tx_born if k not in draining]:
+            del self._tx_born[k]
 
     def _lane(self, d) -> "_RelayLane":
         if d.lane is None:
@@ -958,24 +2136,14 @@ class _RelayedTrack:
         if age is None or not self._cache:
             return
         oldest = time.monotonic() - age
-        last = max(((c[0], c[2]) for c in self._cache if c[8] < oldest),
-                   default=None)
+        if self._born_floor >= oldest:
+            return
+        last, self._born_floor = self._cache.expired(oldest)
         if last is None:
             return
-        kept = deque()
-        size = 0
-        for c in self._cache:
-            if (c[0], c[2]) > last:
-                kept.append(c)
-                continue
-            size += retained_object_bytes(c[3], c[4])
-            self._note_lost(c[0], c[2])
-            left = self._groups.pop(c[0]) - 1
-            if left:
-                self._groups[c[0]] = left
-        self._cache = kept
-        self._cache_bytes -= size
-        _budget.bytes -= size
+        for gid, oid, _ in self._cache.drop_through(last):
+            self._note_lost(gid, oid)
+        self._sync_cache()
         self._prune()
 
     def _expire(self, session, group_id) -> bool:
@@ -991,6 +2159,10 @@ class _RelayedTrack:
                 streamed = True
         return streamed or not self._datagrams
 
+    def shed_bytes(self) -> int:
+        """Bytes its lanes skipped, ended lanes included."""
+        return self._shed_done + sum(ln.shed_bytes for ln in self._lanes)
+
     def _queued(self, d) -> bool:
         """`d`'s lane still holds or is writing something."""
         return d.lane is not None and not d.lane.idle
@@ -1001,7 +2173,7 @@ class _RelayedTrack:
         _budget.forget(self)
         self._cache.clear()
         self._cache_bytes = 0
-        self._groups.clear()
+        self._born_floor = float("inf")
 
     def _release_publish(self) -> None:
         """Drop the PUBLISH's handlers on the publisher's session, unless a
@@ -1066,9 +2238,10 @@ class _RelayedTrack:
                     session.stream_reset(sid, int(reset_code))
                 self._streams.pop(k, None)
 
-    def _reset_streams(self, session, below) -> None:
-        """Reset the session's streams of groups below `below`: open ones,
-        and FINed ones the transport has not yet sent out."""
+    def _reset_streams(self, session, below,
+                       code=StreamResetCode.CANCELLED) -> None:
+        """Reset the session's streams of groups below `below` with `code`:
+        open ones, and FINed ones the transport has not yet sent out."""
         sk = id(session)
         tx = self._tx_streams.get(sk) or {}
         used = _tx_used(session)
@@ -1076,10 +2249,10 @@ class _RelayedTrack:
             if k[0] < below:
                 del tx[k]
                 if (sk, *k) not in self._streams and used(sid):
-                    session.stream_reset(sid, StreamResetCode.CANCELLED)
+                    session.stream_reset(sid, code)
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == sk and k[1] < below:
-                session.stream_reset(sid, StreamResetCode.CANCELLED)
+                session.stream_reset(sid, code)
                 self._streams.pop(k, None)
 
     def _tx_queued(self, session, floor=None) -> int:
@@ -1156,14 +2329,15 @@ class _RelayedTrack:
         if self._upstream_ended >= need:
             self._enqueue_terminal(status, reason, key)
 
-    def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0):
+    def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0,
+                      feed=None):
         """Upstream ended a subgroup stream: mirror it. A FIN becomes our
         FIN (the subscriber may infer end-of-group, §11.4.2); a reset
         becomes our reset with the same code, never a FIN. A malformed
         upstream track ends every downstream subscription with
         PUBLISH_DONE MALFORMED_TRACK (§2.4.2)."""
         if not clean:
-            reset_code = self._canonical_reset(reset_code)
+            reset_code = self._canonical_reset(reset_code, feed)
         if not clean and reset_code == StreamResetCode.MALFORMED_TRACK:
             self.finish(SubscribeDoneCode.MALFORMED_TRACK,
                         reset_code=StreamResetCode.MALFORMED_TRACK,
@@ -1174,19 +2348,41 @@ class _RelayedTrack:
             _drop_track(self.key, self)
             self.close()
             return
-        self.queue.put_nowait(
-            (group_id, subgroup_id or 0, None, None, None, None,
-             "END" if clean else "RESET", reset_code))
-        if clean:
-            self._ended.add((group_id, subgroup_id or 0))
+        k = (group_id, subgroup_id or 0)
+        if self._mirrors_end(k, clean, feed):
+            self.queue.put_nowait(
+                (group_id, subgroup_id or 0, None, None, None, None,
+                 "END" if clean else "RESET", reset_code))
+            if clean:
+                self._ended.add(k)
+                self._end_due(k, 1)
+            elif self._multi:
+                self._reset.add(k)
         self._ensure_drain()
-        self._upstream_ended += 1
-        self._check_pending_done()
+        if feed is self.feed:
+            self._upstream_ended += 1
+            self._check_pending_done()
+        elif feed is not None:
+            feed.ended += 1
 
-    def _canonical_reset(self, wire) -> StreamResetCode:
+    def _mirrors_end(self, k, clean, feed) -> bool:
+        """One publisher's stream of subgroup `k` ended: the first FIN
+        ends it downstream; a reset does only once no other publisher
+        carries it."""
+        st = self._subgroups.get(k)
+        if st is not None:
+            st[1].discard(feed)
+        if not self._multi:
+            return True
+        if k in self._ended or k in self._reset:
+            return False
+        return clean or not any(self._carried(c)
+                                for c in (st[1] if st else ()))
+
+    def _canonical_reset(self, wire, feed=None) -> StreamResetCode:
         """An upstream reset code by meaning, so each subscriber gets it
         encoded for its own draft; unknown codes become INTERNAL_ERROR."""
-        up = _upstream_session(self)
+        up = _upstream_session(self) if feed is None else feed.session
         prof = getattr(up, "_profile", None)
         code = wire if prof is None else canonical_stream_reset(wire, prof)
         try:
@@ -1200,20 +2396,62 @@ class _RelayedTrack:
                                      or tuple(location) > self.largest):
             self.largest = tuple(location)
 
-    def on_object(self, msg, size, ts, group_id, subgroup_id):
+    def _copy(self, feed, gid, sgid, oid, dgram) -> bool:
+        """§7.3: True for an object already taken from another publisher,
+        or one of a subgroup already ended; else it is recorded."""
+        if feed is not None and (feed.at is None or (gid, oid) > feed.at):
+            feed.at = (gid, oid)
+        # A standby opens nothing far from Largest: it is numbering
+        # another track.
+        far = feed is not self.feed and not self._near(gid)
+        if dgram:
+            if self._multi and far:
+                return True
+            if (gid, oid) in self._dgrams:
+                return self._multi
+            self._dgrams.add((gid, oid))
+            if not self._multi and gid > self._dgram_gid:
+                self._dgram_gid = gid
+                self._dgrams = {k for k in self._dgrams if k[0] >= gid - 1}
+            return False
+        k = (gid, sgid)
+        if self._multi and (gid < self._floor or k in self._ended
+                            or k in self._reset):
+            return True
+        st = self._subgroups.get(k)
+        if st is None:
+            if self._multi and far:
+                return True
+            self._subgroups[k] = [oid, {feed}]
+            return False
+        st[1].add(feed)
+        if self._multi and oid <= st[0]:
+            return True
+        st[0] = oid
+        return False
+
+    def on_object(self, msg, size, ts, group_id, subgroup_id, feed=None):
         """Upstream delivery callback (sync) — hand off to the drain."""
         if self._closed:
             return
+        gid = getattr(msg, "group_id", None)
+        gid = gid if gid is not None else group_id
+        dgram = isinstance(msg, (ObjectDatagram, ObjectDatagramStatus))
+        if self._end_at is not None and (gid, msg.object_id) > self._end_at:
+            return
+        if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
+            self._copies += 1
+            return
+        if getattr(msg, "status", None) == ObjectStatus.END_OF_TRACK:
+            self._end_at = (gid, msg.object_id)
         self._objects_in += 1
         payload = bytes(msg.payload)
         self._bytes_in += len(payload)
-        gid = getattr(msg, "group_id", None)
-        gid = gid if gid is not None else group_id
         if gid != self._last_gid:
             self._groups_in += 1
             self._last_gid = gid
         if msg.object_id == 0:
-            self._heads.add(gid)
+            self._heads.add((gid, 0))
         if self._gaps and self._gaps[-1][1] is None and not self.paused:
             self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
@@ -1233,7 +2471,7 @@ class _RelayedTrack:
         # the publisher sent as a datagram goes out as one, with its
         # end-of-group bit, not re-framed onto a subgroup stream.
         shape = getattr(msg, "stream_flags", None)
-        if isinstance(msg, (ObjectDatagram, ObjectDatagramStatus)):
+        if dgram:
             shape = ("DGRAM", bool(getattr(msg, "end_of_group", False)))
             self._datagrams = True
         elif isinstance(shape, tuple) and shape:
@@ -1244,12 +2482,15 @@ class _RelayedTrack:
                 shape = (False,) + tuple(shape[1:])
             else:
                 self._opened.add(key)
+        status = getattr(msg, "status", None)
         self.queue.put_nowait(
             (gid, subgroup_id or 0, msg.object_id,
              payload, msg.extensions or None,
              128 if prio is None else prio,
-             getattr(msg, "status", None),
+             status,
              shape))
+        if status in _STREAM_ENDS:
+            self._end_due((gid, subgroup_id or 0), 1)
         self._ensure_drain()
 
     def _ensure_drain(self) -> None:
@@ -1304,16 +2545,30 @@ class _RelayedTrack:
                     task.cancel()
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
+        # A cancelled subscription's open streams must be reset.
+        if _session_live(session):
+            self._reset_streams(session, float("inf"))
         for k in [k for k in self._streams if k[0] == id(session)]:
             self._streams.pop(k, None)
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
+        self._tx_written.pop(id(session), None)
+        self._tx_born.pop(id(session), None)
+
+    def _end_due(self, k, n) -> None:
+        n += self._ends_due.get(k, 0)
+        if n > 0:
+            self._ends_due[k] = n
+        else:
+            self._ends_due.pop(k, None)
 
     async def _forward_loop(self):
         while True:
             gid, sgid, oid, payload, exts, prio, status, shape = \
                 await self.queue.get()
+            if status in _STREAM_ENDS:
+                self._end_due((gid, sgid), -1)
             if status == "DONE":
                 # Terminal, in queue order: each subscriber's PUBLISH_DONE
                 # follows what its lane already holds.
@@ -1324,6 +2579,7 @@ class _RelayedTrack:
                         self._replay(d)
                 self.finish(status_code=code, reason=reason)
                 self.release_upstream()
+                self._release_standby()
                 self._release_publish()
                 self._release_downstream()
                 self._drop_cache()
@@ -1372,6 +2628,21 @@ class _RelayedTrack:
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
+            if born is not None and born >= self._mark_at:
+                self.mark_lanes(born)
+
+    def mark_lanes(self, born) -> None:
+        """Mark each session's bytes written and the newest arrival among
+        them, _mark_s of arrivals apart."""
+        self._mark_at = born + self._mark_s
+        if not self._lanes:
+            return
+        marks = self._marks
+        marks.append((self._tx_written.copy(), self._tx_born.copy()))
+        self._marks_n += 1
+        # LANE_MARKS span the longest deadline.
+        if len(marks) > LANE_MARKS + 2:
+            del marks[0]
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
                   shape=None, cost=None, born=None) -> None:
@@ -1385,51 +2656,72 @@ class _RelayedTrack:
                 return
             if gid > self._uncached:
                 self._uncached = None
-        self._cache.append((gid, sgid, oid, payload, exts, prio, status,
-                            shape, time.monotonic() if born is None
-                            else born))
-        size = (retained_object_bytes(payload, exts) if cost is None
-                else cost)
-        self._cache_bytes += size
-        _budget.bytes += size
-        self._groups[gid] = self._groups.get(gid, 0) + 1
+        if born is None:
+            born = time.monotonic()
+        self._cache.append(gid, sgid, oid, payload, exts, prio, status,
+                           shape, born, cost)
+        if born < self._born_floor:
+            self._born_floor = born
+        self._sync_cache()
         self.note_largest((gid, oid))
         _budget.touch(self)
         self._evict()
 
     def _evict(self) -> None:
-        """Drop the oldest objects past CACHE_GROUPS groups or
-        CACHE_BYTES, then hold the relay to its budget."""
-        while self._cache and (len(self._groups) > CACHE_GROUPS
-                               or self._cache_bytes > CACHE_BYTES):
-            dropped = self._cache.popleft()
-            size = retained_object_bytes(dropped[3], dropped[4])
-            self._note_lost(dropped[0], dropped[2])
-            self._cache_bytes -= size
-            _budget.bytes -= size
-            left = self._groups.pop(dropped[0]) - 1
-            if left:
-                self._groups[dropped[0]] = left
+        """Drop the oldest objects past CACHE_BYTES, then hold the relay
+        to its budget."""
+        cache = self._cache
+        while cache and cache.bytes > CACHE_BYTES:
+            gid, oid, _ = cache.popleft()
+            self._note_lost(gid, oid)
+        self._sync_cache()
         self._prune()
         _budget.enforce()
 
+    def _sync_cache(self) -> None:
+        """Charge the track and the budget what the cache holds."""
+        delta = self._cache.bytes - self._cache_bytes
+        self._cache_bytes += delta
+        _budget.bytes += delta
+
     def _evictable(self) -> bool:
         """Holds a group the budget may drop: anything but the newest
-        group of a track with a live subscriber."""
-        if len(self._groups) > 1:
-            return True
-        return bool(self._groups) and not any(
-            _session_live(d.session) for d in self.downstream)
+        group of a track with a live subscriber, or of a catalog whose
+        publisher is live."""
+        n = self._cache.group_count()
+        if n != 1:
+            return n > 1
+        if (self.key[1] in CATALOG_TRACKS
+                and _session_live(_upstream_session(self))):
+            return False
+        return not any(_session_live(d.session) for d in self.downstream)
+
+    def _above_floor(self) -> bool:
+        """Without its oldest group the cache still spans the floor:
+        CACHE_FLOOR_S, or --lag-limit plus one group when longer."""
+        cache = self._cache
+        n = cache.group_count()
+        if n < 2:
+            return False
+        newest, oldest = cache.born(-1), cache.born(0)
+        floor = max(CACHE_FLOOR_S, _lag_limit + (newest - oldest) / (n - 1))
+        return newest - cache.born(1) >= floor
+
+    def cache_span_s(self) -> float:
+        """Seconds between the oldest and the newest cached arrival."""
+        if not self._cache:
+            return 0.0
+        return round(max(self._cache.born(-1) - self._cache.born(0), 0.0), 1)
 
     def _drop_oldest_group(self) -> None:
         """Drop every cached object of the oldest group, so the cache
         stays a contiguous run of the newest groups."""
-        self._drop_group(min(self._groups))
+        self._drop_group(self._cache.groups()[0])
 
     def _truncate_live(self) -> None:
         """At the relay's hard ceiling: drop the newest cached group and
         cache none of the rest of it. Live delivery is unaffected."""
-        gid = max(self._groups)
+        gid = self._cache.groups()[-1]
         logger.warning(
             f"relay: cache {_budget.bytes} bytes over its "
             f"{CACHE_BUDGET_BYTES + CACHE_BYTES}-byte ceiling: dropping "
@@ -1442,34 +2734,51 @@ class _RelayedTrack:
             self._lost[gid] = oid
 
     def _drop_group(self, gid) -> None:
-        size = sum(retained_object_bytes(c[3], c[4]) for c in self._cache
-                   if c[0] == gid)
-        self._note_lost(gid, max(c[2] for c in self._cache if c[0] == gid))
-        self._cache = deque(c for c in self._cache if c[0] != gid)
-        del self._groups[gid]
-        self._cache_bytes -= size
-        _budget.bytes -= size
+        objs = self._cache.pop_group(gid)
+        self._note_lost(gid, max(c[1] for c in objs))
+        self._sync_cache()
         self._prune()
 
     def _prune(self) -> None:
-        """Forget per-group state below the oldest cached group; an
-        empty cache leaves the budget's LRU."""
-        floor = (self._cache[0][0] if self._cache
+        """Forget per-group state below the oldest cached group, and what
+        only live arrivals consult below STATE_GROUPS behind the newest;
+        an empty cache leaves the budget's LRU."""
+        head = self._cache.head() if self._cache else None
+        floor = (head[0] if head is not None
                  else self.largest[0] if self.largest else 0)
-        self._lost = {g: o for g, o in self._lost.items() if g >= floor}
-        oldest = (self._cache[0][0], self._cache[0][2]) if self._cache else None
-        self._gaps = [g for g in self._gaps if g[1] is None
-                      or (oldest is not None and g[1] > oldest)]
-        if not self._cache:
+        if self._lost:
+            self._lost = {g: o for g, o in self._lost.items() if g >= floor}
+        if self._gaps:
+            oldest = head
+            self._gaps = [g for g in self._gaps if g[1] is None
+                          or (oldest is not None and g[1] > oldest)]
+        if head is None:
             _budget.forget(self)
-        else:
-            first = self._cache[0][0]
-            self._ended = {k for k in self._ended if k[0] >= first}
-            self._opened = {k for k in self._opened if k[0] >= first}
-            self._heads = {g for g in self._heads if g >= first}
-            self._backfilled = {k for k in self._backfilled
-                                if k[0] >= first}
-            self._stopped = {k for k in self._stopped if k[1] >= first}
+            return
+        first = head[0]
+        newest = max(first, self.largest[0]) if self.largest else first
+        if newest >= self._state_to:
+            # Swept every STATE_GROUPS groups, so each holds at most
+            # twice that.
+            self._state_to = newest + STATE_GROUPS
+            low = self._state_floor = max(first, newest - STATE_GROUPS + 1)
+            self._subgroups = {k: v for k, v in self._subgroups.items()
+                               if k[0] >= low}
+            self._reset = {k for k in self._reset if k[0] >= low}
+            self._dgrams = {k for k in self._dgrams if k[0] >= low}
+            self._opened = {k for k in self._opened if k[0] >= low}
+            self._backfilled = {k for k in self._backfilled if k[0] >= low}
+            self._stopped = {k for k in self._stopped if k[1] >= low}
+        # Copies below the swept state cannot be told apart: dropped.
+        self._floor = max(first, self._state_floor)
+        if first < self._pruned_to:
+            return
+        # Replays of cached groups need these. Swept once the floor has
+        # moved past as many groups as are cached, so the cost per
+        # object stays flat.
+        self._pruned_to = first + self._cache.group_count()
+        self._ended.drop_below(first)
+        self._heads.drop_below(first)
 
     def _replay(self, d) -> None:
         """Queue on `d`'s lane the cached objects inside its window, in
@@ -1480,8 +2789,11 @@ class _RelayedTrack:
             return
         self._expire_cache()
         d.lost = {g for g, o in self._lost.items() if (g, o) >= d.start}
-        objs = sorted((c for c in self._cache if d.passes(c[0], c[2])
-                       and d.admits(c[1], c[2], c[5], c[4])),
+        objs = sorted((c for c in self._cache.between(d.start[0],
+                                                      d.window[1])
+                       if d.passes(c[0], c[2])
+                       and (d.filters is None
+                            or d.admits(c[1], c[2], c[5], c[4]))),
                       key=lambda c: (c[0], c[1], c[2]))
         if objs:
             _budget.touch(self)
@@ -1490,9 +2802,10 @@ class _RelayedTrack:
         # never --lag-limit: stamps shift by that limit minus the deadline.
         limit = _tightest(self._timeout_s(d), self._max_age_s())
         shift = None if limit is None else limit - lane.deadline
-        for gid, sgid, oid, payload, exts, prio, status, shape, born in objs:
+        for gid, sgid, oid, payload, exts, prio, status, shape, born, cost \
+                in objs:
             lane.offer(_item(gid, False, sgid, oid, payload, exts, prio,
-                             status, shape,
+                             status, shape, cost=cost,
                              born=None if shift is None else born + shift))
         for gid, sgid in sorted({(c[0], c[1]) for c in objs}):
             if (gid, sgid) in self._ended:
@@ -1509,16 +2822,19 @@ class _RelayedTrack:
         self._expire_cache()
         if not self._cache:
             return False
-        first = (self._cache[0][0], self._cache[0][2])
-        return start >= first
+        return start >= self._cache.head()
 
     def holds_through(self, end) -> bool:
         """The cache reaches `end`: it holds an object at or past it, the
         End of Group of `end`'s group, or End of Track."""
-        return any((c[0], c[2]) >= end
-                   or c[6] == ObjectStatus.END_OF_TRACK
-                   or (c[0] == end[0] and c[6] == ObjectStatus.END_OF_GROUP)
-                   for c in reversed(self._cache))
+        if not self._cache:
+            return False
+        newest = self._cache.groups()[-1]
+        if newest > end[0] or any(st == ObjectStatus.END_OF_TRACK for _, st
+                                  in self._cache.group_oids(newest)):
+            return True
+        return any(oid >= end[1] or st == ObjectStatus.END_OF_GROUP
+                   for oid, st in self._cache.group_oids(end[0]))
 
     def open_gap(self) -> None:
         """Note a pause: what is published from just past Largest, or
@@ -1540,7 +2856,7 @@ class _RelayedTrack:
         """The last cached Location of a group, which is its END_OF_GROUP
         when held; (group, 0) when none is held, and never before
         `start`."""
-        oids = [c[2] for c in self._cache if c[0] == group_id]
+        oids = [oid for oid, _ in self._cache.group_oids(group_id)]
         return max(start, (group_id, max(oids) if oids else 0))
 
     def cached_range(self, start, end):
@@ -1549,13 +2865,13 @@ class _RelayedTrack:
         across subgroups (§3.2.1)."""
         self._expire_cache()
         out = []
-        for gid, sgid, oid, payload, exts, prio, status, *_ in self._cache:
-            if (gid, oid) < start:
+        for o in self._cache.fetch_rows(start[0],
+                                        None if end is None else end[0]):
+            loc = (o[0], o[2])
+            if loc < start or (end is not None and loc > end):
                 continue
-            if end is not None and (gid, oid) > end:
-                continue
-            out.append((gid, sgid, oid, payload, exts, prio, status))
-        out.sort(key=lambda o: (o[0], o[2]))
+            out.append(o)
+        out.sort(key=_LOCATION)
         if out:
             _budget.touch(self)
         return out
@@ -1565,16 +2881,21 @@ class _RelayedTrack:
         `gid` from before what upstream delivered to this relay."""
         cf = self.complete_from
         return (start is not None and cf is not None
-                and max(start, (gid, 0)) < cf and gid not in self._heads)
+                and max(start, (gid, 0)) < cf and (gid, 0) not in self._heads)
 
-    async def _forward_one(self, session, alias, gid, sgid, oid,
-                           payload, exts, prio, status=None, shape=None,
-                           encoded=None, start=None, lost=(), lane=None):
+    def _forward_one(self, session, alias, gid, sgid, oid,
+                     payload, exts, prio, status=None, shape=None,
+                     encoded=None, start=None, lost=(), lane=None,
+                     end=None, nowait=False):
         """Write one object downstream, opening the (group, subgroup)
         stream on first sight. Group/subgroup identity is preserved from
         upstream so the downstream sees the publisher's structure. A
         stream short of objects from `start` is reset, never FINed
-        (§11.3.2). `lane` is told what each write awaits."""
+        (§11.3.2). `end`, the (object id, status) of the stream end
+        queued behind the object, ends the stream in the object's write.
+        `lane` is told what each write awaits. None once written, else the
+        awaitable that finishes the write; with `nowait`, _NOT_SENT instead
+        and the stream's header state as it was."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
             is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
@@ -1606,38 +2927,9 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         if entry is None:
-            if lane is not None:
-                lane.parked, lane.sid = "header", None
-            stream_id = await session.open_uni_stream()
-            if lane is not None:
-                lane.sid = stream_id
-            session.set_stream_priority(stream_id, _stream_band(session, prio))
-            # Mirror the upstream stream's shape: END_OF_GROUP,
-            # FIRST_OBJECT and the subgroup-id mode are part of the
-            # delivery semantics a subscriber checks, and re-encoding
-            # with our own flags loses them.
-            first_obj, eog, inherited = shape or (False, False, False)
-            header = SubgroupHeader(
-                track_alias=alias, group_id=gid, subgroup_id=sgid,
-                publisher_priority=prio, extensions_present=True,
-                end_of_group=eog, first_object=first_obj,
-                prof=session._profile)
-            try:
-                await session.stream_write_drain(stream_id,
-                                                 header.serialize().data)
-            except MOQTStreamStopped:
-                self._stopped.add(skey)
-                return
-            except BaseException:
-                # Never leave a stream open without its header.
-                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
-                raise
-            entry = (stream_id, header)
-            self._streams[skey] = entry
-            self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
-                stream_id
-            self._sent_streams[id(session)] = \
-                self._sent_streams.get(id(session), 0) + 1
+            return self._open_stream(
+                session, skey, alias, gid, sgid, oid, payload, exts, prio,
+                status, shape, encoded, start, lost, lane, end)
         stream_id, header = entry
         if status in ("END", ObjectStatus.END_OF_GROUP,
                       ObjectStatus.END_OF_TRACK) and (
@@ -1658,26 +2950,169 @@ class _RelayedTrack:
                 payload=b"", status=status,
                 object_id=header.next_object_id if oid is None else oid)
             session.stream_write(stream_id, buf.data, end_stream=True)
+            self._count_tx(session, len(buf.data))
             self._streams.pop(skey, None)
             return
-        # One encoding per object per stream state, shared by subscribers.
-        state = header.encoding_state()
-        data = None if encoded is None else encoded.get(state)
-        if data is None:
-            data = header.next_object_bytes(payload=payload, extensions=exts,
-                                            object_id=oid)
-            if encoded is not None:
-                encoded[state] = data
-        else:
-            header.advance(oid)
+        if nowait:
+            last = header.next_object_id - 1
+        data = _object_data(header, payload, exts, oid, encoded)
+        tail = (None if end is None
+                else self._end_data(header, gid, end, start, lost))
         if lane is not None:
             lane.parked, lane.sid = "object", stream_id
+        wire = data if tail is None else data + tail
+        ended = tail is not None
         try:
-            await session.stream_write_drain(stream_id, data)
+            if session.stream_write_nowait(stream_id, wire, ended,
+                                           wait_at=_TX_YIELD_AT):
+                tx = self._tx_written
+                tx[skey[0]] = tx.get(skey[0], 0) + len(wire)
+                self._wrote(session, skey, entry, end, ended)
+                return None
+        except MOQTStreamStopped:
+            self._streams.pop(skey, None)
+            self._stopped.add(skey)
+            return None
+        if nowait:
+            header.advance(last)
+            return _NOT_SENT
+        return self._write_drain(session, skey, entry, wire, end, ended)
+
+    async def _write_drain(self, session, skey, entry, wire, end, ended):
+        # Counted before the wait: the transport takes it in pieces.
+        self._count_tx(session, len(wire))
+        try:
+            await session.stream_write_drain(entry[0], wire, end_stream=ended)
         except MOQTStreamStopped:
             # The session has reset the stream; the subscription goes on.
             self._streams.pop(skey, None)
             self._stopped.add(skey)
+            return True
+        self._wrote(session, skey, entry, end, ended)
+        return True
+
+    def _count_tx(self, session, n) -> None:
+        tx = self._tx_written
+        tx[id(session)] = tx.get(id(session), 0) + n
+
+    def _wrote(self, session, skey, entry, end, ended) -> None:
+        if end is None:
+            return
+        if ended:
+            self._streams.pop(skey, None)
+        else:
+            self._reset_stream(session, skey, entry)
+
+    async def _open_stream(self, session, skey, alias, gid, sgid, oid,
+                           payload, exts, prio, status, shape, encoded,
+                           start, lost, lane, end):
+        """_forward_one for the write that opens a subgroup stream."""
+        if lane is not None:
+            lane.parked, lane.sid = "header", None
+        # Mirror the upstream stream's shape: END_OF_GROUP,
+        # FIRST_OBJECT and the subgroup-id mode are part of the
+        # delivery semantics a subscriber checks, and re-encoding
+        # with our own flags loses them.
+        first_obj, eog, inherited = shape or (False, False, False)
+        # A stream written whole is the same bytes for every subscriber
+        # with this alias and draft: shared through `encoded`.
+        whole = (end is not None and status not in _STREAM_ENDS
+                 and gid not in lost and not self._short(gid, start))
+        prof = session._profile
+        parts = None
+        if whole and encoded is not None:
+            key = (alias, id(prof), end)
+            parts = encoded.get(key)
+        header = first = None
+        if parts is not None:
+            initial = b"".join(parts)
+        else:
+            header = SubgroupHeader(
+                track_alias=alias, group_id=gid, subgroup_id=sgid,
+                publisher_priority=prio, extensions_present=True,
+                end_of_group=eog, first_object=first_obj, prof=prof)
+            initial = header.serialize().data
+            if status not in _STREAM_ENDS:
+                # The header and the first object open the stream together.
+                first = _object_data(header, payload, exts, oid, encoded)
+                if whole:
+                    parts = (initial, first,
+                             self._end_data(header, gid, end, start, lost))
+                    if encoded is not None:
+                        encoded[key] = parts
+                    initial = b"".join(parts)
+                else:
+                    initial += first
+        self._count_tx(session, len(initial))
+        try:
+            stream_id = await session.open_uni_stream(
+                initial=initial, priority=_stream_band(session, prio),
+                end_stream=whole)
+        except MOQTStreamStopped:
+            self._stopped.add(skey)
+            return True
+        if lane is not None:
+            lane.sid = stream_id
+        entry = (stream_id, header)
+        if not whole:
+            self._streams[skey] = entry
+        self._tx_streams.setdefault(id(session), {})[(gid, sgid)] = \
+            stream_id
+        self._sent_streams[id(session)] = \
+            self._sent_streams.get(id(session), 0) + 1
+        if whole:
+            return True
+        if first is not None:
+            if end is not None:
+                self._reset_stream(session, skey, entry)
+            return True
+        # A status object on the stream just opened.
+        rest = self._forward_one(session, alias, gid, sgid, oid, payload,
+                                 exts, prio, status, shape, encoded, start,
+                                 lost, lane, end)
+        return True if rest is None else await rest
+
+    def _end_data(self, header, gid, end, start, lost):
+        """The bytes before the FIN that ends a stream for `end`, its
+        (object id, status): the upstream's marker, or nothing for a bare
+        FIN. None when the stream is short and is reset instead."""
+        if gid in lost or self._short(gid, start):
+            return None
+        oid, status = end
+        if status == "END":
+            return b""
+        return header.next_object(
+            payload=b"", status=status,
+            object_id=header.next_object_id if oid is None else oid).data
+
+    def _reset_stream(self, session, skey, entry) -> None:
+        """Reset a stream short of objects (§11.3.2), if still open."""
+        if self._streams.get(skey) is entry:
+            session.stream_reset(entry[0], StreamResetCode.INTERNAL_ERROR)
+            self._streams.pop(skey, None)
+
+
+# Statuses that end a subgroup stream instead of carrying an object.
+_STREAM_ENDS = ("END", ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)
+# _forward_one(nowait=True): the transport refused the write.
+_NOT_SENT = object()
+# TX event ring fill past which a write takes the drained path, which yields.
+_TX_YIELD_AT = 0.5
+
+
+def _object_data(header, payload, exts, oid, encoded):
+    """The object's bytes on header's stream. One encoding per object per
+    stream state, shared by subscribers through `encoded`."""
+    state = header.encoding_state()
+    data = None if encoded is None else encoded.get(state)
+    if data is None:
+        data = header.next_object_bytes(payload=payload, extensions=exts,
+                                        object_id=oid)
+        if encoded is not None:
+            encoded[state] = data
+    else:
+        header.advance(oid)
+    return data
 
 
 _watched: set = set()
@@ -1805,9 +3240,13 @@ def _forget_session(session) -> None:
         lane.track.drop_session(session)
     for key, track in list(_tracks.items()):
         track.drop_session(session)
+        for f in [f for f in track.standby if f.session is session]:
+            track.drop_feed(f)
         if _upstream_session(track) is session or (
                 track.pending_publish is not None
                 and track.pending_publish[0] is session):
+            if track.fail_over(key):
+                continue
             # Upstream is gone: give each subscriber a clean terminal
             # before dropping the fan-out.
             track.finish()
@@ -1841,6 +3280,36 @@ def _session_subscriptions(session) -> int:
     return _subscribing[id(session)] + sum(
         1 for t in _tracks.values() for d in t.downstream
         if d.session is session)
+
+
+def _subscriber_sessions() -> int:
+    """Sessions with a SUBSCRIBE in flight or attached to a track, the
+    watchdog's aside."""
+    ids = set(_subscribing)
+    for key, t in _tracks.items():
+        if not _internal_ns(key[0]):
+            ids.update(id(d.session) for d in t.downstream)
+    return len(ids)
+
+
+def _admits_new_subscriber() -> bool:
+    return not MAX_SUBSCRIBERS or _subscriber_sessions() < MAX_SUBSCRIBERS
+
+
+def _refused_by_load(session, msg) -> bool:
+    """Refuse a session's first SUBSCRIBE at --max-subscribers. The
+    watchdog's probe is exempt: refusing it would exit the relay."""
+    if (not MAX_SUBSCRIBERS or _internal_ns(_ns_tuple(msg.track_namespace))
+            or _session_subscriptions(session)):
+        return False
+    if _admits_new_subscriber():
+        return False
+    global _admission_refused
+    _admission_refused += 1
+    session._refuse_peer_request(
+        msg, RequestErrorCode.EXCESSIVE_LOAD, "relay overloaded",
+        retry_interval=random.randint(*ADMISSION_RETRY_MS) + 1)
+    return True
 
 
 def _refused_over_cap(session, msg, what: str, cap: int, held: int) -> bool:
@@ -1889,6 +3358,7 @@ async def _on_publish_namespace(session, msg):
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
     session.publish_namespace_ok(msg)
+    _join_live_tracks(ns, session)
     if _catalog_probe and _probe_wanted(ns):
         _spawn(_probe_catalog(ns))
 
@@ -2070,11 +3540,10 @@ async def _backfill(track, msg, largest) -> None:
         return
     want = _subscription_window(msg, largest)[0]
     if want < (track.upstream_from or cf):
-        # The cache's reach: CACHE_GROUPS groups, by the IDs it has seen
-        # below cf, never short of a contiguous span.
-        seen = sorted(g for g in track._groups if g < cf[0])
-        reach = min([cf[0] - CACHE_GROUPS + 1,
-                     *seen[-(CACHE_GROUPS - 1):][:1]])
+        # BACKFILL_GROUPS groups, by the IDs cached below cf, never
+        # short of a contiguous span.
+        seen = track._cache.ids_below(cf[0], BACKFILL_GROUPS - 1)
+        reach = min([cf[0] - BACKFILL_GROUPS + 1, *seen[:1]])
         start = max(want, (max(0, reach), 0))
     else:
         start = max(want, (cf[0], 0))
@@ -2091,18 +3560,15 @@ async def _backfill(track, msg, largest) -> None:
     if (objs is None or track.complete_from != cf or track._closed
             or track.finished):
         return
-    held = {(c[0], c[2]) for c in track._cache}
+    held = {(c[0], c[2]) for c in track._cache.between(start[0], end[0])}
     now = time.monotonic()
     new = [(o.group_id, o.subgroup_id, o.object_id, bytes(o.payload),
             o.extensions or None, o.publisher_priority, o.status, None, now)
            for o in objs if (o.group_id, o.object_id) not in held]
-    track._cache = deque(sorted([*new, *track._cache],
-                                key=lambda c: (c[0], c[2])))
-    size = sum(retained_object_bytes(c[3], c[4]) for c in new)
-    track._cache_bytes += size
-    _budget.bytes += size
-    for c in new:
-        track._groups[c[0]] = track._groups.get(c[0], 0) + 1
+    track._cache.merge(new)
+    if new and now < track._born_floor:
+        track._born_floor = now
+    track._sync_cache()
     _budget.touch(track)
     track._evict()
     track._backfilled.update((c[0], c[2]) for c in new)
@@ -2134,8 +3600,8 @@ async def _probe_catalog_head(track) -> None:
     head = SimpleNamespace(filter_type=FilterType.ABSOLUTE_START,
                            start_group=g, start_object=0, end_group=None)
     await _backfill(track, head, track.largest)
-    for c in list(track._cache):
-        if c[0] == g and c[2] == 0:
+    for c in list(track._cache.group(g)):
+        if c[2] == 0:
             _note_catalog(track.key[0], c[3])
             return
 
@@ -2248,7 +3714,9 @@ async def _subscribe_publishers(entry):
     key = entry.key
     ns, track_name = key
     refusal = None
+    tried = []
     for pub in _publishers_for(ns):
+        tried.append(pub)
         if entry.fut.done():
             break
         track = _RelayedTrack(key)
@@ -2330,8 +3798,67 @@ async def _subscribe_publishers(entry):
         _tracks[key] = track
         logger.info(f"relay: upstream established ns={ns} track={name} "
                     f"alias={upstream.track_alias}")
+        for other in _announcers(ns):
+            if all(other is not p for p in tried):
+                _spawn(_subscribe_standby(track, other))
         return track, None
     return None, refusal
+
+
+def _standby_wanted(track, pub) -> bool:
+    """`pub` is live and not yet feeding `track`, a live track the relay
+    subscribed to; a PUBLISHed track keeps its one publisher."""
+    return (_session_live(pub) and not track._closed and not track.finished
+            and track.pending_publish is None and track.upstream is not None
+            and not _is_session(track.upstream) and not track.feeds_from(pub))
+
+
+def _join_live_tracks(ns, session) -> None:
+    """§7.6: the publisher of a newly announced namespace is subscribed
+    to each live track under it."""
+    for key, track in list(_tracks.items()):
+        if key[0][:len(ns)] == ns and _standby_wanted(track, session):
+            _spawn(_subscribe_standby(track, session))
+
+
+async def _subscribe_standby(track, pub) -> None:
+    """§7.6: subscribe `pub`, a further publisher of the track's
+    namespace, from the live edge. Its objects join the fan-out,
+    deduplicated by Location (§7.3)."""
+    if not _standby_wanted(track, pub):
+        return
+    key = track.key
+    ns, track_name = key
+    name = (track_name.decode() if isinstance(track_name, bytes)
+            else track_name)
+    feed = _Feed()
+    feed.sub = SubscribedTrack(
+        pub, ns, name,
+        on_object=lambda m, n, ts, g, sg, f=feed: track.on_object(
+            m, n, ts, g, sg, feed=f),
+        on_done=lambda done, f=feed: _upstream_done(track, key, done, f))
+    # Its objects may land before the SUBSCRIBE_OK is handled here.
+    track._multi = True
+    track._joining.add(id(pub))
+    try:
+        await feed.sub.subscribe(timeout=10.0,
+                                 forward=0 if track.paused else 1)
+    except Exception as e:
+        logger.info(f"relay: standby subscribe {key} failed: {e}")
+        return
+    finally:
+        track._joining.discard(id(pub))
+    feed.bound = True
+    rid = getattr(feed.sub, "request_id", None)
+    feed.props = _track_properties(pub, _subscribe_ok_for(pub, rid))
+    if (track._closed or track.finished or not _session_live(pub)
+            or _mandatory(pub, feed.props)):
+        feed.release(cancel=True)
+        return
+    track.add_standby(feed)
+    logger.info(f"relay: standby upstream established ns={ns} "
+                f"track={name} alias={feed.sub.track_alias} -> "
+                f"{1 + len(track.standby)} publisher(s)")
 
 
 def _joined_subscription(session, request_id):
@@ -2377,10 +3904,17 @@ async def _await_joined(session, request_id):
     return None
 
 
-def _upstream_done(track, key, done) -> None:
-    """Upstream ended the track: FIN downstream streams, PUBLISH_DONE
-    each subscriber, and drop the fan-out so a later SUBSCRIBE starts a
-    fresh upstream subscription."""
+def _upstream_done(track, key, done, feed=None) -> None:
+    """Upstream ended the track: a standby takes over, else FIN
+    downstream streams, PUBLISH_DONE each subscriber, and drop the
+    fan-out so a later SUBSCRIBE starts a fresh upstream subscription.
+    A standby's own end only removes it."""
+    if feed is not track.feed:
+        if feed is not None and track.drop_feed(feed):
+            logger.info(f"relay: standby upstream PUBLISH_DONE {key} "
+                        f"status={getattr(done, 'status_code', None)} -> "
+                        f"{1 + len(track.standby)} publisher(s)")
+        return
     status = getattr(done, "status_code", SubscribeDoneCode.TRACK_ENDED)
     reason = getattr(done, "reason", "") or "track ended"
     logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
@@ -2388,6 +3922,8 @@ def _upstream_done(track, key, done) -> None:
                 f"-> {len(track.downstream)} subscriber(s), objects "
                 f"in={track._objects_in} out={track._objects_out}, "
                 f"upstream streams ended={track._upstream_ended}")
+    if track.fail_over(key):
+        return
     if track.task is None and not track.attaching:
         # Nothing queued and no subscriber attached.
         track.finish(status_code=status, reason=reason)
@@ -2670,6 +4206,8 @@ def _resume_paused(track, wanted=False):
                                        **location)
         logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
                     f"forward=1 request {rid}")
+        for f in track.standby:
+            f.update(1)
     except Exception:
         logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
@@ -2780,6 +4318,8 @@ def _pause_upstream(track) -> None:
         return
     track.paused = True
     track.lowered = True
+    for f in track.standby:
+        f.update(0)
     track.open_gap()
     track.pause_largest = None
     track.pause_reply = (asyncio.ensure_future(
@@ -3201,6 +4741,8 @@ async def _on_subscribe(session, msg):
                          MAX_SUBSCRIPTIONS_PER_SESSION,
                          _session_subscriptions(session)):
         return
+    if _refused_by_load(session, msg):
+        return
     _subscribing[id(session)] += 1
     try:
         await _relay_subscribe(session, msg)
@@ -3316,9 +4858,12 @@ def transport_settings(args) -> dict:
     """MOQTServer transport settings from the relay's flags."""
     return {"congestion_control_algorithm": args.cc_algo,
             "congestion_control_options": args.cc_options,
+            "packet_train_mode": args.pacing_trains,
             "max_connections": args.max_connections,
+            "workers": args.workers,
             "stream_ring_cap": args.stream_ring_cap,
-            "tx_max_inflight_bytes": args.max_inflight_bytes}
+            "tx_max_inflight_bytes": args.max_inflight_bytes,
+            "auth": auth_from_args(args)}
 
 
 def parse_args(argv=None):
@@ -3375,6 +4920,11 @@ def parse_args(argv=None):
                              "(a child process relays one object over "
                              "loopback every SEC seconds). 0 = off "
                              "(default).")
+    parser.add_argument("--stall-trace", type=float, default=0, metavar="MS",
+                        help="Log the event loop thread's Python stack when "
+                             "the loop has not run for MS milliseconds, and "
+                             "the stall's length when it ends. 0 = off "
+                             "(default).")
     parser.add_argument("--catalog-probe", action="store_true",
                         help="Subscribe to each announced or published "
                              "namespace's catalog track at once, so the "
@@ -3404,7 +4954,10 @@ def parse_args(argv=None):
                         help="Drop a subscriber's live objects older than "
                              "SEC seconds when no OBJECT_DELIVERY_TIMEOUT "
                              "applies, resetting the subgroup with "
-                             "DELIVERY_TIMEOUT. Cache replays are exempt. "
+                             "DELIVERY_TIMEOUT, and shed whole groups once "
+                             "its queue and streams hold more than SEC at "
+                             "the track's input rate. Cache replays are "
+                             "exempt. "
                              f"0 = never. Default: {LAG_LIMIT_S:g}")
     parser.add_argument("--goaway-uri", type=str, default="", metavar="URL",
                         help="New Session URI sent in GOAWAY on SIGTERM or "
@@ -3443,23 +4996,33 @@ def parse_args(argv=None):
                         help="Option string for the congestion controller, "
                              "e.g. Q0.02: bbr sends bursts of 20 ms of "
                              "pacing rate")
+    parser.add_argument("--pacing-trains", action="store_true",
+                        help="When pacing holds a connection back, send up "
+                             "to 10 packets at once instead of one or two")
     parser.add_argument("--max-connections", type=int, default=4096,
                         help="Most connections held at once (aiopquic "
                              ">= 0.5.1). Default: 4096")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="picoquic worker threads sharing the port, "
+                             "each with its own connections (Linux, "
+                             "aiopquic with workers=). Default: 1")
     parser.add_argument("--stream-ring-cap", type=int, default=1 << 20,
                         metavar="BYTES",
                         help="Per-stream send buffer, allocated whole for "
-                             "each open stream; must exceed the largest "
-                             "object. Default: 1 MiB")
+                             "each open stream; larger objects are written "
+                             "in pieces. Default: 1 MiB")
     parser.add_argument("--max-inflight-bytes", type=int, default=512 << 10,
                         metavar="BYTES",
                         help="Per-stream send budget, below "
                              "--stream-ring-cap. Default: 512 KiB")
     parser.add_argument("--cache-bytes", type=int,
                         default=CACHE_BUDGET_BYTES, metavar="BYTES",
-                        help="Object cache budget across all tracks; past "
-                             "it the least recently used tracks lose their "
-                             "oldest groups. Default: 256 MiB")
+                        help="Object cache budget across all tracks, an "
+                             "eighth of it per track; past it the least "
+                             "recently used tracks lose their oldest groups, "
+                             "each keeping its newest 10 s while others hold "
+                             "more. Send lanes holding more than this fall "
+                             "back to 4 MiB each. Default: 256 MiB")
     parser.add_argument("--max-namespaces-per-session", type=int,
                         default=MAX_NAMESPACES_PER_SESSION, metavar="N",
                         help="PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE and "
@@ -3471,6 +5034,11 @@ def parse_args(argv=None):
                         help="SUBSCRIBEs one session may hold; more are "
                              "refused with EXCESSIVE_LOAD. Default: "
                              f"{MAX_SUBSCRIPTIONS_PER_SESSION}")
+    parser.add_argument("--max-subscribers", type=int, default=0,
+                        metavar="N",
+                        help="Sessions the relay serves SUBSCRIBEs for; new "
+                             "ones are refused with EXCESSIVE_LOAD. "
+                             "Default: 0, no limit")
     parser.add_argument("--stream-scheduling", choices=SCHEDULING,
                         default=STREAM_SCHEDULING,
                         help="Order among data streams of one priority: "
@@ -3480,6 +5048,7 @@ def parse_args(argv=None):
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
                              "DEBUG, TRACE, INFO")
+    add_auth(parser)
     add_logging(parser)
     add_help(parser)
     args = _parse_with_config(parser, argv)
@@ -3733,6 +5302,8 @@ def _install_fetch_sink(pub) -> None:
 
 # Relay-wide FETCH payload bytes by source, including tracks with no state.
 _fetch_bytes = {"cache": 0, "upstream": 0}
+# Relay-wide FETCHes served, ended tracks and tracks with no state included.
+_fetch_count = 0
 
 
 def _counted_fetch(objs, track, source):
@@ -3822,6 +5393,7 @@ async def _on_fetch(session, msg):
     """FETCH (§10.12) served from the track's recent-object cache, or
     from the publisher when the range predates it. A joining FETCH is
     resolved against its subscription and served the same way."""
+    global _fetch_count
     # A joining FETCH names no track: both come from its subscription.
     ns, track_name = _ns_tuple(msg.namespace), msg.track_name
     _watch_session(session, ns or None)
@@ -3877,6 +5449,7 @@ async def _on_fetch(session, msg):
     have_cache = live and track.cache_covers(start) and not gapped
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
+    up_keys: set = set()
     props = track.properties if track is not None else {}
     end_of_track = 0
     if objs and objs[-1][6] == ObjectStatus.END_OF_TRACK:
@@ -3911,11 +5484,13 @@ async def _on_fetch(session, msg):
             objs = [(o.group_id, o.subgroup_id, o.object_id, o.payload,
                      o.extensions, o.publisher_priority, o.status)
                     for o in upstream]
+            up_keys = {(o[0], o[2]) for o in objs}
             if gapped and track.cache_covers(start):
                 objs = _merged(objs, track.cached_range(start, end))
             end_of_track = int(getattr(up_ok, 'end_of_track', 0) or 0)
             props = dict(getattr(up_ok, "track_extensions", None) or {})
             source = "upstream"
+    _fetch_count += 1
     if track is not None:
         track._fetches += 1
     if track_name == CATALOG_TRACK:
@@ -3953,8 +5528,11 @@ async def _on_fetch(session, msg):
         msg.request_id, _counted_fetch(objs, track, source),
         group_order=int(order),
         stream_priority=_stream_band(session, objs[0][5] if objs else None))
+    n_up = sum((o[0], o[2]) in up_keys for o in objs) if up_keys else 0
+    size = sum(len(o[3] or b"") for o in objs)
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "
-                f"{len(objs)} object(s) {start}..{last} from {source}")
+                f"{len(objs)} object(s) {start}..{last}: {len(objs) - n_up} "
+                f"from cache, {n_up} upstream, {size} B")
 
 
 async def _on_subscribe_namespace(session, msg):
@@ -4255,7 +5833,8 @@ async def _self_probe(host, port, use_quic, draft, timeout,
             for _ in range(2 if full else 1):
                 client = MOQTClient(host, port, path="/", use_quic=use_quic,
                                     verify_tls=False, supported_drafts=draft,
-                                    implementation=impl)
+                                    implementation=impl,
+                                    auth=auth_from_args(argparse.Namespace()))
                 s = await stack.enter_async_context(client.connect())
                 await s.client_session_init()
                 sessions.append(s)
@@ -4290,13 +5869,17 @@ _PROBE_CHILD = (
 
 
 async def _probe_in_child(host, port, use_quic, draft, timeout,
-                          full=True) -> bool:
+                          full=True, auth=None) -> bool:
     """Run one self-probe in a child process, so a crash in the probe's
-    client transport cannot take the relay down."""
+    client transport cannot take the relay down. `auth` reaches it in the
+    environment, off the command line."""
+    env = None if auth is None else {
+        **os.environ, AUTH_KEY_ENV: auth.spec,
+        AUTH_TYPE_ENV: str(auth.token_type)}
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _PROBE_CHILD, host, str(port),
         "1" if use_quic else "0", str(draft), str(timeout),
-        "1" if full else "0",
+        "1" if full else "0", env=env,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     try:
         _, err = await asyncio.wait_for(proc.communicate(), timeout + 15)
@@ -4330,34 +5913,37 @@ TRANSPORT_COUNTERS = (
     "rx_overflow_depth_now", "rx_overflow_max_depth", "rx_overflow_pushed",
     "rx_event_drops", "tx_event_ring_count_now", "tx_event_ring_pops",
     "tx_worker_idle_now", "tx_wake_lost", "loop_callbacks",
-    "wake_calls", "wake_skipped_coalesced")
+    "wake_calls", "wake_skipped_coalesced", "loop_late_checks", "loop_late_us")
 
 
-def _transport_of(handle):
-    """The aiopquic TransportContext behind a serve() handle, else None."""
+def _transports_of(handle) -> list:
+    """Every worker's aiopquic TransportContext behind a serve() handle."""
+    transports = getattr(handle, "transports", None)
+    if transports:
+        return list(transports)
     transport = getattr(handle, "_transport", None)
     if transport is None:
         transport = getattr(getattr(handle, "_engine", None), "_transport",
                             None)
-    return transport
+    return [] if transport is None else [transport]
 
 
 def transport_counters(handles) -> list:
-    """TRANSPORT_COUNTERS of each listener's transport."""
+    """TRANSPORT_COUNTERS of each listener's transports, one per worker."""
     out = []
     for handle in handles:
-        try:
-            counters = _transport_of(handle).counters
-        except Exception:
-            continue
-        out.append({k: counters.get(k) for k in TRANSPORT_COUNTERS})
+        for transport in _transports_of(handle):
+            try:
+                counters = transport.counters
+            except Exception:
+                continue
+            out.append({k: counters.get(k) for k in TRANSPORT_COUNTERS})
     return out
 
 
-def _kick_rx(handle) -> bool:
+def _kick_rx(transport) -> bool:
     """Wake asyncio's reader for the transport once, as the network thread
     does. Linux only: elsewhere the wake fd's write end is not exposed."""
-    transport = _transport_of(handle)
     if transport is None or not sys.platform.startswith("linux"):
         return False
     try:
@@ -4373,14 +5959,14 @@ async def _diagnose_probe_miss(handles) -> None:
     wake; staying queued means no reader is attached."""
     logger.warning(f"relay: watchdog: probe failed; transport "
                    f"{transport_counters(handles)}")
-    kicked = [_kick_rx(h) for h in handles]
+    kicked = [_kick_rx(t) for h in handles for t in _transports_of(h)]
     await asyncio.sleep(WATCHDOG_KICK_S)
     logger.warning(f"relay: watchdog: woke readers {kicked}; transport "
                    f"{transport_counters(handles)}")
 
 
 async def _watchdog(period, host, port, use_quic, draft,
-                    handles=()) -> None:
+                    handles=(), auth=None) -> None:
     """Exit so the supervisor restarts the relay when it hangs or stops
     relaying: a loop stall past `period`, or WATCHDOG_MISSES self-probes
     in a row, on the newest draft, that deliver no object. Each failed
@@ -4395,7 +5981,8 @@ async def _watchdog(period, host, port, use_quic, draft,
         full = ticks % WATCHDOG_FULL_EVERY == 0
         ticks += 1
         passed = await _probe_in_child(host, port, use_quic, newest,
-                                       min(period, WATCHDOG_PROBE_S), full)
+                                       min(period, WATCHDOG_PROBE_S), full,
+                                       auth)
         ok += passed
         if time.monotonic() >= report_at:
             logger.info(f"relay: watchdog: {ok}/{ticks} probes ok in the "
@@ -4494,7 +6081,8 @@ _HISTORY_KEYS = ("t", "ingress_bps", "egress_bps", "media_in_bps",
                  "subscribers", "subscriptions", "tracks",
                  "loss_pct", "rtt_p50_ms", "lag_p99_ms", "objects_in_per_s",
                  "objects_out_per_s", "groups_per_s", "groups_out_per_s",
-                 "drops")
+                 "send_late_ms", "gc_max_ms",
+                 "drops", "shed_bytes")
 _PLATFORM_KEYS = ("t", "cpu", "cpu_user", "cpu_nice", "cpu_system",
                   "cpu_iowait", "cpu_irq", "cpu_steal", "proc_cpu",
                   "proc_user", "proc_system", "proc_rss", "mem_used",
@@ -4516,6 +6104,11 @@ def _cache_efficiency():
     return round(cache / total, 4) if total else None
 
 
+def _lane_delay_ms(lane, in_bps: float) -> float:
+    """What a lane and its streams hold, in time at the track's input rate."""
+    return round((lane.bytes + lane.tx_bytes) * 8000 / in_bps, 1)
+
+
 class _Status:
     """The dashboard's status.json, rewritten every STATUS_INTERVAL_S, and
     platform.json, every PLATFORM_INTERVAL_S."""
@@ -4529,6 +6122,7 @@ class _Status:
         self.relay = relay
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
+        self.gc = relay_status.GcTimer.shared()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -4544,6 +6138,8 @@ class _Status:
         self._quic_prev: dict[int, tuple] = {}
         self._delivered = 0
         self._drops = 0
+        self._shed = 0
+        self._late_seen = (0, 0)
         self._last = None
 
     async def run(self) -> None:
@@ -4563,6 +6159,18 @@ class _Status:
             except Exception:
                 logger.warning("relay: status write failed", exc_info=True)
             await asyncio.sleep(STATUS_INTERVAL_S)
+
+    def _send_late_ms(self):
+        """How overdue the network threads' next wakes were on average since
+        the last call, None without the counters or a pass to judge."""
+        rows = transport_counters(self.handles)
+        checks = sum(r["loop_late_checks"] or 0 for r in rows)
+        late = sum(r["loop_late_us"] or 0 for r in rows)
+        seen_checks, seen_late = self._late_seen
+        self._late_seen = (checks, late)
+        if checks <= seen_checks:
+            return None
+        return round((late - seen_late) / (checks - seen_checks) / 1000, 2)
 
     def snapshot(self, now: float, wall: float) -> dict:
         """Relay, totals, namespace, track and session tables, host
@@ -4589,13 +6197,16 @@ class _Status:
         pubs, subs = set(), set()
         ns_viewers: dict[tuple, set] = {}
         tracks, prev = [], {}
+        queue_ms: list[float] = []
         for key, t in list(_tracks.items()):
             if _internal_ns(key[0]):
                 continue
-            p_in, p_out, p_drops, p_obj, p_grp = self._track_prev.get(
-                id(t), (0, 0, 0, 0, 0))
+            p_in, p_out, p_drops, p_obj, p_grp, p_shed = self._track_prev.get(
+                id(t), (0, 0, 0, 0, 0, 0))
+            shed = t.shed_bytes()
             prev[id(t)] = (t._bytes_in, t._bytes_out, t._drops, t._objects_in,
-                           t._groups_in)
+                           t._groups_in, shed)
+            self._shed += shed - p_shed
             self._delivered += t._bytes_out - p_out
             self._drops += t._drops - p_drops
             owner = _track_owner(t)
@@ -4629,6 +6240,11 @@ class _Status:
                     "lane_stalls": lane.stalls if lane else 0,
                     "since": info["since"] if info else None,
                     **(_sent_fields(d) if _trace_subscribers else {})})
+            in_bps = bps(t._bytes_in - p_in)
+            if in_bps:
+                queue_ms.extend(_lane_delay_ms(d.lane, in_bps)
+                                for d in t.downstream
+                                if d.lane is not None and d.forward)
             tracks.append((key, {
                 "id": "\x1f".join((_ns_str(key[0]), _name_str(key[1]))),
                 "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
@@ -4641,6 +6257,7 @@ class _Status:
                 "bytes_in": t._bytes_in, "bytes_out": t._bytes_out,
                 "objects_in": t._objects_in, "objects_out": t._objects_out,
                 "fetches": t._fetches, "drops": t._drops,
+                "shed_bytes": shed,
                 "fetch_cache_bytes": t._fetch_bytes["cache"],
                 "fetch_upstream_bytes": t._fetch_bytes["upstream"],
                 "groups_in": t._groups_in,
@@ -4652,7 +6269,8 @@ class _Status:
                 "latency_ms": (None if up is None or down is None
                                else round((up + down) / 2, 1)),
                 "largest": list(t.largest) if t.largest else None,
-                "cache_groups": len({c[0] for c in t._cache}),
+                "cache_groups": len(t._cache.groups()),
+                "cache_seconds": t.cache_span_s(),
                 "cache_bytes": t._cache_bytes,
                 "state": _track_state(t, t._bytes_in > p_in),
                 "origin": (f"{_transport(owner)} d{_draft(owner)}"
@@ -4747,6 +6365,9 @@ class _Status:
                 "lost_packets": pq.get("lost"),
                 "timer_losses": pq.get("timer_losses"),
                 "spurious_losses": pq.get("spurious_losses"),
+                # The congestion controller's own report (aiopquic path_quality()).
+                "cc_state": pq.get("cc_state"),
+                "cc_param": pq.get("cc_param"),
                 "namespaces": _session_namespaces(s),
                 "subscriptions": held_subs[id(s)],
                 "dgram_drops": _dgram_drops.get(id(s), 0),
@@ -4756,6 +6377,9 @@ class _Status:
         media_in = sum(r["in_bps"] or 0 for _, r in tracks)
         media_out = sum(r["out_bps"] or 0 for _, r in tracks)
         lag = self.lag.summary()
+        gc_line, long_passes = self.gc.take()
+        for p in long_passes:
+            logger.warning(f"relay: {relay_status.format_gc_pass(*p)}")
         totals = {
             "sessions": len(sessions),
             "by_draft": dict(Counter(f"d{s['draft']}" for s in sessions)),
@@ -4782,7 +6406,8 @@ class _Status:
             "efficiency": (max(0.0, 1 - media_in / media_out)
                            if media_out else None),
             "delivered_bytes": self._delivered, "drops": self._drops,
-            "fetches": sum(r["fetches"] for _, r in tracks),
+            "shed_bytes": self._shed, "lane_bytes": _lane_bytes,
+            "fetches": _fetch_count,
             "fetch_cache_bytes": _fetch_bytes["cache"],
             "fetch_upstream_bytes": _fetch_bytes["upstream"],
             "cache_efficiency": _cache_efficiency(),
@@ -4795,6 +6420,13 @@ class _Status:
             "rtt_p50_ms": relay_status.percentile(rtts, 50),
             "rtt_p99_ms": relay_status.percentile(rtts, 99),
             "loop_lag_ms": lag,
+            "send_late_ms": self._send_late_ms(),
+            "gc": gc_line,
+            "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
+                         "p90": relay_status.percentile(queue_ms, 90),
+                         "max": max(queue_ms, default=None)},
+            "admission": {"open": _admits_new_subscriber(),
+                          "refused": _admission_refused},
         }
         self._subs_peak = max(self._subs_peak, totals["subscribers"])
         totals["subscribers_peak"] = self._subs_peak
@@ -4813,7 +6445,10 @@ class _Status:
             "objects_out_per_s": totals["objects_out_per_s"],
             "groups_per_s": totals["groups_per_s"],
             "groups_out_per_s": totals["groups_out_per_s"],
+            "send_late_ms": totals["send_late_ms"],
+            "gc_max_ms": gc_line["max_ms"],
             "drops": totals["drops"],
+            "shed_bytes": totals["shed_bytes"],
         })
         self._add_track_history(tracks)
         self.platform = self._platform(wall, host, totals, lag)
@@ -4839,7 +6474,8 @@ class _Status:
         """One point per tracked track, None for one absent this tick; a
         track absent for the whole window is dropped. With every slot
         taken, a present track (subscribed ones first) takes the slot of
-        the track absent longest."""
+        the track absent longest; a subscribed one may instead take the
+        slot of a present track without subscribers."""
         length = self.history.length
         filled = len(self.history.series["t"])
         now = {row["id"]: row for _, row in tracks}
@@ -4847,7 +6483,7 @@ class _Status:
             if tid in self.track_history:
                 continue
             if len(self.track_history) >= TRACK_HISTORY_MAX:
-                gone = self._longest_gone(now)
+                gone = self._free_slot(now, bool(now[tid]["subscribers"]))
                 if gone is None:
                     continue
                 del self.track_history[gone]
@@ -4861,18 +6497,20 @@ class _Status:
             if row is None and all(v is None for v in series["subscribers"]):
                 del self.track_history[tid]
 
-    def _longest_gone(self, now):
-        """The tracked track absent from `now` for the most ticks, or None."""
-        def absent(tid):
-            col = self.track_history[tid]["subscribers"]
+    def _free_slot(self, now, subscribed):
+        """The tracked track to drop for a new one, or None: one absent
+        from `now`, else, for a `subscribed` newcomer, one present without
+        subscribers; the one without subscribers longest first."""
+        def idle(tid):
             ticks = 0
-            for v in reversed(col):
-                if v is not None:
+            for v in reversed(self.track_history[tid]["subscribers"]):
+                if v:
                     break
                 ticks += 1
             return ticks
-        gone = [tid for tid in self.track_history if tid not in now]
-        return max(gone, key=absent, default=None)
+        free = [tid for tid in self.track_history if tid not in now
+                or (subscribed and not now[tid]["subscribers"])]
+        return max(free, key=lambda t: (t not in now, idle(t)), default=None)
 
     def _platform(self, wall: float, host: dict, totals: dict,
                   lag: dict) -> dict:
@@ -5041,7 +6679,8 @@ def _sent_fields(d) -> dict:
 # bytes/s, packets).
 _PATH_QUALITY_KEYS = ("rtt", "rtt_min", "rtt_max", "cwin", "bytes_in_transit",
                       "pacing_rate", "sent", "lost", "timer_losses",
-                      "spurious_losses", "bytes_sent", "bytes_received")
+                      "spurious_losses", "bytes_sent", "bytes_received",
+                      "cc_state", "cc_param")
 
 
 def _sessions_report() -> dict:
@@ -5154,8 +6793,7 @@ async def _refuse_connections(handles) -> None:
     ones keep running."""
     transports = {}
     for h in handles:
-        t = _transport_of(h)
-        if t is not None:
+        for t in _transports_of(h):
             transports[id(t)] = t
     for t in transports.values():
         refuse = getattr(t, "set_max_connections", None)
@@ -5280,14 +6918,20 @@ async def main():
     if args.drain_timeout < 0:
         print("Error: --drain-timeout must be 0 or more", file=sys.stderr)
         sys.exit(2)
-    global CACHE_BUDGET_BYTES, STREAM_SCHEDULING
+    global CACHE_BUDGET_BYTES, CACHE_BYTES, STREAM_SCHEDULING
     CACHE_BUDGET_BYTES = args.cache_bytes
+    CACHE_BYTES = CACHE_BUDGET_BYTES // 8
     if (args.max_namespaces_per_session <= 0
             or args.max_subscriptions_per_session <= 0):
         print("Error: --max-namespaces-per-session and "
               "--max-subscriptions-per-session must be above 0",
               file=sys.stderr)
         sys.exit(2)
+    if args.max_subscribers < 0:
+        print("Error: --max-subscribers must be 0 or more", file=sys.stderr)
+        sys.exit(2)
+    global MAX_SUBSCRIBERS
+    MAX_SUBSCRIBERS = args.max_subscribers
     global MAX_NAMESPACES_PER_SESSION, MAX_SUBSCRIPTIONS_PER_SESSION
     MAX_NAMESPACES_PER_SESSION = args.max_namespaces_per_session
     MAX_SUBSCRIPTIONS_PER_SESSION = args.max_subscriptions_per_session
@@ -5335,8 +6979,13 @@ async def main():
         # --quic and --dual serve raw QUIC on --port; otherwise WT.
         watchdog = asyncio.create_task(_watchdog(
             args.watchdog, host, args.port, args.quic or args.dual,
-            args.draft, handles))
+            args.draft, handles, transport["auth"]))
         _background.add(watchdog)
+
+    if args.stall_trace > 0:
+        _background.add(asyncio.create_task(relay_status.StallSampler(
+            args.stall_trace, logger, relay_status.GcTimer.shared(),
+            prefix="relay: ").run()))
 
     if args.status_dir:
         os.makedirs(args.status_dir, exist_ok=True)
@@ -5349,17 +6998,19 @@ async def main():
                            else ["quic"] if args.quic else ["wt"]),
             "started": time.time(),
             "watchdog_s": args.watchdog,
-            "cache": {"groups": CACHE_GROUPS, "bytes": CACHE_BYTES,
+            "workers": args.workers,
+            "cache": {"track_bytes": CACHE_BYTES, "floor_s": CACHE_FLOOR_S,
                       "budget": CACHE_BUDGET_BYTES},
             "per_session": {"namespaces": MAX_NAMESPACES_PER_SESSION,
                             "subscriptions": MAX_SUBSCRIPTIONS_PER_SESSION},
+            "admission": {"max_subscribers": MAX_SUBSCRIBERS},
         }, handles)
         _background.add(asyncio.create_task(status.run()))
 
     print(
         "=" * 64
         + "\n aiomoqt-relay: a MoQT relay in Python.\n"
-        " No authentication or rate limiting.\n"
+        " CAT authorization with --auth-key; no rate limiting.\n"
         + "=" * 64,
         file=sys.stderr,
     )

@@ -34,10 +34,13 @@ class _Session:
         self.fins = set()
         self.dgrams = []
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
         self.streams[sid] = bytearray()
+        if initial or end_stream:
+            await self.stream_write_drain(sid, initial, end_stream)
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
@@ -45,9 +48,11 @@ class _Session:
         if end_stream:
             self.fins.add(sid)
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         await asyncio.sleep(0)
         self.streams[sid] += data
+        if end_stream:
+            self.fins.add(sid)
 
     def datagram_max_payload(self):
         return 1 << 16
@@ -288,7 +293,7 @@ async def test_datagram_encodings_kept_are_bounded(monkeypatch, aliases,
 
     monkeypatch.setattr(delivery_mod.SendLane, "offer", spy)
     await _run(fan, _OBJECTS[:3])
-    held = [len(item[-1]) for item in items if isinstance(item, tuple)]
+    held = [len(item[8]) for item in items if isinstance(item, tuple)]
     assert held and max(held) == kept
     for alias, s in zip(aliases, peers):
         assert s.dgrams == [ObjectDatagram(

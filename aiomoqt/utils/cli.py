@@ -21,7 +21,8 @@ addressing
                        host[:port]                 WebTransport
                      There is no -q: an address you dial already says
                      how to reach it.
-  -Q/--quic          on tools that LISTEN (no URL to imply it). Both
+  -Q/--quic          on tools that LISTEN (no URL to imply it); abr_ingest
+                     listens for its source and dials its outputs. Both
   -W/--wt            together = serve both on one port via per-connection
                      ALPN dispatch. Neither = -W.
   --bind, -p/--port, --path      listener address. The path is shared by
@@ -33,13 +34,16 @@ publisher media   -s/--object-size -g/--group-size -P/--streams
                   -r/--rate -D/--datagram, plus video
 video             --video RES: -r = frame rate, -g = GOP frames; refuses
                   -s/-P/-D (check_video)
+side tracks       --audio --catalog beside --video; with them -D applies to
+                  --audio (check_side_tracks)
 run               -t/--duration -d/--debug --no-stats
 logging           --log-level --log (long only; -d/--debug = --log-level
                   debug)
 interval          -i/--interval
 session           --draft -k/--insecure --keylogfile --cc-algo
-                  --cc-options --fc-window --max-queued-bytes
-                  --max-inflight-bytes --quic-debug
+                  --cc-options --pacing-trains --fc-window
+                  --max-queued-bytes --max-inflight-bytes --quic-debug
+                  --auth-key --auth-token-type
 keepalive         --keepalive
 fetch history     --fetch-history (long only)
 compat            --compat
@@ -52,7 +56,9 @@ split execution (tools that can run one end or both)
 """
 import argparse
 import logging
+import os
 
+from aiomoqt.cat import DEFAULT_TOKEN_TYPE, CatAuth
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
 from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
                                   parse_log_spec)
@@ -61,8 +67,8 @@ from aiomoqt.utils.url import parse_relay_url
 # Defaults, one place. Powers of two, same on every tool.
 DEFAULT_OBJECT_SIZE = 4096
 DEFAULT_GROUP_SIZE = 4096
-DEFAULT_DURATION = 30
 DEFAULT_INTERVAL = 5.0
+SETUP_TIMEOUT = 30
 
 # Conservative universal datagram payload cap: the 1200 B frame ceiling
 # picoquic admits without consulting live path MTU, minus MoQT header
@@ -70,8 +76,11 @@ DEFAULT_INTERVAL = 5.0
 DGRAM_MAX_OBJECT = 1152
 
 VIDEO_PROFILES = ('240p', '270p', '360p', '480p',
-                  '720p', '1080p', '1440p', '4k')
+                  '720p', '1080p', '1440p', '4k', '4kuhd')
 VIDEO_FPS = 30
+
+AUTH_KEY_ENV = 'AIOMOQT_AUTH_KEY'
+AUTH_TYPE_ENV = 'AIOMOQT_AUTH_TOKEN_TYPE'
 
 
 def _note_given(namespace, dest):
@@ -240,15 +249,25 @@ def add_payload_check(p):
 
 # -- run / session ---------------------------------------------------
 
-def add_run(p, duration=DEFAULT_DURATION):
-    p.add_argument('-t', '--duration', type=int, default=duration,
-                   help=f'Duration seconds (default: {duration})')
+def add_run(p):
+    p.add_argument('-t', '--duration', type=int, default=0,
+                   help='Run time in seconds; 0 (default): no limit')
     p.add_argument('-d', '--debug', action='store_true',
                    help='Verbose logging')
     p.add_argument('--no-stats', action='store_true',
                    help='Count objects and bytes only — no latency, '
                         'jitter, loss or group accounting. Measures the '
                         'delivery ceiling without the measurement in it.')
+
+
+def setup_timeout(args):
+    """Seconds to wait for a session or catalog: -t, or SETUP_TIMEOUT."""
+    return args.duration or SETUP_TIMEOUT
+
+
+def duration_label(seconds):
+    """-t for a banner."""
+    return f"{seconds}s" if seconds else "no limit"
 
 
 def log_spec(value):
@@ -311,6 +330,9 @@ def add_session(p):
     p.add_argument('--cc-options', type=str, default=None, metavar='OPTS',
                    help='Option string for the congestion controller, e.g. '
                         'Q0.02: bbr sends bursts of 20 ms of pacing rate')
+    p.add_argument('--pacing-trains', action='store_true', default=None,
+                   help='When pacing holds a connection back, send up to '
+                        '10 packets at once instead of one or two')
     p.add_argument('--fc-window', type=int, default=None, metavar='BYTES',
                    help='QUIC flow-control window, per stream and per '
                         'connection; the receiver buffers this much per '
@@ -325,17 +347,47 @@ def add_session(p):
                         '(1 MiB). 0 disables.')
     p.add_argument('--quic-debug', action='store_true',
                    help='Verbose QUIC-layer logging')
+    add_auth(p)
+
+
+def add_auth(p):
+    p.add_argument('--auth-key', type=str, default=None, metavar='KID:SECRET',
+                   help='Shared HMAC key for session admission: a client '
+                        'presents a CAT granting everything, without expiry, '
+                        'in SETUP; a listener requires one and checks each '
+                        'request against its grants. Also '
+                        f'{AUTH_KEY_ENV}. Default: no auth')
+    p.add_argument('--auth-token-type', type=int, default=None, metavar='N',
+                   help="MOQT Auth Token Type of that CAT; must match the "
+                        f"relay's. Also {AUTH_TYPE_ENV}. "
+                        f"Default: {DEFAULT_TOKEN_TYPE}")
+
+
+def auth_from_args(args):
+    """The CatAuth from --auth-key / --auth-token-type or their environment
+    variables, or None."""
+    spec = getattr(args, 'auth_key', None) or os.environ.get(AUTH_KEY_ENV)
+    if not spec:
+        return None
+    token_type = getattr(args, 'auth_token_type', None)
+    try:
+        if token_type is None:
+            token_type = int(os.environ.get(AUTH_TYPE_ENV, DEFAULT_TOKEN_TYPE))
+        return CatAuth.parse(spec, token_type)
+    except ValueError as e:
+        raise SystemExit(f"--auth-key: {e}") from None
 
 
 def transport_kwargs(args) -> dict:
     """MOQTClient / MOQTServer transport kwargs from the --cc-algo,
-    --cc-options, --fc-window, --max-queued-bytes, --max-inflight-bytes and
-    --keepalive flags. An
+    --cc-options, --pacing-trains, --fc-window, --max-queued-bytes,
+    --max-inflight-bytes, --keepalive and --auth-key flags. An
     unset flag is left out so the library default applies;
     --max-inflight-bytes 0 maps to None (disabled)."""
     kw = {}
     for attr, key in (('cc_algo', 'congestion_control_algorithm'),
                       ('cc_options', 'congestion_control_options'),
+                      ('pacing_trains', 'packet_train_mode'),
                       ('fc_window', 'flow_control_window'),
                       ('max_queued_bytes', 'tx_max_queued_bytes'),
                       ('keepalive', 'keep_alive_interval')):
@@ -345,6 +397,9 @@ def transport_kwargs(args) -> dict:
     inflight = getattr(args, 'max_inflight_bytes', None)
     if inflight is not None:
         kw['tx_max_inflight_bytes'] = inflight or None
+    auth = auth_from_args(args)
+    if auth is not None:
+        kw['auth'] = auth
     return kw
 
 
@@ -359,6 +414,8 @@ def describe_transport(args) -> str:
     cc_options = getattr(args, 'cc_options', None)
     if cc_options:
         cc += f" {cc_options}"
+    if getattr(args, 'pacing_trains', None):
+        cc += " trains"
     return (f"cc={cc}  "
             f"queued={budget(getattr(args, 'max_queued_bytes', None), 'default')}  "
             f"inflight={budget(getattr(args, 'max_inflight_bytes', None), 'default')}  "
@@ -442,6 +499,60 @@ def check_datagram(parser, args):
         parser.error(
             f'-D/--datagram: object-size {size} can never fit a DATAGRAM '
             f'frame (max ~{DGRAM_MAX_OBJECT} B; frames cannot fragment)')
+
+
+# --audio: AAC at 128 kbps, 1024-sample frames at 48 kHz.
+AUDIO_RATE = 48000 / 1024
+AUDIO_OBJECT_SIZE = 341
+CATALOG_RATE = 1.0
+CATALOG_OBJECT_SIZE = 512
+
+
+def add_side_tracks(p):
+    """--audio and --catalog: tracks beside --video, one object per group."""
+    p.add_argument('--audio', action='store_true',
+                   help="With --video: also 'audio', "
+                        f"{AUDIO_OBJECT_SIZE} B objects at {AUDIO_RATE:g}/s "
+                        "(AAC, 128 kbps), one object per group; with -D, as "
+                        "ObjectDatagrams")
+    p.add_argument('--catalog', action='store_true',
+                   help="With --video: also 'catalog', "
+                        f"{CATALOG_OBJECT_SIZE} B objects at {CATALOG_RATE:g}/s, "
+                        "one object per group. With --audio or --catalog, -T "
+                        "defaults to 'video'")
+
+
+def check_side_tracks(parser, args):
+    """--audio/--catalog validity and -T's default, before check_video.
+    With --video, -D applies to the --audio track. Sets args.side_tracks."""
+    side = [n for n in ('audio', 'catalog') if getattr(args, n)]
+    for name in side:
+        if not args.video:
+            parser.error(f'--{name} needs --video')
+    args.audio_datagram = bool(args.video and args.audio
+                               and getattr(args, 'datagram', False))
+    if args.audio_datagram:
+        args.datagram = False
+        given(args).discard('datagram')
+    if side and args.trackname is None:
+        args.trackname = 'video'
+    if args.trackname in side:
+        parser.error(f"-T {args.trackname} clashes with --{args.trackname}")
+    args.side_tracks = side_track_shapes(args)
+
+
+def side_track_shapes(args):
+    """(name, object size, objects/s, as datagrams) per side track."""
+    shapes = ([('catalog', CATALOG_OBJECT_SIZE, CATALOG_RATE, False)]
+              if args.catalog else [])
+    if args.audio:
+        shapes.append(('audio', AUDIO_OBJECT_SIZE, AUDIO_RATE,
+                       args.audio_datagram))
+    return shapes
+
+
+def side_tracks_mbps(shapes):
+    return sum(size * 8 * rate for _, size, rate, _ in shapes) / 1e6
 
 
 def check_video(parser, args):

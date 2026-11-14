@@ -59,8 +59,11 @@ class _FakeSession:
         self.resets, self.fins, self.writes, self.dgrams = [], [], [], []
         self._next = 2
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         self._next += 4
+        if initial or end_stream:
+            await self.stream_write_drain(self._next, initial, end_stream)
         return self._next
 
     def set_stream_priority(self, *_):
@@ -68,6 +71,8 @@ class _FakeSession:
 
     async def stream_write_drain(self, sid, data, end_stream=False):
         self.writes.append(sid)
+        if end_stream:
+            self.fins.append(sid)
 
     def stream_write(self, sid, data, end_stream=False):
         if end_stream:
@@ -91,7 +96,7 @@ async def _run_lane(mapping, items, timeout):
     for group_id, object_id, age in items:
         lane.offer((group_id, OBJECT_RECORD_BYTES + 1, True,
                     time.monotonic() - age, object_id, b"p", None,
-                    object_id == 0, None))
+                    object_id == 0, None, False))
     await out.close()
     return session, delivery, lane
 
@@ -112,7 +117,7 @@ async def test_a_late_subgroup_object_resets_its_stream():
     first, second = sorted(set(session.writes))
     assert session.resets == [(first, StreamResetCode.DELIVERY_TIMEOUT)]
     # Nothing more on group 0's subgroup, no reopen; group 1 flows.
-    assert session.writes.count(first) == 3  # header + objects 0, 1
+    assert session.writes.count(first) == 2  # header with object 0, object 1
     assert session.fins == [second]
     assert delivery.largest == (1, 1)
     assert lane.expired == 1
@@ -156,10 +161,10 @@ def _stall_once(session, after: int, seconds: float):
             until[0] = time.monotonic() + seconds
         return until[0] is not None and time.monotonic() < until[0]
 
-    async def held(sid, data, end_stream=False):
+    async def held(sid, data, end_stream=False, **kw):
         if stalled():
             await asyncio.sleep(until[0] - time.monotonic())
-        return await orig(sid, data, end_stream=end_stream)
+        return await orig(sid, data, end_stream=end_stream, **kw)
 
     def refused(sid, data):
         if stalled():

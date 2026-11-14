@@ -34,9 +34,12 @@ _CLOSE = ("CLOSE",)
 
 # Bytes a send lane holds, its queued live objects plus what its streams
 # still hold in the transport, before it sheds groups: the relay's per
-# subscriber, and a publisher's per peer.
+# subscriber until rate and deadline set it, and a publisher's per peer.
 LANE_BYTES = 4 * 1024 * 1024
 PUBLISHER_LANE_BYTES = 16 * 1024 * 1024
+# A lane's time bound never goes under this: a low-rate track's objects
+# and bursts are not shed.
+LANE_MIN_BYTES = 64 * 1024
 # Live offers between reads of a lane's transport backlog.
 LANE_TX_PROBE = 8
 # Seconds between a lane's shed log lines after its first.
@@ -53,6 +56,20 @@ def _tx_used(session):
     """The session's per-stream count of bytes queued in the transport."""
     quic = getattr(session, "_quic", None)
     return getattr(quic, "tx_data_ring_used", None) or _no_tx
+
+
+def _tx_sent(session):
+    """The session's per-stream count of bytes taken into packets."""
+    quic = getattr(session, "_quic", None)
+    return getattr(quic, "tx_sent_bytes", None) or _no_tx
+
+
+def _path_quality(session) -> dict:
+    fn = getattr(getattr(session, "_quic", None), "path_quality", None)
+    try:
+        return (fn() if fn is not None else None) or {}
+    except Exception:
+        return {}
 
 
 def _cancelling() -> bool:
@@ -399,6 +416,75 @@ def _cache(encoded: list, key, extensions, data: bytes) -> None:
         encoded.append((key, extensions, data))
 
 
+class HeadTrace:
+    """Logs each group's first object once per peer: when the track wrote
+    it, when its stream opened with it and when the transport took its
+    bytes into packets, with the connection's cwin, bytes in flight,
+    pacing rate, RTT and losses at the open and at that pickup. One INFO
+    line on aiomoqt.data per group and peer."""
+
+    POLL_S = 0.005
+    GIVE_UP_S = 10.0
+
+    def __init__(self, name: str):
+        self.name = name
+        self._made: Dict[int, float] = {}
+
+    def produced(self, group_id: int) -> None:
+        made = self._made
+        made[group_id] = time.monotonic()
+        if len(made) > 16:
+            del made[next(iter(made))]
+
+    def opened(self, session, group_id: int, sid: int, size: int) -> None:
+        """Stream `sid` opened with `size` bytes carrying the head."""
+        opened = time.monotonic()
+        made = self._made.get(group_id, opened)
+        before = _path_quality(session)
+        sent = _tx_sent(session)
+        loop = asyncio.get_running_loop()
+
+        def check() -> None:
+            now = time.monotonic()
+            if sent(sid) >= size:
+                self._log(session, group_id, size, made, opened, now, before,
+                          _path_quality(session))
+            elif now - opened < self.GIVE_UP_S:
+                loop.call_later(self.POLL_S, check)
+            else:
+                data_log.info(f"head {self.name} g{group_id} to "
+                              f"{_peer(session)}: {size} B not taken into "
+                              f"packets within {self.GIVE_UP_S:g} s")
+
+        check()
+
+    def _log(self, session, group_id, size, made, opened, now, before,
+             after) -> None:
+        def kb(q, key):
+            v = q.get(key)
+            return "?" if v is None else f"{v / 1024:.0f}"
+
+        wall = time.time() - (now - made)
+        stamp = (time.strftime("%H:%M:%S", time.gmtime(wall))
+                 + f".{int(wall * 1000) % 1000:03d}Z")
+        pacing, rtt = after.get("pacing_rate"), after.get("rtt")
+        data_log.info(
+            f"head {self.name} g{group_id} to {_peer(session)}: {size} B "
+            f"made {stamp}, stream open +{(opened - made) * 1e3:.1f} ms, "
+            f"in packets +{(now - made) * 1e3:.1f} ms; cwin "
+            f"{kb(before, 'cwin')}->{kb(after, 'cwin')} KB, in flight "
+            f"{kb(before, 'bytes_in_transit')}->"
+            f"{kb(after, 'bytes_in_transit')} KB, pacing "
+            f"{'?' if pacing is None else f'{pacing * 8 / 1e6:.1f}'} Mbps, "
+            f"rtt {'?' if rtt is None else f'{rtt / 1e3:.1f}'} ms, lost "
+            f"{before.get('lost', '?')}->{after.get('lost', '?')}")
+
+
+def _peer(session) -> str:
+    addr = getattr(session, "_peer_addr", None)
+    return f"{addr[0]}:{addr[1]}" if addr else "peer"
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -418,6 +504,8 @@ class SubgroupDelivery:
         # caller; None leaves the session default.
         self.stream_priority = stream_priority
         self.mapping = mapping
+        # Group whose PER_GROUP stream open is in flight.
+        self._opening: Optional[int] = None
         self.stream_count = 0
         self.largest: Optional[tuple] = None
         self.objects_sent = 0
@@ -444,6 +532,8 @@ class SubgroupDelivery:
         # stream_id -> group_id of FINed streams the transport may still
         # hold bytes of; kept only behind a lane.
         self._tx_streams: dict = {}
+        # Told of each PER_GROUP stream opened at a group start.
+        self.head_trace: Optional[HeadTrace] = None
 
     @property
     def _prof(self):
@@ -460,18 +550,27 @@ class SubgroupDelivery:
         FIN. No-op when no stream is open."""
         if self._stream_id is None:
             return
-        end_id = self._header.next_object_id
+        self.session.stream_write(self._stream_id,
+                                  self._end_bytes(self._header),
+                                  end_stream=True)
+        self._ended(self._stream_id, self._header.group_id)
+
+    def _end_bytes(self, hdr: SubgroupHeader) -> bytes:
+        """What precedes the FIN that ends hdr's stream: END_OF_GROUP,
+        or nothing where the peer's filter ends before it."""
+        end_id = hdr.next_object_id
         if (self.excludes_end is not None
-                and self.excludes_end(self._header.group_id, end_id)):
-            self.session.stream_write(self._stream_id, b"", end_stream=True)
-        else:
-            buf = self._header.end_group(object_id=end_id)
-            self.session.stream_write(self._stream_id, buf.data,
-                                      end_stream=True)
+                and self.excludes_end(hdr.group_id, end_id)):
+            return b""
+        return hdr.end_group(object_id=end_id).data
+
+    def _ended(self, sid: int, group_id: int) -> None:
+        """Stream `sid` of `group_id` is FINed."""
         if self.lane is not None:
-            self._tx_streams[self._stream_id] = self._header.group_id
-        self._stream_id = None
-        self._header = None
+            self._tx_streams[sid] = group_id
+        if sid == self._stream_id:
+            self._stream_id = None
+            self._header = None
 
     async def end_track(self, largest: Optional[tuple]) -> None:
         """Mark the end of the track with an End of Track status object:
@@ -524,14 +623,16 @@ class SubgroupDelivery:
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
                     group_start: bool = False,
-                    encoded: Optional[list] = None) -> bool:
+                    encoded: Optional[list] = None,
+                    end_of_group: bool = False) -> bool:
         """Place one object; False when the peer's filter excludes it.
-        `group_start` rotates the PER_GROUP stream. A callable
-        `extensions` is resolved against this session. `encoded` is a
-        list shared by the deliveries writing this object: peers in the
-        same encoding state reuse one encoding through it."""
+        `group_start` rotates the PER_GROUP stream; `end_of_group` closes
+        it in the object's write, as end_group() would after it. A
+        callable `extensions` is resolved against this session.
+        `encoded` is a list shared by the deliveries writing this object:
+        peers in the same encoding state reuse one encoding through it."""
         if self.passes is not None and not self.passes(group_id, object_id):
-            if group_start:
+            if group_start or end_of_group:
                 self.end_group()
             return False
         if group_id == self._stopped_group and not group_start:
@@ -556,25 +657,20 @@ class SubgroupDelivery:
                 lane = self.lane
                 if lane is not None:
                     lane.parked, lane.sid = "header", None
-                sid = await self.session.open_uni_stream()
-                self.stream_count += 1
-                if lane is not None:
-                    lane.sid = sid
-                if self.stream_priority is not None:
-                    self.session.set_stream_priority(sid, self.stream_priority)
                 hdr = SubgroupHeader(
                     track_alias=self.track_alias, group_id=group_id,
                     subgroup_id=object_id, publisher_priority=self.priority,
                     extensions_present=True, prof=self._prof)
-                await self.session.stream_write_drain(sid, hdr.serialize().data)
+                # The header and the object open the stream together.
+                first = hdr.serialize().data + self._object_bytes(
+                    hdr, object_id, payload, extensions, encoded)
+                sid = await self.session.open_uni_stream(
+                    initial=first, priority=self.stream_priority,
+                    end_stream=True)
+                self.stream_count += 1
                 if lane is not None:
-                    lane.parked = "object"
-                data = self._object_bytes(hdr, object_id, payload,
-                                          extensions, encoded)
-                await self.session.stream_write_drain(sid, data)
-                self.session.stream_write(sid, b"", end_stream=True)
-                if lane is not None:
-                    self._tx_streams[sid] = group_id
+                    lane.sid, lane.parked = sid, "object"
+                self._ended(sid, group_id)
             else:  # PER_GROUP
                 if group_start or self._stream_id is None:
                     # A filter can admit a group part-way through: the stream
@@ -583,34 +679,50 @@ class SubgroupDelivery:
                     lane = self.lane
                     if lane is not None:
                         lane.parked, lane.sid = "header", None
-                    sid = await self.session.open_uni_stream()
+                    hdr = SubgroupHeader(
+                        track_alias=self.track_alias, group_id=group_id,
+                        subgroup_id=0, publisher_priority=self.priority,
+                        extensions_present=True, prof=self._prof,
+                        first_object=group_start)
+                    # The header and the first object open the stream together.
+                    first = hdr.serialize().data + self._object_bytes(
+                        hdr, object_id, payload, extensions, encoded)
+                    if end_of_group:
+                        first += self._end_bytes(hdr)
+                    self._opening = group_id
+                    try:
+                        sid = await self.session.open_uni_stream(
+                            initial=first, priority=self.stream_priority,
+                            end_stream=end_of_group)
+                    finally:
+                        self._opening = None
                     self.stream_count += 1
                     if lane is not None:
                         lane.sid = sid
                     if self._epoch != epoch:
                         self.session.stream_reset(sid, StreamResetCode.CANCELLED)
                         return False
-                    if self.stream_priority is not None:
-                        self.session.set_stream_priority(
-                            sid, self.stream_priority)
-                    hdr = SubgroupHeader(
-                        track_alias=self.track_alias, group_id=group_id,
-                        subgroup_id=0, publisher_priority=self.priority,
-                        extensions_present=True, prof=self._prof,
-                        first_object=group_start)
-                    self._stream_id, self._header = sid, hdr
-                    await self.session.stream_write_drain(
-                        sid, hdr.serialize().data)
+                    if group_start and self.head_trace is not None:
+                        self.head_trace.opened(self.session, group_id, sid,
+                                               len(first))
+                    if end_of_group:
+                        self._ended(sid, group_id)
+                    else:
+                        self._stream_id, self._header = sid, hdr
                     if lane is not None:
                         lane.parked = "object"
+                else:
+                    sid, hdr = self._stream_id, self._header
+                    data = self._object_bytes(hdr, object_id, payload,
+                                              extensions, encoded)
+                    if end_of_group:
+                        data += self._end_bytes(hdr)
+                    await self.session.stream_write_drain(
+                        sid, data, end_stream=end_of_group)
                     if self._epoch != epoch:
                         return False
-                sid, hdr = self._stream_id, self._header
-                data = self._object_bytes(hdr, object_id, payload,
-                                          extensions, encoded)
-                await self.session.stream_write_drain(sid, data)
-                if self._epoch != epoch:
-                    return False
+                    if end_of_group:
+                        self._ended(sid, group_id)
         except MOQTStreamStopped:
             # The session has reset the stream; a group's is not reopened.
             if (self.mapping is StreamMapping.PER_GROUP
@@ -705,11 +817,18 @@ class SubgroupDelivery:
 
     # -- SendLane writer -------------------------------------------------
 
-    def send(self, item):
+    def send(self, item, end=None):
         """Write a SendLane item: (group_id, cost, live, born, object_id,
-        payload, extensions, group_start, encoded)."""
+        payload, extensions, group_start, encoded, end_of_group). `end`
+        is the END_GROUP queued behind it, closing the group in the same
+        write."""
         return self.write(item[0], item[4], item[5], extensions=item[6],
-                          group_start=item[7], encoded=item[8])
+                          group_start=item[7], encoded=item[8],
+                          end_of_group=item[9] or end is not None)
+
+    def ends_stream(self, item, nxt) -> bool:
+        """`nxt`, queued behind object `item`, closes its group stream."""
+        return nxt is _END_GROUP and self.mapping is StreamMapping.PER_GROUP
 
     def send_nowait(self, item) -> Optional[bool]:
         """send(item) when it completes without waiting: an object on the
@@ -720,8 +839,10 @@ class SubgroupDelivery:
         write = self._write_nowait
         if sid is None or item[7] or write is None:
             return None
-        group_id, object_id = item[0], item[4]
+        group_id, object_id, end = item[0], item[4], item[9]
         if self.passes is not None and not self.passes(group_id, object_id):
+            if end:
+                self.end_group()
             return False
         hdr = self._header
         last = hdr.next_object_id - 1
@@ -732,8 +853,10 @@ class SubgroupDelivery:
             extensions = extensions(self.session)
         data = self._object_bytes(hdr, object_id, payload, extensions,
                                   item[8])
+        if end:
+            data += self._end_bytes(hdr)
         try:
-            if not write(sid, data):
+            if not (write(sid, data, True) if end else write(sid, data)):
                 hdr.advance(last)
                 return None
         except MOQTStreamStopped:
@@ -741,6 +864,8 @@ class SubgroupDelivery:
             self._stream_id = None
             self._header = None
             return False
+        if end:
+            self._ended(sid, group_id)
         self._count_sent(group_id, object_id, payload)
         return True
 
@@ -784,7 +909,8 @@ class SubgroupDelivery:
     def reset_below(self, floor: int) -> None:
         """Reset the streams of groups below `floor`: the open one, and
         FINed ones the transport has not yet sent out."""
-        if self._header is not None and self._header.group_id < floor:
+        if ((self._header is not None and self._header.group_id < floor)
+                or (self._opening is not None and self._opening < floor)):
             self.reset_group()
         tx = self._tx_streams
         if tx:
@@ -801,25 +927,36 @@ class SendLane:
     """One peer's objects behind its own FIFO and writer task.
 
     The source hands each object to every lane without waiting, so a
-    peer held up by its transport holds up only itself. Past `max_bytes`
-    of live objects, counting what the peer's streams still hold in the
-    transport, the lane sheds whole groups: their streams are reset,
-    never FINed short, and delivery resumes at a newer group. Group IDs
-    are taken to ascend.
+    peer held up by its transport holds up only itself. Past `bound`
+    bytes of live objects, counting what the peer's streams still hold in
+    the transport, the lane sheds whole groups: their streams are reset,
+    never FINed short, and delivery resumes at a newer group. `bound` is
+    `max_bytes`, or less once `rate` gives the bytes `deadline` covers.
+    Group IDs are taken to ascend.
 
     An item is a tuple (group_id, cost, live, born, ...), the rest for
     the writer: `cost` is the object's retained_object_bytes, 0 for a
     stream marker; `live` objects count against the bound, a replay does
     not; `born` is the monotonic time it was produced, or None. The
     writer is the peer's delivery: send(item), end_group(),
-    reset_group(code), reset_below(floor), close_streams(), final(*args),
+    reset_group(code), reset_below(floor[, code]), close_streams(), final(*args),
     tx_queued(floor) and expire(group_id), and end_track(largest) when
     the lane is given end_track(). A writer may set `parked`
     ("header" or "object") and `sid` on the lane while a send waits.
+    A writer with ends_stream(item, next) is handed an object and the
+    queued item behind it that ends the object's stream together, as
+    send(item, next), so both leave in one write.
 
     Write-through: a writer with send_nowait(item) is handed an object
     inline from offer() while the lane is empty and under its bound; it
     is queued only when the writer would wait, so order is kept.
+
+    A subclass may replace the byte bound through _probe(), _over(),
+    _keeps() and _shed_reason(), and set `cut_code`, the reset code of
+    shed streams handed to reset_below() (None: the writer's). With
+    `bound` 0 there is no byte bound: offer() neither probes the
+    transport nor limits write-through by bytes. A subclass sets `late`
+    to stop write-through until its _over() decides.
     """
 
     log = logger
@@ -830,6 +967,8 @@ class SendLane:
                  name: str = ""):
         self.writer = writer
         self.max_bytes = max_bytes
+        self.bound = max_bytes   # bytes held before shedding
+        self._rate = 0.0         # the track's input bytes/s, 0 for unknown
         self.name = name         # the track's, for logs
         self.items: deque = deque()
         self.bytes = 0           # live object bytes queued
@@ -841,6 +980,7 @@ class SendLane:
         self.floor = None        # objects of groups below it are not sent
         self._lost = None        # newest group shed, expired or failed
         self.shed = 0            # objects shed
+        self.shed_bytes = 0      # bytes shed, the transport's included
         self.sheds = 0           # shed episodes
         self.expired = 0         # objects past the delivery timeout (§8)
         # False while the peer's Forward State is 0 (§5.1): nothing is
@@ -868,6 +1008,8 @@ class SendLane:
         self._stalled = False
         self.stopped = False
         self._cut = False
+        self.cut_code = None
+        self.late = False
         self._closing = False
         self._wake = asyncio.Event()
         self._nowait = (getattr(writer, "send_nowait", None)
@@ -885,8 +1027,25 @@ class SendLane:
     @deadline.setter
     def deadline(self, value: Optional[float]) -> None:
         self._deadline = value or None
+        self._set_bound()
         if self.on_deadline is not None:
             self.on_deadline()
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    @rate.setter
+    def rate(self, value: float) -> None:
+        self._rate = value
+        self._set_bound()
+
+    def _set_bound(self) -> None:
+        bound = self.max_bytes
+        if self._deadline is not None and self._rate > 0:
+            bound = min(bound, max(LANE_MIN_BYTES,
+                                   int(self._rate * self._deadline)))
+        self.bound = bound
 
     @property
     def idle(self) -> bool:
@@ -912,14 +1071,16 @@ class SendLane:
             if cost and self.gate:
                 self.shed += 1
             return False
-        if live:
+        bound = self.bound
+        if live and bound:
             if gid != self._probe_gid or self._probe_n >= LANE_TX_PROBE:
                 self._probe_gid, self._probe_n = gid, 0
-                self.tx_bytes = self.writer.tx_queued(floor)
+                self._probe(floor)
             self._probe_n += 1
         nowait = self._nowait
         if (nowait is not None and not self.items and not self.busy
-                and self.gate and self.tx_bytes + cost <= self.max_bytes):
+                and self.gate and not self.late
+                and (not bound or self.tx_bytes + cost <= bound)):
             try:
                 sent = nowait(item)
             except Exception as e:
@@ -939,9 +1100,24 @@ class SendLane:
                 self.replay_bytes += cost
         self.items.append(item)
         self._wake.set()
-        if live and self.bytes + self.tx_bytes > self.max_bytes:
-            self._shed(gid)
+        if live and self._over(item):
+            self._shed(item)
         return True
+
+    def _probe(self, floor) -> None:
+        """Read what the transport holds of the lane's groups from `floor`."""
+        self.tx_bytes = self.writer.tx_queued(floor)
+
+    def _over(self, item) -> bool:
+        """Shed, live `item` just queued."""
+        return self.bytes + self.tx_bytes > self.bound
+
+    def _keeps(self, item) -> bool:
+        """`item`'s group stays once the groups before it are shed."""
+        return self.bytes + self.tx_bytes <= self.bound
+
+    def _shed_reason(self) -> str:
+        return f"over its {self.bound}-byte send lane"
 
     def end_group(self) -> None:
         """Close the writer's open group once what is queued is out."""
@@ -1016,6 +1192,7 @@ class SendLane:
             self._uncount(item)
             if count and item[1]:
                 self.shed += 1
+                self.shed_bytes += item[1]
         self.items = kept
 
     def _skip(self, gid, count: bool = True) -> None:
@@ -1025,23 +1202,25 @@ class SendLane:
             self.floor = floor
             self._drop_below(floor, count)
 
-    def _shed(self, gid) -> None:
-        """Drop the groups queued before `gid`, and `gid` too if it alone
-        is over the bound; their open streams are reset first."""
+    def _shed(self, item) -> None:
+        """Drop the groups queued before `item`'s, and its group too unless
+        _keeps(item); their open streams are reset first."""
         writer = self.writer
-        floor = gid
+        gid = floor = item[0]
+        held = writer.tx_queued(self.floor)
         self._drop_below(floor)
-        self.tx_bytes = writer.tx_queued(floor)
-        if self.bytes + self.tx_bytes > self.max_bytes:
+        self._probe(floor)
+        if not self._keeps(item):
             floor = gid + 1
             self._drop_below(floor)
-            self.tx_bytes = writer.tx_queued(floor)
+            self._probe(floor)
+        self.shed_bytes += max(held - self.tx_bytes, 0)
         self.floor = floor if self.floor is None else max(self.floor, floor)
         self._lost = self.floor - 1
         if self.busy and self.opening:
             # A parked header write waits on this session's transport
             # backlog, which only these resets free.
-            writer.reset_below(self.floor)
+            self._reset_below()
         if not self._cut:
             self._cut = True
             self.items.appendleft(_CUT)
@@ -1050,6 +1229,12 @@ class SendLane:
             self.shedding = True
             self.sheds += 1
             self._log_shed()
+
+    def _reset_below(self) -> None:
+        if self.cut_code is None:
+            self.writer.reset_below(self.floor)
+        else:
+            self.writer.reset_below(self.floor, self.cut_code)
 
     def _log_shed(self) -> None:
         """WARNING on the first shed, then one INFO line per SHED_LOG_S
@@ -1060,13 +1245,13 @@ class SendLane:
         who = f"{self.prefix}{self._who()}"
         if self._logged_at is None:
             self.log.warning(
-                f"{who} over its {self.max_bytes}-byte send lane: resetting "
-                f"groups below {self.floor}")
+                f"{who} {self._shed_reason()}: resetting groups below "
+                f"{self.floor}")
         else:
             self.log.info(
                 f"{who} shed {self.sheds - self._logged_sheds} more "
-                f"time(s) over its send lane: resetting groups below "
-                f"{self.floor}")
+                f"time(s), last {self._shed_reason()}: resetting groups "
+                f"below {self.floor}")
         self._logged_at, self._logged_sheds = now, self.sheds
 
     def stop(self) -> bool:
@@ -1155,7 +1340,7 @@ class SendLane:
         try:
             if kind == "CUT":
                 self._cut = False
-                writer.reset_below(self.floor)
+                self._reset_below()
             elif kind == "END_GROUP":
                 writer.end_group()
             elif kind == "RESET_GROUP":
@@ -1188,6 +1373,7 @@ class SendLane:
 
     async def _run(self) -> None:
         writer = self.writer
+        ends = getattr(writer, "ends_stream", None)
         woke = True
         try:
             while not self.stopped:
@@ -1230,14 +1416,23 @@ class SendLane:
                         and time.monotonic() - item[3] > deadline):
                     # §8: not sent; on a stream the group is not resumed.
                     self.expired += 1
+                    self.shed_bytes += item[1]
                     if writer.expire(gid):
                         self._skip(gid)
                         self._lost = gid
                     self.done += 1
                     continue
+                end = None
+                if items and ends is not None and ends(item, items[0]):
+                    end = items.popleft()
+                    if end[0].__class__ is not str:
+                        self._uncount(end)
                 self.busy = True
                 try:
-                    sent = await writer.send(item)
+                    sent = (writer.send(item) if end is None
+                            else writer.send(item, end))
+                    if sent is not True:
+                        sent = await sent
                 except (Exception, asyncio.CancelledError) as e:
                     if _cancelling():
                         raise
@@ -1248,7 +1443,7 @@ class SendLane:
                     self.busy = False
                 if sent and self.on_sent is not None:
                     self.on_sent(item)
-                self.done += 1
+                self.done += 1 if end is None else 2
         finally:
             self._exit()
 
@@ -1282,6 +1477,8 @@ class FanoutDelivery:
         self._group: Optional[int] = None
         # Some lane has a delivery timeout: objects are stamped when made.
         self._timed = False
+        # Given to each delivery added after it is set.
+        self.head_trace: Optional[HeadTrace] = None
         for delivery in deliveries:
             self.add(delivery, joining=False)
 
@@ -1298,6 +1495,7 @@ class FanoutDelivery:
         lane.on_fatal = self._fail
         lane.on_deadline = self._retime
         delivery.lane = lane
+        delivery.head_trace = self.head_trace
         if joining and self._group is not None:
             lane.floor = self._group + 1
         self.lanes = [*self.lanes, lane]
@@ -1352,11 +1550,14 @@ class FanoutDelivery:
 
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
-                    group_start: bool = False) -> None:
+                    group_start: bool = False,
+                    end_of_group: bool = False) -> None:
         if self.error is not None:
             raise self.error
         if self.on_write is not None:
             self.on_write(group_id, object_id, payload, extensions)
+        if group_start and self.head_trace is not None:
+            self.head_trace.produced(group_id)
         lanes = self.lanes
         # One encoding per header state, shared by the lanes in it; it
         # lives as long as the item is queued.
@@ -1371,7 +1572,7 @@ class FanoutDelivery:
             cost = retained_object_bytes(payload, extensions)
         item = (group_id, cost, True,
                 time.monotonic() if self._timed else None, object_id,
-                payload, extensions, group_start, encoded)
+                payload, extensions, group_start, encoded, end_of_group)
         self._group = group_id
         queued = False
         for lane in lanes:

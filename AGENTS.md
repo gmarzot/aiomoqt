@@ -18,16 +18,17 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
 | `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
+| `aiomoqt/cat.py` | CAT credentials in the format moqx verifies: mint, verify, grants |
 | `aiomoqt/types.py`, `context.py` | draft numbers, error codes, `DraftProfile`, `profile_for()` |
-| `aiomoqt/media/` | MSF catalog, `broadcast.py` composer, LOC, CMAF, LOCMAF packaging; ingest (PyAV, DASH, MPEG-TS) and synthetic sources |
-| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (aiomoqt-relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
+| `aiomoqt/media/` | MSF catalog, `broadcast.py` composer, LOC, CMAF, LOCMAF packaging; ingest (PyAV, DASH, MPEG-TS) and synthetic sources; `abr.py` ABR ladder on cymedia |
+| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `abr_ingest`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (aiomoqt-relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
 | `aiomoqt/utils/` | CLI grid (`cli.py`), stats, URL parsing, logging, bench workers |
 | `aiomoqt/examples/` | minimal pub, sub, join and server examples; ship in the wheel |
 | `aiomoqt/versions.py` | `aiomoqt-versions`: aiomoqt, aiopquic, picoquic and picotls build info |
 | `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
 | `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
 | `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public aiomoqt-relay |
-| `docs/` | bench and demo runbooks |
+| `docs/` | bench and demo runbooks; CAT auth flows (`cat-auth.md`) |
 
 ## Setup
 
@@ -135,6 +136,7 @@ exceptions; `moq_interop_client`'s `-r/-t/-l/-v` are the interop runner's interf
 defaults, never which flags exist (also tested). A dialed URL's
 scheme selects the transport (`moqt://` raw QUIC, `https://` or bare `host:port`
 WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALPN dispatch.
+`-t` defaults to 0, no limit, on every tool and example (also tested); a tool may add an exit condition with `--exit COND`.
 `-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
 all three). Write `-h` in docs: `-?` is a shell glob.
 

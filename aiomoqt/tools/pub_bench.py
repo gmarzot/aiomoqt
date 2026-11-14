@@ -5,6 +5,8 @@
   moq-pub-bench https://relay.example.com/moq -s 4096 -P 4 -r 120 -t 60
   moq-pub-bench moqt://relay:4433 -D -s 1100 -r 500      # datagrams
   moq-pub-bench moqt://relay:4433 --video 1080p          # media profile
+  moq-pub-bench moqt://relay:4433 --video 720p -r 30 -g 60 --audio --catalog
+  moq-pub-bench moqt://relay:4433 --video 720p --audio -D   # audio as datagrams
 """
 import argparse
 import asyncio
@@ -139,6 +141,7 @@ The URL scheme selects the transport:
     parser.add_argument('--second-track', action='store_true',
                         help='Also PUBLISH <trackname>-2, whose objects '
                              'differ, with the --forward state')
+    _cli.add_side_tracks(parser)
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -167,6 +170,7 @@ The URL scheme selects the transport:
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
+    _cli.check_side_tracks(parser, args)
     _cli.check_video(parser, args)
     _cli.check_datagram(parser, args)
     if args.prefill and not args.fetch_history:
@@ -180,6 +184,39 @@ The URL scheme selects the transport:
         mode = "dgram" if args.datagram else f"x{args.streams}"
         args.trackname = f"{sz_s}-{rate_s}-{mode}-{uuid.uuid4().hex[:4]}"
     return args
+
+
+class _SideTrack(PublishedTrack):
+    """A --catalog or --audio track: no stats table of its own."""
+    _quiet = True
+
+
+def _side_tracks(session, args):
+    """The --catalog and --audio tracks: one object per group, so each
+    object opens a subgroup stream."""
+    tracks = []
+    for name, size, rate, datagram in args.side_tracks:
+        t = _SideTrack(
+            session,
+            namespace=args.namespace,
+            trackname=name,
+            object_size=size,
+            group_size=1,
+            rate=rate,
+            forwarding=(ForwardingPreference.DATAGRAM if datagram
+                        else ForwardingPreference.SUBGROUP),
+            auth_token=args.auth_token.encode() or None,
+            timestamps=args.timestamps,
+        )
+        tracks.append(t)
+    return tracks
+
+
+def print_track_totals(tracks):
+    """One sent-totals line per track."""
+    for t in tracks:
+        print(f"  {t.trackname + ':':<10} {t._total_sent:,} objects, "
+              f"{t._total_groups:,} groups, {t._total_bytes:,} bytes")
 
 
 def print_banner(relay, args):
@@ -209,7 +246,10 @@ def print_banner(relay, args):
     print(f"  group size:  {args.group_size} objects")
     print(f"  rate:        {rate_s}")
     print(f"  target:      {target_s}")
-    print(f"  duration:    {args.duration}s")
+    side = [n for n in ('catalog', 'audio') if getattr(args, n, False)]
+    if side:
+        print(f"  with:        {', '.join(side)}")
+    print(f"  duration:    {_cli.duration_label(args.duration)}")
     print(f"  cpu:         {cpu_summary()}")
     print("─" * 56)
 
@@ -236,8 +276,10 @@ async def run(args):
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=bool(args.pacing_trains),
         flow_control_window=args.fc_window,
         tx_max_queued_bytes=args.max_queued_bytes,
+        auth=_cli.auth_from_args(args),
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
              else args.max_inflight_bytes)}
@@ -252,12 +294,14 @@ async def run(args):
 
     print("  Connecting...")
     failed = False
+    side = []
     async with contextlib.AsyncExitStack() as stack:
         try:
-            async with asyncio.timeout(args.duration or None):
+            async with asyncio.timeout(_cli.setup_timeout(args)):
                 session = await stack.enter_async_context(client.connect())
         except TimeoutError:
-            print(f"  Connection failed: no session within {args.duration}s")
+            print("  Connection failed: no session within "
+                  f"{_cli.setup_timeout(args)}s")
             return 1
         except Exception as e:
             print(f"  Connection failed: {e}")
@@ -316,6 +360,13 @@ async def run(args):
                 forward=args.forward,
             )
             print(f"  Published '{track.fqtn}', waiting for subscriber...")
+            side = _side_tracks(session, args)
+            for t in side:
+                if args.pub_ns and not args.pub_both:
+                    t.attach()
+                else:
+                    await t.publish(forward=args.forward)
+                print(f"  Published '{t.fqtn}'")
             if args.second_track:
                 second = PublishedTrack(
                     session,
@@ -333,7 +384,8 @@ async def run(args):
             if args.goaway_after is not None:
                 loop.call_later(args.goaway_after, session.goaway)
             if args.end_after is not None:
-                loop.call_later(args.end_after, track.end)
+                for t in (track, *side):
+                    loop.call_later(args.end_after, t.end)
             if args.withdraw_after is not None:
                 loop.call_later(args.withdraw_after, functools.partial(
                     session.publish_namespace_done, namespace=args.namespace))
@@ -348,6 +400,8 @@ async def run(args):
             print(f"  Error: {e}")
             failed = True
 
+    if side:
+        print_track_totals([track, *side])
     print("  Done.")
     return 1 if failed else 0
 

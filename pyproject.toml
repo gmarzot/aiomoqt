@@ -34,7 +34,7 @@ classifiers = [
 ]
 dependencies = [
     "certifi",
-    "aiopquic>=0.7.1",
+    "aiopquic>=0.8.0rc1",
     "sortedcontainers>=2.4.0",
 ]
 
@@ -70,6 +70,9 @@ dev = [
 ]
 media = [
     "av>=19",
+]
+abr = [
+    "cymedia>=0.1.2,<0.2",
 ]
 examples = [
     "argparse",

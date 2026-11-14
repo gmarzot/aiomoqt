@@ -42,6 +42,80 @@ function relayUrls(relay) {
           quic: `moqt://${host}:${relay.quic_port || relay.port}`};
 }
 
+const mib = (b) => b / 2 ** 20;
+
+// FETCH totals from each new snapshot over the last WIN_S, for the cache gauge.
+const WIN_S = 600;
+const fetchWin = [];
+
+function trackFetches(s) {
+  const T = s.totals || {};
+  const p = {t: s.generated, r: (s.relay || {}).started, n: T.fetches || 0,
+             c: T.fetch_cache_bytes || 0, u: T.fetch_upstream_bytes || 0, k: 0};
+  let last = fetchWin[fetchWin.length - 1];
+  if (last && p.t === last.t) return;
+  if (last && (p.r !== last.r || p.t < last.t)) fetchWin.length = 0;  // relay restarted
+  last = fetchWin[fetchWin.length - 1];
+  // Count rises: on older relays T.fetches sums open tracks only and falls when one ends.
+  if (last) p.k = last.k + Math.max(0, p.n - last.n);
+  fetchWin.push(p);
+  while (fetchWin.length > 1 && p.t - fetchWin[0].t > WIN_S) fetchWin.shift();
+}
+
+// FETCH hit % of bytes, FETCH count and bytes from cache over the window when it saw a
+// FETCH, with its span in minutes; otherwise since start, with min null.
+function fetchWindow(T) {
+  const a = fetchWin[0], b = fetchWin[fetchWin.length - 1];
+  if (a && b.t - a.t >= 60) {
+    const c = b.c - a.c, all = c + b.u - a.u, n = b.k - a.k;
+    if (n > 0 || all > 0) {
+      return {hit: all > 0 ? 100 * c / all : null, n, bytes: c, min: Math.round((b.t - a.t) / 60)};
+    }
+  }
+  return {hit: none(T.cache_efficiency) ? null : 100 * T.cache_efficiency,
+          n: T.fetches || 0, bytes: T.fetch_cache_bytes || 0, min: null};
+}
+
+// Cache held of its budget: GiB from 1 GiB, MiB below.
+function cacheFill(held, budget) {
+  const g = (b) => +(b / 2 ** 30).toFixed(2);
+  return budget >= 2 ** 30 ? `${(held / 2 ** 30).toFixed(1)}/${g(budget)} GiB`
+    : `${Math.round(mib(held))}/${Math.round(mib(budget))} MiB`;
+}
+
+// Cache budget: GiB from 1 GiB, MiB below.
+const cacheSize = (b) => b >= 2 ** 30 ? `${+(b / 2 ** 30).toFixed(2)} GiB` : `${Math.round(mib(b))} MiB`;
+
+const ago = (s) => s < 120 ? `${Math.round(s)} s` : `${Math.round(s / 60)} min`;
+
+// Shallowest and deepest cache reach over watched video tracks, or null.
+function videoReach(tracks) {
+  const r = (tracks || []).filter((t) => /video/i.test(t.name) && t.subscribers > 0
+                                      && t.cache_bytes > 0 && !none(t.cache_seconds))
+    .map((t) => t.cache_seconds);
+  return r.length ? `watched video reach ${ago(Math.min(...r))}–${ago(Math.max(...r))}` : null;
+}
+
+// The cache gauge's hover: FETCH hit over its span and since start, held of budget, video
+// reach, per-track bound, evictions.
+function cacheDetail(c, T, w, tracks) {
+  const track = none(c.track_bytes) ? `${fmt.num(c.groups)} groups / ${Math.round(mib(c.bytes))} MiB`
+    : `${Math.round(mib(c.track_bytes))} MiB` + (none(c.floor_s) ? '' : `, newest ${c.floor_s} s kept`);
+  const span = none(w.min) ? 'since start' : `last ${w.min} min`;
+  const hit = !w.n && none(w.hit) ? 'no FETCH yet'
+    : `${span}: ${fmt.plural(w.n, 'fetch', 'fetches')}, ${fmt.bytes(w.bytes)} from cache`
+      + (none(w.hit) ? '' : `, ${Math.round(w.hit)}% of their bytes`);
+  const since = none(w.min) || none(T.cache_efficiency) ? null
+    : `since start: ${fmt.plural(T.fetches, 'fetch', 'fetches')}, ${Math.round(100 * T.cache_efficiency)}%`
+      + ` from cache (${fmt.bytes(T.fetch_cache_bytes)}`
+      + ` of ${fmt.bytes((T.fetch_cache_bytes || 0) + (T.fetch_upstream_bytes || 0))})`;
+  return [hit, since,
+          `${none(T.cache_bytes) ? '—' : cacheFill(T.cache_bytes, c.budget)} held;`
+            + ' at the budget it drops the oldest group of the least recently used track',
+          videoReach(tracks), `per track ${track}`, fmt.plural(T.cache_evictions, 'eviction')]
+    .filter(Boolean).join('\n');
+}
+
 function renderRelay(s, urls) {
   const r = s.relay, v = r.versions || {}, h = s.host || {};
   $('hostname').textContent = location.hostname;
@@ -50,15 +124,19 @@ function renderRelay(s, urls) {
   $('drafts').textContent = (r.drafts || []).join(', ');
   const badge = $('badge-version');
   badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt-relay';
-  badge.title = [['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
-    .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`).join(' · ');
+  badge.title = [none(r.workers) ? null : fmt.plural(r.workers, 'picoquic worker'),
+                 none((r.cache || {}).budget) ? null : `${cacheSize(r.cache.budget)} cache`,
+                 ...[['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
+                   .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`)]
+    .filter(Boolean).join(' · ');
   $('uptime').textContent = fmt.uptime(r.uptime_s)
     + (r.watchdog_s ? ` · watchdog ${r.watchdog_s}s` : '');
   $('date').textContent = fmt.date(s.generated);
-  $('hw').textContent = [h.arch, h.cores && `${h.cores} vCPU`,
-                         h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB RAM`]
-    .filter(Boolean).join(' · ') || '—';
-  $('cpu-model').textContent = h.cpu_model || '—';
+  const hw = [h.cpu_model || h.arch, h.cores && `${h.cores} vCPU`,
+              h.mem_total && `${(h.mem_total / 2 ** 30).toFixed(0)} GiB`].filter(Boolean);
+  // Lines break only between items.
+  const items = hw.flatMap((t, i) => [...(i ? [' · '] : []), el('span', {class: 'nw'}, t)]);
+  $('hw').replaceChildren(...(items.length ? items : ['—']));
   $('os').textContent = h.os || '—';
 }
 
@@ -76,31 +154,39 @@ function arc(r, f0, f1) {
   return `M${polar(r, a0)}A${r},${r} 0 ${large} 1 ${polar(r, a1)}`;
 }
 
-const level = (pct) => pct >= 90 ? 'high' : pct >= 70 ? 'warn-level' : 'ok';
+const level = (pct) => pct >= 90 ? 'high' : pct >= 75 ? 'warn-level' : 'ok';
 
-// `bands`: amber and red past 70% and 90%; without, high is good and stays green.
-function drawGauge(svg, pct, bands = true) {
-  const tone = (v) => bands ? level(v) : 'ok';
-  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}));
-  if (bands) {
-    svg.append(svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.7, 0.9)}),
-               svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)}));
-  }
-  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : tone(pct)}`, x: G.cx,
+// Amber and red past 75% and 90%; `plain`: no bands, always green.
+function drawGauge(svg, pct, plain = false) {
+  const lv = plain ? () => 'ok' : level;
+  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}),
+                      ...(plain ? [] : [
+                        svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.75, 0.9)}),
+                        svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)})]));
+  const text = svgEl('text', {class: `g-value ${none(pct) ? '' : lv(pct)}`, x: G.cx,
                               y: G.cy + 8, 'text-anchor': 'middle', stroke: 'none'});
   text.textContent = none(pct) ? '—' : `${Math.round(pct)}%`;
   if (!none(pct)) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
-    svg.append(svgEl('path', {class: `g-arc ${tone(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
+    svg.append(svgEl('path', {class: `g-arc ${lv(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
   }
   svg.append(text);
 }
 
-function renderGauges(h) {
+// Cache: share of FETCH bytes served from it; FETCH count and bytes on hover.
+function renderGauges(s) {
+  const h = s.host || {}, T = s.totals || {}, c = s.relay.cache;
   const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
   drawGauge($('gauge-cpu'), h.cpu);
   drawGauge($('gauge-ram'), pct(h.mem_used, h.mem_total));
   drawGauge($('gauge-disk'), pct(h.disk_used, h.disk_total));
+  const fig = $('fig-cache');
+  fig.hidden = !c || none(c.budget);
+  if (fig.hidden) return;
+  trackFetches(s);
+  const w = fetchWindow(T);
+  drawGauge($('gauge-cache'), w.hit, true);
+  fig.title = cacheDetail(c, T, w, s.tracks);
 }
 
 // -- tiles ----------------------------------------------------------------------
@@ -118,6 +204,12 @@ function setPair(key, rateIn, rateOut, title) {
   setTile(key, [el('span', {}, fmt.rate(rateIn)), el('span', {}, fmt.rate(rateOut))],
           [el('span', {}, el('i', {class: 'key-area s1'}), 'in'),
            el('span', {}, el('i', {class: 'key-area s0'}), 'out')], title);
+}
+
+// Bytes skipped over the 10-minute history.
+function skipped(h) {
+  const d = (h.shed_bytes || []).filter(v => !none(v));
+  return d.length ? Math.max(d[d.length - 1] - d[0], 0) : 0;
 }
 
 // New drops per minute over the 10-minute history, oldest first; null without drops history.
@@ -170,12 +262,14 @@ function renderTiles(s) {
   setTile('tracks', fmt.num(T.tracks), `${fmt.num(live)} live`);
   setTile('rtt', fmt.ms(T.rtt_p50_ms), `p99 ${fmt.ms(T.rtt_p99_ms)}`);
   const lag = T.loop_lag_ms || {};
-  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)}`);
+  setTile('lag', fmt.ms(lag.p99), `p50 ${fmt.ms(lag.p50)} · send late ${fmt.ms(T.send_late_ms)}`,
+          'Python loop lag; send late = how overdue the network thread\'s next wake was');
   setTile('loss', fmt.pct(T.loss_pct, 2),
           none(T.spurious_pct) ? 'delivery sessions' : `spurious ${fmt.pct(T.spurious_pct, 2)}`,
           'Packets lost toward viewers; spurious = declared lost, acknowledged later');
   setTile('drops', drops ? fmt.num(drops.reduce((a, b) => a + b, 0)) : '—',
-          `${fmt.num(T.drops)} since start`, 'Subscribers dropped; bars per minute');
+          `${fmt.num(T.drops)} since start · ${fmt.bytes(skipped(s.history))} skipped`,
+          'Subscribers dropped, bars per minute; data skipped for viewers too far behind, 10 min');
   const groupsIn = none(T.groups_per_s) ? groups : T.groups_per_s;
   const out = (k, rate) => (none(T[k]) ? fanout(rate) : T[k]);
   setPair('groups', groupsIn, out('groups_out_per_s', 'groups_per_s'),
@@ -296,7 +390,8 @@ function trackDetail(r) {
     `${r.namespace} / ${r.name}`,
     `peak ${fmt.num(r.peak)} subscribers · ${fmt.bytes(r.bytes_out)} delivered · `
       + `${fmt.plural(r.fetches, 'fetch', 'fetches')} · ${fmt.plural(r.drops, 'drop')}`,
-    `cache ${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
+    `cache ${none(r.cache_seconds) ? '' : r.cache_seconds.toFixed(1) + ' s, '}`
+      + `${fmt.num(r.cache_groups)} groups, ${fmt.bytes(r.cache_bytes)}`
       + (r.largest ? ` · largest ${r.largest[0]} · ${r.largest[1]}` : ''),
     ...(none(T.cache_budget) ? [] : [
       `relay cache ${fmt.bytes(T.cache_bytes)} of ${fmt.bytes(T.cache_budget)} · `
@@ -342,7 +437,7 @@ function render(s) {
   latest = s;
   const urls = relayUrls(s.relay);
   renderRelay(s, urls);
-  renderGauges(s.host || {});
+  renderGauges(s);
   renderTiles(s);
   if (!s.namespaces.some((r) => r.namespace === scope)) {
     scope = s.namespaces.length ? s.namespaces[0].namespace : null;

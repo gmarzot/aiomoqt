@@ -265,8 +265,8 @@ class MediaPublisher:
 
     async def start(self, announce_namespace: bool = False,
                     publish_track: bool = True, forward: int = 0) -> None:
-        """Announce the broadcast, then install the session-level demux
-        over PublishedTrack's per-track handlers.
+        """Install the session-level demux over PublishedTrack's per-track
+        handlers, then announce the broadcast.
 
         announce_namespace: one PUBLISH_NAMESPACE for the broadcast; the
         relay forwards subscriber SUBSCRIBEs per track.
@@ -278,17 +278,7 @@ class MediaPublisher:
         if not (announce_namespace or publish_track):
             raise ValueError("start(): need announce_namespace or "
                              "publish_track")
-        if announce_namespace:
-            await self.session.publish_namespace(
-                namespace=self.namespace, wait_response=True)
-            logger.info(f"MediaPublisher: announced '{self.namespace}'")
-        for track in self._by_name.values():
-            if publish_track:
-                # The track may also serve other sessions; this is ours.
-                await track.publish(publish_track=True, forward=forward,
-                                    session=self.session)
-            else:
-                track._sub_for(self.session).state = TrackState.ANNOUNCED
+        # Before any announcement: a SUBSCRIBE may overtake its reply.
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._demux_subscribe)
         self.session.register_handler(
@@ -297,6 +287,19 @@ class MediaPublisher:
             MOQTMessageType.SUBSCRIBE_UPDATE, self._demux_update)
         self.session.register_handler(
             MOQTMessageType.FETCH, self._demux_fetch)
+        if not publish_track:
+            # Set first: an early SUBSCRIBE moves it on to SUBSCRIBED.
+            for track in self._by_name.values():
+                track._sub_for(self.session).state = TrackState.ANNOUNCED
+        if announce_namespace:
+            await self.session.publish_namespace(
+                namespace=self.namespace, wait_response=True)
+            logger.info(f"MediaPublisher: announced '{self.namespace}'")
+        if publish_track:
+            for track in self._by_name.values():
+                # The track may also serve other sessions; this is ours.
+                await track.publish(publish_track=True, forward=forward,
+                                    session=self.session)
 
     def _track_for_request(self, request_id) -> Optional[PublishedTrack]:
         for track in self._by_name.values():
@@ -373,8 +376,7 @@ class MediaSubscriber:
     on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
-    delta. `loc_bare` expects LOC payloads without the Private
-    Properties block. `timestamp_errors` is each media track's
+    delta. `timestamp_errors` is each media track's
     SubscribedTrack policy. A media track's Track Properties are its
     subscriber's (`tracks[name]`); `properties(name)` is the merged view.
     """
@@ -385,11 +387,9 @@ class MediaSubscriber:
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False,
                  timestamp_errors: str = 'cancel'):
         self.session = session
         self.namespace = namespace
-        self.loc_bare = loc_bare
         self.timestamp_errors = timestamp_errors
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
@@ -551,10 +551,8 @@ class MediaSubscriber:
                 sub = LocmafTrackSubscriber(self.session, namespace, name,
                                             init=init, **callbacks)
             else:
-                # CMAF objects are not LOC: no Private Properties block.
-                bare = self.loc_bare or entry.packaging != PACKAGING_LOC
                 sub = LocTrackSubscriber(self.session, namespace, name,
-                                         loc_bare=bare, **callbacks)
+                                         **callbacks)
             if entry.packaging == PACKAGING_LOC:
                 # cmaf init is a CMAF header consumed by the sink, not
                 # decoder extradata — leave config unset there.

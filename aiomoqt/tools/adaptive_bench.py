@@ -7,7 +7,12 @@ process, or pub and sub processes with --mp); against a relay the
 publisher and subscribers always run in worker processes. A controller
 reads subscriber-side samples (p90 latency, achieved throughput,
 delivering subscribers) each interval and nudges one continuous
-publisher, or the subscriber count, up or down.
+publisher, or the subscriber count, up or down. Subs mode with --hold
+steps and holds instead, to the most subscribers it holds through a
+confirmation with no loss and p90 under the threshold, and holds them to
+the end of the run. Subs mode with --join-burst holds an audience and
+has bursts of its subscribers rejoin at once, to the largest burst served
+with that audience healthy.
 
 Load axes are independent CLI flags: --object-size, -P streams,
 --start-mbps, --step-mbps, --max-mbps. With P > 1, each subgroup gets
@@ -22,6 +27,7 @@ Usage:
 import argparse
 import asyncio
 import csv
+import math
 import os
 import platform
 import sys
@@ -30,13 +36,12 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import SubscribedTrack
-from aiomoqt.types import (FilterType, MOQTMessageType, ObjectStatus,
-                           parse_draft_spec)
+from aiomoqt.types import FilterType, MOQTMessageType, ObjectStatus
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.certs import (REPO_CERTS_DIR, ensure_self_signed,
                                  find_cert, find_key)
@@ -123,6 +128,19 @@ class Signal:
     tx_ring_streams: int = 0
     # False when no latency sample arrived: shown as n/a, not 0.
     latency_known: bool = True
+    # subs-mode: worst p90 of each worker's last report. latency_p90_ms is
+    # the worst across the tick, the figure the controller acts on.
+    latest_p90_ms: Optional[float] = None
+    # subs-mode: slots whose last subscribe the relay refused.
+    refusing_subs: int = 0
+    # subs-mode, --too-far-behind: slots past it.
+    behind_subs: int = 0
+    # subs-mode: slots not delivering because they lost an object in the
+    # keep window, or their p90 is over the threshold.
+    lossy_subs: int = 0
+    late_subs: int = 0
+    # subs-mode: slots with a continuous track that stopped advancing.
+    starved_subs: int = 0
 
 
 @dataclass
@@ -141,7 +159,6 @@ class BenchState:
     history: deque = field(default_factory=lambda: deque(maxlen=64))
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     ceiling_reason: Optional[str] = None
-    ceiling_mbps: Optional[float] = None
     received_data: bool = False
     failed: bool = False
 
@@ -167,6 +184,7 @@ class LiveStats:
         self._stride: dict = {}
         self._newest_gid = -1
         self._prune_at = 0
+        self._key_floor = -1
         # Jitter (RFC 3550)
         self._last_recv_ms = 0
         self._last_send_ms = 0
@@ -205,8 +223,9 @@ class LiveStats:
                 self._last_send_ms = send_us
 
         lost = 0
-        if not is_status:
-            gid = getattr(msg, 'group_id', group_id)
+        gid = getattr(msg, 'group_id', group_id)
+        # Groups below the pruned floor stay counted but get no loss keys.
+        if not is_status and (gid is None or gid >= self._key_floor):
             sid = subgroup_id if subgroup_id is not None else 0
             oid = msg.object_id
             key = (gid, sid)
@@ -238,6 +257,7 @@ class LiveStats:
             self._events.popleft()
 
     def _prune(self, floor: int) -> None:
+        self._key_floor = max(self._key_floor, floor)
         for d in (self._last_seen, self._stride):
             for k in [k for k in d if k[0] is not None and k[0] < floor]:
                 del d[k]
@@ -254,7 +274,8 @@ class LiveStats:
                           loss_pct=0.0, jitter_ms=self._jitter,
                           latency_known=False)
 
-        window_t = max(0.01, self._events[-1][0] - self._events[0][0])
+        # Through now, so silence after the last arrival lowers the rate.
+        window_t = max(0.01, t - max(self._events[0][0], cutoff))
         n = len(self._events)
         total_bytes = sum(e[1] for e in self._events)
         lats = sorted(e[2] for e in self._events if e[2] is not None)
@@ -280,6 +301,18 @@ class LiveStats:
 # ---------------------------------------------------------------------------
 # LoadActuator: the "how do we apply a load level" abstraction
 # ---------------------------------------------------------------------------
+
+def _overlap_bytes(window, lo: float, hi: float) -> float:
+    """Bytes of (t, bytes, dt) reports, each prorated by the share of its
+    interval [t - dt, t] inside [lo, hi]; dt 0 counts whole."""
+    total = 0.0
+    for t, b, dt in window:
+        if dt > 0:
+            total += b * max(0.0, min(t, hi) - max(t - dt, lo)) / dt
+        else:
+            total += b
+    return total
+
 
 class BWActuator:
     """Actuator for bandwidth-ramp mode.
@@ -318,7 +351,7 @@ class BWActuator:
         self._events_q = mp_events_queue
         self._stop_ev = mp_stop_event
         # rolling stats aggregated from sub-worker events
-        self._mp_rx_window = []   # (t, rx_bytes)
+        self._mp_rx_window = []   # (t, rx_bytes, dt)
         # The one subscriber worker's latest windowed latency (its
         # TrackStats window matches _mp_window_s): (n, mean, p90).
         self._mp_lat = (0, 0.0, 0.0)
@@ -383,9 +416,8 @@ class BWActuator:
                 self._mp_tx_ring_streams = ev.get(
                     'tx_ring_streams', 0)
             elif kind == 'stats':
-                rx_bytes = ev.get('rx_bytes', 0)
-                if rx_bytes:
-                    self._mp_rx_window.append((t, rx_bytes))
+                self._mp_rx_window.append(
+                    (t, ev.get('rx_bytes', 0), ev.get('dt', 0.0)))
                 self._mp_lat = (ev.get('lat_n', 0),
                                 ev.get('lat_mean_ms', 0.0),
                                 ev.get('lat_p90_ms', 0.0))
@@ -400,9 +432,7 @@ class BWActuator:
             # health events: no-op for stats; logged elsewhere.
         # Trim windows.
         cutoff = time.monotonic() - self._mp_window_s
-        self._mp_rx_window = [
-            (t, b) for (t, b) in self._mp_rx_window if t >= cutoff
-        ]
+        self._mp_rx_window = [e for e in self._mp_rx_window if e[0] >= cutoff]
         self._mp_tx_window = [
             (t, b) for (t, b) in self._mp_tx_window if t >= cutoff
         ]
@@ -434,7 +464,6 @@ class BWActuator:
         self._drain_events()
         t = time.monotonic()
         lat_n, mean, p90 = self._mp_lat
-        rx_bytes = sum(b for (_, b) in self._mp_rx_window)
         # tx column reports wire-bytes (picoquic ground truth); falls
         # back to queued bytes if the wire counter isn't available.
         wire_bytes = sum(b for (_, b) in self._mp_wire_window)
@@ -445,10 +474,13 @@ class BWActuator:
         covered = (t - self._mp_t0 if self._mp_t0 is not None
                    else self._mp_window_s)
         win = max(0.5, min(self._mp_window_s, covered))
+        # Ends at the newest report: data after it is not reported yet.
+        rx_end = max((e[0] for e in self._mp_rx_window), default=t)
+        rx_bytes = _overlap_bytes(self._mp_rx_window, rx_end - win, rx_end)
         rx_mbps = (rx_bytes * 8) / (win * 1e6)
         tx_mbps = (tx_bytes * 8) / (win * 1e6)
-        loss_pct = (100.0 * self._mp_total_lost
-                    / max(1, self._mp_total_objs))
+        seen = self._mp_total_objs + self._mp_total_lost
+        loss_pct = 100.0 * self._mp_total_lost / seen if seen else 0.0
         shortfall = (self.state.target_mbps > 0
                      and rx_mbps
                      < self.shortfall_ratio * self.state.target_mbps)
@@ -492,6 +524,34 @@ class BWActuator:
                 pass
 
 
+def _hold_label(sig: Signal, default: str) -> str:
+    """A shortfall hold, named by its cause when the slots report one."""
+    if sig.refusing_subs:
+        return "hold (relay refusing)"
+    if sig.lossy_subs:
+        return "hold (subs losing objects)"
+    if sig.late_subs:
+        return "hold (subs over threshold)"
+    if sig.starved_subs:
+        return "hold (subs missing a track)"
+    return default
+
+
+def _apportion(b: int, counts: dict) -> dict:
+    """Split b over counts in proportion (largest remainder), at most each
+    count and their total."""
+    total = sum(counts.values())
+    b = min(b, total)
+    if b <= 0:
+        return {}
+    exact = {k: b * c / total for k, c in counts.items()}
+    out = {k: int(x) for k, x in exact.items()}
+    for k in sorted(counts, key=lambda k: exact[k] - out[k],
+                    reverse=True)[:b - sum(out.values())]:
+        out[k] += 1
+    return out
+
+
 def _delivering(batch: dict) -> int:
     """A batch's slots receiving their rate; 'active' from a worker
     that does not judge delivery."""
@@ -505,11 +565,11 @@ class SubsActuator:
     BATCHES: each worker process runs K = --step-subs subscriptions and
     self-heals individual drops internally, so the relay still sees one
     QUIC connection per sub without one OS process per sub. apply(level)
-    spawns/terminates whole workers to reach ceil(level / K). observe()
-    drains batch_stats events and aggregates:
+    spawns/terminates whole workers to reach ceil(level / K). A task
+    reads batch_stats events as they arrive; observe() aggregates:
 
-      rx_mbps         = sum of per-worker batch rates (rx_bytes / dt)
-      latency         = worst slot p90 across mature workers
+      rx_mbps         = sum of per-worker rates over the tick (rx_bytes / dt)
+      latency         = worst slot p90 across mature workers and the tick
       loss_pct        = max per-batch loss_pct
       active_subs     = subscribed slots
       delivering_subs = subscribed slots receiving >= half their rate
@@ -526,6 +586,8 @@ class SubsActuator:
     starved by the controller's batch-stats drain.
     """
     unit = "subs"
+    DRAIN_INTERVAL_S = 0.1
+    STALE_REPORT_S = 5.0
 
     def __init__(self, relay_url: str,
                  namespace: str, trackname: str,
@@ -533,11 +595,31 @@ class SubsActuator:
                  min_subs: int, max_subs: int,
                  start_subs: int, step_subs: int,
                  object_size: int, per_sub_mbps: float,
+                 side_tracks: tuple = (),
                  sub_filter: FilterType = FilterType.LATEST_OBJECT,
                  interval_s: float = 5.0,
                  stagger: float = 0.1,
                  shortfall_ratio: float = 0.85,
-                 transport_options: Optional[dict] = None):
+                 transport_options: Optional[dict] = None,
+                 too_far_behind: float = 0.0,
+                 slot_latency_ms: float = 0.0,
+                 join_burst: bool = False,
+                 watchers: float = 0.25,
+                 sparse_tracks: tuple = (),
+                 lat_min_us: Optional[int] = None):
+        self.too_far_behind = too_far_behind
+        # Tracks exempt from the per-track progress check (catalogs).
+        self.sparse_tracks = tuple(sparse_tracks)
+        # Most negative latency a slot keeps (us); None = TrackStats' own.
+        self.lat_min_us = lat_min_us
+        # Workers get a shared trial Array (start time, joiners); see
+        # start_trial(). They judge health on watchers once one starts.
+        self.join_burst = join_burst
+        self.watchers = watchers
+        self._trial_arrays: dict = {}
+        self._trial: Optional[dict] = None
+        # A slot with p90 over this stops counting as delivering; 0 = off.
+        self.slot_latency_ms = slot_latency_ms
         self.relay_url = relay_url
         self.namespace = namespace
         self.trackname = trackname
@@ -558,6 +640,7 @@ class SubsActuator:
         self.initial_level = float(start_subs)
         self.object_size = object_size
         self.per_sub_mbps = per_sub_mbps
+        self.side_tracks = side_tracks
         self.sub_filter = sub_filter
         self.interval_s = interval_s
         # Seconds between consecutive handshakes in a spawn batch —
@@ -572,13 +655,21 @@ class SubsActuator:
         # Each worker process hosts a BATCH of subscriptions and
         # self-heals individual drops internally. --step-subs doubles as
         # the batch size K: one worker == one group of K subs, so the
-        # controller adding a group per --join-rate spawns one worker.
+        # controller adding a group per interval spawns one worker.
         self.batch_size = max(1, int(step_subs))
+        # Startup grace is a FIXED floor, not interval-scaled: QUIC
+        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
+        # of them staggered), so a small --interval must not reap a
+        # worker before it can come online.
+        self._startup_grace = max(8.0, self.keep_window
+                                  + self.batch_size * max(0.0, self.stagger))
 
         from aiomoqt.utils.workers import MP_CTX as mp
         self._mp = mp
         self._events_q = mp.Queue(maxsize=10000)
         self._workers: dict = {}    # worker_id -> (Process, stop_event)
+        # Starved workers told to stop, terminated if still up next observe.
+        self._reaping: list = []
         self._next_worker_id = 0
         # Targeted setpoint, in SUBS — the count the controller aims for.
         # Distinct from hosted capacity (workers x K): reaping a dead
@@ -588,6 +679,18 @@ class SubsActuator:
         self._targeted = float(start_subs)
         # Per-worker latest batch_stats event:
         self._latest_batch: dict = {}
+        # Per-worker totals since the last observe(): rx_bytes, dt, p90.
+        self._tick: dict = {}
+        self._drain_task: Optional[asyncio.Task] = None
+        self._oldest_report_s = 0.0
+        # Per-worker refused subscribes, kept after a worker is reaped.
+        self._refused: dict = {}
+        self.refused_reason = None
+        # Per-worker resubscribes under --too-far-behind, kept the same way.
+        self._resubscribed: dict = {}
+        # Per-worker objects received and lost, kept the same way.
+        self._objs: dict = {}
+        self._lost: dict = {}
         # Lifecycle counters for summary + shortfall detection:
         self._subscribed_ever: set = set()
         self._failed_window = 0     # resets each observe()
@@ -617,7 +720,80 @@ class SubsActuator:
             self._kill_worker(wid)
         return len(dead)
 
+    def _drain_events(self) -> None:
+        """Read the reports queued now. mp.Queue reads Empty whenever its
+        pipe is momentarily dry, so one pass takes about a pipe-full however
+        many wait; _drain_loop repeats it to keep up with many workers."""
+        from queue import Empty
+        while True:
+            try:
+                msg = self._events_q.get_nowait()
+            except Empty:
+                return
+            if msg.get('kind') != 'batch_stats':
+                continue
+            wid = msg.get('worker_id')
+            now = time.monotonic()
+            self._latest_batch[wid] = msg
+            self._last_batch_t[wid] = now
+            if msg.get('rx_bytes', 0) > 0:
+                self._last_bytes_t[wid] = now
+            if msg.get('active', 0) > 0:
+                self._subscribed_ever.add(wid)
+            if msg.get('refused', 0) > 0:
+                self._refused[wid] = msg['refused']
+                self.refused_reason = msg.get('refused_reason')
+            if msg.get('resubscribed', 0) > 0:
+                self._resubscribed[wid] = msg['resubscribed']
+            self._objs[wid] = msg.get('total_objs', 0)
+            self._lost[wid] = msg.get('loss', 0)
+            tr = self._trial
+            if tr is not None:
+                t = tr['t']
+                for pt, n in msg.get('trial_picked', ()):
+                    if pt == t:
+                        tr['picked'] += n
+                        tr['reported'].add(wid)
+                tr['joins'] += [(s, f) for jt, s, f in msg.get('trial_joins', ()) if jt == t]
+                tr['failed'] += sum(ft == t for ft in msg.get('trial_failed', ()))
+            self._oldest_report_s = max(self._oldest_report_s,
+                                        now - msg.get('t', now))
+            tick = self._tick.setdefault(
+                wid, {'rx_bytes': 0, 'dt': 0.0, 'p90': None})
+            tick['rx_bytes'] += msg.get('rx_bytes', 0)
+            tick['dt'] += msg.get('dt', 1.0)
+            if (msg.get('lat_n', 0) > 0 and now - self._spawned_t.get(wid, now)
+                    >= self._startup_grace):
+                p90 = msg['lat_p90_ms']
+                tick['p90'] = p90 if tick['p90'] is None else max(tick['p90'], p90)
+
+    @property
+    def refused_total(self) -> int:
+        return sum(self._refused.values())
+
+    @property
+    def resubscribed_total(self) -> int:
+        return sum(self._resubscribed.values())
+
+    @property
+    def lost_total(self) -> tuple:
+        """Objects (lost, received) over the run, whole groups included."""
+        return sum(self._lost.values()), sum(self._objs.values())
+
+    async def _drain_loop(self) -> None:
+        while True:
+            self._drain_events()
+            await asyncio.sleep(self.DRAIN_INTERVAL_S)
+
+    def _ensure_draining(self) -> None:
+        """Start the drain task; a failure in it surfaces here."""
+        if self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain_loop())
+        elif self._drain_task.done():
+            self._drain_task.result()
+
     async def apply(self, level: float) -> None:
+        self._ensure_draining()
         self._reap_dead()
         target = max(int(self.min_level), min(int(self.max_level),
                                               int(round(level))))
@@ -630,10 +806,10 @@ class SubsActuator:
         target = workers_target * self.batch_size
         self._targeted = float(target)
         # Spawn-up is BOUNDED to one worker (one group of K) per call:
-        # the controller adds a group every --join-rate, so an unbounded
+        # the controller adds a group every interval, so an unbounded
         # respawn can't fire dozens of simultaneous batches at a
         # struggling relay (the death-spiral amplifier). Each worker
-        # spaces its own K handshakes internally by --stagger.
+        # spaces its own K handshakes internally by the stagger.
         if len(self._workers) < workers_target:
             wid = self._next_worker_id
             self._next_worker_id += 1
@@ -650,9 +826,17 @@ class SubsActuator:
                 force_quic=self.force_quic,
                 sub_filter=int(self.sub_filter),
                 per_sub_mbps=self.per_sub_mbps,
+                side_tracks=self.side_tracks,
                 keep_window=self.keep_window,
+                too_far_behind=self.too_far_behind,
+                slot_latency_ms=self.slot_latency_ms,
+                sparse_tracks=self.sparse_tracks,
+                lat_min_us=self.lat_min_us,
                 **self.transport_options,
             )
+            if self.join_burst:
+                cfg['trial'] = self._trial_arrays[wid] = self._mp.Array('d', 2)
+                cfg['watchers'] = self.watchers
             from aiomoqt.utils.workers import sub_batch_worker_entry
             p = self._mp.Process(
                 target=sub_batch_worker_entry,
@@ -662,13 +846,64 @@ class SubsActuator:
             p.start()
             self._workers[wid] = (p, stop_ev)
             self._spawned_t[wid] = time.monotonic()
-        # wind down
-        while len(self._workers) > workers_target:
-            wid = next(iter(self._workers))
+        for wid in self._shed_order()[:max(0, len(self._workers) - workers_target)]:
             self._kill_worker(wid)
+
+    def _shed_order(self) -> list:
+        """Workers in stop order: those still in startup grace, newest first,
+        then the rest by their worst subscriber's p90, furthest behind first."""
+        now = time.monotonic()
+
+        def key(wid):
+            t = self._spawned_t.get(wid, now)
+            if now - t < self._startup_grace:
+                return (0, -t)
+            return (1, -self._latest_batch.get(wid, {}).get('lat_p90_ms', 0.0))
+        return sorted(self._workers, key=key)
+
+    async def drop_all(self) -> None:
+        """Stop every worker at once so the relay sheds all their state."""
+        self._targeted = 0.0
+        for _, stop_ev in self._workers.values():
+            stop_ev.set()
+        for wid in list(self._workers):
+            self._kill_worker(wid)
+
+    def _eligible(self) -> dict:
+        return {wid: int(self._latest_batch.get(wid, {}).get('eligible', 0))
+                for wid in self._trial_arrays}
+
+    @property
+    def eligible_total(self) -> int:
+        """Joiners a trial could pick, per the workers' last reports."""
+        return sum(self._eligible().values())
+
+    def start_trial(self, b: int) -> float:
+        """Have b eligible joiners redial at once, spread over the workers in
+        proportion to their eligible counts; returns the trial start time."""
+        share = _apportion(b, self._eligible())
+        t = time.monotonic()
+        for wid, arr in self._trial_arrays.items():
+            with arr.get_lock():
+                arr[0], arr[1] = t, share.get(wid, 0)
+        self._trial = {'t': t, 'asked': set(self._trial_arrays), 'reported': set(),
+                       'picked': 0, 'joins': [], 'failed': 0}
+        return t
+
+    def trial_view(self) -> dict:
+        """The open trial: joiners picked, (SUBSCRIBE_OK ms, first object ms)
+        from its start per completed join, failed joins, and whether every
+        worker has picked and every pick has resolved."""
+        tr = self._trial or {'asked': set(), 'reported': set(), 'picked': 0,
+                             'joins': [], 'failed': 0}
+        resolved = (tr['asked'] <= tr['reported']
+                    and len(tr['joins']) + tr['failed'] >= tr['picked'])
+        return dict(picked=tr['picked'], joins=list(tr['joins']), failed=tr['failed'],
+                    resolved=resolved)
 
     def _kill_worker(self, wid):
         proc, stop_ev = self._workers.pop(wid, (None, None))
+        self._trial_arrays.pop(wid, None)
         if proc is None:
             return
         stop_ev.set()
@@ -682,24 +917,23 @@ class SubsActuator:
         self._last_bytes_t.pop(wid, None)
         self._spawned_t.pop(wid, None)
 
+    def settled(self) -> bool:
+        """The target's workers are all up and past their startup grace."""
+        now = time.monotonic()
+        want = -(-int(self._targeted) // self.batch_size)
+        return (len(self._workers) >= want
+                and all(now - t >= self._startup_grace
+                        for t in self._spawned_t.values()))
+
     async def observe(self) -> Signal:
-        # Drain all pending batch_stats events from workers.
-        from queue import Empty
+        self._ensure_draining()
+        self._drain_events()
+        if self._oldest_report_s > self.STALE_REPORT_S:
+            print(f"  warning: read a worker report "
+                  f"{self._oldest_report_s:.0f}s old; figures are late")
+        self._oldest_report_s = 0.0
         failed_this_window = 0
-        while True:
-            try:
-                msg = self._events_q.get_nowait()
-            except Empty:
-                break
-            if msg.get('kind') != 'batch_stats':
-                continue
-            wid = msg.get('worker_id')
-            self._latest_batch[wid] = msg
-            self._last_batch_t[wid] = time.monotonic()
-            if msg.get('rx_bytes', 0) > 0:
-                self._last_bytes_t[wid] = self._last_batch_t[wid]
-            if msg.get('active', 0) > 0:
-                self._subscribed_ever.add(wid)
+        self._finish_reaping()
 
         # A worker reports how many of its K slots are subscribed
         # ('active') and how many of those receive their rate
@@ -710,12 +944,7 @@ class SubsActuator:
         live_ids = [wid for wid, t in self._last_bytes_t.items()
                     if t >= bytes_cutoff and wid in self._workers]
 
-        # Startup grace is a FIXED floor, not interval-scaled: QUIC
-        # handshake + SUBSCRIBE is a ~constant cost (and a batch opens K
-        # of them staggered), so a small --interval must not reap a
-        # worker before it can come online.
-        startup_grace = max(8.0, keep_window
-                            + self.batch_size * max(0.0, self.stagger))
+        startup_grace = self._startup_grace
         starve_cutoff = now - keep_window
         starved = []
         for wid, (proc, stop_ev) in list(self._workers.items()):
@@ -726,15 +955,19 @@ class SubsActuator:
             spawned = self._spawned_t.get(wid, now)
             if last_bytes is None and (now - spawned) < startup_grace:
                 continue
+            # Refused by the relay, not stuck: reaping would only redial.
+            if self._latest_batch.get(wid, {}).get('refusing', 0) > 0:
+                continue
             if last_bytes is None or last_bytes <= starve_cutoff:
                 starved.append(wid)
         for wid in starved:
             lost = self._latest_batch.get(wid, {}).get('active',
                                                        self.batch_size)
             proc, stop_ev = self._workers.pop(wid, (None, None))
+            self._trial_arrays.pop(wid, None)
             if proc is not None:
                 stop_ev.set()
-                proc.join(timeout=0.5)
+                self._reaping.append(proc)
             self._latest_batch.pop(wid, None)
             self._last_batch_t.pop(wid, None)
             self._last_bytes_t.pop(wid, None)
@@ -743,6 +976,7 @@ class SubsActuator:
 
         rx_bps_total = 0.0
         worst_p90 = 0.0
+        tick_p90 = None
         worst_mean = 0.0
         lat_known = False
         max_loss_pct = 0.0
@@ -756,8 +990,12 @@ class SubsActuator:
             s = self._latest_batch.get(wid, {})
             active_subs += int(s.get('active', 0))
             delivering_subs += _delivering(s)
-            # rx_bytes is the batch's delta over its dt.
-            rx_bps_total += s.get('rx_bytes', 0) * 8 / max(s.get('dt', 1.0), 1e-3)
+            # A tick shorter than the report interval may have no report.
+            tick = self._tick.get(wid) or s
+            rx_bps_total += tick.get('rx_bytes', 0) * 8 / max(tick.get('dt', 1.0), 1e-3)
+            p90 = self._tick.get(wid, {}).get('p90')
+            if p90 is not None:
+                tick_p90 = p90 if tick_p90 is None else max(tick_p90, p90)
             # Latency drives the back-off, so only MATURE workers feed it:
             # a worker still in its startup grace is catching up (old
             # send-timestamps -> seconds-scale p90) and would trip the SLA
@@ -778,6 +1016,9 @@ class SubsActuator:
                 jitter_sum += jit
                 jitter_n += 1
 
+        self._tick.clear()
+        acted_p90 = max(worst_p90, tick_p90 or 0.0)
+
         # Setpoint is the TARGETED count, not live capacity — reaping a
         # worker must not silently lower the target the controller ramps
         # against (else a lost worker permanently decays the run instead
@@ -786,7 +1027,7 @@ class SubsActuator:
 
         # Shortfall is judged only against MATURE workers — those past
         # their startup grace. A freshly-spawned group spends its first
-        # `startup_grace` bringing K slots online (staggered by --stagger)
+        # `startup_grace` bringing K slots online (staggered)
         # and self-healing the stragglers; holding it to its full K
         # immediately would read that ramp-up as a deficit and trip a
         # false shortfall the instant the controller adds a group. So a
@@ -795,14 +1036,16 @@ class SubsActuator:
         # so a partial final batch isn't over-expected. A group that never
         # delivers is still caught by the starve reaper above
         # (failed_this_window), which forces the shortfall independently.
-        # Mature slots count only while delivering their rate.
+        # Mature slots count only while delivering their rate, and only the
+        # slots a worker judges: its watchers while it cycles joiners.
         mature_active = 0
         mature_target = 0
         for wid in self._workers:
             if (now - self._spawned_t.get(wid, now)) < startup_grace:
                 continue
-            mature_active += _delivering(self._latest_batch.get(wid, {}))
-            mature_target += self.batch_size
+            batch = self._latest_batch.get(wid, {})
+            mature_active += _delivering(batch)
+            mature_target += int(batch.get('judged', self.batch_size))
         mature_target = min(mature_target, target_subs)
 
         # Aggregate check: the delivering subs together receive their rate.
@@ -829,7 +1072,8 @@ class SubsActuator:
             t=now,
             level=float(target_subs),
             latency_mean_ms=worst_mean,
-            latency_p90_ms=worst_p90,
+            latency_p90_ms=acted_p90,
+            latest_p90_ms=worst_p90,
             loss_pct=max_loss_pct,
             shortfall=shortfall,
             target_mbps=target_mbps,
@@ -841,10 +1085,37 @@ class SubsActuator:
             delivering_subs=delivering_subs,
             failed_subs=failed_this_window,
             health=health,
-            latency_known=lat_known,
+            latency_known=lat_known or tick_p90 is not None,
+            refusing_subs=sum(self._latest_batch.get(wid, {}).get('refusing', 0)
+                              for wid in self._workers),
+            behind_subs=sum(self._latest_batch.get(wid, {}).get('behind', 0)
+                            for wid in self._workers),
+            lossy_subs=sum(self._latest_batch.get(wid, {}).get('lossy', 0)
+                           for wid in self._workers),
+            late_subs=sum(self._latest_batch.get(wid, {}).get('late', 0)
+                          for wid in self._workers),
+            starved_subs=sum(
+                self._latest_batch.get(wid, {}).get('track_starved', 0)
+                for wid in self._workers),
         )
 
+    def _finish_reaping(self) -> None:
+        """Terminate reaped workers still running since the last observe."""
+        left = []
+        for proc in self._reaping:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=0.1)
+            if proc.is_alive():
+                left.append(proc)
+        self._reaping = left
+
     async def shutdown(self) -> None:
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+            self._drain_task = None
+        self._tick.clear()
         # Parallel shutdown: signal all stops at once, join with one
         # shared deadline, terminate stragglers, then a final short
         # join. Serial _kill_worker at 1s each would block ~Nworkers s
@@ -853,14 +1124,16 @@ class SubsActuator:
         self._workers.clear()
         for _sid, (_p, stop_ev) in items:
             stop_ev.set()
+        procs = [proc for _sid, (proc, _ev) in items] + self._reaping
+        self._reaping = []
         deadline = time.monotonic() + 2.0
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             remaining = max(0.0, deadline - time.monotonic())
             proc.join(timeout=remaining)
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             if proc.is_alive():
                 proc.terminate()
-        for _sid, (proc, _ev) in items:
+        for proc in procs:
             proc.join(timeout=1.0)
         self._latest_batch.clear()
         self._last_batch_t.clear()
@@ -879,12 +1152,21 @@ class SubsActuator:
 # Controller: scalar P-control over a LoadActuator
 # ---------------------------------------------------------------------------
 
+# --too-far-behind: back off once this share of viewers is past the limit.
+BEHIND_SHARE = 0.05
+# Split hosts: negative latency kept down to this (us), so the skew-safe
+# baseline can cancel a clock offset instead of every sample being dropped.
+SKEW_LAT_MIN_US = -60_000_000
+
+
 class AIMDController:
     """Additive-increase / multiplicative-decrease over a LoadActuator.
 
     Keeps probing: it backs off on a signal and resumes ramping from the
-    lower level, never locking in a ceiling. Ends at the actuator's max
-    level, -t/--duration, Ctrl-C, or rx=0 for 3 intervals (a failure).
+    lower level, never locking in a ceiling. Holds at the actuator's max
+    level, still backing off on a signal. Ends at -t/--duration, Ctrl-C,
+    or rx=0 for 3 intervals (a failure). exit_at_max also ends the run on
+    reaching max, or at the first back-off if that comes sooner.
 
     - Every tick, observe a Signal and decide.
     - headroom = (threshold - p90) / threshold; p90 is over a running
@@ -897,8 +1179,10 @@ class AIMDController:
       then drain until headroom >= 0.2.
     - Shortfall: hold; sustained for 3 intervals, bw backs off toward
       the delivered rate and subs holds and respawns.
-    - Loss is reported, not acted on; in subs mode a slot losing over
-      half its rate stops counting as delivering, which is a shortfall.
+    - Loss counts whole groups and group tails never received. In subs
+      mode a slot stops counting as delivering, which is a shortfall,
+      while it gets under half its rate, lost an object in the keep
+      window, or has p90 over the threshold.
     - high_water: the best delivered level (bw: rx Mbps; subs:
       delivering subscribers) seen with headroom >= 0.2 and no shortfall.
     """
@@ -912,21 +1196,30 @@ class AIMDController:
                  backoff_factor: float = 0.9,
                  loss_threshold_pct: float = 0.5,
                  duration_s: float | None = None,
+                 exit_at_max: bool = False,
                  tick_s: float | None = None,
-                 skew_safe: bool = False):
+                 skew_safe: bool = False,
+                 too_far_behind: bool = False,
+                 clock: Callable[[], float] = time.monotonic):
+        self.too_far_behind = too_far_behind
+        self.peak_behind = (0, 0)  # most viewers past it, of how many
+        self.peak_lossy = self.peak_late = self.peak_starved = (0, 0)
+        # Whether any observed interval carried a latency sample.
+        self.latency_measured = False
+        self.delivered_mbps = self.wanted_mbps = 0.0
         self.actuator = actuator
         self.state = state
         self.interval_s = interval_s
         # tick_s = how often we observe / decide / add a group; report_s
         # = how often we print a row + write CSV. Subs mode passes
-        # tick_s=join_rate so a group is added every --join-rate while
+        # tick_s=group_interval so a group is added every interval while
         # rows print every --interval. BW mode leaves tick_s=interval,
         # so every tick reports — byte-identical to the old behavior.
         self.report_s = interval_s
         self.tick_s = tick_s if (tick_s and tick_s > 0) else interval_s
         # Streaks are wall-clock windows; express them in ticks so the
         # dead-air / back-off / shortfall reaction times stay constant
-        # when tick_s < report_s (otherwise a fast --join-rate would
+        # when tick_s < report_s (otherwise a short group interval would
         # make a dead-air abort fire in ~2s instead of ~3 intervals).
         self._tpr = max(1, round(self.report_s / self.tick_s))
         self._last_report_t = 0.0
@@ -935,7 +1228,9 @@ class AIMDController:
         self.latency_threshold_ms = latency_threshold_ms
         self.backoff_factor = backoff_factor
         self.loss_threshold_pct = loss_threshold_pct
-        self.duration_s = duration_s
+        self.duration_s = duration_s or None
+        self.exit_at_max = exit_at_max
+        self.held_at_max = False
         # Skew-safe: act on p90 over a running baseline (see _control_p90).
         self.skew_safe = skew_safe
         self._p90_seen: deque = deque(maxlen=self.BASELINE_SAMPLES)
@@ -947,13 +1242,22 @@ class AIMDController:
         self.high_water = 0.0
         self.samples = 0
         self.draining = False
-        self.t0 = time.monotonic()
+        self._now = clock
+        self.t0 = clock()
         # Equilibrium learning: record every direction flip (ramp↔back-off)
         # as a pivot. Step size shrinks with pivot count, and eq_level is an
         # EWMA of pivots so later steps converge around the true ceiling.
         self.pivots: list[float] = []
         self.eq_level: float = actuator.initial_level
         self.direction: int = +1   # +1 ramping, -1 backed-off
+
+    async def _wait_tick(self) -> bool:
+        """Wait one tick; True once the run is stopped."""
+        try:
+            await asyncio.wait_for(self.state.stop.wait(), timeout=self.tick_s)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def run(self):
         state = self.state
@@ -962,17 +1266,13 @@ class AIMDController:
         await a.apply(a.initial_level)
 
         while not state.stop.is_set():
-            try:
-                await asyncio.wait_for(state.stop.wait(),
-                                       timeout=self.tick_s)
+            if await self._wait_tick():
                 break
-            except asyncio.TimeoutError:
-                pass
 
-            # Hard wall-clock cap. Checked at tick boundaries so the
+            # Duration cap, checked at tick boundaries so the
             # in-progress sample completes and gets reported.
             if (self.duration_s is not None
-                    and time.monotonic() - self.t0 >= self.duration_s):
+                    and self._now() - self.t0 >= self.duration_s):
                 state.ceiling_reason = (
                     f"duration cap reached ({self.duration_s:.0f}s)")
                 state.stop.set()
@@ -981,6 +1281,7 @@ class AIMDController:
             sig = await a.observe()
             self.samples += 1
             state.received_data |= sig.rx_mbps > 0
+            self.latency_measured |= sig.latency_known
 
             if self.samples < 2:
                 self._emit(sig, "warming")
@@ -1008,8 +1309,15 @@ class AIMDController:
             #   1.0 = idle (p90 = 0), 0.0 = at SLA, <0 = overshoot.
             # p90 is more sensitive than p50 — catches queue build-up
             # sooner while being less noisy than p99.
-            headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
-                / self.latency_threshold_ms
+            self._tally(sig)
+            if self.too_far_behind:
+                # The same control over the share of viewers past the limit.
+                share = sig.behind_subs / max(sig.active_subs, 1)
+                headroom = (BEHIND_SHARE - share) / BEHIND_SHARE
+            else:
+                headroom = (self.latency_threshold_ms - self._control_p90(sig)) \
+                    / self.latency_threshold_ms
+            over = "too far behind" if self.too_far_behind else "p90 over"
 
             # Back off on sustained p90 overshoot; the first bad interval
             # only watches, so a transient RTT spike is not a cliff. Loss
@@ -1023,15 +1331,18 @@ class AIMDController:
             if over_p90:
                 self.pressure_streak += 1
                 if self.pressure_streak < 2 * self._tpr:
-                    self._emit(sig, "watch (p90 over)")
+                    self._emit(sig, f"watch ({over})")
                     continue
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "p90 over threshold")
+                    return
                 retreat = max(self.backoff_factor, 1.0 + headroom)
                 new_level = level * retreat
                 new_level = max(a.min_level, new_level)
                 # Symmetric clamp with ramp: drop at most initial_step.
                 new_level = max(new_level, level - a.initial_step)
                 self.pressure_streak = 0
-                await self._apply(new_level, sig, "back-off (p90 over)",
+                await self._apply(new_level, sig, f"back-off ({over})",
                                   force=True)
                 self.draining = True
                 continue
@@ -1053,10 +1364,13 @@ class AIMDController:
                 if self.shortfall_streak < 3 * self._tpr:
                     # Onset: hold and watch. apply(level) is a reconcile
                     # (subs respawns lost workers); BW it's a no-op.
-                    self._emit(sig, "hold (watch)")
+                    self._emit(sig, _hold_label(sig, "hold (watch)"))
                     await a.apply(level)
                     continue
                 # Sustained — the relay isn't catching up.
+                if self.exit_at_max:
+                    self._end_at_ceiling(sig, "delivery short of target")
+                    return
                 if a.unit == "Mbps":
                     # BW: back off the target toward what's actually
                     # delivered, so Target settles at the real ceiling
@@ -1077,16 +1391,10 @@ class AIMDController:
                     # reconcile (apply at the SAME target respawns it).
                     # Backing off here would kill more subs and
                     # re-introduce the setpoint-decay-on-loss bug.
-                    self._emit(sig, "hold (shortfall)")
+                    self._emit(sig, _hold_label(sig, "hold (shortfall)"))
                     await a.apply(level)
                 continue
 
-            if level >= a.max_level:
-                state.ceiling_mbps = self.high_water
-                state.ceiling_reason = f"reached max {a.max_level} {a.unit}"
-                self._emit(sig, "max", force=True)
-                state.stop.set()
-                return
             # High-water tracks the *delivered* metric (bw: rx_mbps;
             # subs: active sub count), not the commanded target —
             # a target the system can't sustain shouldn't pollute the
@@ -1100,6 +1408,17 @@ class AIMDController:
                     and headroom >= 0.2
                     and not sig.shortfall):
                 self.high_water = observed
+            if level >= a.max_level:
+                if self.exit_at_max:
+                    state.ceiling_reason = (
+                        f"reached max {a.max_level:g} {a.unit}")
+                    self._emit(sig, "max", force=True)
+                    state.stop.set()
+                    return
+                self.held_at_max = True
+                self._emit(sig, "hold (max)")
+                await a.apply(level)
+                continue
             # Gain curve: full step when headroom > 0.5, linearly taper
             # to zero at headroom = 0.05. Below that → hold.
             if headroom >= 0.5:
@@ -1161,6 +1480,21 @@ class AIMDController:
             self.hold_intervals = 0
             await self._apply(min(a.max_level, level + step), sig, "ramp")
 
+    def _tally(self, sig: Signal) -> None:
+        """Totals for the summary."""
+        if sig.behind_subs > self.peak_behind[0]:
+            self.peak_behind = (sig.behind_subs, sig.active_subs)
+        if sig.lossy_subs > self.peak_lossy[0]:
+            self.peak_lossy = (sig.lossy_subs, sig.active_subs)
+        if sig.late_subs > self.peak_late[0]:
+            self.peak_late = (sig.late_subs, sig.active_subs)
+        if sig.starved_subs > self.peak_starved[0]:
+            self.peak_starved = (sig.starved_subs, sig.active_subs)
+        per_sub = getattr(self.actuator, 'per_sub_mbps', None)
+        if per_sub:
+            self.delivered_mbps += sig.rx_mbps
+            self.wanted_mbps += sig.active_subs * per_sub
+
     def _control_p90(self, sig: Signal) -> float:
         """The p90 the controller acts on: absolute, or when skew-safe
         over a baseline (min p90 seen, its 1st percentile once mature)
@@ -1178,25 +1512,35 @@ class AIMDController:
             baseline = ordered[len(ordered) // 100]
         return sig.latency_p90_ms - baseline
 
+    def _end_at_ceiling(self, sig: Signal, reason: str) -> None:
+        self.state.ceiling_reason = reason
+        self._emit(sig, f"ceiling ({reason})", force=True)
+        self.state.stop.set()
+
     def _emit(self, sig: Signal, action: str, force: bool = False) -> None:
         """Throttle console + CSV output to report_s. The control loop
-        ticks at tick_s (= --join-rate in subs mode), but rows print at
+        ticks at tick_s (the group interval in subs mode), but rows print at
         --interval; force=True always emits (terminal + back-off rows
         the user must not miss)."""
-        now = time.monotonic()
+        now = self._now()
         if not (force or (now - self._last_report_t) >= self.report_s):
             return
         self._last_report_t = now
         if self.writer:
+            # Without a latency sample the cells are blank.
+            def ms(v):
+                return f"{v:.2f}" if sig.latency_known else ""
             self.writer.writerow([
                 f"{sig.t:.3f}",
                 f"{sig.target_mbps:.2f}",
                 f"{sig.tx_mbps:.2f}",
                 f"{sig.rx_mbps:.2f}",
-                f"{sig.latency_mean_ms:.2f}",
-                f"{sig.latency_p90_ms:.2f}",
+                ms(sig.latency_mean_ms),
+                ms(sig.latency_p90_ms if sig.latest_p90_ms is None
+                   else sig.latest_p90_ms),
                 f"{sig.loss_pct:.3f}",
                 *self._cpu,
+                *([] if sig.latest_p90_ms is None else [ms(sig.latency_p90_ms)]),
             ])
         self._print_row(sig, action)
 
@@ -1306,6 +1650,481 @@ class AIMDController:
 
 CERT = find_cert([REPO_CERTS_DIR])
 KEY = find_key(CERT)
+
+
+class HoldController(AIMDController):
+    """Step and hold: the most subscribers held at equilibrium (subs mode).
+
+    Each step raises the level, waits until the new workers are past their
+    startup grace (actuator.settled()), then holds hold_s. From the step on,
+    a tick fails it when p90 is over the threshold, delivery falls short, a
+    subscriber fails, is refused, runs late or loses an object, or the lost
+    object count grows. A held step also fails while p90 is still rising:
+    the mean of its last half over RISE_MIN x the threshold and over
+    RISE_RATIO x its first half plus RISE_FLOOR x the threshold.
+
+    Steps add 10% of the level while the hold's p90 stayed under 10% of the
+    threshold, 5% under 25%, else one group; never less than one group. The
+    first failure sheds back to the last level that passed, stopping the
+    workers furthest behind; the rest stay on and must run clean for
+    recover_clean_s within recover_s, plus the actuator's keep window for
+    the overshoot's loss flags to age out, then pass a confirm_s hold. A
+    level that does not recover gets one reset: every subscriber dropped,
+    reset_gap_s, then a rejoin, for a relay that does not shed late work.
+    A confirmed level is held, still checked, until the run ends
+    (exit_sustained ends it at once). A fault there, a failed confirmation
+    or no recovery after the reset sheds one group lower, MAX_RETREATS
+    step-downs in all. `sustained` is (level, p90 max) of the level held to
+    the end, or None, and `held_s` how long it has held since its
+    confirmation began.
+    """
+
+    MAX_RETREATS = 3
+    RISE_MIN = 0.5
+    RISE_RATIO = 1.25
+    RISE_FLOOR = 0.05
+
+    def __init__(self, actuator, state: BenchState, *, hold_s: float,
+                 confirm_s: float, recover_s: float = 15.0,
+                 recover_clean_s: float = 10.0, reset_gap_s: float = 5.0,
+                 exit_sustained: bool = False, **kw):
+        super().__init__(actuator, state, **kw)
+        self.hold_s = hold_s
+        self.confirm_s = confirm_s
+        self.recover_s = recover_s
+        self.recover_clean_s = recover_clean_s
+        self.reset_gap_s = reset_gap_s
+        self.exit_sustained = exit_sustained
+        self.sustained: Optional[tuple] = None
+        self.held_s = 0.0
+        self.last_pass: Optional[float] = None
+        self.retreats = 0
+
+    def _next_level(self, level: float, p90_max: float) -> float:
+        a, thr = self.actuator, self.latency_threshold_ms
+        frac = 0.10 if p90_max < 0.10 * thr else 0.05 if p90_max < 0.25 * thr else 0.0
+        step = max(a.step_floor, round(level * frac / a.step_floor) * a.step_floor)
+        return min(a.max_level, level + step)
+
+    def _fault(self, sig: Signal, p90: float, lost0: int) -> Optional[str]:
+        if p90 > self.latency_threshold_ms:
+            return "p90 over"
+        for n, why in ((sig.failed_subs, "subscribers failed"),
+                       (sig.refusing_subs, "relay refusing"),
+                       (sig.lossy_subs, "subscribers losing objects"),
+                       (sig.late_subs, "subscribers over the threshold"),
+                       (sig.starved_subs, "subscribers missing a track")):
+            if n:
+                return why
+        if sig.shortfall:
+            return "delivery short"
+        if self.actuator.lost_total[0] > lost0:
+            return "objects lost"
+        return None
+
+    def _rising(self, p90s: list) -> bool:
+        half = len(p90s) // 2
+        if half < 2:
+            return False
+        first, last = sum(p90s[:half]) / half, sum(p90s[-half:]) / half
+        thr = self.latency_threshold_ms
+        return last > self.RISE_MIN * thr and last > self.RISE_RATIO * first + self.RISE_FLOOR * thr
+
+    def _finish(self, sig: Signal, reason: str) -> None:
+        self.state.ceiling_reason = reason
+        self._emit(sig, reason, force=True)
+        self.state.stop.set()
+
+    async def run(self):
+        state, a = self.state, self.actuator
+        level = a.initial_level
+        await a.apply(level)
+        phase = "step"                # step | reset | rejoin | recover | confirm | held
+        since = clean_since = None    # hold start; recovery's clean run start
+        p90s: list = []
+        lost0 = a.lost_total[0]
+        recover_t = rejoin_t = 0.0
+        reset = False                 # this level has had its reset
+        no_data = 0
+        while not state.stop.is_set():
+            if await self._wait_tick():
+                break
+            now = self._now()
+            if self.duration_s is not None and now - self.t0 >= self.duration_s:
+                state.ceiling_reason = (
+                    f"held {self.sustained[0]:.0f} {a.unit} to the end" if self.sustained
+                    else f"duration cap reached ({self.duration_s:.0f}s)")
+                state.stop.set()
+                break
+            sig = await a.observe()
+            self.samples += 1
+            if phase == "reset":
+                if now < rejoin_t:
+                    self._emit(sig, "reset")
+                    continue
+                await a.apply(level)
+                phase, no_data = "rejoin", 0
+                self._emit(sig, f"rejoin to {level:.0f}", force=True)
+                continue
+            state.received_data |= sig.rx_mbps > 0
+            self.latency_measured |= sig.latency_known
+            if sig.rx_mbps <= 0:
+                no_data += 1
+                if no_data >= 3 * self._tpr:
+                    state.ceiling_reason = ("no data received — subscribe "
+                                            "failed or publisher stalled")
+                    state.failed = True
+                    self._emit(sig, "ABORT: rx=0", force=True)
+                    state.stop.set()
+                    return
+                self._emit(sig, "rx=0 (no data)")
+                continue
+            no_data = 0
+            self._tally(sig)
+            p90 = self._control_p90(sig)
+            await a.apply(level)      # reconcile: spawns the step's next worker
+
+            if phase == "rejoin":
+                if a.settled():
+                    phase, recover_t, clean_since = "recover", now, None
+                self._emit(sig, "rejoin")
+                continue
+
+            if phase == "recover":
+                # Loss counted late from the overshoot does not block recovery.
+                why = self._fault(sig, p90, a.lost_total[0]) or (
+                    None if a.settled() else "settling")
+                if why is None:
+                    clean_since = clean_since or now
+                    if now - clean_since >= self.recover_clean_s:
+                        phase, since, p90s, lost0 = "confirm", None, [], a.lost_total[0]
+                        self._emit(sig, "recovered", force=True)
+                    else:
+                        self._emit(sig, "recover")
+                    continue
+                clean_since = None
+                if now - recover_t < self.recover_s:
+                    self._emit(sig, f"recover ({why})")
+                    continue
+                if not reset:
+                    await a.drop_all()
+                    self._emit(sig, f"no recovery, reset at {level:.0f}", force=True)
+                    phase, rejoin_t, reset = "reset", self._now() + self.reset_gap_s, True
+                    continue
+                level = await self._retreat(sig, level, "no recovery")
+                if level is None:
+                    return
+                phase, recover_t, reset = "recover", self._now() + a.keep_window, False
+                continue
+
+            why = self._fault(sig, p90, lost0)
+            if why is None:
+                if not a.settled():
+                    self._emit(sig, "settle")
+                    continue
+                if since is None:
+                    since, p90s = now, []
+                p90s.append(p90)
+                if phase == "held":
+                    self.sustained, self.held_s = (level, max(p90s)), now - since
+                    self._emit(sig, "hold (sustained)")
+                    continue
+                if now - since < (self.hold_s if phase == "step" else self.confirm_s):
+                    self._emit(sig, phase if phase == "confirm" else "hold")
+                    continue
+                if self._rising(p90s):
+                    why = "p90 still rising"
+            if why:
+                self.sustained = None
+                if phase == "step" and self.last_pass is None:
+                    self._finish(sig, f"not demonstrated: {why} at the first "
+                                      f"level, {level:.0f} {a.unit}")
+                    return
+                if phase == "step":
+                    level = self.last_pass
+                    await a.apply(level)
+                    self._emit(sig, f"fail ({why}), back to {level:.0f}", force=True)
+                else:
+                    level = await self._retreat(sig, level, why)
+                    if level is None:
+                        return
+                phase, recover_t, reset = "recover", self._now() + a.keep_window, False
+                clean_since = since = None
+                continue
+
+            if phase == "confirm":
+                self.sustained, self.held_s = (level, max(p90s)), now - since
+                cap = f" (--max-{a.unit})" if level >= a.max_level else ""
+                reason = f"equilibrium confirmed at {level:.0f} {a.unit}{cap}"
+                if self.exit_sustained:
+                    self._finish(sig, reason)
+                    return
+                phase = "held"
+                self._emit(sig, reason, force=True)
+                continue
+            self.last_pass, held_max = level, max(p90s)
+            since, p90s, lost0 = None, [], a.lost_total[0]
+            if level >= a.max_level:
+                phase = "confirm"
+                self._emit(sig, "confirm (at max)", force=True)
+                continue
+            level = self._next_level(level, held_max)
+            await a.apply(level)
+            self._emit(sig, f"step to {level:.0f}", force=True)
+
+    async def _retreat(self, sig: Signal, level: float, why: str) -> Optional[float]:
+        """Shed one group lower; None ends the run."""
+        self.retreats += 1
+        if self.retreats > self.MAX_RETREATS or level - self.actuator.step_floor < self.actuator.min_level:
+            self._finish(sig, f"not demonstrated: {why} after {self.retreats - 1} step(s) down")
+            return None
+        level -= self.actuator.step_floor
+        await self.actuator.apply(level)
+        self._emit(sig, f"fail ({why}), down to {level:.0f}", force=True)
+        return level
+
+
+def _pctl(values, p: float) -> float:
+    """Nearest-rank percentile; 0 when empty."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    return s[min(len(s) - 1, max(0, -(-len(s) * p // 100) - 1))]
+
+
+@dataclass
+class JoinTrial:
+    """One burst of b joins; passed only once judged."""
+    b: int
+    bound_ms: float
+    ok: int = 0                 # first object within bound_ms of the start
+    sub_ms: list = field(default_factory=list)
+    first_ms: list = field(default_factory=list)
+    burst_ms: float = 0.0       # start to the last first object within bound
+    fault: Optional[str] = None
+    passed: bool = False
+
+    def judge(self, joins: list, share: float) -> None:
+        """Take (SUBSCRIBE_OK ms, first object ms) per completed join."""
+        self.sub_ms = [s for s, _ in joins]
+        self.first_ms = [f for _, f in joins]
+        within = [f for f in self.first_ms if f <= self.bound_ms]
+        self.ok, self.burst_ms = len(within), max(within, default=0.0)
+        if self.fault is None and self.ok < share * self.b:
+            self.fault = "joins late or failed"
+        self.passed = self.fault is None
+
+    def line(self) -> str:
+        verdict = "passed" if self.passed else f"failed ({self.fault or 'run ended'})"
+        sub, first = self.sub_ms, self.first_ms
+        return (f"  Join trial:  B={self.b} {verdict}, {self.ok}/{self.b} joined within "
+                f"{self.bound_ms:g} ms, SUBSCRIBE_OK p50/p99 "
+                f"{_pctl(sub, 50):.0f}/{_pctl(sub, 99):.0f} ms, first object p50/p99 "
+                f"{_pctl(first, 50):.0f}/{_pctl(first, 99):.0f} ms, "
+                f"burst {self.burst_ms:.0f} ms")
+
+
+class JoinSearchController(HoldController):
+    """Join burst: the most subscribers joining at once that a relay serves
+    while an existing audience stays healthy (subs mode).
+
+    Spawns the base audience (the max level), waits for actuator.settled()
+    and holds it base_s free of HoldController's faults, judging everyone.
+    A trial of B has B eligible joiners redial at once; it passes when
+    JOIN_OK_SHARE of them get a first object within join_bound_ms of its
+    start and no watcher fault occurs until they are all done. Between
+    trials the watchers must run clean for trial_gap_s, within
+    RESET_TIMEOUT_S. The search grows B by GROW (GROW_NEAR once first-object
+    p99 passes half the bound), at most to join_max and the eligible pool;
+    bisects after the first failure; then needs CONFIRMS passes in a row,
+    stepping down 10% on a failure, MAX_STEP_DOWNS times at most. A failing
+    first trial halves B down to 1. `burst` is the confirmed B or None.
+    """
+
+    JOIN_OK_SHARE = 0.99
+    GROW, GROW_NEAR = 1.5, 1.2
+    CONFIRMS = 3
+    MAX_STEP_DOWNS = 3
+    RESET_TIMEOUT_S = 30.0
+    RESOLVE_SLACK_S = 5.0
+
+    def __init__(self, actuator, state: BenchState, *, b0: int, join_max: Optional[int],
+                 join_bound_ms: float, trial_gap_s: float, base_s: float, **kw):
+        super().__init__(actuator, state, hold_s=base_s, confirm_s=base_s, **kw)
+        self.b0, self.join_max = b0, join_max
+        self.join_bound_ms, self.trial_gap_s, self.base_s = join_bound_ms, trial_gap_s, base_s
+        self.trials: list = []
+        self.burst: Optional[int] = None
+        self.confirmed = 0
+        self.cap_flag = ""
+        self.not_demonstrated: Optional[str] = None
+        self._sig: Optional[Signal] = None
+        self._no_data = 0
+        self._ended = False
+
+    async def _tick(self) -> Optional[Signal]:
+        """Wait a tick and observe; None once the run ends."""
+        state, a = self.state, self.actuator
+        if await self._wait_tick():
+            return None
+        if self.duration_s is not None and self._now() - self.t0 >= self.duration_s:
+            state.ceiling_reason = f"duration cap reached ({self.duration_s:.0f}s)"
+            state.stop.set()
+            return None
+        sig = self._sig = await a.observe()
+        self.samples += 1
+        state.received_data |= sig.rx_mbps > 0
+        self.latency_measured |= sig.latency_known
+        self._no_data = self._no_data + 1 if sig.rx_mbps <= 0 else 0
+        if self._no_data >= 3 * self._tpr:
+            state.failed = True
+            state.ceiling_reason = "no data received — subscribe failed or publisher stalled"
+            self._emit(sig, "ABORT: rx=0", force=True)
+            state.stop.set()
+            return None
+        self._tally(sig)
+        await a.apply(a.max_level)    # reconcile: spawns the next worker
+        return sig
+
+    def _why(self, sig: Signal, lost0: int) -> Optional[str]:
+        if sig.rx_mbps <= 0:
+            return "no data"
+        return self._fault(sig, self._control_p90(sig), lost0)
+
+    def _give_up(self, reason: str) -> None:
+        self.not_demonstrated, self._ended = reason, True
+        self._finish(self._sig, f"not demonstrated: {reason}")
+
+    def _cap(self) -> int:
+        pool = self.actuator.eligible_total
+        return pool if self.join_max is None else min(self.join_max, pool)
+
+    async def run(self):
+        await self.actuator.apply(self.actuator.max_level)
+        if await self._base():
+            await self._search()
+        if self.burst is None and self.not_demonstrated is None:
+            self.not_demonstrated = "run ended"
+
+    async def _base(self) -> bool:
+        a, since = self.actuator, None
+        lost0 = a.lost_total[0]
+        while True:
+            sig = await self._tick()
+            if sig is None:
+                return False
+            if not a.settled():
+                lost0 = a.lost_total[0]
+                self._emit(sig, "settle")
+                continue
+            why = self._why(sig, lost0)
+            if why:
+                self.not_demonstrated = f"base audience did not hold: {why}"
+                self._finish(sig, f"not demonstrated: base audience did not hold ({why})")
+                return False
+            since = since or self._now()
+            if self._now() - since >= self.base_s:
+                return True
+            self._emit(sig, "base")
+
+    async def _trial(self, b: int) -> JoinTrial:
+        """Run one trial and the reset after it; sets _ended if the run ends."""
+        a = self.actuator
+        tr = JoinTrial(b, self.join_bound_ms)
+        self.trials.append(tr)
+        lost0 = a.lost_total[0]
+        t0 = a.start_trial(b)
+        self._emit(self._sig, f"trial B={b}", force=True)
+        from aiomoqt.utils.workers import JOIN_TIMEOUT_S
+        deadline = t0 + JOIN_TIMEOUT_S + self.RESOLVE_SLACK_S
+        while True:
+            sig = await self._tick()
+            if sig is None:
+                tr.fault, self._ended = "run ended", True
+                return tr
+            tr.fault = tr.fault or self._why(sig, lost0)
+            view = a.trial_view()
+            if view['resolved'] or self._now() >= deadline:
+                break
+            self._emit(sig, f"trial B={b}")
+        tr.judge(view['joins'], self.JOIN_OK_SHARE)
+        self._emit(sig, f"B={b} " + ("passed" if tr.passed else f"failed ({tr.fault})"),
+                   force=True)
+        await self._reset(b)
+        return tr
+
+    async def _reset(self, b: int) -> None:
+        """Wait for the watchers to run clean for trial_gap_s."""
+        a, start, clean = self.actuator, self._now(), None
+        lost0 = a.lost_total[0]
+        while True:
+            sig = await self._tick()
+            if sig is None:
+                self._ended = True
+                return
+            now = self._now()
+            if self._why(sig, lost0):
+                clean, lost0 = None, a.lost_total[0]
+            else:
+                clean = clean or now
+            if clean is not None and now - clean >= self.trial_gap_s:
+                return
+            if now - start >= self.RESET_TIMEOUT_S:
+                self._give_up(f"relay did not recover after B={b}")
+                return
+            self._emit(sig, "reset")
+
+    async def _search(self) -> None:
+        b, failed_b = self.b0, None
+        while True:
+            cap = self._cap()
+            if cap <= 0:
+                self._give_up("no eligible joiners")
+                return
+            b = min(b, cap)
+            last = await self._trial(b)
+            if self._ended:
+                return
+            if last.passed:
+                break
+            if b <= 1:
+                self._give_up(f"B=1 failed: {last.fault}")
+                return
+            failed_b, b = b, max(1, b // 2)
+        lo, hi, capped = b, failed_b, False
+        while hi is None:
+            cap = self._cap()
+            if lo >= cap:
+                capped = True
+                break
+            near = _pctl(last.first_ms, 99) > 0.5 * self.join_bound_ms
+            nxt = min(max(math.ceil(lo * (self.GROW_NEAR if near else self.GROW)), lo + 1), cap)
+            last = await self._trial(nxt)
+            if self._ended:
+                return
+            lo, hi = (nxt, hi) if last.passed else (lo, nxt)
+        while hi is not None and hi - lo > max(1, math.ceil(0.1 * lo)):
+            mid = (lo + hi) // 2
+            last = await self._trial(mid)
+            if self._ended:
+                return
+            lo, hi = (mid, hi) if last.passed else (lo, mid)
+        for downs in range(self.MAX_STEP_DOWNS + 1):
+            for _ in range(self.CONFIRMS):
+                last = await self._trial(lo)
+                if self._ended:
+                    return
+                if not last.passed:
+                    break
+            else:
+                self.burst, self.confirmed = lo, self.CONFIRMS
+                if capped:
+                    at_max = self.join_max is not None and lo >= self.join_max
+                    self.cap_flag = " (at --join-max)" if at_max else " (pool-limited)"
+                self._finish(self._sig, f"join burst of {lo} confirmed{self.cap_flag}")
+                return
+            hi, lo, capped = lo, max(1, math.floor(lo * 0.9)), False
+        self._give_up(f"confirmation failed after {self.MAX_STEP_DOWNS} step(s) down")
 
 
 async def run_loopback_server(args, state: BenchState):
@@ -1451,17 +2270,21 @@ def parse_args():
                    dest="group_size", action=_cli.StoreGiven,
                    help="objects per group (default: 4096)")
     _cli.add_video(p)
+    _cli.add_side_tracks(p)
+    p.add_argument("-D", "--datagram", action=_cli.StoreTrueGiven,
+                   help="With --video --audio: the audio track as "
+                        "ObjectDatagrams")
     p.add_argument("--start-mbps", type=float, default=10.0,
                    help="initial aggregate bitrate (default: 10)")
     p.add_argument("--step-mbps", type=float, default=10.0,
                    help="ramp step size (default: 10)")
     p.add_argument("--max-mbps", type=float, default=10000.0,
-                   help="bw-mode cap; the run ends on reaching it "
+                   help="bw-mode cap; the run holds there until -t "
                         "(default: 10000)")
     p.add_argument("--interval", type=float, default=5.0,
                    metavar="S", help="controller tick period seconds (default: 5)")
-    p.add_argument("--draft", type=parse_draft_spec, default=None,
-                   help="MoQT draft version: 14, 16, or 18")
+    _cli.add_session(p)
+    _cli.add_keepalive(p)
     p.add_argument("-N", "--namespace", default="aiomoqt",
                    help="MoQT namespace (default: aiomoqt)")
     p.add_argument("-T", "--trackname", default=None,
@@ -1494,8 +2317,6 @@ def parse_args():
                         "Splitting across hosts is subs-mode only: there "
                         "the publisher is fixed-rate and the whole "
                         "control loop lives on the subscriber side.")
-    p.add_argument("-k", "--insecure", action="store_true",
-                   help="skip TLS verification")
     p.add_argument("--cert", default=CERT)
     p.add_argument("--key", default=KEY)
     p.add_argument("--report", metavar="PATH",
@@ -1504,6 +2325,11 @@ def parse_args():
                    metavar="MS", dest="latency_threshold",
                    help="p90 latency SLA in ms; back off after 2 intervals "
                         "over (default: 100)")
+    p.add_argument("--too-far-behind", type=float, default=0.0, metavar="SEC",
+                   dest="too_far_behind",
+                   help="subs mode: back off on the share of viewers more than "
+                        "SEC behind, over 5%%, instead of on the worst viewer's "
+                        "p90; a viewer past it resubscribes (default: off)")
     p.add_argument("--backoff-factor", type=float, default=0.9,
                    dest="backoff_factor", metavar="F",
                    help="multiplicative back-off factor on ceiling signal "
@@ -1519,26 +2345,26 @@ def parse_args():
     p.add_argument("--step-subs", type=int, default=1,
                    help="subs-mode: subscribers per group (default: 1). "
                         "Also the batch size: one worker process hosts a "
-                        "group of this many self-healing subscriptions.")
+                        "group of this many self-healing subscriptions on one "
+                        "picoquic thread, each with its own source port.")
     p.add_argument("--max-subs", type=int, default=200,
-                   help="subs-mode: cap; the run ends on reaching it "
+                   help="subs-mode: cap; the run holds there until -t "
                         "(default: 200)")
     p.add_argument("--sub-mbps", type=float, default=10.0,
                    action=_cli.StoreGiven,
                    help="subs-mode: fixed per-track publisher bitrate "
                         "(default: 10 Mbps; with --video, the profile's)")
-    p.add_argument("-j", "--join-rate", type=float, default=None,
-                   dest="join_rate", metavar="SEC",
-                   help="subs-mode: seconds between subscriber GROUPS "
-                        "(a group = --step-subs subs). The ramp cadence, "
-                        "independent of --interval (reporting). Default: "
-                        "--interval (one group per report).")
-    p.add_argument("-S", "--stagger", type=float, default=0.1,
-                   help="subs-mode: seconds between individual joins "
-                        "WITHIN a group (default: 0.1), applied inside "
-                        "the worker as it opens its batch. Spaces QUIC "
-                        "Initials so a group doesn't burst the relay. "
-                        "0 = open the batch simultaneously.")
+    p.add_argument("-R", "--ramp-rate", type=float, default=None, metavar="SUBS/S",
+                   help="subs-mode: new subscribers per second, added one "
+                        "group (--step-subs) at a time. Default: one group "
+                        "per --interval.")
+    p.add_argument("--spread", type=float, default=None, metavar="F",
+                   help="with --ramp-rate: share of each group's slot, 0 to "
+                        "1, its joins spread over. 1 (default) spaces joins "
+                        "evenly; 0 opens the group at once.")
+    p.add_argument("-j", type=float, default=None, dest="group_interval",
+                   help=argparse.SUPPRESS)
+    p.add_argument("-S", "--stagger", type=float, default=None, help=argparse.SUPPRESS)
     # CLI names from FilterType enum: kebab-case of the member name.
     # NEXT_GROUP_START → next-group-start, LATEST_OBJECT → latest-object,
     # etc. ABSOLUTE_START/RANGE are enumerated here but rejected below
@@ -1553,39 +2379,49 @@ def parse_args():
                         "'next-group-start' skips current-group replay "
                         "some relays do on latest-object.")
     p.add_argument("-d", "--debug", action="store_true")
-    p.add_argument("-t", "--duration", type=float, default=None,
+    p.add_argument("-t", "--duration", type=float, default=0,
                    metavar="SECONDS",
-                   help="hard wall-clock cap; controller exits after "
-                        "this many seconds even if --max-mbps / --max-subs "
-                        "hasn't been reached. Useful for fixed-budget "
-                        "regression runs.")
-    p.add_argument("--keylogfile", default=None,
-                   help="TLS secrets log path (NSS Key Log Format) for "
-                        "Wireshark decryption of pcap captures. Each MP "
-                        "worker (publisher / subscriber) gets a "
-                        "process-suffixed file: PATH.pub.<pid>, "
-                        "PATH.sub.<pid> — combined when decrypting.")
-    p.add_argument("--cc-algo", type=str, default="bbr",
-                   help="Congestion control (bbr | bbr1 | c4 | cubic | "
-                        "dcubic | fast | newreno | prague). Default: bbr")
-    p.add_argument("--keepalive", type=float, default=None, metavar="SEC",
-                   help="QUIC keep-alive interval in seconds (PING) so a "
-                        "flow-controlled, consumer-stalled connection "
-                        "isn't dropped on the idle timeout. Default: off.")
-    p.add_argument("--max-queued-bytes", type=int, default=None,
-                   help="Aggregate publisher byte budget across ALL "
-                        "streams (QuicConfiguration.tx_max_queued_bytes): "
-                        "producer parks at stream rollover while total "
-                        "un-transmitted TX bytes exceed this. "
-                        "Steady-state latency ~ value / throughput. "
-                        "Default: aiopquic default (4 MiB). "
-                        "Pass 0 to disable.")
-    p.add_argument("--max-inflight-bytes", type=int, default=None,
-                   help="Per-stream TX budget (aiomoqt "
-                        "tx_max_inflight_bytes): producer pauses while "
-                        "one stream's un-transmitted bytes exceed this. "
-                        "Default: aiomoqt default (1 MiB). "
-                        "Pass 0 to disable.")
+                   help="run time; the run ends after this many seconds, "
+                        "holding at --max-mbps / --max-subs once there. "
+                        "0 (default): until Ctrl-C.")
+    p.add_argument("--exit", dest="exit_on", choices=("max", "sustained"),
+                   default=None, metavar="COND",
+                   help="also end the run on COND; -t still applies. max: "
+                        "on reaching --max-mbps / --max-subs, without "
+                        "holding there, or at the first back-off if that "
+                        "comes sooner. sustained (with --hold): once the "
+                        "level is confirmed.")
+    p.add_argument("--hold", type=float, default=0, metavar="SEC",
+                   help="subs-mode: step and hold instead of ramping. Hold "
+                        "each step SEC seconds, drop back to the last passing "
+                        "level on the first bad tick, confirm it for "
+                        "--confirm, then hold it to the end (default: 0, ramp)")
+    p.add_argument("--confirm", type=float, default=30, metavar="SEC",
+                   help="with --hold: seconds the final level must hold "
+                        "to count (default: 30)")
+    p.add_argument("--join-burst", type=int, default=None, metavar="B0",
+                   help="subs-mode: find the largest burst of subscribers joining "
+                        "at once. Hold --max-subs for --base-s, then have B "
+                        "joiners redial together, from B0 up, bisecting after "
+                        "the first failure and confirming 3x; --start-subs is "
+                        "ignored (default: off)")
+    p.add_argument("--join-max", type=int, default=None, metavar="N",
+                   help="with --join-burst: largest burst to try (default: the "
+                        "eligible joiner pool)")
+    p.add_argument("--join-bound", type=float, default=1000, metavar="MS",
+                   help="with --join-burst: a join counts only with its first "
+                        "object within MS of the burst (default: 1000)")
+    p.add_argument("--trial-gap", type=float, default=5, metavar="SEC",
+                   help="with --join-burst: seconds the watchers must run clean "
+                        "between bursts; with --hold: seconds with no subscribers "
+                        "after a failure (default: 5)")
+    p.add_argument("--base-s", type=float, default=30, metavar="SEC",
+                   help="with --join-burst: seconds the base audience must "
+                        "hold first (default: 30)")
+    p.add_argument("--watchers", type=float, default=0.25, metavar="SHARE",
+                   help="with --join-burst: share of each group's subscribers "
+                        "never cycled, whose health the bursts are judged on; "
+                        "the rest join (default: 0.25)")
     _cli.add_logging(p)
     _cli.add_help(p)
     args = p.parse_args()
@@ -1597,6 +2433,58 @@ def parse_args():
                 "cannot be "
                 "combined with a URL — a URL says where to dial, "
                 "loopback options say what to bind")
+
+    if args.duration < 0:
+        p.error("-t/--duration: seconds, or 0 for no limit")
+    if args.too_far_behind < 0:
+        p.error("--too-far-behind: seconds, or 0 for off")
+    if args.too_far_behind and args.mode != "subs":
+        p.error("--too-far-behind is subs-mode only")
+    if args.exit_on == "max" and args.role == "pub":
+        p.error("--exit max: --role pub has no max to reach")
+    if args.hold < 0 or args.confirm <= 0:
+        p.error("--hold and --confirm: seconds")
+    if min(args.trial_gap, args.base_s, args.join_bound) <= 0:
+        p.error("--trial-gap, --base-s and --join-bound: positive")
+    if not 0 < args.watchers < 1:
+        p.error("--watchers: a share between 0 and 1")
+    if args.ramp_rate is not None and args.ramp_rate <= 0:
+        p.error("--ramp-rate: new subscribers per second, above 0")
+    if args.ramp_rate is not None and args.mode != "subs":
+        p.error("--ramp-rate is subs-mode only")
+    if args.spread is not None and args.ramp_rate is None:
+        p.error("--spread needs --ramp-rate")
+    if args.spread is not None and not 0 <= args.spread <= 1:
+        p.error("--spread: a share from 0 to 1")
+    if args.ramp_rate is not None and (args.group_interval is not None
+                                       or args.stagger is not None):
+        p.error("--ramp-rate replaces -j and -S/--stagger; drop them")
+    if args.ramp_rate is not None:
+        args.group_interval = args.step_subs / args.ramp_rate
+        args.stagger = (1.0 if args.spread is None else args.spread) / args.ramp_rate
+    elif args.stagger is None:
+        args.stagger = 0.1
+    if args.join_burst is not None:
+        if args.join_burst < 1:
+            p.error("--join-burst: a burst of at least 1")
+        if args.join_max is not None and args.join_max < args.join_burst:
+            p.error("--join-max: at least --join-burst")
+        if args.mode != "subs":
+            p.error("--join-burst is subs-mode only")
+        if args.hold:
+            p.error("--join-burst runs its own trials; drop --hold")
+        if args.exit_on:
+            p.error("--join-burst ends with its result; drop --exit")
+        if args.too_far_behind:
+            p.error("--join-burst judges each viewer's p90; drop --too-far-behind")
+    if args.hold and args.mode != "subs":
+        p.error("--hold is subs-mode only")
+    if args.hold and args.exit_on == "max":
+        p.error("--hold confirms its own end; use --exit sustained, not max")
+    if args.exit_on == "sustained" and not args.hold:
+        p.error("--exit sustained needs --hold")
+    if args.hold and args.too_far_behind:
+        p.error("--hold judges each viewer's p90; drop --too-far-behind")
 
     # Splitting the run across hosts is subs-mode only. In subs mode the
     # publisher is fixed-rate and the controller's only actuator is the
@@ -1616,6 +2504,8 @@ def parse_args():
     # carries their clock offset, so the controller acts on p90 over a
     # running baseline instead (AIMDController skew_safe).
     args.skew_safe_signals = args.role != "both"
+    if args.too_far_behind and args.skew_safe_signals:
+        p.error("--too-far-behind reads absolute latency, so it needs --role both")
 
     args.sub_filter = filter_choices[args.sub_filter]
     if args.sub_filter in (FilterType.ABSOLUTE_START,
@@ -1627,6 +2517,9 @@ def parse_args():
     if not args.pub_ns and not args.pub_both:
         args.pub_both = True
 
+    _cli.check_side_tracks(p, args)
+    if args.datagram:
+        p.error("-D applies only with --video --audio")
     if args.trackname is None:
         args.trackname = f"adaptive-bench-{uuid.uuid4().hex[:4]}"
 
@@ -1638,7 +2531,8 @@ def parse_args():
         if "sub_mbps" in _cli.given(args):
             p.error("--video sets the track's bitrate; drop --sub-mbps")
         _cli.check_video(p, args)
-        args.sub_mbps = args.object_size * 8 * args.video_fps / 1e6
+        args.sub_mbps = (args.object_size * 8 * args.video_fps / 1e6
+                         + _cli.side_tracks_mbps(args.side_tracks))
 
     args.scenario = Scenario(
         object_size=args.object_size,
@@ -1656,7 +2550,8 @@ def _video_cfg(args) -> dict:
     """Worker config keys for a --video publisher; empty without one."""
     if not args.video:
         return {}
-    return dict(video=args.video, video_fps=args.video_fps)
+    return dict(video=args.video, video_fps=args.video_fps,
+                side_tracks=args.side_tracks)
 
 
 def _print_banner(args):
@@ -1691,6 +2586,18 @@ def _print_banner(args):
     if args.mode == "subs":
         cli_name = args.sub_filter.name.lower().replace("_", "-")
         print(f"  subscribe filter:   {cli_name}")
+    if args.too_far_behind:
+        print(f"  too far behind:     {args.too_far_behind:g} s, back off over "
+              f"{BEHIND_SHARE:.0%} of viewers")
+    if getattr(args, "hold", 0):
+        print(f"  step and hold:      {args.hold:g} s per step, "
+              f"{args.confirm:g} s to confirm")
+    if getattr(args, "join_burst", None):
+        top = f"B={args.join_max}" if args.join_max else "the pool"
+        print(f"  join search:        {args.max_subs} subs (--start-subs ignored) held "
+              f"{args.base_s:g} s, then bursts from B={args.join_burst} to {top}, "
+              f"bound {args.join_bound:g} ms, gap {args.trial_gap:g} s, "
+              f"{args.watchers:.0%} watchers")
     print(f"  latency threshold:  {args.latency_threshold:.0f} ms"
           + (" over baseline (split hosts)" if args.skew_safe_signals
              else ""))
@@ -1700,24 +2607,82 @@ def _print_banner(args):
     print()
 
 
+def latency_unmeasured(state: BenchState, controller) -> bool:
+    """Data flowed but no interval had a latency sample, so no level the
+    controller reached is latency-qualified."""
+    return state.received_data and not controller.latency_measured
+
+
 def _print_summary(state: BenchState, controller, samples: int, args):
     unit = controller.actuator.unit
+    unmeasured = latency_unmeasured(state, controller)
+    qual = " — throughput only, latency unmeasured" if unmeasured else ""
     print()
     print("═" * 68)
     if unit == "Mbps":
         from aiomoqt.utils.format import fmt_bps
         print(f"  High-water:  {fmt_bps(controller.high_water * 1e6)} "
-              f"(rx delivered)")
-    else:
-        print(f"  High-water:  {controller.high_water:.1f} {unit}")
-    if controller.pivots:
+              f"(rx delivered){qual}")
+    elif not isinstance(controller, HoldController):
+        print(f"  High-water:  {controller.high_water:.1f} {unit}{qual}")
+    if unmeasured:
+        print("  Latency:     unmeasured — no object carried a usable "
+              "send timestamp")
+    if isinstance(controller, JoinSearchController):
+        for trial in controller.trials:
+            print(trial.line())
+        if controller.burst is not None:
+            print(f"  Join burst:  {controller.burst} subscribers at once "
+                  f"(confirmed {controller.confirmed}x){controller.cap_flag}")
+        else:
+            print(f"  Join burst:  not demonstrated "
+                  f"({controller.not_demonstrated or 'run ended'})")
+    elif isinstance(controller, HoldController):
+        if controller.sustained:
+            level, p90 = controller.sustained
+            print(f"  Sustained:   {level:.0f} {unit}, held "
+                  f"{controller.held_s:.0f} s, p90 max {p90:.0f} ms, "
+                  f"0 objects lost")
+        else:
+            print("  Sustained:   not demonstrated")
+            if controller.last_pass is not None:
+                print(f"  Last step:   {controller.last_pass:.0f} {unit} held "
+                      f"{controller.hold_s:g} s, unconfirmed")
+    elif controller.pivots:
         print(f"  Equilibrium: {controller.eq_level:.1f} {unit} "
               f"({len(controller.pivots)} pivots)")
+    elif controller.held_at_max:
+        print(f"  Equilibrium: not reached — held at max "
+              f"{controller.actuator.max_level:g} {unit} with no back-off")
     else:
         print("  Equilibrium: not reached — no ramp/back-off pivot "
               "(ended while still climbing)")
     if state.ceiling_reason:
         print(f"  Reason:      {state.ceiling_reason}")
+    refused = getattr(controller.actuator, 'refused_total', 0)
+    if refused:
+        print(f"  Refused:     {refused} subscribes by the relay "
+              f"({controller.actuator.refused_reason})")
+    lost_total = getattr(controller.actuator, 'lost_total', None)
+    if lost_total is not None:
+        lost, got = lost_total
+        pct = 100 * lost / (lost + got) if lost + got else 0.0
+        print(f"  Lost:        {lost} objects ({pct:.2f}%), whole groups "
+              f"included")
+        for what, (n, of) in (("losing objects", controller.peak_lossy),
+                              ("over the threshold", controller.peak_late),
+                              ("missing a track", controller.peak_starved)):
+            if n:
+                print(f"  Not counted: peak {n} of {of} subscribers {what}")
+    if controller.wanted_mbps:
+        print(f"  Delivered:   "
+              f"{100 * controller.delivered_mbps / controller.wanted_mbps:.1f}% "
+              f"of the subscribed viewers' rate")
+    if controller.too_far_behind:
+        behind, of = controller.peak_behind
+        print(f"  Too far behind: peak {behind} of {of} viewers, "
+              f"{getattr(controller.actuator, 'resubscribed_total', 0)} "
+              f"resubscribes")
     print(f"  Samples:     {samples}")
     print(f"  Host:        {cpu_summary()}")
     print("═" * 68)
@@ -1753,6 +2718,8 @@ async def _run_fixed_publisher(args) -> int:
           f"at {args.sub_mbps} Mbps; run the subscriber host with:")
     shape = (f"--video {args.video} -g {args.group_size}" if args.video
              else f"--sub-mbps {args.sub_mbps}")
+    for name, *_ in args.side_tracks:
+        shape += f" --{name}"
     print(f"    moq-adaptive-bench {args.relay_url} --mode subs "
           f"--role sub -N {args.namespace} -T {args.trackname} {shape}")
     published = failed = interrupted = False
@@ -1825,12 +2792,14 @@ async def main():
     if args.report:
         csv_file = open(args.report, "w", newline="")
         csv_writer = csv.writer(csv_file)
-        # bw: the subscriber's windowed latency; subs: the worst slot's.
+        # bw: the subscriber's windowed latency; subs: the worst slot's in
+        # the last reports, and tick_p90_ms across the tick (acted on).
         lat_cols = (["win_mean_ms", "win_p90_ms"] if args.mode == "bw"
                     else ["worst_mean_ms", "worst_p90_ms"])
         csv_writer.writerow([
             "t_monotonic", "target_mbps", "tx_mbps", "rx_mbps",
             *lat_cols, "loss_pct", *CPU_FIELDS,
+            *([] if args.mode == "bw" else ["tick_p90_ms"]),
         ])
 
     mp_cleanup_queues: list = []
@@ -1857,11 +2826,21 @@ async def main():
             start_subs=args.start_subs, step_subs=args.step_subs,
             object_size=args.scenario.object_size,
             per_sub_mbps=args.sub_mbps,
+            side_tracks=args.side_tracks,
             sub_filter=args.sub_filter,
             interval_s=args.scenario.interval_s,
             stagger=args.stagger,
             shortfall_ratio=args.shortfall_ratio,
             transport_options=_cli.transport_kwargs(args),
+            too_far_behind=args.too_far_behind,
+            # Split hosts: absolute latency carries their clock offset.
+            slot_latency_ms=(0.0 if args.skew_safe_signals
+                             else args.too_far_behind * 1000
+                             or args.latency_threshold),
+            join_burst=args.join_burst is not None,
+            watchers=args.watchers,
+            sparse_tracks=('catalog',) if args.catalog else (),
+            lat_min_us=SKEW_LAT_MIN_US if args.skew_safe_signals else None,
         )
     else:
         # BW mode. SP loopback runs publisher + subscriber as in-process
@@ -1979,17 +2958,28 @@ async def main():
             mp_rate_queue=mp_rate_q, mp_events_queue=mp_events_q,
             mp_stop_event=mp_stop_event,
         )
-    # Subs mode adds a group (--step-subs) every --join-rate while rows
+    # Subs mode adds a group (--step-subs) every group interval while rows
     # print every --interval; BW mode ticks at --interval (tick_s=None).
-    controller = AIMDController(
+    hold = (dict(hold_s=args.hold, confirm_s=args.confirm, reset_gap_s=args.trial_gap,
+                 exit_sustained=args.exit_on == "sustained")
+            if args.hold else {})
+    kind = HoldController if hold else AIMDController
+    if args.join_burst is not None:
+        kind, hold = JoinSearchController, dict(
+            b0=args.join_burst, join_max=args.join_max, join_bound_ms=args.join_bound,
+            trial_gap_s=args.trial_gap, base_s=args.base_s)
+    controller = kind(
         actuator, state,
+        **hold,
         interval_s=args.scenario.interval_s,
         writer=csv_writer,
         latency_threshold_ms=args.latency_threshold,
         backoff_factor=args.backoff_factor,
         duration_s=args.duration,
-        tick_s=(args.join_rate if args.mode == "subs" else None),
+        exit_at_max=args.exit_on == "max",
+        tick_s=(args.group_interval if args.mode == "subs" else None),
         skew_safe=args.skew_safe_signals,
+        too_far_behind=bool(args.too_far_behind),
     )
 
     server = None

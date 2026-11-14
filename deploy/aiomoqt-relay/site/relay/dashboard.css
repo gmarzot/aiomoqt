@@ -35,20 +35,26 @@ code {
   margin-right: 9px; vertical-align: -2px;
 }
 .facts.first { display: flex; flex-direction: column; align-self: stretch; }
-.facts .badge-version { align-self: flex-start; margin-bottom: 8px; }
+/* Boxed text starts on the labels' edge; border and padding sit outside it. */
+.badge-row {
+  display: flex; flex-wrap: wrap; align-items: baseline; row-gap: 2px; margin: 0 0 8px -9px;
+}
+.facts.first .mono { grid-template-columns: 9ch minmax(0, 1fr); }
 .badge-version {
   background: #1d1a10; color: var(--gold); border: 1.5px solid var(--gold); border-radius: 6px;
-  padding: 3px 12px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
+  padding: 3px 8px; font: 700 14px/1.4 "JetBrains Mono", ui-monospace, Menlo, Consolas,
   monospace; overflow-wrap: anywhere;
 }
 
+/* The gauges take what the facts leave, shrinking to 84 px before the header stacks. */
 .hero-grid {
-  display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content auto;
-  gap: 16px 32px; align-items: start;
+  display: grid; grid-template-columns: max-content max-content minmax(0, 1fr);
+  gap: 16px 28px; align-items: start;
 }
 /* UPTIME level with the last URL line. */
 .hero-grid > .facts:not(.first) { align-self: end; padding-bottom: 5px; }
-.hero-links { align-self: end; padding-bottom: 5px; }
+.facts.side { justify-self: start; }
+.hero-links { margin-left: auto; white-space: nowrap; }
 .mono {
   display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 1px 12px; margin: 0;
   font: 13px/1.45 "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
@@ -56,8 +62,10 @@ code {
 .mono dt { color: var(--gold); font-weight: 600; }
 .mono dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .facts .urls {
-  margin-top: auto; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
+  margin: auto 0 0 -9px; border: 1px solid var(--edge); border-radius: 6px; padding: 4px 8px;
 }
+#badge-version { white-space: nowrap; }
+.mono .nw { white-space: nowrap; }
 .urls { overflow-x: auto; }
 .urls dd { white-space: nowrap; overflow-wrap: normal; }
 .copyable {
@@ -73,11 +81,15 @@ code {
 }
 .toast[hidden] { display: none; }
 
-.gauges { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
-.gauge { margin: 0; width: 120px; text-align: center; }
-.gauge svg { display: block; width: 120px; height: 104px; }
+.gauges {
+  display: grid; grid-template-columns: repeat(4, minmax(84px, 120px)); gap: 8px;
+  justify-content: end;
+}
+.gauge { margin: 0; min-width: 0; text-align: center; }
+.gauge svg { display: block; width: 100%; height: auto; }
 .gauge figcaption {
   margin-top: -6px; font-size: 12px; font-weight: 600; color: var(--gold); letter-spacing: .08em;
+  white-space: nowrap;
 }
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
@@ -297,6 +309,7 @@ td.empty { color: var(--faint); text-align: center; padding: 14px; }
 .jumps { display: inline-flex; gap: 8px; }
 .jump b { font-weight: 600; }
 .jump-error:not(:disabled) b, .jump-crash:not(:disabled) b { color: var(--red); }
+.jump-warning:not(:disabled) b { color: var(--amber); }
 .log-pane {
   height: calc(100vh - 230px); min-height: 320px; overflow: auto; background: var(--field);
   border: 1px solid var(--edge); border-radius: 6px; padding: 6px 0;
@@ -329,12 +342,29 @@ footer {
 footer code { color: var(--dim); }
 footer [data-versions]:empty { display: none; }
 
+/* One stacked facts column: NAME, HOSTNAME, the host facts, then the URLs; gauges 2x2 beside it. */
+@media (max-width: 1119px) {
+  .hero-grid { grid-template-columns: max-content auto; justify-content: space-between; row-gap: 0; }
+  .hero-grid .facts { display: contents; }
+  .hero-grid .mono { grid-template-columns: 9ch minmax(0, 1fr); }
+  .hero-grid .badge-row { grid-area: 1 / 1; }
+  .facts.first .mono:not(.urls) { grid-area: 2 / 1; }
+  .facts.side .mono { grid-area: 3 / 1; }
+  .facts .urls { grid-area: 4 / 1; margin: 8px 0 0 -9px; justify-self: start; }
+  .gauges { grid-area: 1 / 2 / span 4; align-self: center; grid-template-columns: repeat(2, 120px); }
+}
 @media (max-width: 1100px) {
   .warn { white-space: normal; }
   .split { grid-template-columns: minmax(0, 1fr); }
   .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .hero-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .gauges { grid-column: 1 / -1; }
+}
+/* Gauges under the facts. */
+@media (max-width: 719px) {
+  .hero-grid { grid-template-columns: minmax(0, 1fr); }
+  .gauges {
+    grid-area: 5 / 1; grid-template-columns: repeat(4, minmax(0, 120px)); justify-content: start;
+    margin-top: 12px;
+  }
 }
 @media (max-width: 820px) {
   .platform-grid { grid-template-columns: minmax(0, 1fr); }
@@ -348,7 +378,8 @@ footer [data-versions]:empty { display: none; }
   .kv dt { margin-top: 6px; }
   .hero-grid { grid-template-columns: minmax(0, 1fr); }
   .gauges { justify-content: space-between; }
-  .gauge, .gauge svg { width: 22vw; max-width: 120px; }
+  .gauge, .gauge svg { width: 20vw; max-width: 120px; }
+  .gauge figcaption { font-size: 11px; letter-spacing: .03em; }
   .gauge svg { height: auto; }
   .mono { font-size: 13px; }
   /* Phones hide namespaces' Origin, Tracks, Peak and tracks' Peak, Groups/s, Latency. */

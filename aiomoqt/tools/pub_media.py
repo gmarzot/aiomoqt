@@ -14,6 +14,10 @@ audio, plus video from an mp4) to a relay.
   # the same broadcast to two relays: one process, one set of timestamps
   %(prog)s moqt://relay-a:4433/ moqt://relay-b:4433/ -N demo/live --mp4 clip.mp4
 
+  # an ABR ladder: video (with audio), video_1 and video_2, one altGroup
+  %(prog)s https://relay.example/ -N demo/abr --mp4 1080.mp4 --mp4 720.mp4 \\
+    --mp4 360.mp4 --loop --timestamp-mapping
+
 The video track sends the mp4's samples byte-for-byte as LOC canonical
 payloads (loc-02 §2.1.3); the avcC extradata rides the catalog
 initDataList and VIDEO_CONFIG group-start properties. Frames pace to
@@ -65,7 +69,7 @@ import time
 import traceback
 import uuid
 from fractions import Fraction
-from typing import NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Union
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.delivery import DatagramTooLarge
@@ -131,9 +135,13 @@ def parse_args():
         parser, namespace=f'aiomoqt/demo-{uuid.uuid4().hex[:4]}',
         namespace_help='MoQT namespace (default: aiomoqt/demo-<rand4>, '
                        'fresh per run; pass one explicitly to pin it)')
-    parser.add_argument('--mp4', type=str, default=None, metavar='FILE',
+    parser.add_argument('--mp4', action='append', default=None,
+                        metavar='FILE',
                         help='Publish this mp4\'s H.264, H.265 or AV1 track '
-                             'as video (samples pass through, no decode)')
+                             'as video (samples pass through, no decode). '
+                             'Repeatable: the first file gives the audio and '
+                             'track video, each further one a video-only '
+                             'track video_1, video_2, ...')
     parser.add_argument('--loop', action='store_true',
                         help='Loop the mp4 for the full duration')
     parser.add_argument('--h264', type=str, default=None, metavar='FILE',
@@ -143,7 +151,9 @@ def parse_args():
     parser.add_argument('--ts', type=str, default=None, metavar='FILE',
                         help='Publish a live MPEG-TS stream ("-" = stdin): '
                              'H.264 or H.265 video and AAC or Opus audio, '
-                             'stamped from the PES timestamps')
+                             'stamped from the PES timestamps. Each video '
+                             'stream is a track: video, video_1, ... in PMT '
+                             'order; audio is the first audio stream.')
     parser.add_argument('--input', type=str, default=None, metavar='URL',
                         help='Publish anything FFmpeg opens (HLS or DASH '
                              'playlist, file, ...) as CMAF tracks, paced '
@@ -206,10 +216,6 @@ def parse_args():
                              'of each group, and on every object with '
                              '--loc-codecstring. Default: wall-clock µs, '
                              'no TIMESCALE. 1000000 keeps µs values.')
-    parser.add_argument('--loc-bare', action='store_true',
-                        help='LOC payloads without the (empty) Private '
-                             'Properties block 0x0A 0x00, for receivers '
-                             'predating loc-04 §2.2')
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='PUBLISH_NAMESPACE only; the relay forwards '
@@ -234,10 +240,11 @@ def parse_args():
                              'sets in every key frame instead of '
                              'VIDEO_CONFIG or catalog initData; catalog '
                              'codec avc3/hev1')
-    parser.add_argument('--catalog-bitrate', type=int, default=None,
-                        metavar='BPS',
+    parser.add_argument('--catalog-bitrate', type=int, action='append',
+                        default=None, metavar='BPS',
                         help='Catalog bitrate of the video track (of audio '
-                             'when there is no video). Default: the '
+                             'when there is no video); repeat for each video '
+                             'track in order. Default: the '
                              'mp4\'s mean; --ts measures it, and the '
                              'catalog omits it until measured.')
     parser.add_argument('--catalog-audio-bitrate', type=int, default=None,
@@ -245,6 +252,15 @@ def parse_args():
                         help='Catalog bitrate of the audio track, with or '
                              'without video. Default: as for '
                              '--catalog-bitrate.')
+    parser.add_argument('--video-alt', choices=('one', 'each'), default=None,
+                        help='With several video tracks (--mp4, --ts): one '
+                             '= one catalog altGroup for all, a ladder '
+                             '(default); each = an altGroup per track, '
+                             'views')
+    parser.add_argument('--video-label', action='append', default=None,
+                        metavar='TEXT',
+                        help='Catalog label of a video track; repeat for '
+                             'each video track in order (--mp4, --ts)')
     parser.add_argument('--init-data', choices=('catalog', 'track', 'object'),
                         default=None,
                         help='LOC decoder config placement: catalog = '
@@ -318,7 +334,7 @@ def parse_args():
              'is up, anchor with --timestamp-mapping, stats every '
              '--stats interval, endpoint_lost, '
              'endpoint_up, done); human output goes to stderr')
-    _cli.add_run(parser, duration=30)
+    _cli.add_run(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
     _cli.add_fetch_history(parser)
@@ -351,7 +367,6 @@ def parse_args():
         parser.error('--loc-timescale must be positive')
     for flag, on in (('--loc-codecstring', args.loc_codecstring),
                      ('--annexb', args.annexb),
-                     ('--loc-bare', args.loc_bare),
                      ('--loc-timescale', args.loc_timescale)):
         if on and args.packaging != PACKAGING_LOC:
             parser.error(f'{flag} applies to LOC packaging only')
@@ -386,10 +401,20 @@ def parse_args():
             parser.error('--start-at needs --timestamp-mapping')
         if not (args.mp4 or args.ts):
             parser.error('--start-at applies to --mp4 and --ts')
-    for flag, bps in (('--catalog-bitrate', args.catalog_bitrate),
+    for flag, bps in (*(('--catalog-bitrate', b)
+                        for b in args.catalog_bitrate or ()),
                       ('--catalog-audio-bitrate', args.catalog_audio_bitrate)):
         if bps is not None and bps <= 0:
             parser.error(f'{flag} must be positive')
+    if not (args.mp4 or args.ts):
+        for flag, on in (('--video-alt', args.video_alt),
+                         ('--video-label', args.video_label)):
+            if on:
+                parser.error(f'{flag} applies to --mp4 and --ts only')
+        if len(args.catalog_bitrate or ()) > 1:
+            parser.error('--catalog-bitrate: several values need --mp4 or '
+                         '--ts')
+    args.video_alt = args.video_alt or 'one'
     if args.packaging != PACKAGING_LOC:
         for flag, on in (('--no-catalog', args.no_catalog),
                          ('--init-data', args.init_data not in
@@ -480,13 +505,44 @@ def _annexb_codec(codec: str) -> str:
     return {'avc1': 'avc3', 'hvc1': 'hev1'}.get(codec[:4], codec[:4]) + codec[4:]
 
 
+def _video_name(index: int) -> str:
+    """Track name of the index-th video track: video, video_1, ..."""
+    return f'video_{index}' if index else 'video'
+
+
+def _as_list(value) -> list:
+    """None, one value, or a list of them, as a list."""
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _check_video_counts(args, n_video: int) -> None:
+    """At most one --video-label and --catalog-bitrate per video track
+    (one bitrate without video: audio's)."""
+    labels = _as_list(getattr(args, 'video_label', None))
+    if len(labels) > n_video:
+        raise _usage_error(f'{len(labels)} --video-label values for '
+                           f'{n_video} video track(s)')
+    bps = _as_list(getattr(args, 'catalog_bitrate', None))
+    if len(bps) > max(n_video, 1):
+        raise _usage_error(f'{len(bps)} --catalog-bitrate values for '
+                           f'{n_video} video track(s)')
+
+
 def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
+    """`video`: None, one video view or a list, named video, video_1, ...
+    in order; several share one altGroup, or (--video-alt each) take one
+    each."""
     packaging = args.packaging
     chunkers = chunkers or {}
     tracks = []
     init = []
+    videos = _as_list(video)
     live_ts = bool(getattr(args, 'ts', None))
-    explicit = getattr(args, 'catalog_bitrate', None)
+    explicit = _as_list(getattr(args, 'catalog_bitrate', None))
+    labels = _as_list(getattr(args, 'video_label', None))
+    each = getattr(args, 'video_alt', None) == 'each'
     audio_bps = getattr(args, 'catalog_audio_bitrate', None)
     if audio is not None:
         # Opus over LOC needs no decoder description, so no initData.
@@ -497,7 +553,8 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=(audio_bps or (explicit if video is None else None)
+            bitrate=(audio_bps or (explicit[0] if explicit and not videos
+                                   else None)
                      or audio.avg_bitrate or (None if live_ts else 128_000)),
             initRef='a0' if a_init else None))
         if 'audio' in chunkers:
@@ -510,26 +567,30 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
             channelConfig=str(_CHANNELS),
             bitrate=audio_bps or _SAMPLERATE * _CHANNELS * 16))
-    if video is not None:
-        cmaf = 'video' in chunkers
+    for i, video in enumerate(videos):
+        name, ref = _video_name(i), f'v{i}'
+        cmaf = name in chunkers
         # Annex B: a decoder description would contradict the payload.
         annexb = _annexb_family(args, video) is not None
         v_config = None if annexb else video.config
-        tracks.insert(0, CatalogTrack(
-            name='video', packaging=packaging, isLive=True, role='video',
+        tracks.insert(i, CatalogTrack(
+            name=name, packaging=packaging, isLive=True, role='video',
+            label=labels[i] if i < len(labels) else None,
             renderGroup=1,
+            altGroup=None if len(videos) < 2 else i + 1 if each else 1,
             codec=(_annexb_codec(video.codec_string) if annexb
                    else video.codec_string),
             width=video.width, height=video.height,
             framerate=video.fps,
-            bitrate=(explicit or video.avg_bitrate
+            bitrate=((explicit[i] if i < len(explicit) else None)
+                     or video.avg_bitrate
                      or (None if live_ts else 2_000_000)),
-            initRef='v0' if (cmaf or v_config) else None))
+            initRef=ref if (cmaf or v_config) else None))
         if cmaf:
             init.append(InitData.from_bytes(
-                'v0', chunkers['video'].init_segment()))
+                ref, chunkers[name].init_segment()))
         elif v_config:
-            init.append(_init_data(args, 'v0', video.config,
+            init.append(_init_data(args, ref, video.config,
                                    LOC_PROP_VIDEO_CONFIG))
     if getattr(args, 'target_latency', None) is not None:
         for t in tracks:
@@ -687,7 +748,7 @@ class _LiveAudio:
 
 def _open_live_ts(args):
     """Read the stream until the PMT and the codec configs the catalog
-    needs are in; returns (fh, demuxer, units-so-far, video, audio)."""
+    needs are in; returns (fh, demuxer, units-so-far, [video], audio)."""
     fh = sys.stdin.buffer if args.ts == '-' else open(args.ts, 'rb')
     dmx = TsDemuxer()
     first = []
@@ -695,7 +756,7 @@ def _open_live_ts(args):
     def ready():
         if not dmx.pmt_seen:
             return False
-        if dmx.video_pid is not None and dmx.video.config is None:
+        if any(asm.config is None for asm in dmx.videos):
             return False
         want_audio = not args.no_audio and dmx.audio_pid is not None
         return not want_audio or dmx.audio_samplerate is not None
@@ -708,13 +769,13 @@ def _open_live_ts(args):
         if units and not first:
             dmx.to_us(units[0].pts)  # anchor at arrival, not at first send
         first += units
-    video = _LiveVideo(dmx.video) if dmx.video_pid is not None else None
+    videos = [_LiveVideo(asm) for asm in dmx.videos]
     audio = (_LiveAudio(dmx)
              if dmx.audio_pid is not None and not args.no_audio else None)
-    if video is None and audio is None:
+    if not videos and audio is None:
         raise _SourceError('  error: ts stream has no H.264/H.265 video or '
                            'AAC/Opus audio')
-    return fh, dmx, first, video, audio
+    return fh, dmx, first, videos, audio
 
 
 async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
@@ -723,20 +784,23 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     cat = pub.catalog_track.catalog
     init = {i.id: i for i in (cat.initDataList or [])
             if i.type == INIT_TYPE_INLINE} if cat is not None else {}
-    video = tracks.get('video')
-    if video is not None and dmx.video.config != video.config:
-        video.config = dmx.video.config
-        view = _LiveVideo(dmx.video)
+    for i, asm in enumerate(dmx.videos):
+        name, ref = _video_name(i), f'v{i}'
+        video = tracks.get(name)
+        if video is None or asm.config == video.config:
+            continue
+        video.config = asm.config
+        view = _LiveVideo(asm)
         codec = (_annexb_codec(view.codec_string) if video.annexb
                  else view.codec_string)
         if video.codec_string is not None:
             video.codec_string = codec
         for t in (cat.tracks if cat is not None else ()):
-            if t.name == 'video':
+            if t.name == name:
                 t.codec, t.width, t.height = codec, view.width, view.height
-        if 'v0' in init:
-            init['v0'].data = InitData.from_bytes('v0', view.config).data
-        print(f"  video config changed: {view.width}x{view.height} "
+        if ref in init:
+            init[ref].data = InitData.from_bytes(ref, view.config).data
+        print(f"  {name} config changed: {view.width}x{view.height} "
               f"{codec}")
     audio = tracks.get('audio')
     entry = cat.find('audio') if cat is not None else None
@@ -775,9 +839,9 @@ async def _apply_rates(rates: TsRates, args, pub) -> None:
         return
     for t in cat.tracks:
         if t.role == 'video' and t.framerate is None:
-            t.framerate = rates.fps
+            t.framerate = rates.framerates.get(t.name)
         if t.bitrate is None:
-            t.bitrate = rates.bps.get(t.role)
+            t.bitrate = rates.bps.get(t.name)
     await _republish(pub)
 
 
@@ -809,10 +873,10 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
         if [u for u in units if rates.add(u)]:
             await _apply_rates(rates, args, pub)
         for u in units:
-            track = tracks.get(u.kind)
+            track = tracks.get(u.track)
             if track is None:
                 continue
-            key = u.key
+            key, end = u.key, False
             stamp = dmx.to_us(u.pts)
             if wall0 is not None:
                 if stamp < wall0:
@@ -831,8 +895,9 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
                 else:
                     key = n_audio % audio_per_group == 0
                     n_audio += 1
-            await _send(track, stats[u.kind], u.payload, key,
-                        timestamp=stamp)
+                    end = n_audio % audio_per_group == 0
+            await _send(track, stats[u.track], u.payload, key,
+                        timestamp=stamp, end=end)
         if eof or time.monotonic() >= deadline:
             break
         chunk = await loop.run_in_executor(None, fh.read1, 65536)
@@ -1025,20 +1090,32 @@ class _Mp4Pass:
 
 
 def _mp4_passes(reader, audio, loop: bool, align: bool = False):
-    """(video, audio) _Mp4Pass of an mp4, None where absent, looping on
-    one period: the video track's presented duration, else audio's. With
-    `loop` and `align`, see _align_period."""
-    video = reader.video
-    lead = video or reader.audio
-    if lead is None:
-        return None, None
-    period = lead.presented_duration
-    passes = (_Mp4Pass(video, period, loop) if video else None,
-              _Mp4Pass(audio, period, loop, audio.samplerate)
-              if audio else None)
+    """(video, audio) _Mp4Pass of an mp4, None where absent; see
+    _mp4_ladder."""
+    videos, audio_pass = _mp4_ladder(
+        [reader.video] if reader.video else [], audio, loop, align)
+    return (videos[0] if videos else None), audio_pass
+
+
+def _mp4_ladder(videos: list, audio, loop: bool, align: bool = False):
+    """([video _Mp4Pass], audio _Mp4Pass or None) of mp4 tracks, looping
+    on one period: the shortest video track's presented duration, with a
+    WARNING when that trims a longer one, else audio's. With `loop` and
+    `align`, see _align_period."""
+    lead = videos or ([audio] if audio is not None else [])
+    if not lead:
+        return [], None
+    period = min(t.presented_duration for t in lead)
+    if loop and any(t.presented_duration != period for t in videos):
+        log.warning("--loop: video clips of %s s all loop on the shortest, "
+                    "%.3f s", ', '.join(f'{float(t.presented_duration):.3f}'
+                                        for t in videos), period)
+    passes = [_Mp4Pass(t, period, loop) for t in videos]
+    a_pass = (_Mp4Pass(audio, period, loop, audio.samplerate)
+              if audio is not None else None)
     if loop and align:
-        _align_period(*passes)
-    return passes
+        _align_period(passes, a_pass)
+    return passes, a_pass
 
 
 def _lcm(a: Fraction, b: Fraction) -> Fraction:
@@ -1047,18 +1124,19 @@ def _lcm(a: Fraction, b: Fraction) -> Fraction:
                     a.denominator * b.denominator)
 
 
-def _align_period(video: Optional[_Mp4Pass],
+def _align_period(videos: List[_Mp4Pass],
                   audio: Optional[_Mp4Pass]) -> None:
     """Trim the loop period to a whole number of the least common multiple
     of the video group and audio frame durations, so that every pass
     starts on both epoch grids; kept when the clip is shorter."""
     units = []
-    if video is not None and video.cadence:
-        c = video.cadence
-        units.append(Fraction(c.frame * c.per_group, c.timescale))
+    for video in videos:
+        if video.cadence:
+            c = video.cadence
+            units.append(Fraction(c.frame * c.per_group, c.timescale))
     if audio is not None and audio.cadence:
         units.append(Fraction(audio.cadence.frame, audio.cadence.timescale))
-    lead = video if video is not None else audio
+    lead = videos[0] if videos else audio
     if not units or lead is None:
         return
     unit = functools.reduce(_lcm, units)
@@ -1070,15 +1148,36 @@ def _align_period(video: Optional[_Mp4Pass],
                     "frame durations: loop seams carry OBJECT_TIMESTAMP",
                     period, unit)
         return
-    timed = video if video is not None and video.cadence else audio
+    timed = next((p for p in (*videos, audio)
+                  if p is not None and p.cadence), None)
     c = timed.cadence if timed is not None else None
     if c is not None and period - whole > Fraction(c.frame, c.timescale):
         log.warning("--loop: period trimmed from %.3f to %.3f s, a multiple "
                     "of %.3f s, so every pass starts on the group and frame "
                     "grids", period, whole, unit)
-    for p in (video, audio):
+    for p in (*videos, audio):
         if p is not None:
             p.trim(whole)
+
+
+def _check_cadences(passes: Dict[str, _Mp4Pass]) -> None:
+    """--timestamp-mapping: every video track on one frame duration and
+    GOP length in seconds, so their group and object IDs agree."""
+    def shape(p):
+        c = p.cadence
+        return c and (Fraction(c.frame, c.timescale), c.per_group)
+    shapes = {name: shape(p) for name, p in passes.items()}
+    if len(set(shapes.values())) < 2:
+        return
+
+    def fmt(s):
+        if s is None:
+            return 'no fixed cadence'
+        return f'{float(s[0]) * 1000:.3f} ms frames, {s[1]} per GOP'
+    raise _usage_error(
+        '--timestamp-mapping needs one frame duration and GOP length on '
+        'every video track: ' + '; '.join(
+            f'{name} {fmt(s)}' for name, s in shapes.items()))
 
 
 def _sample_us(source) -> int:
@@ -1109,11 +1208,13 @@ def _frindell_for(mp4: _Mp4Pass, per_group=None):
 
 
 def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str,
-                   per_group: int = 1) -> MediaTimestamps:
-    """MediaTimestamps for a --ts track: mapped from --ts-cadence at the
-    Unix epoch (audio on its frame size), else explicit."""
+                   per_group: int = 1, index: int = 0) -> MediaTimestamps:
+    """MediaTimestamps for a --ts track (video: the index-th): mapped from
+    --ts-cadence at the Unix epoch (audio on its frame size), else
+    explicit."""
     cadence = args.ts_cadence
-    if cadence is None or not any(u.kind == kind for u in first):
+    if cadence is None or not any(u.kind == kind and u.index == index
+                                  for u in first):
         return MediaTimestamps(0)
     if kind == 'audio':
         return cadence.audio_timestamps(
@@ -1124,7 +1225,7 @@ def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str,
 def _anchor_ts(dmx: TsDemuxer, first, video: bool, wall0) -> None:
     """Hold the --ts clock with the first video key frame, else the first
     audio frame, at `wall0`."""
-    units = [u for u in first if u.kind == ('video' if video else 'audio')]
+    units = [u for u in first if u.track == ('video' if video else 'audio')]
     if units:
         u = next((u for u in units if u.key), units[0])
         dmx.clock.anchor(u.pts, wall0)
@@ -1139,10 +1240,10 @@ async def _pace(start: float, ts_us: int, pace: bool):
 
 async def _send(track, stats, payload: bytes, key: bool,
                 timestamp: Optional[Union[int, Fraction]] = None,
-                group_id: Optional[int] = None):
+                group_id: Optional[int] = None, end: bool = False):
     """Send one frame, or drop it while no subscriber has started
     generation: a paced feeder stays on the clock instead of queueing a
-    backlog for a late joiner.
+    backlog for a late joiner. `end` makes it its group's last frame.
 
     LOC timestamps without a TIMESCALE property are µs since the Unix
     epoch — players schedule against the wall clock. Paced sources pass
@@ -1156,7 +1257,7 @@ async def _send(track, stats, payload: bytes, key: bool,
         timestamp = entry_us
     stamp = (timestamp * track.timescale // 1_000_000 if track.timescale
              else round_us(timestamp))
-    kw = {}
+    kw = {'end_of_group': True} if end else {}
     frindell = getattr(track, 'frindell', None)
     if frindell is not None:
         kw['capture_us'] = timestamp
@@ -1312,11 +1413,13 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
         at = _exact(ts + offset * 1_000_000)
         await _pace(start, round_us(at), not args.no_pace)
         capture = _exact(wall0 + at)
+        end = False
         if m is not None:
             key, group = m.group_of(capture) != group, m.group_of(capture)
         else:
             key = i % per_group == 0
-        await _send(track, stats, payload, key, timestamp=capture)
+            end = (i + 1) % per_group == 0
+        await _send(track, stats, payload, key, timestamp=capture, end=end)
     await track.finish()
 
 
@@ -1359,17 +1462,20 @@ async def _feed_mp4_track(track, mp4: _Mp4Pass, args,
                        else offset + base + mp4.period if loop else None)
                 payload = wrap(s, ts, None if nxt is None
                                else round(nxt * 1_000_000))
+            end = False
             if grid is not None:
                 key = grid.group_of(capture) != group
                 group = grid.group_of(capture)
             elif group_frames is not None:
                 key = n % group_frames == 0
                 n += 1
+                end = n % group_frames == 0
             else:
                 key = s.key_frame
             if prft and key:
                 payload = _with_prft(payload, round_us(capture))
-            await _send(track, stats, payload, key, timestamp=capture)
+            await _send(track, stats, payload, key, timestamp=capture,
+                        end=end)
         k += 1
         if not loop or k * mp4.period > args.duration:
             break
@@ -1558,56 +1664,70 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     libquicr = apply_compat(getattr(args, 'compat', ''))
     urls = args.url if isinstance(args.url, list) else [args.url]
     relays = [parse_relay_url(u) for u in urls]
-    reader = Mp4Reader(args.mp4) if args.mp4 else None
-    video = reader.video if reader else None
+    readers = [Mp4Reader(path) for path in args.mp4 or ()]
+    reader = readers[0] if readers else None
+    if len(readers) > 1:
+        for path, r in zip(args.mp4, readers):
+            if r.video is None:
+                raise _SourceError(f"  error: {path}: no video track")
+    videos = [r.video for r in readers if r.video is not None]
     live = _open_live_h264(args) if args.h264 else None
     if live:
-        video = live[3]
+        videos = [live[3]]
     ts = _open_live_ts(args) if args.ts else None
     ts_audio = None
     if ts:
-        video, ts_audio = ts[3], ts[4]
+        videos, ts_audio = ts[3], ts[4]
         if args.ts_cadence is not None:
             ts[1].clock.hold()
-            if video is not None:
-                video.fps = args.ts_cadence.framerate
+            for v in videos:
+                v.fps = args.ts_cadence.framerate
         if ts_audio is None:
             args.no_audio = True
+    video = videos[0] if videos else None
+    _check_video_counts(args, len(videos))
     mp4_audio = (reader.audio
                  if reader and not (args.tone or args.no_audio) else None)
     chunkers = {}
     if args.packaging != PACKAGING_LOC and not args.input:
-        chunkers['video'] = CmafChunker(video)
+        for i, v in enumerate(videos):
+            chunkers[_video_name(i)] = CmafChunker(v)
         if mp4_audio is not None:
             chunkers['audio'] = CmafChunker(mp4_audio)
         elif not args.no_audio:
             print(f"  note: {args.packaging} packaging — tone audio skipped "
                   "(no AAC or Opus track in the mp4)")
             args.no_audio = True
-    annexb = _annexb_family(args, video)
-    if args.annexb and annexb is None:
+    annexbs = [_annexb_family(args, v) for v in videos]
+    if args.annexb and (not annexbs or None in annexbs):
         print("  note: --annexb applies to H.264/H.265 video; off")
-    v_codec = (_annexb_codec(video.codec_string) if annexb
-               else video.codec_string if video is not None else None)
+    v_codecs = [_annexb_codec(v.codec_string) if a else v.codec_string
+                for v, a in zip(videos, annexbs)]
     ingest = await _open_ingest(args) if args.input else None
     if ingest is not None:
         catalog = _build_ingest_catalog(args, ingest)
     else:
-        catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
-    v_mp4, a_mp4 = (_mp4_passes(reader, mp4_audio, args.loop,
-                                args.timestamp_mapping)
-                    if reader else (None, None))
+        catalog = _build_catalog(args, videos, mp4_audio or ts_audio,
+                                 chunkers)
+    v_mp4s, a_mp4 = (_mp4_ladder(videos, mp4_audio, args.loop,
+                                 args.timestamp_mapping)
+                     if reader else ([], None))
+    if args.timestamp_mapping and len(v_mp4s) > 1:
+        _check_cadences({_video_name(i): p for i, p in enumerate(v_mp4s)})
     spf = _SAMPLERATE * _FRAME_MS // 1000
     a_per = _audio_per_group(
         args, _sample_us(mp4_audio) if mp4_audio is not None
         else _FRAME_MS * 1000)
     if ts is not None:
-        v_time = _ts_timestamps(args, ts[1], ts[2], 'video')
+        v_times = [_ts_timestamps(args, ts[1], ts[2], 'video', index=i)
+                   for i in range(len(videos))]
         a_time = _ts_timestamps(args, ts[1], ts[2], 'audio', a_per)
     else:
-        v_time = _frindell_for(v_mp4) if v_mp4 else MediaTimestamps(0)
+        v_times = [_frindell_for(p) for p in v_mp4s]
         a_time = (_frindell_for(a_mp4, a_per) if a_mp4 is not None
                   else MediaTimestamps(0, _SAMPLERATE, spf * a_per, spf))
+    # The first video track gives the run its grid and --start-at check.
+    v_time = v_times[0] if v_times else MediaTimestamps(0)
     # With --timestamp-mapping the run starts on the epoch grid of video,
     # else of audio.
     grid = (_grid(v_time if video is not None else None,
@@ -1650,8 +1770,6 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                  if args.audio_subgroups == 'object'
                  else StreamMapping.PER_GROUP)
         session = sessions[0]
-        # CMAF objects are not LOC: no Private Properties block.
-        loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
         cfg_at = _INIT_DATA[args.init_data][1]
 
         def _track(name, **kwargs):
@@ -1661,7 +1779,6 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 return LocmafTrackPublisher(session, args.namespace, name,
                                             init=init, **kwargs)
             return LocTrackPublisher(session, args.namespace, name,
-                                     loc_bare=loc_bare,
                                      timescale=args.loc_timescale,
                                      config_property=cfg_at, **kwargs)
         # One start for every paced feeder.
@@ -1694,20 +1811,21 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 _anchor_ts(dmx, first, video is not None and v_time.mapped,
                            wall0)
             tracks = {}
-            if video is not None:
-                tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
-                    session, args.namespace, 'video', config=video.config,
-                    mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+            for i, v in enumerate(videos):
+                name = _video_name(i)
+                tracks[name] = pub.add_track(_timed(LocTrackPublisher(
+                    session, args.namespace, name, config=v.config,
+                    mapping=v_map, loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(v_codec), annexb=annexb,
+                    codec_string=_cs(v_codecs[i]), annexb=annexbs[i],
                     fetch_history_bytes=args.fetch_history),
-                    v_time))
-                stats['video'] = _TrackStats()
+                    v_times[i]))
+                stats[name] = _TrackStats()
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
                     config=ts_audio.config, mapping=a_map,
-                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(ts_audio.codec_string),
                     fetch_history_bytes=args.fetch_history),
@@ -1743,25 +1861,27 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             feeders.append(_feed_h264_live(
                 pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    mapping=v_map, loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(v_codec), annexb=annexb,
+                    codec_string=_cs(v_codecs[0]), annexb=annexbs[0],
                     fetch_history_bytes=args.fetch_history),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
-        elif video is not None and v_mp4 is not None:
-            v_ck = chunkers.get('video')
-            stats['video'] = _TrackStats()
-            feeders.append(_feed_mp4_track(
-                pub.add_track(_timed(_track(
-                    'video', mapping=v_map,
-                    config=None if v_ck else video.config,
-                    loc01_compat=args.loc01_compat,
-                    codec_string=_cs(v_codec), annexb=annexb),
-                    v_time)),
-                v_mp4, args, stats['video'],
-                wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
-                clock=clock))
+        else:
+            for i, (v, v_mp4) in enumerate(zip(videos, v_mp4s)):
+                name = _video_name(i)
+                v_ck = chunkers.get(name)
+                stats[name] = _TrackStats()
+                feeders.append(_feed_mp4_track(
+                    pub.add_track(_timed(_track(
+                        name, mapping=v_map,
+                        config=None if v_ck else v.config,
+                        loc01_compat=args.loc01_compat,
+                        codec_string=_cs(v_codecs[i]), annexb=annexbs[i]),
+                        v_times[i])),
+                    v_mp4, args, stats[name],
+                    wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
+                    clock=clock))
         start = dict(announce_namespace=(args.pub_ns or args.pub_both),
                      publish_track=(not args.pub_ns or args.pub_both),
                      forward=args.forward)

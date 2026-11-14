@@ -35,7 +35,7 @@ def parse_args():
                         help='MoQT draft, or a comma list offered in order (default: '
                         f'{",".join(map(str, MOQT_DEFAULT_DRAFTS))})')
     parser.add_argument('--libquicr-compat', action='store_true', help='Use libquicr filter encoding (LAPS)')
-    parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
+    parser.add_argument('-t', '--duration', type=int, default=0, help='Duration in seconds (default: 120)')
     parser.add_argument('--subscribe-options', type=int, default=None,
                         help='d16 subscribe_namespace options: 0=PUBLISH, 1=NAMESPACE, 2=both')
     parser.add_argument('--cc-algo', type=str, default='bbr',
@@ -150,7 +150,7 @@ class SimpleStats:
 async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                use_quic: bool, debug: bool, quic_debug: bool, insecure: bool = False,
                auth_token: str = None, draft: int = None, libquicr_compat: bool = False,
-               duration: int = 120,
+               duration: int = 0,
                subscribe_options: int = None,
                cc_algo: str = 'bbr'):
     log_level = logging.DEBUG if debug else logging.INFO

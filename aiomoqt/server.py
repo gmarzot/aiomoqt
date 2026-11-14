@@ -10,6 +10,7 @@ from aiopquic.asyncio.dispatch import serve_dispatch
 from aiopquic.asyncio.webtransport import serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
+from .cat import CatAuth
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer, USER_AGENT)
 from .messages.data import DEFAULT_MAX_OBJECT_BYTES
@@ -90,15 +91,18 @@ class MOQTServer(MOQTPeer):
         tx_max_queued_bytes: Optional[int] = None,
         congestion_control_algorithm: Optional[str] = "bbr",
         congestion_control_options: Optional[str] = None,
+        packet_train_mode: bool = False,
         flow_control_window: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
         max_connections: Optional[int] = None,
+        workers: int = 1,
         implementation: Optional[str] = USER_AGENT,
         quiet_peers: Iterable[str] = (),
         max_filter_ranges: int = 0,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        auth: Optional[CatAuth] = None,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
                          implementation=implementation,
@@ -125,6 +129,8 @@ class MOQTServer(MOQTPeer):
         self.congestion_control_algorithm = congestion_control_algorithm
         # Algorithm option string, e.g. "Q0.02" for bbr.
         self.congestion_control_options = congestion_control_options
+        # Paced sends release up to 10 packets at once (picoquic train mode).
+        self.packet_train_mode = packet_train_mode
         # QUIC flow-control window, per stream and per connection; None = 16 MiB.
         self.flow_control_window = flow_control_window
         # QUIC keep-alive interval (seconds). None = disabled. PING
@@ -142,10 +148,16 @@ class MOQTServer(MOQTPeer):
         # Most connections held at once (aiopquic >= 0.5.1). None =
         # aiopquic default (256).
         self.max_connections = max_connections
+        # picoquic contexts sharing the port, one network thread each
+        # (aiopquic workers=, Linux).
+        self.workers = int(workers)
         # Sessions whose peer's SETUP names an implementation starting
         # with one of these log below WARNING at DEBUG (a health probe's
         # sessions, say).
         self.quiet_peers = tuple(quiet_peers)
+        # Requires a token in SETUP and checks requests against it; None
+        # admits everything.
+        self.auth = auth
         # MAX_FILTER_RANGES sent at d20+ (§9.1.6). Nonzero only where the
         # application applies Range Filters; 0 refuses them all.
         self.max_filter_ranges = int(max_filter_ranges)
@@ -181,6 +193,8 @@ class MOQTServer(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.congestion_control_options is not None:
                 cfg.congestion_control_options = self.congestion_control_options
+            if self.packet_train_mode:
+                cfg.packet_train_mode = True
             if self.flow_control_window is not None:
                 cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
@@ -200,6 +214,7 @@ class MOQTServer(MOQTPeer):
                 self.host, self.port,
                 configuration=cfg,
                 create_protocol=protocol,
+                **self._worker_args(),
             )
 
         # WebTransport mode (use_quic=False): serve_webtransport with
@@ -230,6 +245,8 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             wt_cfg.congestion_control_options = self.congestion_control_options
+        if self.packet_train_mode:
+            wt_cfg.packet_train_mode = True
         if self.flow_control_window is not None:
             wt_cfg.max_data = wt_cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
@@ -257,6 +274,7 @@ class MOQTServer(MOQTPeer):
             session_factory=factory,
             configuration=wt_cfg,
             wt_supported_protocols=wt_supported,
+            **self._worker_args(),
         )
 
     def serve_dual(self) -> Coroutine[Any, Any, Any]:
@@ -283,6 +301,8 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             cfg.congestion_control_options = self.congestion_control_options
+        if self.packet_train_mode:
+            cfg.packet_train_mode = True
         if self.flow_control_window is not None:
             cfg.max_data = cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
@@ -315,7 +335,12 @@ class MOQTServer(MOQTPeer):
             wt_handler=wt_handler,
             wt_session_factory=wt_factory,
             wt_supported_protocols=wt_supported,
+            **self._worker_args(),
         )
+
+    def _worker_args(self) -> dict:
+        # Omitted at 1, so an aiopquic without workers= still serves.
+        return {"workers": self.workers} if self.workers != 1 else {}
 
     def _adopt(self, session):
         self._live.add(session)

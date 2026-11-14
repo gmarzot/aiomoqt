@@ -5,7 +5,7 @@ Guide for agents using the installed `aiomoqt` package: an asyncio implementatio
 
 ## API boundary
 
-Import from `aiomoqt.client` (`MOQTClient`), `aiomoqt.server` (`MOQTServer`), `aiomoqt.track`
+Import from `aiomoqt.client` (`MOQTClient`, `SharedTransport`), `aiomoqt.server` (`MOQTServer`), `aiomoqt.track`
 (`PublishedTrack`, `SubscribedTrack`), `aiomoqt.delivery` (`StreamMapping`), `aiomoqt.media`
 (its `__all__`), `aiomoqt.types` (`MOQTMessageType`, `ParamType`, `SetupParamType`,
 `MOQTRequestError`), and `aiomoqt.messages` when building frames explicitly.
@@ -33,11 +33,11 @@ Console scripts: `moq-pub-bench`, `moq-sub-bench`, `moq-loopback-bench`, `moq-ad
 `moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-interop-client`,
 `moq-interop-relay`, `aiomoqt-versions`. Others run as modules: `python -m
 aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--input` ingest needs the `media` extra),
-`aiomoqt.tools.moqtest_origin`.
+`aiomoqt.tools.abr_ingest` (ABR ladder; needs the `abr` extra), `aiomoqt.tools.moqtest_origin`.
 
 Most tools share one flag grid from `aiomoqt.utils.cli` (listed in its module docstring):
 `-N` namespace, `-T` trackname, `-s` object size, `-g` group size, `-P` streams, `-r` rate,
-`-t` duration, `-i` interval, `-k` insecure, `-d` debug, `-D` datagram, `-p` port, `--draft`.
+`-t` duration (0 or absent: no limit), `-i` interval, `-k` insecure, `-d` debug, `-D` datagram, `-p` port, `--draft`.
 A dialed URL's scheme selects the transport: `moqt://host:port/path` is raw QUIC,
 `https://host:port/path` or bare `host:port` is WebTransport. Listeners take `-Q` (raw QUIC),
 `-W` (WebTransport), or both on one port. `moq-interop-client` follows the interop runner's
@@ -69,11 +69,16 @@ SIGUSR1.
   default. moqx defaults to BBR2. `--cc-algo` takes `bbr`, `bbr1`, `c4`, `cubic`, `dcubic`,
   `fast`, `newreno`, `prague` and `reno`. `--cc-options` / `congestion_control_options=`
   passes an option string to that algorithm, e.g. `Q0.02` for bbr's send quantum.
+  `--pacing-trains` / `packet_train_mode=True` lets paced sends release up to 10 packets
+  at once (off by default; needs aiopquic with `QuicConfiguration.packet_train_mode`).
 - Flow-control window: 16 MiB per stream and per connection, so one stream carries at most
   16 MiB per RTT (2.7 Gbps at 50 ms). `--fc-window` / `flow_control_window=` raises it; the
   receiver buffers that much per stream.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
+- Many sessions in one process: `MOQTClient(shared_transport=SharedTransport(sockets=N))` puts them on
+  one picoquic worker, far cheaper than one each. Give it one socket per session on Linux: sessions sharing
+  a source port all land on one worker thread of a relay that hashes ports to threads (mvfst).
 - FETCH: a `PublishedTrack` keeps no object history unless given `fetch_history_bytes`, and
   refuses FETCH (NOT_SUPPORTED) without one; the MSF catalog track keeps 64 KiB.
 - Ending a track: a `produce()` track sends End of Track after its last object, then
@@ -83,7 +88,7 @@ SIGUSR1.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
-  least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; no authentication, authorization or rate limiting; a per-stream TX budget
+  least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; authorization only with `--auth-key` (SETUP and, from d16, each request), no rate limiting; a per-stream TX budget
   and a bounded send lane per subscriber, shedding whole groups (streams reset) from one that falls
   behind, and logging a `lane stalled` WARNING for one that makes no progress for 10 s;
   per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,

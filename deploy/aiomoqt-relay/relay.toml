@@ -9,3 +9,4 @@ control = "/status/control.sock"
 catalog-probe = true
 cache-bytes = 268435456
 cc-algo = "bbr"
+cc-options = "Q0.02"

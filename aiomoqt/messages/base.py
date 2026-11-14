@@ -55,7 +55,7 @@ class AuthTokenRef:
     alias_type: int
     alias: int
     token_type: Optional[int] = None
-    value: Optional[bytes] = None
+    value: Optional[bytes] = field(default=None, repr=False)
 
 
 class AuthToken(bytes):
@@ -71,7 +71,7 @@ class AuthToken(bytes):
         return token
 
     def __repr__(self) -> str:
-        return f"AuthToken({bytes(self)!r}, token_type={self.token_type})"
+        return f"AuthToken(<{len(self)} bytes>, token_type={self.token_type})"
 
 
 @dataclass(slots=True)
@@ -636,7 +636,9 @@ class MOQTMessage:
             if k % 2 == 0:
                 items.append(f"{pname}={v}")
             else:
-                if isinstance(v, bytes):
+                if isinstance(v, AuthToken):
+                    items.append(f"{pname}={v!r}")
+                elif isinstance(v, bytes):
                     items.append(f"{pname}={MOQTMessage._format_bytes(v, prefer_text=True)}")
                 else:
                     items.append(f"{pname}=\"{v}\"")

@@ -5,7 +5,7 @@ import struct
 import pytest
 
 from aiomoqt.media.sources import (
-    AnnexBAssembler, Mp4AvcReader, Mp4Error, annexb_is_keyframe,
+    AnnexBAssembler, HevcAnnexBAssembler, Mp4AvcReader, Mp4Error, annexb_is_keyframe,
     avcc_codec_string, avcc_from_sps_pps, hvcc_codec_string, pcm_tone_frames,
     split_annexb, sps_dimensions,
 )
@@ -193,6 +193,37 @@ def test_annexb_assembler_aud_and_sei():
     assert frames[0][0] == (struct.pack('>I', len(sei)) + sei
                             + struct.pack('>I', len(idr)) + idr)
     assert frames[0][1] and frames[1][1]
+
+
+def _lp(*nals):
+    return b''.join(struct.pack('>I', len(n)) + n for n in nals)
+
+
+def test_annexb_assembler_keeps_filler_and_end_nals_in_their_access_unit():
+    idr, p1 = b'\x65\x88\x84', b'\x41\x9a\x02'
+    filler, eos, eostream = b'\x0c\xff\xff\x80', b'\x0a', b'\x0b'
+    sc = b'\x00\x00\x00\x01'
+    stream = (sc + _SPS + sc + _PPS + sc + idr + sc + filler
+              + sc + p1 + sc + filler + sc + eos + sc + idr + sc + eostream)
+    asm = AnnexBAssembler()
+    frames = asm.feed(stream) + asm.close()
+    assert [k for _, k in frames] == [True, False, True]
+    assert frames[0][0] == _lp(idr, filler)
+    assert frames[1][0] == _lp(p1, filler, eos)
+    assert frames[2][0] == _lp(idr, eostream)
+
+
+def test_hevc_annexb_assembler_keeps_filler_and_end_nals_in_their_access_unit():
+    idr, trail = b'\x26\x01\x80\x11', b'\x02\x01\x80\x22'
+    fd, eos, eob = b'\x4c\x01\xff\xff', b'\x48\x01', b'\x4a\x01'
+    sc = b'\x00\x00\x00\x01'
+    stream = sc + idr + sc + fd + sc + trail + sc + fd + sc + eos + sc + idr + sc + eob
+    asm = HevcAnnexBAssembler()
+    frames = asm.feed(stream) + asm.close()
+    assert [k for _, k in frames] == [True, False, True]
+    assert frames[0][0] == _lp(idr, fd)
+    assert frames[1][0] == _lp(trail, fd, eos)
+    assert frames[2][0] == _lp(idr, eob)
 
 
 @pytest.mark.parametrize("head, compat, level, entry, expected", [

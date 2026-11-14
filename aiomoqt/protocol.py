@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import functools
+import inspect
 import logging
 import time
 from asyncio import Future
@@ -10,7 +11,9 @@ from types import MappingProxyType
 from typing import (Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, Union)
 
-from aiopquic.quic.connection import QuicErrorCode, stream_is_unidirectional
+from aiopquic.quic.connection import (
+    QuicConnection as _AioPQuicConnection, QuicErrorCode, stream_is_unidirectional,
+)
 from aiopquic.quic.events import (
     DatagramFrameReceived, HandshakeCompleted, ProtocolNegotiated, QuicEvent,
     StopSendingReceived, StreamDataReceived, StreamReset,
@@ -24,6 +27,9 @@ from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
 from .types import SCHEDULING, to_stream_priority
+from .cat import (ACTION_FETCH, ACTION_PUBLISH, ACTION_PUBLISH_NAMESPACE,
+                  ACTION_SUBSCRIBE, ACTION_SUBSCRIBE_NAMESPACE,
+                  ACTION_TRACK_STATUS, CatRefused, Grants)
 from .messages.data import (FETCH_FLAGS_END_TIMED_OUT,
                             FETCH_FLAGS_END_UNKNOWN, encode_padding,
                             DEFAULT_MAX_OBJECT_BYTES, MOQTObjectTooLarge)
@@ -59,6 +65,7 @@ from aiopquic.asyncio.protocol import (
 from aiopquic.asyncio.webtransport import (
     WebTransportClient as _AioPWTClient,
     WebTransportServerSession as _AioPWTServerSession,
+    WebTransportSession as _AioPWTSession,
     _EVT_WT_STREAM_DATA, _EVT_WT_STREAM_FIN,
     _EVT_WT_STREAM_RESET, _EVT_WT_STOP_SENDING,
     _EVT_WT_DATAGRAM, _EVT_WT_SESSION_CLOSED,
@@ -66,6 +73,14 @@ from aiopquic.asyncio.webtransport import (
 
 USER_AGENT = f"aiomoqt/{version('aiomoqt')}"
 
+# aiopquic before 0.8.0 takes no first bytes with a WT stream create.
+_WT_CREATE_WITH_DATA = "initial" in inspect.signature(
+    _AioPWTSession.create_stream).parameters
+
+
+# aiopquic before 0.8.0 sets a raw QUIC stream's priority apart from its writes.
+_RAW_WRITE_PRIORITY = "priority" in inspect.signature(
+    _AioPQuicConnection.send_stream_data_drained).parameters
 
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
 # Every WT stream is prefixed with <type, session_id> as two QUIC varints.
@@ -295,8 +310,18 @@ def _local_cause(event: Any) -> Optional[str]:
             or f"local error 0x{code:x}")
 
 
-def _closed_reason(reason: Any) -> str:
-    return f"session closed: {reason}" if reason else "session closed"
+def _closed_reason(code: Any, reason: Any) -> str:
+    """Why an awaited request failed: the close code, unless graceful, and
+    the peer's reason."""
+    parts = []
+    if code:
+        try:
+            parts.append(SessionCloseCode(int(code)).name)
+        except ValueError:
+            parts.append(f"0x{int(code):x}")
+    if reason:
+        parts.append(str(reason))
+    return "session closed: " + ": ".join(parts) if parts else "session closed"
 
 
 _LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7f)}
@@ -552,6 +577,8 @@ class _MOQTSessionMixin:
             Callable[[AuthToken, MOQTMessage], Optional[int]]] = None
         self._auth_token_cache_used = 0
         self._auth_token_cache_max = 0
+        # What the SETUP token granted, when the server requires one.
+        self._auth_grants: Optional[Grants] = None
         # Aliases the peer assigned (SUBSCRIBE_OK / PUBLISH) -> our
         # request id: the receive-side registry.
         self._track_aliases: Dict[int, int] = {}
@@ -715,7 +742,7 @@ class _MOQTSessionMixin:
             self._pending_requests.pop(request_id, None)
             raise MOQTRequestError(
                 error_code=int(RequestErrorCode.INTERNAL_ERROR),
-                reason=_closed_reason(self._close_err[1]),
+                reason=_closed_reason(*self._close_err),
                 retry_interval=0)
         try:
             async with asyncio.timeout(timeout):
@@ -1300,14 +1327,23 @@ class _MOQTSessionMixin:
             request_id = self._bidi_stream_requests.get(stream_id)
             if request_id is None:
                 return
+            if (stream_id in (self._fetch_request_streams or ())
+                    and (self._request_stream_ends or {}).get(stream_id, 0)
+                    & self._LOCAL_HALF):
+                return  # a finished FETCH: nothing left to cancel
             self._cancelled_request_streams.add(stream_id)
             self._bidi_streams.pop(request_id, None)
             self._notify_request_cancelled(
                 request_id, f"STOP_SENDING (stream {stream_id})",
                 replies_pending=True)
             return
+        if self._fetch_closing and stream_id in self._fetch_closing:
+            # The reset answers our STOP_SENDING on a finished FETCH.
+            self._release_request_stream(stream_id)
+            return
         request_id = self._bidi_stream_requests.pop(stream_id, None)
         self._cancelled_request_streams.discard(stream_id)
+        self._forget_fetch_stream(stream_id)
         if self._request_stream_ends:
             self._request_stream_ends.pop(stream_id, None)
         if self._request_stream_updates:
@@ -1633,6 +1669,7 @@ class _MOQTSessionMixin:
                 self._quiet_token = quiet_session.set(True)
             control_log.info(f"MOQT event: control message parsed: {self._msgstr(msg)})")
             refusal = (self._resolve_auth_token(msg)
+                       or self._authorize_request(msg)
                        or self._refuse_request(msg))
             routed = refusal or self._track_handler(msg, handler)
             if routed is not None:
@@ -1796,6 +1833,7 @@ class _MOQTSessionMixin:
         if key and len(key) == 2 and key[0] == 'fetch':
             request_id = key[1]
             clean = error_code == QuicErrorCode.NO_ERROR
+            self._end_fetch_request(request_id)
             if self._profile.fetch_location_filter:
                 self._fill_requests.pop(request_id, None)
             self._fetch_object_handlers.pop(request_id, None)
@@ -2779,6 +2817,8 @@ class _MOQTSessionMixin:
                     return
                 self._bidi_stream_requests[stream_id] = msg.request_id
                 self._bidi_streams[msg.request_id] = stream_id
+                if isinstance(msg, Fetch):
+                    self._note_fetch_stream(stream_id)
             # d18 §10 Table 5: only SETUP and GOAWAY ride the control
             # stream; a request there cannot own a reply stream, and
             # echoing a reply onto our control stream would mirror the
@@ -2918,6 +2958,7 @@ class _MOQTSessionMixin:
                    if self._request_stream_updates else ())
         self._control_chains.pop(stream_id, None)
         self._cancelled_request_streams.discard(stream_id)
+        self._forget_fetch_stream(stream_id)
         if request_id is None:
             return
         theirs = request_id & 1 != (0 if self._is_client else 1)
@@ -3217,14 +3258,14 @@ class _MOQTSessionMixin:
         if logger.isEnabledFor(logging.DEBUG):
             transport_log.debug(f"QUIC event: event not handled({class_name(event)})")
 
-    def _fail_pending(self, reason: str) -> None:
+    def _fail_pending(self, reason: str, code: int = 0) -> None:
         """A closed session answers nothing more: fail every awaited
         request and end every awaited fetch as unclean."""
         for fut in self._pending_requests.values():
             if not fut.done():
                 fut.set_exception(MOQTRequestError(
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),
-                    reason=_closed_reason(reason), retry_interval=0))
+                    reason=_closed_reason(code, reason), retry_interval=0))
                 fut.exception()  # marks it retrieved if nothing awaits it
         for fut in self._fetch_done_futures.values():
             if not fut.done():
@@ -3325,7 +3366,7 @@ class _MOQTSessionMixin:
                     self.close()
                 except Exception:
                     logger.debug("MOQT: close failed", exc_info=True)
-            self._fail_pending(reason_phrase)
+            self._fail_pending(reason_phrase, error_code)
         if self._reaper_handle is not None:
             self._reaper_handle.cancel()
             self._reaper_handle = None
@@ -3553,6 +3594,9 @@ class _MOQTSessionMixin:
         # Option (removed), count-less Setup Options. Pre-d18 sends
         # CLIENT_SETUP with the version list.
         params.update(self._implementation_option())
+        auth = getattr(getattr(self, '_session', None), 'auth', None)
+        if auth is not None:
+            params[SetupParamType.AUTH_TOKEN] = auth.mint()
         if parameters:
             params.update(parameters)  # caller SETUP options (e.g. AUTH_TOKEN)
         self._auth_token_cache_max = int(
@@ -3596,21 +3640,51 @@ class _MOQTSessionMixin:
         self._established_ms = (time.monotonic() - _t0) * 1000.0
         self._on_setup_complete()
 
-    async def open_uni_stream(self) -> int:
-        """Open a unidirectional data stream. Returns the stream ID."""
+    async def open_uni_stream(self, initial: bytes = b"",
+                              priority: Optional[int] = None,
+                              end_stream: bool = False) -> int:
+        """Open a unidirectional data stream, set its transport priority
+        and write `initial` to it, ending the stream with it when
+        `end_stream`. Returns the stream ID. Over WebTransport all of it
+        travels with the create, so the stream header and the first
+        object leave in one send."""
         if not self._is_wt:
-            return self._quic.get_next_available_stream_id(is_unidirectional=True)
-        # aiopquic-WT: round-trip to picoquic for stream-id allocation
-        try:
-            return await self.create_stream(bidir=False)
-        except WebTransportError:
-            # Session torn down while a producer was at a stream
-            # rollover. Convert to the cancellation path the track
-            # generators already handle cleanly instead of surfacing
-            # a task exception at every shutdown.
-            if not self._session_writable():
-                raise asyncio.CancelledError()
-            raise
+            sid = self._quic.get_next_available_stream_id(is_unidirectional=True)
+        else:
+            with_data = (_WT_CREATE_WITH_DATA
+                         and (initial or priority is not None or end_stream)
+                         and len(initial) <= getattr(self, "stream_ring_cap", 0))
+            create = self.create_stream
+            # aiopquic-WT: round-trip to picoquic for stream-id allocation
+            try:
+                if with_data:
+                    return await create(
+                        bidir=False, initial=initial, priority=priority,
+                        end_stream=end_stream)
+                sid = await create(bidir=False)
+            except WebTransportError:
+                # Session torn down while a producer was at a stream
+                # rollover. Convert to the cancellation path the track
+                # generators already handle cleanly instead of surfacing
+                # a task exception at every shutdown.
+                if not self._session_writable():
+                    raise asyncio.CancelledError()
+                raise
+        if priority is not None and (
+                self._is_wt or not _RAW_WRITE_PRIORITY
+                or not (initial or end_stream)):
+            self.set_stream_priority(sid, priority)
+            priority = None
+        if initial or end_stream:
+            try:
+                await self.stream_write_drain(sid, initial,
+                                              end_stream=end_stream,
+                                              priority=priority)
+            except BaseException:
+                # The caller never learns the id: reset the stream here.
+                self.stream_reset(sid, StreamResetCode.CANCELLED)
+                raise
+        return sid
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
@@ -3639,9 +3713,11 @@ class _MOQTSessionMixin:
         if self._tx_deferred and (stream_id, 'send') in self._tx_deferred:
             return  # the stream's reset or FIN is queued
         if end_stream:
-            if self._served_fetch_streams:
-                self._forget_served_fetch(stream_id)
+            request_id = (self._forget_served_fetch(stream_id)
+                          if self._served_fetch_streams else None)
             self._tx_op(stream_id, 'send', 'fin', data)
+            if request_id is not None:
+                self._end_fetch_request(request_id)
             return
         try:
             self._quic.send_stream_data(stream_id, data)
@@ -3743,9 +3819,25 @@ class _MOQTSessionMixin:
             return False
         return True
 
+    _ring_cap: Optional[int] = None
+
+    def _stream_ring_cap(self) -> int:
+        """The most one write may put on a stream: its TX ring's size,
+        or 0 when the transport doesn't say. Fixed for the session."""
+        cap = self._ring_cap
+        if cap is None:
+            if self._is_wt:
+                cap = getattr(self, "stream_ring_cap", 0) or 0
+            else:
+                cfg = getattr(self._quic, "_configuration", None)
+                cap = getattr(cfg, "stream_ring_cap", 0) or 0
+            self._ring_cap = cap
+        return cap
+
     async def stream_write_drain(self, stream_id: int, data: bytes,
-                                  end_stream: bool = False) -> None:
-        """Write bytes with backpressure.
+                                  end_stream: bool = False,
+                                  priority: Optional[int] = None) -> None:
+        """Write bytes with backpressure; `priority` applies with them.
 
         aiomoqt-owned policy: optional per-stream byte-budget cap
         with hysteresis (MOQTPeer.tx_max_inflight_bytes). The
@@ -3766,6 +3858,17 @@ class _MOQTSessionMixin:
         if stream_id in self._stopped_streams:
             self._stopped_streams.discard(stream_id)
             raise MOQTStreamStopped()
+        cap = self._stream_ring_cap()
+        if cap and len(data) > cap:
+            # aiopquic refuses a single write larger than the stream's ring.
+            piece = cap // 2
+            view = memoryview(data)
+            for at in range(0, len(data), piece):
+                await self.stream_write_drain(
+                    stream_id, bytes(view[at:at + piece]),
+                    end_stream=end_stream and at + piece >= len(data),
+                    priority=None if at else priority)
+            return
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
         # Byte-budget gate (aiomoqt-owned policy). Per-stream sc->tx
@@ -3789,8 +3892,13 @@ class _MOQTSessionMixin:
                 await sc_event.wait()
         # Delegate wire-level send + backpressure to aiopquic.
         try:
-            await quic.send_stream_data_drained(
-                stream_id, data, end_stream=end_stream)
+            if priority is None:
+                await quic.send_stream_data_drained(
+                    stream_id, data, end_stream=end_stream)
+            else:
+                await quic.send_stream_data_drained(
+                    stream_id, data, end_stream=end_stream,
+                    priority=priority)
         except (AssertionError, AttributeError, ConnectionError) as e:
             # Never return silently: a stream gone on a live session ends
             # that stream only; anything but ConnectionError there is
@@ -3809,26 +3917,31 @@ class _MOQTSessionMixin:
     # send_stream_data_drained's hard_wait_at.
     TX_RING_WAIT_AT = 0.9
 
-    def stream_write_nowait(self, stream_id: int, data: bytes) -> bool:
+    def stream_write_nowait(self, stream_id: int, data: bytes,
+                            end_stream: bool = False,
+                            wait_at: float = TX_RING_WAIT_AT) -> bool:
         """stream_write_drain() when it would not wait: True once the
         transport holds `data`. False, with nothing written, when the
-        session is closing, the stream is over its budget or the
-        transport is near full. A stopped stream raises
-        MOQTStreamStopped."""
+        session is closing, the stream is over its budget, the TX event
+        ring is past `wait_at` or `data` is larger than the stream's ring.
+        A stopped stream raises MOQTStreamStopped."""
         quic = self._quic
         if not self._session_writable() or getattr(quic, 'closed', False):
             return False
         if stream_id in self._stopped_streams:
             self._stopped_streams.discard(stream_id)
             raise MOQTStreamStopped()
+        cap = self._stream_ring_cap()
+        if cap and len(data) > cap:
+            return False
         max_bytes = self._session.tx_max_inflight_bytes
         if (max_bytes is not None
                 and quic.tx_data_ring_used(stream_id) > max_bytes):
             return False
-        if quic.tx_event_ring_fill() > self.TX_RING_WAIT_AT:
+        if quic.tx_event_ring_fill() > wait_at:
             return False
         try:
-            quic.send_stream_data(stream_id, data)
+            quic.send_stream_data(stream_id, data, end_stream)
         except BufferError:
             return False
         except (AssertionError, AttributeError, ConnectionError) as e:
@@ -3846,11 +3959,89 @@ class _MOQTSessionMixin:
     # Send streams the peer stopped; the next write raises MOQTStreamStopped.
     _stopped_streams: Set[int] = frozenset()
 
-    def _forget_served_fetch(self, stream_id: int) -> None:
+    def _forget_served_fetch(self, stream_id: int) -> Optional[int]:
+        """Unregister a served fetch stream; its request id, or None."""
         for rid, sid in self._served_fetch_streams.items():
             if sid == stream_id:
                 del self._served_fetch_streams[rid]
-                return
+                return rid
+        return None
+
+    # Request streams a FETCH opened, either direction.
+    _fetch_request_streams: Optional[Set[int]] = None
+    # Our FETCHes' request streams: stream_id -> _FETCH_* bits seen.
+    _fetch_steps: Optional[Dict[int, int]] = None
+    # Finished FETCHes' request streams we sent STOP_SENDING on.
+    _fetch_closing: Optional[Set[int]] = None
+    _FETCH_DATA_DONE, _FETCH_REPLIED = 1, 2
+
+    def _note_fetch_stream(self, sid: int) -> None:
+        if self._fetch_request_streams is None:
+            self._fetch_request_streams = set()
+        self._fetch_request_streams.add(sid)
+
+    def _forget_fetch_stream(self, sid: int) -> None:
+        for table in (self._fetch_request_streams, self._fetch_closing):
+            if table:
+                table.discard(sid)
+        if self._fetch_steps:
+            self._fetch_steps.pop(sid, None)
+
+    def _fetch_request_stream(self, request_id: int) -> Optional[int]:
+        sid = self._bidi_streams.get(request_id)
+        return sid if sid in (self._fetch_request_streams or ()) else None
+
+    def _end_fetch_request(self, request_id: int) -> None:
+        """A FETCH's data stream has ended (§5.2): FIN our half of its
+        request stream. The requester also stops the peer's half once
+        the reply is in."""
+        sid = self._fetch_request_stream(request_id)
+        if sid is None:
+            return
+        self._fin_request_half(sid)
+        if request_id & 1 == (0 if self._is_client else 1):
+            self._fetch_step(sid, self._FETCH_DATA_DONE)
+
+    def _fetch_answered(self, request_id: int, error: bool) -> None:
+        """Our FETCH got FETCH_OK or REQUEST_ERROR. After an error, or a
+        FETCH_OK with the data stream ended, close its request stream."""
+        sid = self._fetch_request_stream(request_id)
+        if sid is None or request_id & 1 != (0 if self._is_client else 1):
+            return
+        if error:
+            if self._fetch_steps:
+                self._fetch_steps.pop(sid, None)
+            self._fin_request_half(sid)
+            self._stop_request_half(sid)
+        else:
+            self._fetch_step(sid, self._FETCH_REPLIED)
+
+    def _fetch_step(self, sid: int, bit: int) -> None:
+        if self._fetch_steps is None:
+            self._fetch_steps = {}
+        state = self._fetch_steps.get(sid, 0) | bit
+        if state == self._FETCH_DATA_DONE | self._FETCH_REPLIED:
+            self._fetch_steps.pop(sid, None)
+            self._stop_request_half(sid)
+        else:
+            self._fetch_steps[sid] = state
+
+    def _fin_request_half(self, sid: int) -> None:
+        if not (self._request_stream_ends or {}).get(sid, 0) & self._LOCAL_HALF:
+            self.stream_fin(sid)
+
+    def _stop_request_half(self, sid: int) -> None:
+        """STOP_SENDING on the peer's half of a finished FETCH's request
+        stream; RFC 9000 §3.5 and §5.2 have the peer reset it. That half
+        counts as ended here: a FIN already in flight may never surface
+        once its receive side is stopped."""
+        if (self._request_stream_ends or {}).get(sid, 0) & self._PEER_HALF:
+            return
+        if self._fetch_closing is None:
+            self._fetch_closing = set()
+        self._fetch_closing.add(sid)
+        self.stream_stop_sending(sid, StreamResetCode.CANCELLED)
+        self._request_half_ended(sid, self._PEER_HALF)
 
     def stream_fin(self, stream_id: int) -> None:
         """End-of-data on a sender-owned stream. Subgroup last object,
@@ -4116,6 +4307,58 @@ class _MOQTSessionMixin:
                     code, f"{ptype.name} option from server or over WT")
                 return True
         return False
+
+    def _refuse_setup_auth(self, options: Optional[Dict]) -> bool:
+        """Close the session unless SETUP carries a token this server admits."""
+        auth = (None if self._is_client
+                else getattr(getattr(self, '_session', None), 'auth', None))
+        if auth is None:
+            return False
+        try:
+            self._auth_grants = auth.admit(
+                (options or {}).get(SetupParamType.AUTH_TOKEN))
+        except CatRefused as e:
+            control_log.info(f"MOQT: session refused: {e.reason}")
+            self._close_session(e.code, e.reason)
+            return True
+        return False
+
+    def _authorize_request(self, msg: MOQTMessage) -> Optional[Callable]:
+        """The handler refusing a d16+ request that neither the session's CAT
+        grants nor the token on the request cover."""
+        action = self._CAT_ACTIONS.get(type(msg))
+        rid = getattr(msg, 'request_id', None)
+        auth = (None if action is None or self._is_client
+                else getattr(getattr(self, '_session', None), 'auth', None))
+        if (auth is None or rid is None
+                or not is_draft16_or_later(self.negotiated_draft)):
+            return None
+        if isinstance(msg, Fetch) and _is_joining(msg.fetch_type):
+            # An unresolvable join is checked as the empty name: fails closed.
+            joined = msg.joining_request_id
+            peer = None if joined is None else self._peer_requests.get(joined)
+            namespace, track = (peer[1] if peer and peer[0] is Subscribe
+                                else ((), b""))
+        else:
+            namespace = (getattr(msg, 'track_namespace', None)
+                         or getattr(msg, 'namespace', None)
+                         or getattr(msg, 'namespace_prefix', None) or ())
+            track = getattr(msg, 'track_name', None)
+        token = (getattr(msg, 'parameters', None) or {}).get(ParamType.AUTH_TOKEN)
+        if auth.permits(action, namespace, track, token, self._auth_grants):
+            return None
+        return self._refusal(msg, int(rid), RequestErrorCode.UNAUTHORIZED,
+                             "authorization token does not permit action")
+
+    _CAT_ACTIONS: Dict[type, int] = {
+        Subscribe: ACTION_SUBSCRIBE,
+        Fetch: ACTION_FETCH,
+        SubscribeNamespace: ACTION_SUBSCRIBE_NAMESPACE,
+        SubscribeTracks: ACTION_SUBSCRIBE_NAMESPACE,
+        TrackStatus: ACTION_TRACK_STATUS,
+        Publish: ACTION_PUBLISH,
+        PublishNamespace: ACTION_PUBLISH_NAMESPACE,
+    }
 
     def _check_setup_location(self, options: Optional[Dict]) -> None:
         """Refuse to send PATH or AUTHORITY where the peer must close."""
@@ -4581,6 +4824,8 @@ class _MOQTSessionMixin:
                     is_unidirectional=False)
                 self._bidi_streams[request_id] = stream_id
                 self._bidi_stream_requests[stream_id] = request_id
+                if isinstance(msg, Fetch):
+                    self._note_fetch_stream(stream_id)
                 self.send_stream_message(stream_id, msg)
             else:
                 # WebTransport: bidi-stream open is async (create_stream
@@ -4612,6 +4857,8 @@ class _MOQTSessionMixin:
             raise
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id
+        if isinstance(msg, Fetch):
+            self._note_fetch_stream(stream_id)
         updates = (self._unbound_updates or {}).pop(request_id, ())
         self.send_stream_message(stream_id, msg)
         for update in updates:
@@ -6395,7 +6642,8 @@ class _MOQTSessionMixin:
             version_ok = (
                 is_draft16_or_later(self.negotiated_draft) or MOQT_VERSION_DRAFT14 in msg.versions
             )
-            if self._refuse_setup_location(msg.parameters):
+            if (self._refuse_setup_location(msg.parameters)
+                    or self._refuse_setup_auth(msg.parameters)):
                 return
             if version_ok:
                 self._ingest_request_limit(msg.parameters)
@@ -6806,6 +7054,7 @@ class _MOQTSessionMixin:
     async def _handle_fetch_ok(self, msg: FetchOk) -> None:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._resolve_request(msg.request_id, msg)
+        self._fetch_answered(msg.request_id, error=False)
 
     async def _handle_fetch_error(self, msg: FetchError) -> None:
         """Subscriber-side: FETCH_ERROR received for a fetch we issued.
@@ -6859,6 +7108,7 @@ class _MOQTSessionMixin:
         control_log.debug(f"MOQT event: handle {self._msgstr(msg)}")
         self._track_status_requests.discard(msg.request_id)
         self._resolve_request(msg.request_id, msg)
+        self._fetch_answered(msg.request_id, error=True)
         kind = self._request_kinds.get(msg.request_id)
         if (msg.redirect is not None and msg.redirect[2] and kind is not None
                 and kind[1] and kind[0].__name__ in self._profile.namespace_scoped):
@@ -6920,7 +7170,7 @@ class _MOQTSessionMixin:
             return
         self._d18_setup_seen = True
         opts = getattr(msg, 'options', None) or {}
-        if self._refuse_setup_location(opts):
+        if self._refuse_setup_location(opts) or self._refuse_setup_auth(opts):
             return
         # Server side has no separate session-init step: bring up our own
         # control write-uni and send SETUP on first receipt of the peer's

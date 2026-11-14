@@ -1,9 +1,9 @@
 """LOC packaging over MoQT — draft-ietf-moq-loc-04.
 
-A LOC object payload is the LOC Private Properties block (§2.2: type
-0x0A, varint length, contents) followed by the raw encoded-media chunk
-(WebCodecs EncodedAudio/VideoChunk bytes). We send the block empty and
-skip its contents on receive. Public metadata rides MOQ object properties
+A LOC object payload in the clear is the raw encoded-media chunk
+(WebCodecs EncodedAudio/VideoChunk bytes): Private Properties exist only
+inside a Secure Object's plaintext (§3.1.3; Secure Objects -01 §3.3).
+Public metadata rides MOQ object properties
 (even ID = bare vi64 value, odd ID = length-prefixed bytes — the
 codec in messages/base.py already implements this rule).
 
@@ -29,8 +29,7 @@ from typing import Any, Callable, Dict, Optional
 from ..delivery import StreamMapping
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
-from ..utils.buffer import Buffer, BufferReadError
-from ..utils.logger import TRACE, get_logger
+from ..utils.logger import get_logger
 from ..utils.timing import OBJECT_TIMESTAMP
 from .sources import avcc_param_sets, hvcc_param_sets, lp_to_annexb
 
@@ -66,10 +65,6 @@ _CONFIG_IDS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 _CONSUMED_IDS = frozenset(_CONFIG_IDS + (LOC_PROP_TIMESCALE,
                                          LOC_PROP_CODECSTRING))
 
-# Private Properties block type (SecureObjects), opening every payload.
-LOC_PRIVATE_PROPERTIES = 0x0A
-_EMPTY_PRIVATE_PROPERTIES = bytes([LOC_PRIVATE_PROPERTIES, 0x00])
-
 # Annex B codec family → (parameter sets from config, NAL header byte is
 # a parameter set).
 _ANNEXB = {
@@ -86,13 +81,15 @@ class LocFrame:
     """One encoded media chunk. `timestamp` is in track timescale units
     (µs since Unix epoch when the track carries no TIMESCALE).
     `group_id` numbers the group a key frame opens (None: next).
-    `capture_us` is its wall-clock capture time for `frindell` timing."""
+    `capture_us` is its wall-clock capture time for `frindell` timing.
+    `end_of_group` makes it its group's last frame."""
     payload: bytes
     key_frame: bool = False
     timestamp: Optional[int] = None
     extensions: Optional[Dict[int, Any]] = None
     group_id: Optional[int] = None
     capture_us: Optional[int] = None
+    end_of_group: bool = False
 
 
 class LocTrackPublisher(PublishedTrack):
@@ -112,9 +109,6 @@ class LocTrackPublisher(PublishedTrack):
     `timescale` is set; video objects carry VIDEO_FRAME_MARKING. Without
     TIMESCALE the timestamps are wall-clock µs, LOC's default; with it,
     LOC reads them as media time.
-
-    `loc_bare` sends the media without the Private Properties block, for
-    receivers predating it; MSF CMAF tracks, which are not LOC, use it too.
 
     `annexb` ('h264' or 'h265') sends length-prefixed video payloads as
     Annex B (loc-04 §2.1.4) with the parameter sets from `config` ahead of
@@ -138,7 +132,6 @@ class LocTrackPublisher(PublishedTrack):
                  queue_size: int = 256,
                  loc01_compat: bool = False,
                  codec_string: Optional[str] = None,
-                 loc_bare: bool = False,
                  config_property: Optional[str] = 'object',
                  annexb: Optional[str] = None,
                  fetch_history_bytes: int = 0):
@@ -154,7 +147,6 @@ class LocTrackPublisher(PublishedTrack):
         self._param_sets: tuple = (None, b'')
         if annexb is not None:
             config_property = None
-        self.loc_bare = loc_bare
         self.config = config
         self.config_property = config_property
         self.mapping = mapping
@@ -191,17 +183,21 @@ class LocTrackPublisher(PublishedTrack):
                          timestamp: Optional[int] = None,
                          extensions: Optional[Dict[int, Any]] = None,
                          group_id: Optional[int] = None,
-                         capture_us: Optional[int] = None) -> None:
+                         capture_us: Optional[int] = None,
+                         end_of_group: bool = False) -> None:
         """Queue one frame (awaits when the queue is full); raises the
         error that ended production (`error`), if one did.
 
         `group_id` sets the group a key frame opens, so tracks fed from
         one source can keep equally numbered groups time-aligned (msf
-        §4.2); ignored unless above the current group."""
+        §4.2); ignored unless above the current group. `end_of_group`
+        ends the group with this frame, its end leaving in the frame's
+        write; the next frame opens a group."""
         if self.error is not None:
             raise self.error
         await self._frames.put(LocFrame(payload, key_frame, timestamp,
-                                        extensions, group_id, capture_us))
+                                        extensions, group_id, capture_us,
+                                        end_of_group))
 
     def _timing_properties(self, vi64: bool) -> Dict[int, Any]:
         if self.frindell is None:
@@ -225,9 +221,7 @@ class LocTrackPublisher(PublishedTrack):
         without using its object id."""
         if self.annexb is not None:
             payload = self._annexb(payload, object_id == 0)
-        if self.loc_bare:
-            return payload
-        return _EMPTY_PRIVATE_PROPERTIES + payload
+        return payload
 
     def _annexb(self, payload: bytes, key_frame: bool) -> bytes:
         """Length-prefixed NAL units as Annex B; a key frame without
@@ -308,6 +302,7 @@ class LocTrackPublisher(PublishedTrack):
         obj_id = 0
         resume_on_key = True  # first group opens on a key frame
         paused_group = None   # a group opened on a key frame while paused
+        ended = False         # the last frame ended its group
         while True:
             frame = await self._frames.get()
             if frame is None:
@@ -318,7 +313,7 @@ class LocTrackPublisher(PublishedTrack):
                 # keeps the open group only.
                 out.reset_group()
                 resume_on_key = True
-                if frame.key_frame or group_id < 0:
+                if frame.key_frame or group_id < 0 or ended:
                     if paused_group is not None:
                         history.discard(paused_group)
                         paused_group = None
@@ -341,6 +336,7 @@ class LocTrackPublisher(PublishedTrack):
                     self._note_largest(group_id, obj_id)
                     self.frames_dropped += 1
                 obj_id += 1
+                ended = frame.end_of_group
                 continue
             if resume_on_key and not frame.key_frame:
                 # With its head held the open group continues; each peer's
@@ -350,7 +346,7 @@ class LocTrackPublisher(PublishedTrack):
                     continue
             resume_on_key = False
             paused_group = None
-            if frame.key_frame or group_id < 0:
+            if frame.key_frame or group_id < 0 or ended:
                 group_id = self._next_group(frame, group_id)
                 obj_id = 0
             group_start = obj_id == 0
@@ -362,9 +358,10 @@ class LocTrackPublisher(PublishedTrack):
                 group_id, obj_id, payload,
                 extensions=functools.partial(
                     self._object_extensions, frame, group_start),
-                group_start=group_start)
+                group_start=group_start, end_of_group=frame.end_of_group)
             self._note_largest(group_id, obj_id)
             obj_id += 1
+            ended = frame.end_of_group
             self._total_sent += 1
             self._total_bytes += len(payload)
 
@@ -381,23 +378,18 @@ class LocTrackSubscriber(SubscribedTrack):
     on_arrival(msg, recv_us, group_id, subgroup_id, frame) sees every
     object first, status markers and rejected objects included
     (frame=None), with its receive wall-clock µs.
-
-    An object without a well-formed Private Properties block is rejected
-    and counted in `objects_rejected`; `loc_bare` expects none.
     """
 
     def __init__(self, session, namespace: str, trackname: str = None,
                  on_frame: Optional[Callable] = None,
                  auth_token: Optional[bytes] = None,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False,
                  timestamp_errors: str = 'cancel'):
         super().__init__(session, namespace, trackname,
                          on_object=self._on_object, auth_token=auth_token,
                          timestamp_errors=timestamp_errors)
         self.on_frame = on_frame
         self.on_arrival = on_arrival
-        self.loc_bare = loc_bare
         self.config: Optional[bytes] = None
         self.timescale: Optional[int] = None
         self.codec_string: Optional[str] = None
@@ -420,28 +412,7 @@ class LocTrackSubscriber(SubscribedTrack):
     def _unpackage(self, msg, group_id: int) -> Optional[bytes]:
         """Frame payload of a received object; None rejects it (no
         on_frame)."""
-        payload = bytes(msg.payload)
-        if self.loc_bare or not payload:
-            return payload
-        # The block is required, never inferred: media may open with 0x0A.
-        buf = Buffer(data=payload)
-        try:
-            ptype = buf.pull_uint_var()
-            length = buf.pull_uint_var()
-        except BufferReadError:
-            return self._reject(msg, group_id, "truncated block header")
-        if ptype != LOC_PRIVATE_PROPERTIES:
-            return self._reject(msg, group_id, f"block type {ptype:#x}")
-        start = buf.tell() + length
-        if start > len(payload):
-            return self._reject(msg, group_id, "block overruns payload")
-        return payload[start:]
-
-    def _reject(self, msg, group_id: int, why: str) -> None:
-        self.objects_rejected += 1
-        logger.log(TRACE, f"LOC {self.trackname}: g{group_id} "
-                          f"o{msg.object_id} rejected: {why}")
-        return None
+        return bytes(msg.payload)
 
     def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:
         gid = getattr(msg, 'group_id', None)

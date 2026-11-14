@@ -8,6 +8,7 @@ dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, wit
 | `relay` | `aiomoqt-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16/14, `--watchdog 30`, pauses a track upstream once no viewer has watched it for 60 s (`--pause-after`), writes `status/` and `relay-logs/` |
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
 | `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
+| `peers` | `relay-peers` | `peers.py`: samples `status/status.json` every 5 s into `peers/peers.db` (IPs, roles, namespaces and tracks published or subscribed; 90 days of detail, daily totals kept) and writes `stats/peers.json` every minute for `/private/peers/`; no network |
 
 Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (OCI, Ubuntu 24.04 aarch64,
 Docker with Compose v2). The subnet's security list opens UDP 4433-4443 and TCP 80/443; the host's
@@ -16,8 +17,10 @@ comes from apt certbot with dns-cloudflare (`/etc/cloudflare/credentials.ini`, 0
 hooks in `/etc/letsencrypt/renewal-hooks/deploy/` restart `aiomoqt-relay` and reload `relay-web` by
 name.
 
-The host is also the perf and release-gate box. UDP 4443 belongs to the public relay; test relays
-use 5443 and up. Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
+The host is also the perf and release-gate box. UDP 4443 belongs to the public relay. A test relay
+on 5443 or up is reachable only from the host. One that takes load from another host needs a port
+in the security list's range, such as 4442, plus its own INPUT ACCEPT and the NOTRACK rules under
+"Host tuning". Before a bench that needs a quiet box, `docker stop aiomoqt-relay`, and start it
 again after.
 
 ## Layout on the host
@@ -41,7 +44,8 @@ relay-swap.sh, relay-rollback.sh
                           make an image the relay, and undo that (deploy/aiomoqt-relay here)
 rollback/                 per swap: the image it replaced (also tagged aiomoqt:rollback),
                           relay.toml and compose.yml; rollback/last is the newest
-stats/                    GoAccess reports: index.html (visitors), crawlers.html
+stats/                    GoAccess reports: index.html (visitors), crawlers.html; peers.json
+peers.py, peers/          the peer log collector and its SQLite database
 stats.htpasswd            the password for /private/, /stats/ and /relay/logs/
 build/                    relay image build context
 ```
@@ -54,9 +58,9 @@ place and `/stats/` fails.
 ```sh
 tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml relay-swap.sh relay-rollback.sh site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
-cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats
-# The relay and GoAccess run with no capabilities, so root must own what they write.
-sudo chown root:ubuntu status relay-logs cores stats && sudo chmod 2775 status relay-logs cores stats
+cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats peers
+# The relay, GoAccess and the peer log run with no capabilities, so root must own what they write.
+sudo chown root:ubuntu status relay-logs cores stats peers && sudo chmod 2775 status relay-logs cores stats peers
 printf 'moqadmin:%s\n' "$(openssl passwd -6)" > stats.htpasswd    # prompts for the password
 sudo tee /etc/logrotate.d/aiomoqt-relay >/dev/null <<'ROT'
 /home/ubuntu/aiomoqt-relay/logs/access.log {
@@ -100,7 +104,8 @@ the host keeps other per-packet work off its cores:
 
 - **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
   queue interrupts to CPU 0, and `host/relay-irq-affinity.service` runs it at boot (irqbalance is
-  off). The relay service has `cpuset: "1,2"`.
+  off). The relay service has `cpuset: "1,2"`. GoAccess runs on CPU 0 at a low CPU share, so its
+  report runs don't take the relay's CPUs.
 
   ```sh
   sudo install -m 755 host/relay-irq-affinity.sh /usr/local/sbin/
@@ -127,6 +132,16 @@ from aiopquic's `wheels-dry-run.yml` artifacts (`gh run download -R gmarzot/aiop
 FROM aiomoqt:<sha>
 COPY aiopquic-*.whl /tmp/
 RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/aiopquic-*.whl && rm /tmp/aiopquic-*.whl
+```
+
+To run on our own Python build, make it once, then pass it as the base image and layer the wheel
+for that Python. `Dockerfile.python` builds CPython with clang 19 (tail-call interpreter, PGO, thin
+LTO, no shared libpython), tuned for this host's Neoverse N1 cores. It takes all three cores for
+about 12 minutes, so build it with the relay idle.
+
+```sh
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build -t aiomoqt-python:3.14.10 -' < deploy/aiomoqt-relay/Dockerfile.python
+ssh ubuntu@aiomoqt-relay.marzresearch.net 'docker build --build-arg PYTHON_IMAGE=aiomoqt-python:3.14.10 --build-arg VERSION=<pep440> -t aiomoqt:<sha>-py314 ~/aiomoqt-relay/build'
 ```
 
 Then, in `~/aiomoqt-relay`, `./relay-swap.sh aiomoqt:<sha> [HHMMSS]` makes it the relay, at that
@@ -156,6 +171,16 @@ an unknown key or a wrong type stops the relay with an error naming it. Flags ad
 compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
 environment. After copying an edited file over, run `docker compose restart relay`.
 
+New subscribers are not refused for load; past saturation the relay sheds instead. `lag-limit`
+(below) keeps each viewer near live by skipping groups, and per-session caps bound its requests.
+`max-subscribers = N` sets a fixed limit, not set here. `status.json` reports `totals.admission`
+and `totals.queue_ms`, the median and p90 viewer backlog in time at the track's rate.
+
+`lag-limit`, 5 s by default, keeps a viewer that close to live: past that, counting what its queue and
+its QUIC streams hold at the track's input rate, it skips to a newer group. It sees a freeze of up to
+one group instead of falling further behind. A subscriber's own delivery timeout replaces the limit.
+`status.json` reports skipped data as `shed_bytes`; the dashboard shows it on the Drops tile.
+
 ## nginx config
 
 `nginx.conf` is bind-mounted as a single file. Replacing it gives it a new inode, and
@@ -169,7 +194,8 @@ files. `crash.log` gets a `relay: start` line at each start and the faulthandler
 crash or watchdog stall. It is not rotated, so trim it by hand if it grows.
 
 In the log viewer, Shift- or Ctrl-click on "Load earlier" loads the whole selected file (up to
-200,000 records).
+200,000 records). The counters count the restarts, errors, warnings and crash dumps shown; each click
+steps to an earlier one. Level "warnings and errors" or "errors" shows only those lines.
 
 Log level: the switch in the log viewer's toolbar toggles DEBUG and logs `relay: debug logging
 on/off`; `docker kill -s USR1 aiomoqt-relay` steps INFO, DEBUG, TRACE, INFO and logs `relay: log
@@ -197,6 +223,7 @@ image that produced one (`docker image ls aiomoqt`) for `gdb`, and delete them b
 curl -s https://aiomoqt-relay.marzresearch.net/status/status.json | python3 -c 'import json,sys,time; s=json.load(sys.stdin); print(round(time.time()-s["generated"]), "s old,", s["totals"]["sessions"], "sessions")'
 docker run --rm --network host --entrypoint python aiomoqt:dev -c 'import asyncio; from aiomoqt.tools import moq_interop_relay as r; print(asyncio.run(r._self_probe("127.0.0.1", 4443, True, 18, 8.0)))'
 curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/stats/    # 401 without the password
+curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/private/peers/    # 401 without the password
 curl -s -o /dev/null -w '%{http_code}\n' https://aiomoqt-relay.marzresearch.net/relay/logs/files/relay.log    # 401 too
 ```
 

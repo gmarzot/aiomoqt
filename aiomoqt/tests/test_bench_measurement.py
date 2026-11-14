@@ -176,6 +176,22 @@ def test_livestats_state_is_bounded():
     assert len(live._stride) <= KEY_HORIZON
 
 
+
+def test_old_groups_count_without_loss_keys():
+    from aiomoqt.utils.stats import KEY_HORIZON
+    track, live = TrackStats(windowed=False), ab.LiveStats(1000)
+    for stats in (track, live):
+        _feed(stats, 200_000, 0)
+        for gid in range(20_000):
+            _feed(stats, gid, 0)
+            _feed(stats, gid, 1)
+    track.snapshot()
+    assert track.total_objects == 40_001
+    assert len(live._events) == 40_001
+    for keys in (track._expected, track._stride, live._last_seen, live._stride):
+        assert len(keys) <= KEY_HORIZON
+
+
 # -- whole-group loss ----------------------------------------------------
 
 def test_missing_middle_group_is_lost_until_it_arrives():
