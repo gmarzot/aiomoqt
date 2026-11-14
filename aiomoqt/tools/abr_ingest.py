@@ -257,10 +257,11 @@ _CONFIG_PROPS = (LOC_PROP_VIDEO_CONFIG, LOC_PROP_AUDIO_CONFIG)
 
 class _Cmaf:
     """One output track's LOC frames as CMSF objects: prft + one-sample
-    moof+mdat. tfdt is the LOC timestamp in track ticks, kept rising;
-    the prft carries the capture time. Audio tfdt steps by each frame's
-    samples and rejoins the timestamp when they differ by over half a frame;
-    an audio frame at or behind the last tfdt is dropped."""
+    moof+mdat. tfdt is the LOC timestamp in track ticks and the prft
+    carries the capture time. A frame at or behind the last tfdt, such as
+    a group's tail that arrives after the next group's key frame, is
+    dropped. Audio tfdt steps by each frame's samples and rejoins the
+    timestamp when they differ by over half a frame."""
 
     def __init__(self, track, loc_timescale: Optional[int],
                  fps: Optional[Tuple[int, int]] = None,
@@ -293,10 +294,12 @@ class _Cmaf:
             self._next = dt + dur
         else:
             if self._last is not None:
-                if dt is not None and dt > self._last and self._frame is None:
-                    self._dur = dt - self._last
-                if dt is None or dt <= self._last:
+                if dt is None:
                     dt = self._last + self._dur
+                elif dt <= self._last:
+                    return None
+                elif self._frame is None:
+                    self._dur = dt - self._last
             dt = dt or 0
             dur = self._frame or self._dur
         self._last = dt
