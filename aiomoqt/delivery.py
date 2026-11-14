@@ -583,7 +583,8 @@ class SubgroupDelivery:
     def __init__(self, session, track_alias: int, *, priority: int = 128,
                  mapping: StreamMapping = StreamMapping.PER_GROUP,
                  stream_priority: Optional[int] = None,
-                 ordered: bool = False):
+                 ordered: bool = False,
+                 chain: Optional[int] = None):
         self.session = session
         self.track_alias = track_alias
         self.priority = priority
@@ -593,6 +594,9 @@ class SubgroupDelivery:
         # per_track: this track's streams on the session, oldest first.
         self.order = (StreamOrder(session, stream_priority)
                       if ordered and stream_priority is not None else None)
+        # chain: this track's transport stream chain on the session,
+        # ranked by group.
+        self.chain = chain
         self.mapping = mapping
         # Group whose PER_GROUP stream open is in flight.
         self._opening: Optional[int] = None
@@ -766,8 +770,13 @@ class SubgroupDelivery:
                 first = hdr.serialize().data + self._object_bytes(
                     hdr, object_id, payload, extensions, encoded)
                 band = self._open_band()
-                sid = await self.session.open_uni_stream(
-                    initial=first, priority=band, end_stream=True)
+                if self.chain is None:
+                    sid = await self.session.open_uni_stream(
+                        initial=first, priority=band, end_stream=True)
+                else:
+                    sid = await self.session.open_uni_stream(
+                        initial=first, priority=band, end_stream=True,
+                        chain=self.chain, order=group_id)
                 self._opened(sid, band)
                 self.stream_count += 1
                 if lane is not None:
@@ -794,9 +803,15 @@ class SubgroupDelivery:
                     self._opening = group_id
                     band = self._open_band()
                     try:
-                        sid = await self.session.open_uni_stream(
-                            initial=first, priority=band,
-                            end_stream=end_of_group)
+                        if self.chain is None:
+                            sid = await self.session.open_uni_stream(
+                                initial=first, priority=band,
+                                end_stream=end_of_group)
+                        else:
+                            sid = await self.session.open_uni_stream(
+                                initial=first, priority=band,
+                                end_stream=end_of_group,
+                                chain=self.chain, order=group_id)
                     finally:
                         self._opening = None
                     self._opened(sid, band)

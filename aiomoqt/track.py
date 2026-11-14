@@ -306,6 +306,8 @@ class _SubgroupSender:
         band = track._stream_band(session, priority)
         # generate()'s streams are in no StreamOrder: oldest first, as fifo.
         self.band = waiting_band(band) if track._ordered(session) else band
+        self.chain = track._chain(session, track_alias)
+        self.group_id = 0
         self.header = None
         self.stream_id = None
         # The peer stopped this group's stream (§11.3.2: not reopened).
@@ -325,6 +327,7 @@ class _SubgroupSender:
             publisher_priority=self.priority,
             extensions_present=True,
         )
+        self.group_id = group_id
 
     def end_stream(self) -> None:
         if self.stream_id is None:
@@ -389,9 +392,15 @@ class _SubgroupSender:
                     initial += data if end is None else data + end
                 if session._close_err is not None:
                     raise asyncio.CancelledError
-                self.stream_id = await session.open_uni_stream(
-                    initial=initial, priority=self.band,
-                    end_stream=end is not None)
+                if self.chain is None:
+                    self.stream_id = await session.open_uni_stream(
+                        initial=initial, priority=self.band,
+                        end_stream=end is not None)
+                else:
+                    self.stream_id = await session.open_uni_stream(
+                        initial=initial, priority=self.band,
+                        end_stream=end is not None, chain=self.chain,
+                        order=self.group_id)
                 self.track._stream_count += 1
                 self.track._stream_opened(self.sub)
                 self.sub.senders.add(self)
@@ -825,6 +834,14 @@ class PublishedTrack(Track):
         return (self.stream_priority is None
                 and self._scheduling(session) == "per_track")
 
+    def _chain(self, session, track_alias: int) -> Optional[int]:
+        """Transport stream chain of this track's streams to `session`
+        under `chain` scheduling, else None."""
+        if (self.stream_priority is None
+                and self._scheduling(session) == "chain"):
+            return track_alias + 1
+        return None
+
     def _add_delivery(self, sub) -> None:
         """Give a peer its delivery of the object sequence under its
         current alias, replacing any it had. It joins at the next group
@@ -842,7 +859,9 @@ class PublishedTrack(Track):
                                         mapping=self.mapping,
                                         stream_priority=self._stream_band(
                                             sub.session),
-                                        ordered=self._ordered(sub.session))
+                                        ordered=self._ordered(sub.session),
+                                        chain=self._chain(sub.session,
+                                                          sub.track_alias))
         sub._filter()
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
