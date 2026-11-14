@@ -334,6 +334,29 @@ def test_cmaf_audio_tfdt_follows_samples_and_drops_late_frames():
     assert len(steps) == 17 and set(steps) == {1024}, steps
 
 
+def test_cmaf_video_tfdt_keeps_timestamps_and_drops_late_frames():
+    """Three repeated video frames are dropped, and every later frame keeps
+    its own timestamp as tfdt instead of running three frames ahead."""
+    from aiomoqt.tools import abr_ingest
+    config, frames = _fake_clip()
+    entry = _source_catalog(config).find('video')
+    pkg = abr_ingest._cmaf_for(entry, config, entry.codec, None, None)
+    t0 = 1_794_405_600_000_000
+
+    def ticks(k):
+        return (t0 + k * 1_000_000 // FPS) * pkg.chunker.timescale // 1_000_000
+
+    order = list(range(10)) + [7, 8, 9] + list(range(10, 20))
+    out = [(k, pkg.wrap(LocFrame(frames[k][0], key_frame=frames[k][1],
+                                 timestamp=t0 + k * 1_000_000 // FPS)))
+           for k in order]
+    assert [i for i, (_, p) in enumerate(out) if p is None] == [10, 11, 12]
+    kept = [(k, _cmaf_object(p)) for k, p in out if p is not None]
+    assert [k for k, _ in kept] == list(range(20))
+    for k, (sync, tfdt) in kept:
+        assert tfdt == ticks(k) and sync == frames[k][1], (k, tfdt)
+
+
 @pytest.mark.parametrize('codec', ['h264', 'av1'])
 async def test_ingester_publishes_cmaf_tracks(impl, clip, codec):
     _needs(impl, codec)

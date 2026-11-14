@@ -11,6 +11,7 @@
 - Logs show an authorization token's length instead of its value.
 - A request that fails because its session closed names the close code in its reason.
 - adaptive_bench `--hold` fails a step for rising p90 only once p90 is over half the threshold.
+- `abr_ingest --packaging cmaf` drops a video frame at or behind the last one, as it does for audio, instead of giving it a tfdt one frame past the last: every later frame kept that lead, so a passthrough `video` ran ahead of its capture time and of the rungs.
 - `abr_ingest --packaging cmaf` keeps audio tfdt on the source timeline: it steps by each frame's samples and drops a frame that arrives behind the last one, so a late frame after a gap no longer stretches every later audio object to the gap's length.
 - The `abr` extra takes cymedia 0.1.0 or later, so installing it no longer needs pre-releases allowed.
 - adaptive_bench's BW mode reads its receive rate over the window each subscriber report covers, so a late report no longer doubles it and silence after a burst lowers it, and gives loss as lost / (received + lost) instead of lost / received. Objects from groups already pruned are counted without recreating loss state.
