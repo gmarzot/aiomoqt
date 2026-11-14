@@ -96,11 +96,7 @@ code {
 .gauge .g-track, .gauge .g-arc { fill: none; stroke-width: 10; stroke-linecap: round; }
 .gauge .g-track { stroke: var(--track); }
 .gauge .g-tick { fill: none; stroke-width: 3; }
-.gauge .g-ring-track, .gauge .g-ring { fill: none; stroke-width: 3; stroke-linecap: round; }
-.gauge .g-ring-track { stroke: var(--track); }
-.gauge .g-ring { stroke: var(--gold); }
 .gauge .g-sub { font: 600 9px Inter, system-ui, sans-serif; fill: var(--gold); }
-.gauge path.g-ring.dim { stroke: var(--faint); }
 .gauge text.g-sub.dim { fill: var(--dim); }
 .gauge .g-value { font: 600 24px Inter, system-ui, sans-serif; }
 .gauge path.ok { stroke: var(--green); }
