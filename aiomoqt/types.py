@@ -684,7 +684,11 @@ STREAM_BAND_CONTROL = 8
 STREAM_BAND_DATA_FLOOR = 10
 STREAM_BAND_PADDING = 255
 
-SCHEDULING = ("round_robin", "fifo")
+# per_track: tracks of one priority share its band round-robin, and each
+# track's streams go oldest first (its later streams wait in band | 1).
+# round_robin: every stream shares the band. fifo: the band goes to its
+# lowest stream id.
+SCHEDULING = ("per_track", "round_robin", "fifo")
 
 
 def to_stream_priority(moqt_priority: int, *,
@@ -694,8 +698,10 @@ def to_stream_priority(moqt_priority: int, *,
     The low bit is cleared and re-set from `discipline`, never inherited from
     the MoQT value: it selects picoquic's tiebreak among equals rather than
     adding resolution, so carrying it through would make adjacent priorities
-    differ in kind. round_robin shares a band fairly; fifo hands the whole
-    band to its lowest stream id, which no caller can steer.
+    differ in kind. round_robin and per_track share a band fairly; fifo
+    hands the whole band to its lowest stream id, which no caller can steer.
+    per_track's band is that of a track's oldest stream; waiting_band()
+    gives its later ones.
 
     Clamped to STREAM_BAND_DATA_FLOOR so declared data can never rise above
     the control band — a greedy track at a lower band would starve the
@@ -711,3 +717,9 @@ def to_stream_priority(moqt_priority: int, *,
             f"MoQT priority must be 0-255, got {moqt_priority}")
     band = max(STREAM_BAND_DATA_FLOOR, moqt_priority & 0xFE)
     return band | (1 if discipline == "fifo" else 0)
+
+
+def waiting_band(band: int) -> int:
+    """Band of a per_track stream queued behind its track's older stream:
+    one step below `band`, oldest first, above the next priority's band."""
+    return band | 1

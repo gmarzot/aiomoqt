@@ -15,7 +15,8 @@ from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
 from .messages import SubgroupHeader
-from .types import MOQTStreamStopped, ObjectStatus, StreamResetCode
+from .types import (MOQTStreamStopped, ObjectStatus, StreamResetCode,
+                    waiting_band)
 from .messages.data import (
     FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram, ObjectDatagramStatus,
 )
@@ -485,6 +486,91 @@ def _peer(session) -> str:
     return f"{addr[0]}:{addr[1]}" if addr else "peer"
 
 
+# How often StreamOrders with waiting streams are checked.
+ORDER_CHECK_S = 0.02
+_waiting_orders: set = set()
+_order_timer = None      # (loop, TimerHandle) of the next check
+
+
+def _check_orders() -> None:
+    global _order_timer
+    _order_timer = None
+    for order in list(_waiting_orders):
+        try:
+            order.check()
+        except Exception:
+            # A session gone mid-check: its streams wait no longer.
+            logger.debug("stream order check failed", exc_info=True)
+            order._waiting.clear()
+        if not order._waiting:
+            _waiting_orders.discard(order)
+    if _waiting_orders:
+        _schedule_order_check()
+
+
+def _schedule_order_check() -> None:
+    global _order_timer
+    loop = asyncio.get_running_loop()
+    if _order_timer is None or _order_timer[0] is not loop:
+        _order_timer = (loop, loop.call_later(ORDER_CHECK_S, _check_orders))
+
+
+class StreamOrder:
+    """per_track order of one track's streams on one session. The oldest
+    stream still holding transport bytes sends in `band`, shared
+    round-robin with the session's other tracks of that band; a stream
+    opened behind it waits in waiting_band(band), oldest first, and moves
+    up once every older stream has drained, checked at each open and every
+    ORDER_CHECK_S while any stream waits."""
+
+    __slots__ = ("session", "band", "_used", "_streams", "_waiting")
+
+    def __init__(self, session, band: int):
+        self.session = session
+        self.band = band
+        self._used = _tx_used(session)
+        self._streams: list = []     # stream ids, oldest first
+        self._waiting: set = set()   # those in waiting_band()
+
+    def open_band(self) -> int:
+        """Band for a stream about to open."""
+        streams = self._streams
+        if not streams:
+            return self.band
+        if self._waiting:
+            self.check()
+            if self._waiting:
+                return waiting_band(self.band)
+        used = self._used
+        streams[:] = [sid for sid in streams if used(sid)]
+        return waiting_band(self.band) if streams else self.band
+
+    def opened(self, sid: int, band: int) -> None:
+        self._streams.append(sid)
+        if band != self.band:
+            self._waiting.add(sid)
+            _waiting_orders.add(self)
+            _schedule_order_check()
+
+    def check(self) -> None:
+        """Move waiting streams up, oldest first, as far as the first
+        stream that still holds transport bytes; forget drained ones."""
+        waiting = self._waiting
+        if not waiting:
+            return
+        used = self._used
+        streams = self._streams
+        drained = 0
+        for sid in streams:
+            if sid in waiting:
+                waiting.discard(sid)
+                self.session.set_stream_priority(sid, self.band)
+            if used(sid):
+                break
+            drained += 1
+        del streams[:drained]
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -496,13 +582,17 @@ class SubgroupDelivery:
 
     def __init__(self, session, track_alias: int, *, priority: int = 128,
                  mapping: StreamMapping = StreamMapping.PER_GROUP,
-                 stream_priority: Optional[int] = None):
+                 stream_priority: Optional[int] = None,
+                 ordered: bool = False):
         self.session = session
         self.track_alias = track_alias
         self.priority = priority
         # Transport band for this track's streams, precomputed by the
         # caller; None leaves the session default.
         self.stream_priority = stream_priority
+        # per_track: this track's streams on the session, oldest first.
+        self.order = (StreamOrder(session, stream_priority)
+                      if ordered and stream_priority is not None else None)
         self.mapping = mapping
         # Group whose PER_GROUP stream open is in flight.
         self._opening: Optional[int] = None
@@ -538,6 +628,15 @@ class SubgroupDelivery:
     @property
     def _prof(self):
         return self.session._profile
+
+    def _open_band(self) -> Optional[int]:
+        order = self.order
+        return self.stream_priority if order is None else order.open_band()
+
+    def _opened(self, sid: int, band: Optional[int]) -> None:
+        order = self.order
+        if order is not None and band is not None:
+            order.opened(sid, band)
 
     def _note_largest(self, group_id: int, object_id: int) -> None:
         """Largest Location is a max: group send order is not guaranteed
@@ -606,10 +705,12 @@ class SubgroupDelivery:
                       status=ObjectStatus.END_OF_TRACK)
             await self.session.dgram_write_drain(msg.serialize(prof=prof).data)
             return
+        band = self._open_band()
         sid = await self.session.open_uni_stream()
         self.stream_count += 1
-        if self.stream_priority is not None:
-            self.session.set_stream_priority(sid, self.stream_priority)
+        if band is not None:
+            self.session.set_stream_priority(sid, band)
+            self._opened(sid, band)
         hdr = SubgroupHeader(
             track_alias=self.track_alias, group_id=group_id, subgroup_id=0,
             publisher_priority=self.priority, extensions_present=True,
@@ -664,9 +765,10 @@ class SubgroupDelivery:
                 # The header and the object open the stream together.
                 first = hdr.serialize().data + self._object_bytes(
                     hdr, object_id, payload, extensions, encoded)
+                band = self._open_band()
                 sid = await self.session.open_uni_stream(
-                    initial=first, priority=self.stream_priority,
-                    end_stream=True)
+                    initial=first, priority=band, end_stream=True)
+                self._opened(sid, band)
                 self.stream_count += 1
                 if lane is not None:
                     lane.sid, lane.parked = sid, "object"
@@ -690,12 +792,14 @@ class SubgroupDelivery:
                     if end_of_group:
                         first += self._end_bytes(hdr)
                     self._opening = group_id
+                    band = self._open_band()
                     try:
                         sid = await self.session.open_uni_stream(
-                            initial=first, priority=self.stream_priority,
+                            initial=first, priority=band,
                             end_stream=end_of_group)
                     finally:
                         self._opening = None
+                    self._opened(sid, band)
                     self.stream_count += 1
                     if lane is not None:
                         lane.sid = sid

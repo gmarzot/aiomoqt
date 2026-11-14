@@ -1,8 +1,9 @@
 """Data stream bands. Every session, client and server, raw QUIC and WT,
 starts undeclared data streams in MoQT's neutral band; a published track's
 streams, and the relay's downstream copies of them, take the band of the
-track's publisher priority. FIFO within a band by default, so a track's
-groups stay in order; stream_scheduling selects round_robin."""
+track's publisher priority. per_track by default: tracks share a band
+and each track's groups stay in order (test_stream_order.py);
+stream_scheduling selects round_robin or fifo."""
 import asyncio
 
 import pytest
@@ -22,7 +23,8 @@ _BASE_PORT = 15490
 _NS = "prio/bands"
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
-_SCHEDULING = pytest.mark.parametrize("scheduling", ["fifo", "round_robin"])
+_SCHEDULINGS = ["per_track", "round_robin", "fifo"]
+_SCHEDULING = pytest.mark.parametrize("scheduling", _SCHEDULINGS)
 # Track name -> publisher priority.
 _TRACKS = {"audio": 64, "video": 200}
 _GROUPS = 2
@@ -111,11 +113,13 @@ async def test_sessions_default_to_the_neutral_band(
         use_quic, scheduling, monkeypatch):
     defaults = _spy(monkeypatch, "set_default_stream_priority")
     bands = _spy(monkeypatch, "set_stream_priority")
-    port = _BASE_PORT + 2 * (not use_quic) + (scheduling != "fifo")
+    port = _BASE_PORT + 3 * (not use_quic) + _SCHEDULINGS.index(scheduling)
     await _run(port, use_quic, scheduling, monkeypatch)
 
-    neutral = to_stream_priority(128, discipline=scheduling)
-    assert neutral == (129 if scheduling == "fifo" else 128)
+    # per_track keeps undeclared streams oldest first, as fifo does.
+    neutral = to_stream_priority(
+        128, discipline="fifo" if scheduling == "per_track" else scheduling)
+    assert neutral == (128 if scheduling == "round_robin" else 129)
     # Publisher, subscriber and the relay's two sessions: one call each.
     assert [(p, ok) for _s, p, ok in defaults] == [(neutral, True)] * 4
     # Control streams stay above every data band.
@@ -129,21 +133,33 @@ async def test_data_streams_take_their_track_band(
         use_quic, scheduling, monkeypatch):
     bands = _spy(monkeypatch, "set_stream_priority")
     opens = _spy_open(monkeypatch)
-    port = _BASE_PORT + 4 + 2 * (not use_quic) + (scheduling != "fifo")
+    port = (_BASE_PORT + 10 + 3 * (not use_quic)
+            + _SCHEDULINGS.index(scheduling))
     pub, server = await _run(port, use_quic, scheduling, monkeypatch)
 
     want = {to_stream_priority(p, discipline=scheduling)
             for p in _TRACKS.values()}
     assert {p % 2 for p in want} == {1 if scheduling == "fifo" else 0}
+    opened = {(id(s), sid) for s, sid, _p, _ok in opens}
     if use_quic and _RAW_WRITE_PRIORITY:
-        assert all(p == STREAM_BAND_CONTROL for _s, _sid, p, _ok in bands)
-    data = [(s, p, ok) for s, _sid, p, ok in bands + opens
-            if p != STREAM_BAND_CONTROL]
+        # Bands ride the first write; per_track's moves up come later.
+        assert all(p == STREAM_BAND_CONTROL for s, sid, p, _ok in bands
+                   if (id(s), sid) not in opened)
+    # Each data stream's band is the first it was given.
+    first = {}
+    for s, sid, p, ok in opens + bands:
+        if p != STREAM_BAND_CONTROL:
+            first.setdefault((id(s), sid), (s, p, ok))
+    data = list(first.values())
     assert all(ok for _s, _p, ok in data), data
     pub_bands = [p for s, p, _ok in data if s is pub]
     relay_bands = [p for s, p, _ok in data if s._session is server]
-    # One stream per group per track, upstream and downstream.
+    # One stream per group per track, upstream and downstream; per_track
+    # opens a track's later stream one step down while an older one still
+    # holds transport bytes.
     for got in (pub_bands, relay_bands):
+        if scheduling == "per_track":
+            got = [p & ~1 for p in got]
         assert sorted(got) == sorted(list(want) * _GROUPS), got
 
 
@@ -192,6 +208,6 @@ async def test_datagrams_share_the_neutral_band(use_quic, monkeypatch):
             await asyncio.sleep(0.1)
     finally:
         handle.close()
-    band = to_stream_priority(128, discipline="fifo")
+    band = to_stream_priority(128, discipline="per_track")
     assert len(calls) == 2, calls                       # client and relay
     assert all(c == (band, True) for c in calls), calls

@@ -34,7 +34,7 @@ from .types import (
     FetchType, MOQTRequestError, MOQTStreamStopped, ParamType, FilterType,
     ForwardingPreference, GroupOrder, LOC_TIMESTAMP, ObjectStatus,
     RequestErrorCode, StreamResetCode, SubscribeDoneCode,
-    SCHEDULING, to_stream_priority,
+    SCHEDULING, to_stream_priority, waiting_band,
 )
 from .delivery import (
     PUBLISHER_LANE_BYTES, DatagramTooLarge, FanoutDelivery, HeadTrace,
@@ -303,7 +303,9 @@ class _SubgroupSender:
         self.track_alias = track_alias
         self.subgroup_id = subgroup_id
         self.priority = priority
-        self.band = track._stream_band(session, priority)
+        band = track._stream_band(session, priority)
+        # generate()'s streams are in no StreamOrder: oldest first, as fifo.
+        self.band = waiting_band(band) if track._ordered(session) else band
         self.header = None
         self.stream_id = None
         # The peer stopped this group's stream (§11.3.2: not reopened).
@@ -806,15 +808,22 @@ class PublishedTrack(Track):
     def _produces(self) -> bool:
         return type(self).produce is not PublishedTrack.produce
 
+    def _scheduling(self, session) -> str:
+        return self.stream_scheduling or getattr(
+            session, 'stream_scheduling', "per_track")
+
     def _stream_band(self, session, priority: Optional[int] = None) -> int:
         """Transport band for this track's data streams on `session`."""
         if self.stream_priority is not None:
             return self.stream_priority
-        sched = self.stream_scheduling or getattr(
-            session, 'stream_scheduling', "fifo")
         return to_stream_priority(
             self.priority if priority is None else priority,
-            discipline=sched)
+            discipline=self._scheduling(session))
+
+    def _ordered(self, session) -> bool:
+        """This track's streams to `session` go oldest first (per_track)."""
+        return (self.stream_priority is None
+                and self._scheduling(session) == "per_track")
 
     def _add_delivery(self, sub) -> None:
         """Give a peer its delivery of the object sequence under its
@@ -832,7 +841,8 @@ class PublishedTrack(Track):
                                         priority=self.priority,
                                         mapping=self.mapping,
                                         stream_priority=self._stream_band(
-                                            sub.session))
+                                            sub.session),
+                                        ordered=self._ordered(sub.session))
         sub._filter()
         sub.delivery.excludes_end = sub.excludes_end
         self._out.add(sub.delivery,
