@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.messages import SubgroupHeader
+from aiomoqt.messages import RequestOk, SubgroupHeader
 from aiomoqt.messages.params import D20ParamType, LocationFilter
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
@@ -343,4 +343,100 @@ async def test_a_fill_past_the_cache_is_not_served_short(use_quic, mode):
             else:
                 assert (clean, got) == (True, _span((2, 0), (2, 2))), name
                 assert rx.gaps[ok.request_id] == [(0x20C, 2, 4)], name
+        assert rx.session._close_err is None
+
+
+_OFFERED = {"catalog": 200, "video": 300}
+
+
+class _One(PublishedTrack):
+    """PUBLISHes one object, (0, 0)."""
+
+    written = False
+
+    async def generate(self, session, track_alias):
+        if self.written:
+            return
+        self.written = True
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(track_alias=track_alias, group_id=0,
+                             subgroup_id=0, publisher_priority=128,
+                             extensions_present=True, prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        await session.stream_write_drain(sid, hdr.next_object(
+            payload=b"x" * _OFFERED[self.trackname], extensions=None,
+            object_id=0).data)
+
+
+@contextlib.contextmanager
+def _one_write(session):
+    """Send the session's stream writes in the block as one write, so the
+    relay reads them together."""
+    held, write = [], session.stream_write
+    session.stream_write = lambda sid, data: held.append((sid, data))
+    try:
+        yield
+    finally:
+        session.stream_write = write
+    assert len({sid for sid, _ in held}) == 1, held
+    write(held[0][0], b"".join(data for _, data in held))
+
+
+@_TRANSPORTS
+@pytest.mark.parametrize("mode", ["fill", "pause"])
+async def test_an_update_read_with_the_publish_ok_is_applied(
+        use_quic, mode, monkeypatch):
+    # d22 §3.1, §9.5: the subscription a PUBLISH_OK establishes takes the
+    # REQUEST_UPDATE behind it on the stream. With both in one read, the
+    # update is held until the relay has attached the subscriber.
+    served = {}
+    serve_fill = relay._serve_fill
+
+    async def record(track, d, request_id, fill, rng, filters=None):
+        served.setdefault(track.key[1].decode(), []).append((request_id, rng))
+        await serve_fill(track, d, request_id, fill, rng, filters)
+
+    monkeypatch.setattr(relay, "_serve_fill", record)
+    case = 6 + ["fill", "pause"].index(mode)
+    async with _relay(_port(case, use_quic), use_quic) as connect:
+        pub = await connect()
+        for name in _OFFERED:
+            await _One(pub, namespace=_NS, trackname=name).publish(
+                publish_track=True, forward=1)
+        assert await _until(lambda: all(
+            _relayed(n) is not None and _relayed(n).largest == (0, 0)
+            for n in _OFFERED))
+        rx = _Rx(await connect())
+        await rx.session.subscribe_tracks(namespace=_NS, wait_response=True)
+        offers, updates = {}, {}
+        for _ in _OFFERED:
+            offer = await rx.session.await_publish(timeout=5.0)
+            name = offer.track_name.decode()
+            offers[name] = offer
+            with _one_write(rx.session):
+                if mode == "pause":
+                    # From d20 a PUBLISH_OK changing Forward State is
+                    # REQUEST_OK, then REQUEST_UPDATE FORWARD=0.
+                    rx.session.publish_ok(offer, forward=0)
+                    continue
+                rx.session.publish_ok(offer, forward=1)
+                fill = {_FILL: {ParamType.LOCATION_FILTER:
+                                LocationFilter.relative(1)}}
+                updates[name] = asyncio.ensure_future(
+                    rx.session.request_update(offer.request_id,
+                                              parameters=fill,
+                                              wait_response=True))
+        assert set(offers) == set(_OFFERED)
+        for name, offer in offers.items():
+            assert await _until(lambda n=name, o=offer: any(
+                d.request_id == o.request_id and d.forward == (mode == "fill")
+                for d in _relayed(n).downstream)), name
+            d = _downstream(name, offer.request_id)
+            # Not ended as a failed update (§9.5.1).
+            assert offer.request_id in d.session._bidi_streams, name
+        for name, task in updates.items():
+            ok = await task
+            assert isinstance(ok, RequestOk), (name, ok)
+            assert await _until(lambda n=name: n in served), name
+            assert served[name] == [(ok.request_id, ((0, 0), (0, 0)))], name
         assert rx.session._close_err is None

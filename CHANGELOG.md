@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay applies a REQUEST_UPDATE that arrives with the PUBLISH_OK for a SUBSCRIBE_TRACKS offer; it answered NOT_SUPPORTED and ended the subscription, so a FILL_PARAMETERS update (moq-web's catalog fill) lost the track.
 - aiomoqt-relay writes `status.json`, `platform.json` and `relay.log` from threads, so a stalled filesystem no longer pauses every session: an 809 ms stall in the status write and 118–153 ms stalls in log flushes were seen live.
 - aiomoqt-relay sends PUBLISH_DONE as soon as the track's last publisher ends it, when it had failed over from another publisher; it was held 3 s, past moxygen's moq-test client wait. A d16 or d18 publisher's SUBSCRIPTION_ENDED reaches a d20 or d22 subscriber as TRACK_ENDED; that subscriber got no PUBLISH_DONE.
 - aiomoqt-relay frees an ended track's cache a slice per event-loop pass (2 ms at most) instead of all at once; when 1.3 GiB of cached tracks ended together, the relay's loop stalled up to 386 ms. The cache budget drops the bytes immediately.
