@@ -3927,6 +3927,14 @@ def _subscribe_pending(session, request_id) -> bool:
     return held is not None and held[0] is Subscribe
 
 
+def _request_pending(session, request_id) -> bool:
+    """Subscription `request_id` is not established yet: the peer's
+    SUBSCRIBE is unanswered, or our PUBLISH offer has no subscriber
+    attached."""
+    return (_subscribe_pending(session, request_id)
+            or (session, request_id) in _offers_pending)
+
+
 def _still_wanted(session, request_id) -> bool:
     """False once the subscriber cancelled the request or closed; no
     reply is sent then."""
@@ -4086,6 +4094,7 @@ async def _on_publish(session, msg):
     offered = False
     for sub_session, prefix, rid in list(_track_subs):
         if (_prefix_covers(prefix, ns)
+                and not _own_track(sub_session, track)
                 and _track_sub_admits(sub_session, rid, track)):
             offered = True
             asyncio.create_task(
@@ -4692,15 +4701,16 @@ async def _on_request_update(session, msg):
     found = _joined_subscription(session, rid)
     held = _held_updates.get((session, rid))
     if d16 and (held is not None
-                or (found is None and _subscribe_pending(session, rid))):
-        # Answered after the SUBSCRIBE it updates, in arrival order: its
-        # reply must not overtake the SUBSCRIBE_OK on the request stream.
+                or (found is None and _request_pending(session, rid))):
+        # Applied in arrival order once its subscription is established:
+        # its reply must not overtake the SUBSCRIBE_OK, and an offer's
+        # subscriber is attached a loop turn after its PUBLISH_OK.
         if held is None:
             held = _held_updates[(session, rid)] = []
             _spawn(_release_held_updates(session, rid))
         held.append(msg)
         logger.info(f"relay: update request {msg.request_id} held until "
-                    f"SUBSCRIBE {rid} is answered")
+                    f"subscription {rid} is established")
         return
     if found is None:
         if d16:
@@ -4712,16 +4722,18 @@ async def _on_request_update(session, msg):
     _apply_update(session, msg, found, d16)
 
 
-# (session, SUBSCRIBE request id) -> REQUEST_UPDATEs waiting for it.
+# (session, request id) -> REQUEST_UPDATEs waiting for its subscription.
 _held_updates: dict = {}
+# (session, request id) of PUBLISH offers with no subscriber attached yet.
+_offers_pending: set = set()
 
 
 async def _release_held_updates(session, rid) -> None:
-    """Answer the updates held for SUBSCRIBE `rid` once it is answered:
-    applied after its SUBSCRIBE_OK, else given the session's default."""
+    """Answer the updates held for subscription `rid`: applied once it is
+    established, else given the session's default."""
     deadline = time.monotonic() + HELD_UPDATE_MAX_S
     while (_joined_subscription(session, rid) is None
-           and _subscribe_pending(session, rid) and _session_live(session)
+           and _request_pending(session, rid) and _session_live(session)
            and time.monotonic() < deadline):
         await asyncio.sleep(HELD_UPDATE_POLL_S)
     found = _joined_subscription(session, rid)
@@ -5232,6 +5244,16 @@ def _prefix_covers(prefix, ns) -> bool:
     return ns[:len(prefix)] == prefix
 
 
+def _own_track(session, track) -> bool:
+    """From d18 SUBSCRIBE_TRACKS excludes tracks published by the
+    subscriber (d22 §3.6); d14 and d16 echo them back."""
+    if not session._profile.two_level_discovery:
+        return False
+    pending = track.pending_publish
+    return (track.feeds_from(session)
+            or (pending is not None and pending[0] is session))
+
+
 def _track_sub_admits(session, request_id, track) -> bool:
     """The track passes the SUBSCRIBE_TRACKS's TRACK_PROPERTY_FILTERs."""
     params = _track_sub_filters.get((id(session), request_id))
@@ -5266,9 +5288,6 @@ async def _offer_track(session, track, key, request_id=None):
         await _resume_for(track, SimpleNamespace(forward=1))
         if not _session_live(session):
             return
-    # A session that subscribed to a prefix gets every track under it,
-    # including one it publishes itself: the subscription is explicit,
-    # and moq-test's publish cases use one session for both roles.
     pub_msg = session.publish(
         namespace=ns,
         track_name=(name.decode() if isinstance(name, bytes) else name),
@@ -5276,26 +5295,34 @@ async def _offer_track(session, track, key, request_id=None):
         track_properties=track.properties)
     fut = session._loop.create_future()
     session._pending_requests[pub_msg.request_id] = fut
+    # A REQUEST_UPDATE read with the PUBLISH_OK runs before this task
+    # resumes; it is held until the subscriber is attached.
+    offer = (session, pub_msg.request_id)
+    _offers_pending.add(offer)
     try:
-        reply = await session._await_response(pub_msg.request_id)
-    except MOQTRequestError as e:
-        logger.info(f"relay: PUBLISH offer declined for {key}: {e}")
-        return
-    forward = getattr(reply, 'forward', None)
-    if forward is None:
-        # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
-        forward = (getattr(reply, 'parameters', None) or {}).get(
-            ParamType.FORWARD, 1)
-    window = _reply_window(session, reply, seen) or _UNFILTERED
-    # Cached objects inside the subscriber's window go first.
-    d = track.add_downstream(session, pub_msg.track_alias,
-                             pub_msg.request_id, forward=bool(forward),
-                             window=window, replay=track.largest is not None)
-    d.set_filters(_track_sub_filters.get((id(session), request_id), {}),
-                  track.properties)
-    session.register_request_cancel_handler(
-        pub_msg.request_id,
-        lambda rid, t=track, s=session: t.drop_session(s))
+        try:
+            reply = await session._await_response(pub_msg.request_id)
+        except MOQTRequestError as e:
+            logger.info(f"relay: PUBLISH offer declined for {key}: {e}")
+            return
+        forward = getattr(reply, 'forward', None)
+        if forward is None:
+            # §10.2.12: FORWARD omitted from PUBLISH_OK means 1.
+            forward = (getattr(reply, 'parameters', None) or {}).get(
+                ParamType.FORWARD, 1)
+        window = _reply_window(session, reply, seen) or _UNFILTERED
+        # Cached objects inside the subscriber's window go first.
+        d = track.add_downstream(session, pub_msg.track_alias,
+                                 pub_msg.request_id, forward=bool(forward),
+                                 window=window,
+                                 replay=track.largest is not None)
+        d.set_filters(_track_sub_filters.get((id(session), request_id), {}),
+                      track.properties)
+        session.register_request_cancel_handler(
+            pub_msg.request_id,
+            lambda rid, t=track, s=session: t.drop_session(s))
+    finally:
+        _offers_pending.discard(offer)
     _answer_publish(track)
     _resume_paused(track)
     logger.info(f"relay: PUBLISH offer accepted for {key} "
@@ -5762,6 +5789,11 @@ async def _on_subscribe_tracks(session, msg):
     for key, track in list(_tracks.items()):
         if _prefix_covers(prefix, key[0]) and (
                 track.pending_publish or track.upstream):
+            if _own_track(session, track):
+                logger.info(f"relay: {key} is the subscriber's own track, "
+                            f"not offered to subscribe-tracks request "
+                            f"{msg.request_id}")
+                continue
             if not _track_sub_admits(session, msg.request_id, track):
                 logger.info(f"relay: {key} filtered out of subscribe-tracks "
                             f"request {msg.request_id}")
