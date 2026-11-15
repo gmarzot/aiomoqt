@@ -11,11 +11,11 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import SubgroupHeader
-from aiomoqt.messages.params import LocationFilter
+from aiomoqt.messages.params import D20ParamType, LocationFilter
 from aiomoqt.server import MOQTServer
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import _UNFILTERED, PublishedTrack
-from aiomoqt.types import MOQTMessageType, ParamType
+from aiomoqt.types import GroupOrder, MOQTMessageType, ParamType
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -222,6 +222,110 @@ async def test_relay_resets_a_group_it_cannot_deliver_whole(use_quic):
             assert rx.ends[name][g] is True
             assert [o for gg, o in rx.got[name] if gg == g] == list(
                 range(_GROUP))
+
+
+class _WholeGroup(_Live):
+    """A publisher that answers any SUBSCRIBE with the current group from
+    object 0, as moq-net does: objects the relay also fetched arrive
+    again on the subscription, then the group's tail live."""
+
+    async def generate(self, session, track_alias):
+        g, _ = self._largest
+        while True:
+            sid = await session.open_uni_stream()
+            hdr = SubgroupHeader(track_alias=track_alias, group_id=g,
+                                 subgroup_id=0, publisher_priority=128,
+                                 extensions_present=True,
+                                 prof=session._profile)
+            session.stream_write(sid, hdr.serialize().data)
+            for oid in range(_GROUP):
+                while self._largest < (g, oid):
+                    await asyncio.sleep(0.005)
+                await session.stream_write_drain(sid, hdr.next_object(
+                    payload=self._payload(g, oid), extensions=None,
+                    object_id=oid).data)
+            session.stream_fin(sid)
+            g += 1
+
+
+@_TRANSPORTS
+async def test_next_object_and_fill_deliver_each_object_once(use_quic):
+    # d22 §3.4: Next Object with a fill of the current group, through a
+    # relay that has not seen the track: the fill ends at SUBSCRIBE_OK's
+    # Largest and the subscription starts after it, so no object comes on
+    # both and the join group's tail comes on the subscription. The
+    # publisher resends the current group, as moq-net does.
+    _reset()
+    port = _port(4, use_quic)
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=(22, 18))
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def connect():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=22)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                return s
+            pub = await connect()
+            tracks = []
+            for name in _NAMES:
+                t = _WholeGroup(pub, namespace=_NS, trackname=name,
+                                fetch_history_bytes=1 << 20)
+                t.attach()
+                t.start_clock()
+                tracks.append(t)
+            await pub.publish_namespace(namespace=_NS, wait_response=True)
+            try:
+                await _mid_group(tracks)
+                rx = _Rx(await connect())
+                filled = {}
+                rx.session.on_fetch_object = (
+                    lambda obj, _n, _ts, rid: filled.setdefault(rid, [])
+                    .append((obj.group_id, obj.object_id)))
+                oks = {}
+                for name in _NAMES:
+                    oks[name] = ok = await rx.session.subscribe(
+                        _NS, name, forward=1, wait_response=True,
+                        group_order=GroupOrder.DESCENDING,
+                        location_filter=LocationFilter.next_object(),
+                        parameters={D20ParamType.FILL_PARAMETERS: {
+                            ParamType.LOCATION_FILTER:
+                                LocationFilter.relative(1)}},
+                        on_object=lambda m, _s, _t, g, _sg, n=name:
+                        rx.got[n].append((g, m.object_id))
+                        if m.payload else None)
+                    rx.session.register_stream_end_handler(
+                        ok.track_alias,
+                        lambda g, sg, clean=True, reset_code=0, n=name:
+                        rx.ends[n].setdefault(g, clean))
+                largest = {n: (ok.largest_group_id, ok.largest_object_id)
+                           for n, ok in oks.items()}
+                assert await _until(lambda: all(
+                    largest[n][0] + 1 in rx.ends[n] for n in _NAMES)), \
+                    (largest, rx.got, rx.ends)
+                for name, ok in oks.items():
+                    g, o = largest[name]
+                    assert await rx.session.await_fetch_done(
+                        ok.request_id, timeout=5)
+                    assert filled[ok.request_id] == [
+                        (g, oo) for oo in range(o + 1)], name
+                    early = [loc for loc in rx.got[name] if loc <= (g, o)]
+                    assert not early, (name, largest[name], early)
+                    assert [oo for gg, oo in rx.got[name] if gg == g] == \
+                        list(range(o + 1, _GROUP)), (name, rx.got[name])
+                    assert rx.ends[name][g] is True, (name, rx.ends[name])
+                    assert [oo for gg, oo in rx.got[name]
+                            if gg == g + 1] == list(range(_GROUP))
+                assert rx.session._close_err is None
+            finally:
+                for t in tracks:
+                    t._clock.cancel()
+    finally:
+        handle.close()
+        _reset()
 
 
 @_TRANSPORTS
