@@ -507,15 +507,17 @@ accuracy.
 ## Phase 1e — media + churn, consolidated report — **DONE (2026-11-15)**
 
 Measured on block `runs/2026-11-11T02-33-51Z`; report is
-`baselines/base-070rc2/SUMMARY.md` §3–§5, CSV is `rollup.csv` (11 rows: M1 3,
-M2 3, C0 1, C1 2, C2 2).
+`baselines/base-070rc2/SUMMARY.md` §3–§5, CSV is `rollup.csv` (88 rows total = 77
+pre-1e + 11 this phase: M1 3, M2 3, C0 1, C1 2, C2 2; no duplicate or empty-`run`
+rows — `emit_rollup_1e.py` now filters by point id rather than run id, so a
+regeneration is idempotent).
 
 | point | n | result |
 |---|---|---|
-| M1 | 3 | 4.81 Mb/s (4.81/4.81/4.83, CV 0.21%) — media profile, not transport |
-| M2 | 3 | 2.38 Mb/s per sub (2.38/2.37/2.37), 11.9 aggregate; latency not measurable (clock offset 114 ms) |
-| C0 | 1 | 200.7 Mb/s, CV 1.0%, 50/50 slots, 0 churn |
-| C1 | 2 | 176.2 Mb/s (176.31/176.07), CV 0.10–4.2%, 967 joins / 933 churns, delivery 0.9996 — **churn costs 12.2% of rate at fixed 200 offered** |
+| M1 | 3 | 4.82 Mb/s (4.82/4.81/4.83, CV 0.21%) — media profile, not transport |
+| M2 | 3 | 2.37 Mb/s per sub (2.38/2.37/2.37), 11.9 aggregate; latency not measurable (clock offset 114 ms) |
+| C0 | 1 | 200.7 Mb/s, interval CV 1.0%, 50/50 slots, 0 churn — **n=1, no dispersion** |
+| C1 | 2 | 176.2 Mb/s (176.31/176.07, rep CV 0.10%), interval CV 3.5–4.2%, 967 joins / 933 churns, delivery 0.9997/0.9995 — **churn costs 12.2% of rate at fixed 200 offered** |
 | C2 | 2 | late-join **TTFF 37.7 ms** (38.12/37.37) vs warm 36.0 ms; catch-up bytes **0** (50.15 MB in 80.3 s at live 4.8 Mb/s) |
 
 Carry-forward defects found and fixed this round (all in `scripts/`):
@@ -535,43 +537,6 @@ Carry-forward defects found and fixed this round (all in `scripts/`):
 
 Note for the log: C2's `result.json` on disk is still the stale failure record;
 the authoritative C2 summary is `result.built.json` beside it.
-
-**Next action: Phase 2a (0.6.1 comparison)** — the three points below, unchanged.
-
-**Status: partial.** The consolidated report skeleton is written and the
-L/P/D/R/Ri baselines are consolidated from their canonical blocks; the Phase 1e
-media/churn block was relaunched at **02:33:51Z** (`runs/2026-11-11T02-33-51Z`)
-with `--waive stray_bench_process,clock_offset_jump` after the first attempt
-(02:28:34Z) aborted on a clock-offset jump, and had completed **M1 (3/3 reps,
-4.81 Mb/s: 4.81/4.81/4.83)** and started M2 when this note was written. **M2, C2, C1, C0 are not yet measured.**
-
-Delivered this pass:
-- `baselines/base-070rc2/SUMMARY.md` — headline table (L/P/D/R/Ri/M/C) + the five
-  required answers + confidence section, built from `rollup.csv` medians. §3 (M2)
-  and §4 (C0/C1/C2) carry an explicit `P1E-PENDING` marker, not placeholder numbers.
-- `baselines/base-070rc2/rollup.csv` — 79 rows, one per point x rep, non-`ok` reps
-  retained and flagged (no cherry-picking, PROGRAM.md §7).
-- `scripts/baseline_report.py` — canonical-block consolidator (median + bootstrap
-  95% CI over `ok`/`dirty` reps).
-- `scripts/ttff_probe.py` — TTFF + catch-up probe for C2 (`TTFF-JSON:` line),
-  deployed to seawolf and smoke-tested (ttff_ms 21.4, burst 308 KB/s).
-- `scenarios/c1-churn-50.json`, `scenarios/c0-steady-50.json`, `manifests/phase1e.yaml`.
-
-Corrections to previously published numbers, from the consolidated pass:
-- **D4** is tight, not noisy: CV 0.50% (CI 784.0–791.6), so direct churn −5.2% vs
-  D3 is a solid claim; it was earlier described as marginal.
-- **Ri1** is tight (CV 0.13%), not cold-start dominated; the 102.7 Mb/s outlier is
-  not in the canonical reps.
-- **P2** ("paced 20 Mb/s") reports 657.5 Mb/s — the pacer never engaged. Unit error
-  (kbit/s vs objects/s) in the manifest; point excluded from the narrative.
-- **R5** has 3/3 usable reps at 154.1 Mb/s median (CV 6.05); R5b 2/3 at 47.5.
-
-Open, for the next pass:
-1. Finish M2 (N=3), C2 (N=2, TTFF + catch-up), C1 (N=2), C0 (N=2); fill §3/§4.
-2. Check that `load_sim` still writes `churn.csv` — `--report churn.csv` was dropped
-   from its argv while `collect` reads `rep_dir/churn.csv`; per-interval rows may be
-   empty (the verdict-line summary still parses).
-3. State the waiver in SUMMARY.md (done) and confirm no rep was silently `failed`.
 
 **Next action: Phase 2a (0.6.1 comparison)**, on the released tags. Compare first,
 in this order:

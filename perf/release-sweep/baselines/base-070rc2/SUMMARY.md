@@ -36,8 +36,11 @@ final; the CC default change matters because every point here pins `cc: bbr1`
 explicitly, so the default flip does not reach these runs. Re-anchoring the
 headline points on the final tags is Phase 2 step 0, not a silent rename here.
 
-**n.** Screening points are N=3. Media (M1, M2) N=3. Churn (C1) and late join (C2)
-are **N=2**, and C0 is N=2 — **no CI is quoted for n=2**, only the two raw values.
+**n.** Screening points are N=3. Media (M1, M2) N=3. Churn storm (C1) and late
+join (C2) are **N=2**, and the steady-state control **C0 is N=1** — **no CI is
+quoted below n=3**: at n=2 the two raw values are shown side by side, and at n=1
+there is no dispersion statement at all. C0's single rep is why §2.5 and §4 quote
+the churn cost against it rather than as an absolute.
 
 ## 1. Headline table
 
@@ -68,11 +71,11 @@ Medians. CI = bootstrap 95% over reps, shown only where n≥3 and n_ok≥2.
 | **R5b** | relay, 20 subs ×50 Mb/s (suppl.) | 1000 | 2/3 | **47.5** /sub | 47.44–47.57 | 0.19 |
 | **N1** | D-raw reference, P=4 unpaced (P1b) | line | 7/7 | **811.7** | 802.1–826.2 | 2.38 |
 | **N2** | M1 media shape, 1 sub (P1b) | ~4.8 | 7/7 | **4.83** | 4.82–4.84 | 0.27 |
-| **M1** | 1080p, 1 sub, 120 s | ~4.8 | 3/3 | **4.81** (4.81, 4.81, 4.83) | n=3 | 0.21 |
-| **M2** | 720p, 5 subs, 120 s | 12 | 3/3 | **2.38** per sub (2.38, 2.37, 2.37), **11.9** aggregate | n=3 | 0.24 |
-| **C0** | 50 slots, steady, 0 churn (control) | 200 | 1/1 | **200.7** | n=1 | 1.0 |
+| **M1** | 1080p, 1 sub, 120 s | ~4.8 | 3/3 | **4.82** (4.82, 4.81, 4.83) | 4.81–4.83 | 0.21 |
+| **M2** | 720p, 5 subs, 120 s | 12 | 3/3 | **2.37** per sub (2.38, 2.37, 2.37), **11.9** aggregate | 2.37–2.38 | 0.24 |
+| **C0** | 50 slots, steady, 0 churn (control) | 200 | 1/1 | **200.7** | n=1 | — |
 | **C1** | churn storm, 50 slots, 300 s | 200 | 2/2 | **176.2** (176.31, 176.07) | n=2 | 0.10 |
-| **C2** | late join t=30 s, 90 s | 200 | 2/2 | **TTFF 37.7 ms** (38.12, 37.37); no Mb/s median — one 1080p track | n=2, no CI | 2.0 |
+| **C2** | late join t=30 s, 90 s | 200 | 2/2 | **TTFF 37.7 ms** (38.12, 37.37); no Mb/s median — one 1080p track | 37.4–38.1 ms | 1.41 |
 
 Per-point config (P, s, g, pacing, subscribers, duration) is the manifest:
 `manifests/baseline-v0.yaml` for N…R, `manifests/phase1e.yaml` for M/C.
@@ -194,19 +197,19 @@ catch CPU/scheduling effects at sub-percent scale — N2's CV is 0.27%, MDE N=3
 
 | point | shape | per-sub rate | n | reps | spread | aggregate egress |
 |---|---|---|---|---|---|---|
-| M1 | 1080p, 1 sub, 120 s | **4.81** Mb/s | 3 | 4.81 / 4.81 / 4.83 | 0.4% | 4.81 Mb/s |
-| M2 | 720p, 5 subs, 120 s | **2.38** Mb/s | 3 | 2.37 / 2.38 / 2.37 | 0.4% | **11.9** Mb/s (5 × 2.38) |
+| M1 | 1080p, 1 sub, 120 s | **4.82** Mb/s | 3 | 4.82 / 4.81 / 4.83 | 0.21% | 4.82 Mb/s |
+| M2 | 720p, 5 subs, 120 s | **2.37** Mb/s | 3 | 2.38 / 2.37 / 2.37 | 0.24% | **11.9** Mb/s (5 × 2.37) |
 
 M2's `mbps` is **per subscriber**, not aggregate: each rep's byte count is
-35.6 MB over 120 s = 2.38 Mb/s for one stream, and every one of the five
+35.6 MB over 120 s = 2.37 Mb/s for one stream, and every one of the five
 subscribers receives the full track. Objects per rep are 3,457–3,468 (M2) and
 3,463–3,466 (M1) — the same object cadence, different object size
 (10.3 KB at 720p vs 20.9 KB at 1080p), which is what a video-profile change
 should look like and nothing else.
 
-- M1 sits at **4.81** vs N2's **4.83** (7 reps, CV 0.27%, Phase 1b) = **−0.4%**,
+- M1 sits at **4.82** vs N2's **4.83** (7 reps, CV 0.27%, Phase 1b) = **−0.2%**,
   inside N2's own 0.43% MDE. Five subscribers cost nothing measurable:
-  M2 −50.5% vs M1 is the 720p profile, not fan-out.
+  M2 −50.7% vs M1 is the 720p profile, not fan-out.
 - **Latency was not measured for M1 or M2, and no latency number is claimed.**
   The cross-host clock offset moved mid-point in every rep (M1: 377 / 520 / 725 ms;
   M2: 67 / 114 / 120 ms) against a 3.8–4.2 ms tolerance, so `p50/p95/p99` are
@@ -226,8 +229,18 @@ needed, and none was made.
 
 | point | n | delivered Mb/s | % of 200 offered | interval CV | p90 mean/max ms | joins | churns | delivery_frac |
 |---|---|---|---|---|---|---|---|---|
-| **C0** | 1 | **200.7** | 100.3% | 1.0% | 4.9 / 6 | 50 | 0 | 1.0026 |
-| **C1** | 2 | **176.2** (176.31 / 176.07) | 88.1% | 4.2% / 3.5% | 8.0 / 41 · 6.4 / 29 | 967 | 933 | 0.9997 / 0.9995 |
+| **C0** | 1 | **200.7** | 100.3% | 1.0% | 4.9 / 6 | 50 | 0 | 1.0026 † |
+| **C1** | 2 | **176.2** (176.31 / 176.07) | 88.1% | 4.2% / 3.5% | 8.0 / 41 · 6.4 / 29 | 967 | 933 ‡ | 0.9997 / 0.9995 |
+
+† C0's `delivery_frac` **exceeds 1** (1.0026), which is physically impossible and
+is an accounting artifact of summing per-interval subscriber byte deltas against a
+nominal published rate; read it as "no loss", not as 0.26% gain. C1's 0.9997 sits
+on the other side of the same rounding, so the honest statement is that the two
+are indistinguishable from 1.0, not that churn saves or costs bytes.
+
+‡ 933 is the generator's own churn counter over the whole run. The interval series
+in `load.log` sums to **926** because its steady-state window starts at t=15 s and
+drops the teardown row; the 7-event difference is warm-up churn, not a disagreement.
 
 **Churn costs 12.2% of delivered rate at a fixed 200 Mb/s offered**
 (C0 200.7 → C1 176.2, n=1 control vs n=2). The two C1 reps agree to **0.14%**
@@ -235,7 +248,7 @@ needed, and none was made.
 is seeded, so this is a repeat of one schedule, not two independent draws; the
 12.2% is a property of *that* schedule, and the n=2 agreement says the rig is
 reproducible, not that the number generalises to other churn rates.
-`delivery_frac` stays at **0.9996** across 933 churns: almost nothing is lost —
+`delivery_frac` stays at **0.9997 / 0.9995** across 933 churns: almost nothing is lost —
 the cost is paid in **rate and tail**, not in dropped objects. p90 mean rises
 4.9 → 8.0 / 6.4 ms with 41 / 29 ms excursions, i.e. the churn cost shows up as
 per-interval dips that the 300 s mean averages down to 12%.
@@ -284,6 +297,18 @@ and `scripts/sweep.py` passed neither, so every subscriber got
 (publisher exits rc=0 if no subscriber is present before it starts), and are
 recorded as `result.built.json` beside the stale sweep `result.json`.
 
+Provenance, C0/C1: the 2026-11-11 sweep's C0/C1 summaries were voided by a `Path`
+`NameError` in `collect.py` (fixed in `d7552cb`), which wrote no summary at all
+rather than a wrong one. From the `t0_reference` stamps: C1 rep-01's raw `load.log` is from
+**2026-11-11T02:56–03:01Z** and its summary was rebuilt from those logs on
+2026-11-15; C1 rep-02's logs are a **full re-run at 2026-11-15T17:31Z** because the
+original had no usable logs; C0's single rep is a **fresh run at
+2026-11-15T17:36Z**, which is why C0 is n=1 and not the n=2 the sweep intended.
+C1's n=2 is therefore **one rep per session, four days apart** — the 0.14%
+agreement (176.31 vs 176.07) is a session-to-session reproducibility result, which
+is the stronger form of the claim, but it is also only two sessions and shares the
+seeded churn schedule. C0 has no such corroboration.
+
 ## 5. Confidence — what is solid, what is at the noise floor
 
 Floors from `noise-floor.md`: link-limited throughput at N=3 must clear **3.8%**
@@ -302,7 +327,7 @@ cross-host one-way latency is **not measurable** without a stable offset;
 | small objects are pps-bound | L5 943.9 = −45.5% vs L2 | huge effect |
 | churn: loopback / direct / relay ceiling | L4 −15.8%, D4 −5.2%, R3 −20.7% | ≫ 3.8% floor, CV 0.50–3.83 |
 | relay is not CPU-bound | R2 0.98, R3 0.18, R4 0.32 core | 6-core host, <1 core |
-| media is transport-insensitive | M1 4.81 (n=2), N2 4.83 (−0.4%) | inside 0.43% floor |
+| media is transport-insensitive | M1 4.82 (n=3), N2 4.83 (−0.2%) | inside 0.43% floor |
 
 **At or near the noise floor — quote as "small", never as an exact percentage:**
 
@@ -329,9 +354,13 @@ cross-host one-way latency is **not measurable** without a stable offset;
   by design (clock drift 220–310 ms). The only valid cross-host tails in this
   document are R4's. L/P tails are valid (same clock domain).
 
-**n=2, no CI:** C0, C1, C2. Two values are reported side by side and the spread
-between them is the only uncertainty statement available. This is why C1's cost
-is quoted against C0's control rather than as an absolute.
+**n=2, no CI: C1, C2.** Two values are reported side by side and the spread
+between them is the only uncertainty statement available. **C0 is n=1** — a single
+control rep, no dispersion statement possible — which is why C1's cost is quoted
+against C0's control rather than as an absolute, and why the 12.2% inherits
+whatever C0's single run happened to be, including its 1.0026 `delivery_frac`
+artifact. Treat ±1% as the plausible error on the churn cost, not the 0.14% that
+C1's own two reps agree to.
 
 **Not claimed at all:** any benefit of WebTransport (only its cost is measured),
 relay behaviour for >20 subscribers, anything about the observability stack

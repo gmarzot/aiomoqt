@@ -136,7 +136,14 @@ def load(blocks: dict[str, Path]) -> dict[str, list[dict]]:
             except ValueError:
                 continue
             r.setdefault("meta", {})["block"] = block.name
+            # collect.build_csv reads meta["run_id"]; without this the rebuilt
+            # C0/C1/C2 rows reach rollup.csv with an empty run column.
+            r["meta"].setdefault("run_id", block.name)
             r["meta"].setdefault("rep", rp.name)
+            # rollup.csv numbers reps 1,2,3 everywhere else; "rep-01" here would
+            # split the same column into two conventions.
+            _rep = str(r["meta"]["rep"]).replace("rep-", "")
+            r["meta"]["rep"] = str(int(_rep)) if _rep.isdigit() else _rep
             if "status" in r and "status" not in r["meta"]:
                 r["meta"]["status"] = r["status"]
             by_point.setdefault(point, []).append(r)
@@ -175,7 +182,22 @@ def stats_block(by_point: dict[str, list[dict]]) -> None:
               if (r.get("meta") or {}).get("status") in ("ok", "dirty")]
         vals = [v for v in (key_metric(r) for r in ok) if v is not None]
         if not vals:
-            st = ",".join(sorted({(r.get("meta") or {}).get("status", "?") for r in reps}))
+            # C2 has no Mb/s key metric: it is a TTFF point. Report the TTFF
+            # median rather than "0/2 — status ok", which reads as a failure.
+            tt = []
+            for r in ok:
+                v = (r.get("summary") or {}).get("ttff_ms")
+                if isinstance(v, (int, float)):
+                    tt.append(float(v))
+            if tt:
+                tt.sort()
+                k = len(tt)
+                med = tt[k // 2] if k % 2 else 0.5 * (tt[k // 2 - 1] + tt[k // 2])
+                ci = f"{fmt(tt[0])}–{fmt(tt[-1])}" if k >= 3 else "—"
+                print(f"| {point} | {len(ok)}/{len(reps)} | TTFF {fmt(med)} ms | {ci} | — | "
+                      f"{note} — no Mb/s metric; n={k}, so no CI is claimed |")
+                continue
+            st = ", ".join(sorted({(r.get("meta") or {}).get("status", "?") for r in reps}))
             print(f"| {point} | 0/{len(reps)} | — | — | — | {note} — status {st} |")
             continue
         vals.sort()

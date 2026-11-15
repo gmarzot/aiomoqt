@@ -10,6 +10,11 @@ import csv, glob, json, os, sys
 BLOCK = "runs/2026-11-11T02-33-51Z"
 RUN = "2026-11-11T02-33-51Z"
 CSV = "baselines/base-070rc2/rollup.csv"
+# Every point this phase owns. Filtering on the point id rather than on the run
+# id is what makes the rewrite idempotent: an earlier generator emitted these
+# five points with an empty ``run`` column, so a ``run != RUN`` filter kept them
+# and every regeneration doubled the block.
+POINTS_1E = {"M1", "M2", "C0", "C1", "C2"}
 
 def g(summary, *keys, default=""):
     for k in keys:
@@ -39,7 +44,7 @@ def started_utc(d):
 def main():
     header = next(csv.reader(open(CSV, newline="")))
     with open(CSV, newline="") as f:
-        old = [r for r in csv.DictReader(f) if r["run"] != RUN]
+        old = [r for r in csv.DictReader(f) if r["point_id"] not in POINTS_1E]
     print(f"kept {len(old)} non-1e rows")
 
     new = []
@@ -52,6 +57,9 @@ def main():
             except Exception:
                 pass
         point, rep = d.split("/")[-2], d.split("/")[-1].replace("rep-", "")
+        # The rest of rollup.csv numbers reps 1,2,3; rep-NN dirs would otherwise
+        # introduce a second convention in the same column.
+        rep = str(int(rep)) if rep.isdigit() else rep
         r = json.load(open(path))
         s = r.get("summary") or {}
         cfg = r.get("config") or {}
