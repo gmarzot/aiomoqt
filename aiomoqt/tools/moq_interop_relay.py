@@ -5430,6 +5430,16 @@ async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
     return None, None, refusal
 
 
+def _publisher_end(ok):
+    """An upstream FETCH_OK's End Location, inclusive; None when it gives
+    none or the pre-d20 whole-group form."""
+    group = getattr(ok, "largest_group_id", None)
+    obj = getattr(ok, "largest_object_id", None)
+    if group is None or not obj:
+        return None
+    return (group, obj - 1)
+
+
 def _fetch_range(msg, largest):
     """(start, end) Locations a FETCH asks for, both inclusive, the end at
     most `largest`: (group, 2^64-1) for a whole End Group below it, None
@@ -5567,8 +5577,9 @@ async def _on_fetch(session, msg):
     order = msg.group_order or GroupOrder.ASCENDING
     # FETCH_OK End Location (d22 §9.12): the requested End, at most
     # Largest; a whole End Group ends at its last Object. From upstream,
-    # the last Object served, with the publisher's End Of Track; with
-    # none served, the publisher's End.
+    # the publisher's End, which counts what a FETCH stream cannot carry
+    # (a trailing End of Group), at most the requested End and never
+    # before the last Object served; with none served, the publisher's.
     # fetch_ok() takes End as the last Object plus one at every draft.
     last = (objs[-1][0], objs[-1][2]) if objs else None
     if objs:
@@ -5576,6 +5587,10 @@ async def _on_fetch(session, msg):
         if source == "cache" and end is not None:
             end_loc = (end if end[1] != U64_MAX
                        else track.group_end(end[0], start))
+        elif source == "upstream":
+            pub = _publisher_end(up_ok)
+            if pub is not None:
+                end_loc = max(last, pub if end is None else min(pub, end))
         end_next = (end_loc[0], end_loc[1] + 1)
     else:
         end_next = (up_ok.largest_group_id, up_ok.largest_object_id)
