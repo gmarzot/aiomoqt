@@ -564,3 +564,66 @@ same experiment:
 This run did **not** re-run anything on released tags and did not relabel the arm:
 the 1e numbers are rc2 numbers and are labelled as such. Decision belongs to the
 operator; 2a should not start until it is made.
+
+## Phase 2a — transport comparison, 0.6.1 vs 0.7.0 (released tags) — **DONE (2026-11-15)**
+
+**Tag-basis conflict resolved by the operator's 2026-11-02 comment** ("use the final
+released tags, not rc2") → option **(b)**: both arms built fresh on released tags and
+compared release-to-release. Arm A `arms/cmp-061` = aiopquic `v0.6.1`
+(`ccf37d8a`, wheel sha256 `3220fb9f…46f05`); arm B `arms/base-070` = aiopquic `v0.7.0`
+(`7baed8b8`, wheel sha256 `e7d28cbd…1b9ab`), version prints verified
+`aiopquic: 0.6.1` / `aiopquic: 0.7.0`, same aiomoqt tree (`0.13.3-20-g6cbe7af`).
+The 1a–1e rc2 numbers are **not** a comparison basis anywhere in 2a.
+
+Block: 30 single-rep runs, one day, `18:04:01Z`–`18:51:15Z`, tagged `p2a-<slot>`
+(`runs/p2a-runs.txt` 30/30 `rc=0`); one `sweep.py` invocation per rep so arms alternate
+`A,B,B,A,A,B,B,A,A,B` per point (PROGRAM §6.2) with `meta.arm` per-rep truth.
+N=5 per arm per point, 60 s. D3 control at block start and end.
+
+**Control valid:** D3 early 808.35 vs late 806.44 Mb/s = **−0.24 %** (CI −1.82…+2.66,
+MWU p=1.00), inside the P1b MDE(N=5) of 2.95 % → no drift, no day-split caveat.
+
+| point | 0.6.1 | 0.7.0 | Δ (B−A) | 95 % CI | MWU |
+|---|---|---|---|---|---|
+| D3 direct ceiling | 802.83 | 817.55 | **+1.83 %** | −1.13…+2.72 % | iv p=0.216 (60v60), reps p=0.151 |
+| D3 tail (iv p99) | 1182.0 | 1017.2 | −13.94 % | −32.15…+9.73 % | — |
+| R2 relay unpaced | 740.50 | 745.75 | +0.71 % | −6.11…+5.24 % | p=1.00 (n=5 reps; **no intervals**) |
+| R3 relay+churn | 601.43 | 601.01 | −0.07 % | −64.98…+35.03 % | p=0.84 (n=5 reps; **no intervals**) |
+
+Findings:
+
+1. **No transport regression 0.6.1 → 0.7.0 at the direct ceiling.** +1.83 % with CI
+   excluding any regression > ~2.7 %; point estimate positive. Throughput and tail rank
+   the same way (iv CV 15.5 %→10.8 %, no slow intervals in either arm).
+2. **R2 is not a relay ceiling and never was.** Both releases get the subscriber stream
+   reset after ~1.1 s / **~104.6 MB** (active_s 1.1 in 9/10, bytes Δ −0.21 % CI
+   −4.25…+104). R3: reset after ~0.1 s / ~7.6 MB. Eviction is relay-side and
+   release-invariant, so R2/R3 deltas measure reset timing, not throughput, and carry
+   no per-interval samples at all (§6.9's test cannot run on them).
+3. **Retracted: the "relay tax −7.8 %"** (1e R2 764.5 vs D3 829.4). It compared a 1.1 s
+   burst against a 60 s ceiling. No sustained relay ceiling has been measured in this
+   program yet.
+4. **+1.8 % is not attributable to aiopquic's Python layer**: 0.6.1 pins picoquic 1.1.53.0 /
+   picotls `f06553b8`, 0.7.0 pins 1.1.54.0 / `e446233b` → the A/B compares the whole
+   released stack (PROGRAM §6.4 caveat, disclosed in the report).
+5. Latency **p50/p99 remain unquotable** (clock waived, offset 272→277 ms this block);
+   tail is described with interval-throughput stats instead. All 30 reps are
+   `status=dirty` solely for that waived clock jump; hosts otherwise clean (no strays,
+   no orphans, no foreign bench procs, qdisc unchanged pre/post).
+
+Report: `regressions/compare-transport.md`; raw stats `regressions/phase2a-data.json`;
+reproduce with `python3 scripts/p2a_analysis.py`.
+
+**Bisect shortlist (not executed — card says do not bisect):**
+1. rebuild `cmp-061` on picoquic 1.1.54.0 / picotls `e446233b` (one knob) — prerequisite
+   for attributing the +1.8 % to aiopquic at all;
+2. moqx relay: the ~104.6 MB / ~1.1 s stream reset (R2) and ~7.6 MB / ~0.1 s (R3), identical
+   on both releases → bisect moqx on stream-limit/`MaxStreamsUni` eviction; restores two
+   of three transport points;
+3. only if (2) implicates the client: aiopquic `v0.6.1..v0.7.0` credit/MaxStreamsUni
+   replenishment (predicted low yield — threshold is arm-invariant to 0.2 %).
+
+**Next action: Phase 2b (media/churn comparison)** — M1/M2/C1/C2 on 0.6.1 vs 0.7.0, same
+alternating-A/B protocol, and re-use the D3 control. Do **not** carry R2 forward as a
+ceiling: use a paced relay point (offered ≈ 800 Mb/s) or drop the "relay tax" framing
+until the eviction is fixed.
