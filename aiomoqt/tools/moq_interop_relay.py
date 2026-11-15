@@ -5547,8 +5547,11 @@ async def _on_fetch(session, msg):
                     f"{anchor[0]} (anchor {anchor})")
     track = _tracks.get((ns, track_name))
     start, end = _fetch_range(msg, None if track is None else track.largest)
+    # Unclamped: while paused, Largest is stale and the range may reach
+    # past it into the pause's gap.
+    asked = _fetch_range(msg, None)[1]
     live = track is not None and _track_live(track)
-    gapped = live and track.crosses_gap(start, end)
+    gapped = live and track.crosses_gap(start, asked)
     have_cache = live and track.cache_covers(start) and not gapped
     objs = track.cached_range(start, end) if have_cache else []
     source = "cache"
@@ -5563,8 +5566,12 @@ async def _on_fetch(session, msg):
         # relay has never subscribed to.
         up_ok, upstream, refusal = await _fetch_upstream(ns, track_name, msg)
         if (not upstream and track is not None and _track_live(track)
-                and track.cache_covers(start)):
-            # Cached while upstream was asked.
+                and track.cache_covers(start)
+                and (not track.paused
+                     or (asked is not None and track.holds_through(asked)))):
+            # Cached while upstream was asked. Paused, only a range held
+            # to its requested End: short, the rest would read as
+            # non-existent (§3.2.2).
             objs = track.cached_range(start, end)
         if objs:
             end_of_track = int(objs[-1][6] == ObjectStatus.END_OF_TRACK)
