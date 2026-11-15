@@ -2289,6 +2289,8 @@ class _RelayedTrack:
                 request_id=d.request_id, status_code=status_code,
                 stream_count=self._sent_streams.get(id(session), 0),
                 reason=reason)
+        except ConnectionError:
+            logger.debug("relay: ending a subscription on a closed session")
         except Exception:
             logger.warning("relay: ending a subscription failed",
                            exc_info=True)
