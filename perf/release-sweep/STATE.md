@@ -547,3 +547,20 @@ in this order:
 3. **R4** (relay fan-out, 5 subs) — the stream-credit eviction (`MaxStreamsUni`
    never replenished) is the known 0.7.0 defect; if 0.6.1 evicts less, it explains
    R4/R6/R5b in one shot.
+
+**Tag-basis conflict to resolve before 2a.** Every phase 1a–1e number here is
+measured on the frozen arm `base-070rc2` (aiopquic v0.7.0rc2 @51a80c9). On
+2026-11-02 the operator recorded a release-basis update: *"aiomoqt 0.14.0
+(PyPI/tag 0.14.0), aiopquic 0.7.0 (PyPI/tag v0.7.0) … Use the final released tags,
+not rc2."* Phase 2a therefore has two possible comparisons, and they are not the
+same experiment:
+
+- (a) released tags vs this rc2 arm — cheap, but any delta mixes the release
+  change with the rc→final change and cannot be attributed;
+- (b) re-baseline the three points above on the released tags, then compare
+  release-to-release — doubles 2a's cost, and is the only version that answers
+  "did the transport regress".
+
+This run did **not** re-run anything on released tags and did not relabel the arm:
+the 1e numbers are rc2 numbers and are labelled as such. Decision belongs to the
+operator; 2a should not start until it is made.
