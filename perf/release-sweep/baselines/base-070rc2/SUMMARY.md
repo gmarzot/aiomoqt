@@ -242,6 +242,15 @@ are indistinguishable from 1.0, not that churn saves or costs bytes.
 in `load.log` sums to **926** because its steady-state window starts at t=15 s and
 drops the teardown row; the 7-event difference is warm-up churn, not a disagreement.
 
+§ **No `churn.csv` exists in any C0/C1 rep dir.** `--report churn.csv` was dropped
+from the `load_sim` argv while the collector still reads `rep_dir/churn.csv`, so the
+per-interval churn artifact was never written. Every churn number here comes from
+`load.log` instead: the generator's verdict line
+(rep-01: `joins=967 churn=933 exodus=35 fails=0 died=0 objs=387738/387863`,
+rep-02: same counters, `objs=387694/387874`) and its per-interval `T+` series. The numbers are sound and independently checkable; the
+missing file is an artifact gap, not a measurement gap. The per-interval churn
+distribution cannot be reconstructed below the 15 s window the interval series uses.
+
 **Churn costs 12.2% of delivered rate at a fixed 200 Mb/s offered**
 (C0 200.7 → C1 176.2, n=1 control vs n=2). The two C1 reps agree to **0.14%**
 (176.31 vs 176.07) with **identical 967 joins / 933 churns** — the churn schedule
