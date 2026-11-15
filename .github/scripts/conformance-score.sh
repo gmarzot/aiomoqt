@@ -11,6 +11,7 @@ TRANSPORT=${TRANSPORT:-quic}          # quic | h3wt
 SUITE=${SUITE:?path to conformance_test.sh}
 MOXDIR=${MOXDIR:?directory holding moxygen/moqtest/moqtest_client}
 OUT=${OUT:-reports}
+NAME="$DRAFT-$TRANSPORT${LABEL:+-$LABEL}"   # report name
 
 mkdir -p "$OUT"
 args=("$URL" "$DRAFT")
@@ -19,19 +20,19 @@ args=("$URL" "$DRAFT")
 # The suite writes its report into the working directory, named by
 # timestamp; run it somewhere disposable and rename the result.
 work=$(mktemp -d)
-echo "=== full suite: draft $DRAFT over $TRANSPORT ==="
+echo "=== full suite: $NAME ==="
 # Per-case lines as they land: the suite takes minutes, and a silent
 # step is indistinguishable from a hung one.
 (cd "$work" && MOXYGEN_DIR="$MOXDIR" SKIP_FETCH="${SKIP_FETCH:-0}" \
     bash "$SUITE" "${args[@]}") 2>&1 \
-    | tee "$OUT/$DRAFT-$TRANSPORT-full.log" \
+    | tee "$OUT/$NAME-full.log" \
     | stdbuf -oL grep -E --line-buffered \
         "Test [0-9]+\]|PASSED|FAILED|SECTION [0-9]|Success Rate|Total Tests"
 rc=${PIPESTATUS[0]}
 report=$(ls -t "$work"/moqtest_conformance_report_*.txt 2>/dev/null | head -1)
 if [ -z "$report" ]; then
-    echo "::warning::no conformance report produced for $DRAFT/$TRANSPORT"
+    echo "::warning::no conformance report produced for $NAME"
     exit 0
 fi
-mv "$report" "$OUT/$DRAFT-$TRANSPORT.txt"
-echo "report: $OUT/$DRAFT-$TRANSPORT.txt (suite exit $rc)"
+mv "$report" "$OUT/$NAME.txt"
+echo "report: $OUT/$NAME.txt (suite exit $rc)"
