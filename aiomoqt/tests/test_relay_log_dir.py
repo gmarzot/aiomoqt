@@ -38,9 +38,7 @@ def log_dir(tmp_path, monkeypatch):
         yield tmp_path / "logs", enabled
     finally:
         os.umask(old_umask)
-        if relay._log_listener is not None:
-            relay._log_listener.stop()
-            relay._log_listener = None
+        relay._stop_log_listener()
         for h in root.handlers:
             if h not in handlers:
                 root.removeHandler(h)
@@ -65,7 +63,7 @@ def test_relay_log_rotates_and_mirrors_stderr(log_dir):
     relay.logger.info(f"relay: start {relay._versions_line()} pid "
                       f"{os.getpid()}")
     logging.getLogger("other.lib").warning("from the root")
-    relay._log_listener.stop()
+    relay._stop_log_listener()
     text = (path / "relay.log").read_text()
     # aiomoqt's own format, and the root's for everything else.
     assert re.search(r"^\S+ \S+\.\d{3} INFO : relay: start aiomoqt \S+ "
@@ -98,7 +96,7 @@ def test_a_slow_relay_log_write_does_not_hold_the_caller(log_dir,
         relay.logger.info(f"relay: line {i}")
         logging.getLogger("other.lib").warning(f"root line {i}")
     assert time.monotonic() - t0 < 0.1
-    relay._log_listener.stop()
+    relay._stop_log_listener()
     text = (path / "relay.log").read_text()
     for i in range(3):
         assert f"relay: line {i}" in text and f"root line {i}" in text, text

@@ -6637,6 +6637,14 @@ class _Tee(logging.Handler):
         pass
 
 
+def _stop_log_listener() -> None:
+    """Write what relay.log's queue holds and end its thread."""
+    global _log_listener
+    listener, _log_listener = _log_listener, None
+    if listener is not None:
+        listener.stop()
+
+
 def _versions_line() -> str:
     v = relay_status.versions()
     return f"aiomoqt {v['aiomoqt']} aiopquic {v['aiopquic']}"
@@ -6660,7 +6668,7 @@ def _start_log_dir(log_dir: str) -> None:
     _log_listener = QueueListener(records, log_file,
                                   respect_handler_level=True)
     _log_listener.start()
-    atexit.register(_log_listener.stop)
+    atexit.register(_stop_log_listener)
     to_file = QueueHandler(records)
     logging.getLogger().addHandler(to_file)
     set_log_handler(_Tee(shown, to_file) if shown is not None else to_file)
