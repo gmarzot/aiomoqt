@@ -98,6 +98,7 @@ exits at once.
 from array import array
 import argparse
 import asyncio
+import atexit
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict, deque
 import contextlib
@@ -111,8 +112,9 @@ import logging
 import marshal
 import math
 from operator import itemgetter
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 import os
+import queue
 import random
 import signal
 import sys
@@ -6162,12 +6164,15 @@ class _Status:
             try:
                 now = loop.time()
                 _prune_catalogs()
-                relay_status.write_json_atomic(
-                    self.path, self.snapshot(now, time.time()))
+                # Written by a thread: a filesystem stall must not pause
+                # the loop.
+                await asyncio.to_thread(relay_status.write_json_atomic,
+                                        self.path,
+                                        self.snapshot(now, time.time()))
                 if now >= platform_due:
                     platform_due = now + PLATFORM_INTERVAL_S
-                    relay_status.write_json_atomic(self.platform_path,
-                                                   self.platform)
+                    await asyncio.to_thread(relay_status.write_json_atomic,
+                                            self.platform_path, self.platform)
             except Exception:
                 logger.warning("relay: status write failed", exc_info=True)
             await asyncio.sleep(STATUS_INTERVAL_S)
@@ -6589,6 +6594,8 @@ LOG_FILE_BACKUPS = 4
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 # faulthandler's target with --log-dir (crash.log); stderr otherwise.
 _crash_file = None
+# The thread writing relay.log with --log-dir.
+_log_listener = None
 
 
 class _LogFile(RotatingFileHandler):
@@ -6639,7 +6646,7 @@ def _start_log_dir(log_dir: str) -> None:
     """DIR/relay.log: the stderr log, rotated. DIR/crash.log: a start
     line, then faulthandler's crash and stall dumps (it takes one file,
     so they no longer reach stderr)."""
-    global _crash_file
+    global _crash_file, _log_listener
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o755)
     shown = logger.handlers[0] if logger.handlers else None
@@ -6648,8 +6655,15 @@ def _start_log_dir(log_dir: str) -> None:
     log_file.setFormatter(_MirrorFormatter(
         shown.formatter if shown is not None and shown.formatter
         else logging.Formatter(LOG_FORMAT)))
-    logging.getLogger().addHandler(log_file)
-    set_log_handler(_Tee(shown, log_file) if shown is not None else log_file)
+    # A thread writes relay.log: a filesystem stall must not pause the loop.
+    records = queue.SimpleQueue()
+    _log_listener = QueueListener(records, log_file,
+                                  respect_handler_level=True)
+    _log_listener.start()
+    atexit.register(_log_listener.stop)
+    to_file = QueueHandler(records)
+    logging.getLogger().addHandler(to_file)
+    set_log_handler(_Tee(shown, to_file) if shown is not None else to_file)
 
     path = os.path.join(log_dir, "crash.log")
     _crash_file = open(path, "a")
