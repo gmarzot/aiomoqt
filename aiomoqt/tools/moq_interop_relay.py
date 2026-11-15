@@ -882,6 +882,12 @@ class _ObjectCache:
     def __init__(self) -> None:
         self.clear()
 
+    def detach(self) -> list:
+        """Empty the cache; its payload blocks, for the caller to free."""
+        pay = self._pay
+        self.clear()
+        return pay
+
     def clear(self) -> None:
         # Per block; a sealed block's lists become a tuple and bytes, a
         # freed block's entries None.
@@ -1401,6 +1407,40 @@ class _CacheBudget:
 
 
 _budget = _CacheBudget()
+
+# Payloads of dropped caches, newest last, freed a slice per loop pass:
+# freeing a whole track's cache at once pauses the loop for its size.
+_unfreed: deque = deque()
+RELEASE_SLICE_S = 0.002
+_releasing = None
+
+
+def _free_later(blocks) -> None:
+    """Free these payload blocks a slice per loop pass, newest first; at
+    once without a running loop."""
+    global _releasing
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _unfreed.extend(list(b) for b in blocks if b)
+    if _unfreed and _releasing is not loop:
+        _releasing = loop
+        loop.call_soon(_free_some)
+
+
+def _free_some() -> None:
+    global _releasing
+    end = time.perf_counter() + RELEASE_SLICE_S
+    while _unfreed:
+        block = _unfreed[-1]
+        while block:
+            del block[-32:]
+            if time.perf_counter() >= end:
+                asyncio.get_running_loop().call_soon(_free_some)
+                return
+        _unfreed.pop()
+    _releasing = None
 
 # Send lanes still running, including those draining past their track.
 _lanes: set = set()
@@ -1988,8 +2028,8 @@ class _RelayedTrack:
         self._multi = True
         feed.session.register_stream_end_handler(
             feed.sub.track_alias,
-            lambda g, sg, clean=True, code=0, f=feed: self.on_stream_end(
-                g, sg, clean, code, feed=f))
+            lambda g, sg, clean=True, reset_code=0, f=feed:
+            self.on_stream_end(g, sg, clean, reset_code, feed=f))
         largest = feed.sub.largest
         if largest is not None and self._near(largest[0]):
             self.note_largest(largest)
@@ -2173,7 +2213,7 @@ class _RelayedTrack:
         """Empty the cache and return its bytes to the relay budget."""
         _budget.bytes -= self._cache_bytes
         _budget.forget(self)
-        self._cache.clear()
+        _free_later(self._cache.detach())
         self._cache_bytes = 0
         self._born_floor = float("inf")
 
@@ -2281,15 +2321,21 @@ class _RelayedTrack:
         session = d.session
         if (d.lane is not None and d.lane.stop() and reset_code is None):
             reset_code = StreamResetCode.CANCELLED
+        if (status_code == SubscribeDoneCode.SUBSCRIPTION_ENDED
+                and not session._profile.publish_done_subscription_ended):
+            # A pre-d20 upstream's code; d20 has none.
+            status_code = SubscribeDoneCode.TRACK_ENDED
         try:
             self._close_streams(session, reset_code)
             session.subscribe_done(
                 request_id=d.request_id, status_code=status_code,
                 stream_count=self._sent_streams.get(id(session), 0),
                 reason=reason)
+        except ConnectionError:
+            logger.debug("relay: ending a subscription on a closed session")
         except Exception:
-            logger.debug("relay: ending a subscription failed",
-                         exc_info=True)
+            logger.warning("relay: ending a subscription failed",
+                           exc_info=True)
 
     def _enqueue_terminal(self, status, reason, key) -> None:
         """Terminal behind everything already queued."""
