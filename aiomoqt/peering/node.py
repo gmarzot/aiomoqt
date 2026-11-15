@@ -4,6 +4,10 @@ Dials peers (re-dialing after a close), optionally listens, learns nodes,
 announces, subscribes and SNS sets per session, and originates its own
 announces and subscribes. It advertises only itself, with a high metric,
 and never forwards what it learns, so no relay routes through it.
+
+publish() makes a FabricTrack that sends d18 objects to every subscriber
+node, one SNS per session; receive() subscribes and measures a track's
+objects with TrackStats.
 """
 import asyncio
 import dataclasses
@@ -11,8 +15,8 @@ import functools
 import ipaddress
 import ssl
 from collections import Counter
-from typing import (Callable, Dict, Iterator, List, Optional, Sequence, Tuple,
-                    Union, cast)
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
+                    Set, Tuple, Union, cast)
 
 from aiopquic.asyncio import QuicConnectionProtocol
 from aiopquic.asyncio import connect as quic_connect
@@ -22,13 +26,21 @@ from aiopquic.quic.events import (ConnectionTerminated, DatagramFrameReceived,
                                   HandshakeCompleted, StreamDataReceived,
                                   StreamReset)
 
+from aiomoqt.messages import ObjectStatus
 from aiomoqt.peering.hashing import (fresh_node_id, node_id_format,
                                      node_id_parse, track_hashes)
+from aiomoqt.peering.ib import DEFAULT_TTL_MS, OriginTrack, reconcile
+from aiomoqt.peering.inner import (DEFAULT_PRIORITY, DatagramObject,
+                                   StreamObject, SubgroupWriter,
+                                   encode_datagram)
 from aiomoqt.peering.report import describe, event_fields, track_text
-from aiomoqt.peering.session import (DataFlow, Learned, PeerSession,
+from aiomoqt.peering.session import (DataFlow, Inbound, Learned, PeerSession,
                                      SessionEvent, Stamp, log, now_stamp)
 from aiomoqt.peering.wire import (ALPN, ANNOUNCE_NAMESPACE, AnnounceInfo,
-                                  MsgType, NodeInfo, NodeType, SubscribeInfo)
+                                  DataHeader, DataType, MsgType, NodeInfo,
+                                  NodeType, SubscribeInfo)
+from aiomoqt.utils.payload import PayloadCheck
+from aiomoqt.utils.stats import TrackStats
 
 LEAF_METRIC = 1 << 32
 DEFAULT_LABEL = "aiomoqt-peer"
@@ -37,6 +49,9 @@ REDIAL_INTERVAL = 2.0
 CONNECT_TIMEOUT = 5.0
 MAX_EVENTS = 100_000
 MAX_CLOSED_SESSIONS = 100
+# Samples kept of the gap from a stream's NEW_STREAM header to its first
+# whole object.
+HEADER_GAP_SAMPLES = 10_000
 # Longest a stop waits for its withdraws to be sent and acked.
 WITHDRAW_GRACE = 0.25
 
@@ -120,8 +135,7 @@ class _PeerProtocol(QuicConnectionProtocol):
         elif isinstance(event, DatagramFrameReceived):
             self.node._on_datagram(self, event)
         elif isinstance(event, StreamReset):
-            if self.session is not None:
-                self.session.stream_reset(event.stream_id)
+            self.node._on_stream_reset(self, event)
         elif isinstance(event, ConnectionTerminated):
             self.node._on_terminated(self, event)
             self.terminated.set()
@@ -158,6 +172,15 @@ class _PeerProtocol(QuicConnectionProtocol):
             self._priority_set = True
             self._pending.pop(0)
 
+    async def send_data(self, stream_id: int, data: bytes,
+                        fin: bool = False) -> None:
+        """Data stream bytes, waiting out aiopquic backpressure."""
+        try:
+            self._quic.send_stream_data(stream_id, data, end_stream=fin)
+        except BufferError:
+            await self._quic.send_stream_data_drained(stream_id, data,
+                                                      end_stream=fin)
+
     def control_flushed(self) -> bool:
         """Every control byte written has left aiopquic's ring and nothing
         is in flight unacked."""
@@ -167,6 +190,172 @@ class _PeerProtocol(QuicConnectionProtocol):
         if sid is not None and self._quic.tx_data_ring_used(sid):
             return False
         return not self._quic.path_quality().get("bytes_in_transit")
+
+
+class _Egress:
+    """One subgroup in flight: its encoder and its stream per session."""
+    __slots__ = ("writer", "streams")
+
+    def __init__(self, writer: SubgroupWriter):
+        self.writer = writer
+        self.streams: Dict[int, int] = {}
+
+
+class FabricTrack:
+    """A track this node publishes (FabricNode.publish). Objects go to the
+    sessions holding an SNS for it; a session gains a subgroup's stream
+    only when that subgroup opens."""
+
+    def __init__(self, node: "FabricNode", origin: OriginTrack):
+        self.node = node
+        self.origin = origin
+        self._subgroups: Dict[Tuple[int, int], _Egress] = {}
+        self.objects = 0
+        self.bytes = 0
+        self.streams = 0
+        self.datagrams = 0
+        self.datagrams_dropped = 0
+
+    @property
+    def fullname_hash(self) -> int:
+        return self.origin.fullname_hash
+
+    @property
+    def subscribed(self) -> bool:
+        return bool(self.origin.sns)
+
+    def _sessions(self) -> List[Tuple[int, "_PeerProtocol", int]]:
+        out = []
+        for sid, sns in list(self.origin.sns.items()):
+            proto = self.node._protocols.get(sid)
+            if proto is not None and not proto.terminated.is_set():
+                out.append((sid, proto, sns.sns_id))
+        return out
+
+    async def write(self, group_id: int, subgroup_id: int, object_id: int,
+                    payload: bytes, extensions=None) -> None:
+        """One object, on one stream per subscribed session."""
+        key = (group_id, subgroup_id)
+        eg = self._subgroups.get(key)
+        opening = eg is None
+        if eg is None:
+            eg = self._subgroups[key] = _Egress(SubgroupWriter(
+                self.fullname_hash, group_id, subgroup_id,
+                self.origin.priority))
+        data = eg.writer.object(object_id, payload, extensions)
+        self.objects += 1
+        self.bytes += len(payload)
+        if opening:
+            for sid, proto, sns_id in self._sessions():
+                stream = proto._quic.get_next_available_stream_id(True)
+                head = DataHeader(DataType.NEW_STREAM, sns_id,
+                                  self.fullname_hash, self.origin.priority,
+                                  self.origin.ttl_ms).encode()
+                eg.streams[sid] = stream
+                self.streams += 1
+                await proto.send_data(stream, head + eg.writer.header + data)
+            return
+        for sid, stream in list(eg.streams.items()):
+            proto = self.node._protocols.get(sid)
+            if proto is None or proto.terminated.is_set():
+                eg.streams.pop(sid, None)
+                continue
+            await proto.send_data(stream, data)
+
+    async def end_subgroup(self, group_id: int, subgroup_id: int, *,
+                           end_of_group: Optional[int] = None,
+                           reset: bool = False) -> None:
+        """FIN the subgroup's streams, after an END_OF_GROUP status object
+        with id `end_of_group` when given; or reset them."""
+        eg = self._subgroups.pop((group_id, subgroup_id), None)
+        if eg is None:
+            return
+        tail = b""
+        if end_of_group is not None and not reset:
+            tail = eg.writer.status(end_of_group, ObjectStatus.END_OF_GROUP)
+        for sid, stream in eg.streams.items():
+            proto = self.node._protocols.get(sid)
+            if proto is None or proto.terminated.is_set():
+                continue
+            if reset:
+                proto._quic.reset_stream(stream, 0)
+            else:
+                await proto.send_data(stream, tail, fin=True)
+
+    def datagram(self, group_id: int, object_id: int, payload: bytes,
+                 extensions=None, end_of_group: bool = False) -> int:
+        """One object as a datagram to each subscribed session; returns the
+        sessions it was queued on. A full datagram ring drops it."""
+        inner = encode_datagram(self.fullname_hash, group_id, object_id,
+                                payload, extensions, self.origin.priority,
+                                end_of_group)
+        self.objects += 1
+        self.bytes += len(payload)
+        sent = 0
+        for _, proto, sns_id in self._sessions():
+            head = DataHeader(DataType.DATAGRAM, sns_id,
+                              self.fullname_hash).encode()
+            if proto._quic.send_datagram_frame(head + inner):
+                sent += 1
+                self.datagrams += 1
+            else:
+                self.datagrams_dropped += 1
+        return sent
+
+    def _drop_session(self, session_id: int) -> None:
+        """FIN this track's streams on a session that lost its SNS."""
+        proto = self.node._protocols.get(session_id)
+        for eg in self._subgroups.values():
+            stream = eg.streams.pop(session_id, None)
+            if stream is not None and proto is not None \
+                    and not proto.terminated.is_set():
+                self.node._spawn(proto.send_data(stream, b"", fin=True))
+
+
+class RxTrack:
+    """A track this node receives (FabricNode.receive): TrackStats for
+    objects, loss, dups and latency; stream ends; the NEW_STREAM header
+    to first object gap."""
+
+    def __init__(self, namespace: Tuple[bytes, ...], name: bytes,
+                 verify_every: int = 0, **stats_kw):
+        self.namespace = namespace
+        self.name = name
+        self.fullname_hash = track_hashes(namespace, name).fullname
+        self.stats = TrackStats(**stats_kw)
+        self.check = PayloadCheck(verify_every) if verify_every else None
+        self.ends: Counter = Counter()
+        self.statuses: Counter = Counter()
+        self.per_session: Counter = Counter()
+        self.datagrams = 0
+        self.header_gap_ms: List[float] = []
+        self._open: Set[Tuple[int, Optional[int]]] = set()
+
+    def on_object(self, where: Inbound,
+                  obj: Union[StreamObject, DatagramObject]) -> None:
+        if obj.status != ObjectStatus.NORMAL:
+            self.statuses[obj.status.name] += 1
+            return
+        self.per_session[where.session.id] += 1
+        t_us = where.stamp[1] // 1000
+        if isinstance(obj, DatagramObject):
+            self.datagrams += 1
+            self.stats.on_object(obj, len(obj.payload), t_us, obj.group_id)
+        else:
+            key = (where.session.id, where.stream_id)
+            if key not in self._open and where.header_stamp is not None:
+                self._open.add(key)
+                if len(self.header_gap_ms) < HEADER_GAP_SAMPLES:
+                    self.header_gap_ms.append(
+                        (where.stamp[0] - where.header_stamp[0]) / 1e6)
+            self.stats.on_object(obj, len(obj.payload), t_us, obj.group_id,
+                                 obj.subgroup_id)
+        if self.check is not None:
+            self.check(obj.group_id, obj.object_id, obj.payload)
+
+    def on_stream_end(self, session_id: int, stream_id: int, how: str) -> None:
+        self.ends[how] += 1
+        self._open.discard((session_id, stream_id))
 
 
 class FabricNode:
@@ -203,6 +392,12 @@ class FabricNode:
         self.dial_failures: Counter = Counter()
         self._announces: Dict[int, AnnounceInfo] = {}
         self._subscribes: Dict[int, SubscribeInfo] = {}
+        self._origins: Dict[int, FabricTrack] = {}
+        self._rx: Dict[int, RxTrack] = {}
+        # Called for each received object of a receive() track.
+        self.object_hook: Optional[Callable[[Inbound, Any, RxTrack],
+                                            None]] = None
+        self._tasks: Set[asyncio.Task] = set()
         self._protocols: Dict[int, _PeerProtocol] = {}
         self._next_session = 1
         self._dial_tasks: List[asyncio.Task] = []
@@ -334,6 +529,9 @@ class FabricNode:
         session = PeerSession(self.local, dialer=proto.dialer,
                               session_id=sid, peer=peer, clock=self.clock,
                               start=proto.dial_start, on_event=self._event)
+        session.decode = self._rx
+        session.on_object = self._on_object
+        session.on_stream_end = self._on_stream_end
         proto.session = session
         self.sessions[sid] = session
         self._protocols[sid] = proto
@@ -358,6 +556,11 @@ class FabricNode:
             events = session.control_data(event.stream_id, event.data)
         self._apply(session, events)
         self._flush(proto)
+
+    def _on_stream_reset(self, proto: _PeerProtocol,
+                         event: StreamReset) -> None:
+        if proto.session is not None:
+            proto.session.stream_reset(event.stream_id)
 
     def _on_datagram(self, proto: _PeerProtocol,
                      event: DatagramFrameReceived) -> None:
@@ -397,6 +600,13 @@ class FabricNode:
             log.warning(f"peering: {session.tag} CONNECT refused, "
                         f"code {ev.body.code}")
         self._record(ev.kind, session, ev.stamp, **event_fields(ev))
+        if ev.kind in ("subscribe", "subscribe_withdrawn"):
+            track = self._origins.get(ev.body.fullname_hash)
+            if track is not None:
+                self._reconcile(track)
+        elif ev.kind in ("connected", "node", "node_withdrawn"):
+            for track in list(self._origins.values()):
+                self._reconcile(track)
 
     def _sync(self, session: PeerSession) -> None:
         """A new session gets our own announces and subscribes only."""
@@ -412,6 +622,8 @@ class FabricNode:
                  f"{ev.note}")
         self._record("closed", session, ev.stamp, note=ev.note)
         self._protocols.pop(session.id, None)
+        for track in list(self._origins.values()):
+            self._reconcile(track)
         closed = [s for s in self.sessions.values() if s.state == "closed"]
         for old in closed[:-MAX_CLOSED_SESSIONS]:
             del self.sessions[old.id]
@@ -433,6 +645,44 @@ class FabricNode:
         else:
             self.events_dropped += 1
         self._changed.set()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _on_object(self, where: Inbound, obj) -> None:
+        rx = self._rx.get(where.fullname_hash)
+        if rx is None:
+            return
+        rx.on_object(where, obj)
+        if self.object_hook is not None:
+            self.object_hook(where, obj, rx)
+
+    def _on_stream_end(self, session: PeerSession, fullname_hash: int,
+                       stream_id: int, how: str) -> None:
+        rx = self._rx.get(fullname_hash)
+        if rx is not None:
+            rx.on_stream_end(session.id, stream_id, how)
+
+    def _reconcile(self, track: FabricTrack) -> None:
+        """Send the SNS changes the track's subscribers call for."""
+        for ch in reconcile(track.origin, self.connected(), self.node_id,
+                            lambda s: s.next_sns_id()):
+            session = self.sessions.get(ch.session_id)
+            live = session is not None and session.state == "connected"
+            if ch.withdraw:
+                track._drop_session(ch.session_id)
+                kind = "sns_withdrawn_originated"
+            else:
+                kind = "sns_originated"
+            self._record(kind, session, hash=f"0x{track.fullname_hash:016x}",
+                         sns=ch.sns.sns_id,
+                         nodes=[node_id_format(n) for n in ch.sns.nodes])
+            if live and session is not None:
+                session.send(MsgType.SNS_WD if ch.withdraw else MsgType.SNS_ADV,
+                             ch.sns)
+                self._flush(self._protocols[session.id])
 
     def sample_srtt(self, session: PeerSession) -> None:
         proto = self._protocols.get(session.id)
@@ -464,6 +714,8 @@ class FabricNode:
         """Withdraw every announce and subscribe this node originated, on
         every connected session, and wait up to `grace` seconds for the
         withdraws to be sent and acked."""
+        for track in list(self._origins.values()):
+            self.unpublish(track)
         for ann in list(self._announces.values()):
             self.withdraw_announce(ann.namespace, ann.name)
         for sub in list(self._subscribes.values()):
@@ -476,6 +728,44 @@ class FabricNode:
                 not p.control_flushed() for p in protos
                 if not p.terminated.is_set()):
             await asyncio.sleep(0.005)
+
+    def publish(self, namespace: Name, name: Union[str, bytes], *,
+                priority: int = DEFAULT_PRIORITY,
+                ttl_ms: int = DEFAULT_TTL_MS) -> FabricTrack:
+        """Announce a track and return its sender."""
+        ns, nm = namespace_tuple(namespace), _bytes(name)
+        if not nm:
+            raise ValueError("publish names a track")
+        track = FabricTrack(self, OriginTrack(ns, nm, priority, ttl_ms))
+        self._origins[track.fullname_hash] = track
+        self.announce(ns, nm)
+        self._reconcile(track)
+        return track
+
+    def unpublish(self, track: FabricTrack) -> None:
+        """SNS_WD on every session, FIN the track's streams, withdraw the
+        announce."""
+        if self._origins.pop(track.fullname_hash, None) is None:
+            return
+        for sid, sns in list(track.origin.sns.items()):
+            track._drop_session(sid)
+            session = self.sessions.get(sid)
+            if session is not None and session.state == "connected":
+                session.send(MsgType.SNS_WD, sns)
+                self._flush(self._protocols[sid])
+        track.origin.sns.clear()
+        if track.fullname_hash in self._announces:
+            self.withdraw_announce(track.origin.namespace, track.origin.name)
+
+    def receive(self, namespace: Name, name: Union[str, bytes], *,
+                verify_every: int = 0, stats: Optional[dict] = None,
+                **subscribe_kw) -> RxTrack:
+        """Subscribe to a track and measure its objects."""
+        ns, nm = namespace_tuple(namespace), _bytes(name)
+        rx = RxTrack(ns, nm, verify_every, **(stats or {}))
+        self._rx[rx.fullname_hash] = rx
+        self.subscribe(ns, nm, **subscribe_kw)
+        return rx
 
     def withdraw_announce(self, namespace: Name,
                           name: Union[str, bytes] = b"") -> None:
@@ -533,6 +823,12 @@ class FabricNode:
     def originated_subscribes(self) -> List[SubscribeInfo]:
         return list(self._subscribes.values())
 
+    def published(self) -> List[FabricTrack]:
+        return list(self._origins.values())
+
+    def receiving(self) -> List[RxTrack]:
+        return list(self._rx.values())
+
     def _learned(self, table: str) -> Iterator[Tuple[PeerSession, Learned]]:
         for s in self.sessions.values():
             for rec in getattr(s, table).values():
@@ -568,8 +864,9 @@ class FabricNode:
             pass
 
     async def wait_until(self, predicate: Callable[[], bool],
-                         timeout: float) -> None:
-        """Until predicate() holds; TimeoutError after timeout."""
+                         timeout: Optional[float]) -> None:
+        """Until predicate() holds; TimeoutError after timeout (None:
+        none)."""
         async with asyncio.timeout(timeout):
             while not predicate():
                 self._changed.clear()
