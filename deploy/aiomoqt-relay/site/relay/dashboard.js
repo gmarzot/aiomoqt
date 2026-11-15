@@ -76,14 +76,15 @@ function fetchWindow(T) {
           n: T.fetches || 0, bytes: T.fetch_cache_bytes || 0, min: null};
 }
 
-const count = (n) => n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`;
-
 // Cache held of its budget: GiB from 1 GiB, MiB below.
 function cacheFill(held, budget) {
   const g = (b) => +(b / 2 ** 30).toFixed(2);
   return budget >= 2 ** 30 ? `${(held / 2 ** 30).toFixed(1)}/${g(budget)} GiB`
     : `${Math.round(mib(held))}/${Math.round(mib(budget))} MiB`;
 }
+
+// Cache budget: GiB from 1 GiB, MiB below.
+const cacheSize = (b) => b >= 2 ** 30 ? `${+(b / 2 ** 30).toFixed(2)} GiB` : `${Math.round(mib(b))} MiB`;
 
 const ago = (s) => s < 120 ? `${Math.round(s)} s` : `${Math.round(s / 60)} min`;
 
@@ -124,6 +125,7 @@ function renderRelay(s, urls) {
   const badge = $('badge-version');
   badge.textContent = v.aiomoqt ? `aiomoqt ${v.aiomoqt}` : 'aiomoqt-relay';
   badge.title = [none(r.workers) ? null : fmt.plural(r.workers, 'picoquic worker'),
+                 none((r.cache || {}).budget) ? null : `${cacheSize(r.cache.budget)} cache`,
                  ...[['aiopquic', v.aiopquic], ['picoquic', v.picoquic], ['Python', v.python]]
                    .filter(([, x]) => x).map(([k, x]) => `${k} ${x}`)]
     .filter(Boolean).join(' · ');
@@ -154,13 +156,11 @@ function arc(r, f0, f1) {
 
 const level = (pct) => pct >= 90 ? 'high' : pct >= 75 ? 'warn-level' : 'ok';
 
-// Amber and red past 75% and 90%. `lines`: [{t, dim}] under the value, for a dial with no
-// bands, always green, drawn smaller to make room for them.
-function drawGauge(svg, pct, lines) {
-  const r = lines ? G.r - 4 : G.r;
-  const lv = lines ? () => 'ok' : level;
-  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(r, 0, 1)}),
-                      ...(lines ? [] : [
+// Amber and red past 75% and 90%; `plain`: no bands, always green.
+function drawGauge(svg, pct, plain = false) {
+  const lv = plain ? () => 'ok' : level;
+  svg.replaceChildren(svgEl('path', {class: 'g-track', d: arc(G.r, 0, 1)}),
+                      ...(plain ? [] : [
                         svgEl('path', {class: 'g-tick warn-level', d: arc(G.tick, 0.75, 0.9)}),
                         svgEl('path', {class: 'g-tick high', d: arc(G.tick, 0.9, 1)})]));
   const text = svgEl('text', {class: `g-value ${none(pct) ? '' : lv(pct)}`, x: G.cx,
@@ -168,18 +168,12 @@ function drawGauge(svg, pct, lines) {
   text.textContent = none(pct) ? '—' : `${Math.round(pct)}%`;
   if (!none(pct)) {
     const f = Math.min(Math.max(pct, 0), 100) / 100;
-    svg.append(svgEl('path', {class: `g-arc ${lv(pct)}`, d: arc(r, 0, Math.max(f, 0.004))}));
+    svg.append(svgEl('path', {class: `g-arc ${lv(pct)}`, d: arc(G.r, 0, Math.max(f, 0.004))}));
   }
   svg.append(text);
-  (lines || []).forEach(({t, dim}, i) => {
-    const line = svgEl('text', {class: `g-sub ${dim ? 'dim' : ''}`, x: G.cx,
-                                y: G.cy + 20 + 9 * i, 'text-anchor': 'middle', stroke: 'none'});
-    line.textContent = t;
-    svg.append(line);
-  });
 }
 
-// Cache: share of FETCH bytes served from it, with bytes from cache and FETCH count.
+// Cache: share of FETCH bytes served from it; FETCH count and bytes on hover.
 function renderGauges(s) {
   const h = s.host || {}, T = s.totals || {}, c = s.relay.cache;
   const pct = (used, total) => (none(used) || !total) ? null : 100 * used / total;
@@ -191,9 +185,7 @@ function renderGauges(s) {
   if (fig.hidden) return;
   trackFetches(s);
   const w = fetchWindow(T);
-  drawGauge($('gauge-cache'), w.hit, [
-    {t: fmt.bytes(w.bytes), dim: !w.n},
-    {t: `${count(w.n)} ${w.n === 1 ? 'fetch' : 'fetches'}`, dim: !w.n}]);
+  drawGauge($('gauge-cache'), w.hit, true);
   fig.title = cacheDetail(c, T, w, s.tracks);
 }
 
