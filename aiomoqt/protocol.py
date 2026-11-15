@@ -2817,6 +2817,7 @@ class _MOQTSessionMixin:
                     return
                 self._bidi_stream_requests[stream_id] = msg.request_id
                 self._bidi_streams[msg.request_id] = stream_id
+                self._prioritise_control_stream(stream_id)
                 if isinstance(msg, Fetch):
                     self._note_fetch_stream(stream_id)
             # d18 §10 Table 5: only SETUP and GOAWAY ride the control
@@ -3726,7 +3727,8 @@ class _MOQTSessionMixin:
             transport_log.debug(f"stream({stream_id}): write race: {e}")
 
     def _prioritise_control_stream(self, stream_id: Optional[int]) -> None:
-        """Put a control stream in its own band, above subscription data.
+        """Put a control or request stream in its own band, above
+        subscription data.
 
         Scheduling is strict, so a greedy data track sharing or undercutting
         the control band starves it: no SUBSCRIBE_OK, no PUBLISH_DONE, the
@@ -3746,8 +3748,9 @@ class _MOQTSessionMixin:
         WebTransportSession. Raw QUIC keeps a real connection in _quic and
         is looked up there.
         """
-        if self._quic is not self:
-            return getattr(self._quic, 'set_stream_priority', None)
+        quic = getattr(self, '_quic', None)
+        if quic is not self:
+            return getattr(quic, 'set_stream_priority', None)
         return getattr(super(), 'set_stream_priority', None)
 
     def set_stream_priority(self, stream_id: int, priority: int) -> bool:
@@ -4822,6 +4825,7 @@ class _MOQTSessionMixin:
                 # materialization on first send), so stay sync.
                 stream_id = self._quic.get_next_available_stream_id(
                     is_unidirectional=False)
+                self._prioritise_control_stream(stream_id)
                 self._bidi_streams[request_id] = stream_id
                 self._bidi_stream_requests[stream_id] = request_id
                 if isinstance(msg, Fetch):
@@ -4855,6 +4859,7 @@ class _MOQTSessionMixin:
             self._fail_waiting_updates(request_id,
                                        "request stream did not open")
             raise
+        self._prioritise_control_stream(stream_id)
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id
         if isinstance(msg, Fetch):
@@ -6265,6 +6270,7 @@ class _MOQTSessionMixin:
             self._note_request_kind(request_id, SubscribeNamespace, ours=True)
         if is_draft16_or_later(self.negotiated_draft):
             stream_id = await self.open_bidi_stream()
+            self._prioritise_control_stream(stream_id)
             self.send_stream_message(stream_id, message)
             # Track bidi stream ↔ request mapping for response routing
             self._bidi_streams[request_id] = stream_id
@@ -6452,6 +6458,7 @@ class _MOQTSessionMixin:
         if self._profile.control_uni_pair:
             self._note_request_kind(request_id, SubscribeTracks, ours=True)
         stream_id = await self.open_bidi_stream()
+        self._prioritise_control_stream(stream_id)
         self.send_stream_message(stream_id, message)
         self._bidi_streams[request_id] = stream_id
         self._bidi_stream_requests[stream_id] = request_id

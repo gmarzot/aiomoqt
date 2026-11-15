@@ -2,7 +2,7 @@
 """Render moqtest conformance reports as markdown.
 
 Input: the report files moxygen's conformance_test.sh writes, named
-<draft>-<transport>.txt. Output: one row per run in the shape the MoQ
+<draft>-<transport>[-<label>].txt. Output: one row per run in the shape the MoQ
 interop reports use — a box per section, then passed/total — followed by
 the per-case detail, failures first.
 
