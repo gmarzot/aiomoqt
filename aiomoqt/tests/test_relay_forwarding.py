@@ -1673,6 +1673,7 @@ async def test_relay_flags_reach_the_server(monkeypatch):
                          "workers": 1,
                          "stream_ring_cap": 1 << 20,
                          "tx_max_inflight_bytes": 512 << 10,
+                         "idle_timeout": None,
                          "auth": None}
     server = relay._build_server("localhost", 0, CERT, KEY, True, 18,
                                  **transport)
