@@ -29,6 +29,7 @@ from aiomoqt.types import (FilterType, GroupOrder, MOQTRequestError, ParamType,
 from aiomoqt.utils.buffer import Buffer
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
+from aiomoqt.tests._relay_wait import until_published
 
 STANDALONE, RELATIVE_JOINING = 0x1, 0x2
 
@@ -698,11 +699,11 @@ async def test_a_d16_d18_fetch_of_cached_groups_carries_no_object_status(
 @requires_certs
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 async def test_a_d22_whole_group_fetch_reports_its_last_object(use_quic):
-    # d22 §9.12: group 0 holds objects 0 and 2, no END_OF_GROUP; the whole
-    # group is both of them and End Location is {0, 2}, whether group 0
-    # holds Largest Object (video) or a later group does (audio).
-    layouts = {"video": ((0, 0, (0, 2), None),),
-               "audio": ((0, 0, (0, 2), None), (1, 0, (0,), None))}
+    # d22 §9.12: group 0 holds objects 0 and 2, no END_OF_GROUP, behind
+    # Largest; the whole group is both of them and End Location is {0, 2}.
+    # On a forwarding track that holds Largest it is the same (unit test
+    # above); on a paused one it is refused (pause-gap tests below).
+    layouts = {"audio": ((0, 0, (0, 2), None), (1, 0, (0,), None))}
     async with _cached(_CACHE_PORT + 2 + (not use_quic), use_quic, 22,
                        layouts) as rx:
         for name in layouts:
@@ -849,3 +850,198 @@ async def test_a_subscribe_fill_reaches_a_publish_only_publisher(use_quic):
             assert got.get(ok.request_id) == [
                 (1, o, size) for o in range(_GROUP)], name
         assert rx._close_err is None
+
+
+# -- FETCH into a pause's gap, publisher with no history -------------------
+
+_GAP_PORT = 28000
+_GAP_NS = "relay/pausegap"
+_GAP_SIZES = {"video": 1200, "audio": 80}
+_GAP_GROUPS = 10
+_GAP_PER_GROUP = 10
+
+
+def _gap_payload(name, g, o):
+    return f"{name}-{g}-{o}".encode().ljust(_GAP_SIZES[name], b".")
+
+
+class _NoHistory(PublishedTrack):
+    """A live source keeping no history: one stream per group, the first
+    group written at once and the rest paced; objects are dropped while
+    Forward State is 0."""
+
+    sent = dropped = 0
+    ran = False
+
+    async def generate(self, session, track_alias):
+        if self.ran:
+            return
+        self.ran = True
+        for g in range(_GAP_GROUPS):
+            sid = hdr = None
+            for o in range(_GAP_PER_GROUP):
+                if g:
+                    await asyncio.sleep(0.005)
+                if not self.forward:
+                    self.dropped += 1
+                    continue
+                if sid is None:
+                    sid = await session.open_uni_stream()
+                    hdr = SubgroupHeader(track_alias=track_alias, group_id=g,
+                                         subgroup_id=0, publisher_priority=128,
+                                         extensions_present=True,
+                                         prof=session._profile)
+                    session.stream_write(sid, hdr.serialize().data)
+                data = hdr.next_object(
+                    payload=_gap_payload(self.trackname, g, o),
+                    extensions=None, object_id=o).data
+                if g:
+                    await session.stream_write_drain(sid, data)
+                else:
+                    session.stream_write(sid, data)
+                self.sent += 1
+            if sid is not None:
+                session.stream_fin(sid)
+
+    @property
+    def finished(self):
+        return self.sent + self.dropped == _GAP_GROUPS * _GAP_PER_GROUP
+
+
+@contextlib.asynccontextmanager
+async def _gap_relay(port, use_quic, draft, forward, pause_after):
+    """A relay pausing after `pause_after`; one publisher session
+    PUBLISHing a _NoHistory track per _GAP_SIZES entry at Forward State
+    `forward`. Yields (tracks by name, connect)."""
+    relay._tracks.clear()
+    relay._announced.clear()
+    relay._track_subs.clear()
+    relay._pause_after = pause_after
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def connect():
+                client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=draft)
+                s = await stack.enter_async_context(client.connect())
+                await s.client_session_init()
+                return s
+
+            pub = await connect()
+            tracks = {}
+            for name, size in _GAP_SIZES.items():
+                tracks[name] = _NoHistory(pub, namespace=_GAP_NS,
+                                          trackname=name, object_size=size)
+                await tracks[name].publish(publish_track=True,
+                                           forward=forward)
+            yield tracks, connect
+    finally:
+        relay._pause_after = relay.PAUSE_AFTER_S
+        handle.close()
+        relay._tracks.clear()
+        relay._announced.clear()
+        relay._track_subs.clear()
+
+
+def _gap_track(name):
+    return relay._tracks.get((relay._ns_tuple(_GAP_NS), name.encode()))
+
+
+async def _gap_until(cond, timeout=6.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not cond() and loop.time() < deadline:
+        await asyncio.sleep(0.02)
+    return cond()
+
+
+def _gap_range(draft, start, end):
+    """FETCH range kwargs, `end` inclusive."""
+    if draft >= 20:
+        return {"location_filter": LocationFilter.absolute(*start, *end)}
+    return {"start_group": start[0], "start_object": start[1],
+            "end_group": end[0], "end_object": end[1] + 1}
+
+
+async def _check_gap_fetches(rx, draft, tracks):
+    """Each paused track: a FETCH past its cached objects is refused with
+    the publisher's NOT_SUPPORTED; one up to its Largest gets all of
+    them."""
+    refused = request_error_code(RequestErrorCode.NOT_SUPPORTED,
+                                 profile_for(draft), fetch=True)
+    for name, track in tracks.items():
+        relayed = _gap_track(name)
+        assert relayed.paused, name
+        assert track.dropped, name
+        largest = relayed.largest
+        held = [(c[0], c[2]) for c in relayed._cache]
+        assert held, name
+        with pytest.raises(MOQTRequestError) as err:
+            await asyncio.wait_for(rx.fetch(
+                _GAP_NS, name, wait_response=True,
+                **_gap_range(draft, (0, 0),
+                             (_GAP_GROUPS - 1, _GAP_PER_GROUP - 1))), 5)
+        assert err.value.error_code == refused, (name, err.value)
+        got = []
+        ok = await asyncio.wait_for(rx.fetch(
+            _GAP_NS, name, wait_response=True,
+            on_object=lambda obj, _n, _ts, _rid: got.append(
+                (obj.group_id, obj.object_id, bytes(obj.payload))),
+            **_gap_range(draft, (0, 0), largest)), 5)
+        assert await rx.await_fetch_done(ok.request_id, timeout=5), name
+        assert (ok.largest_group_id, ok.largest_object_id) == (
+            largest[0], largest[1] + 1), name
+        assert got == [(g, o, _gap_payload(name, g, o)) for g, o in held]
+    assert rx._close_err is None
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_fetch_into_the_gap_of_a_pause_at_publish(draft, use_quic):
+    # Nobody forwards: PUBLISH is paused at once and only what the
+    # publisher sent before Forward State 0 landed is cached.
+    port = _GAP_PORT + 2 * (draft == 22) + (not use_quic)
+    async with _gap_relay(port, use_quic, draft, forward=1,
+                          pause_after=relay.PAUSE_AFTER_S) as (tracks,
+                                                               connect):
+        assert await _gap_until(lambda: all(
+            t.finished and _gap_track(n) is not None
+            and _gap_track(n)._objects_in for n, t in tracks.items()))
+        await asyncio.sleep(0.2)
+        await _check_gap_fetches(await connect(), draft, tracks)
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_fetch_into_the_gap_of_a_pause_after(draft, use_quic):
+    # A viewer resumes both tracks and leaves; --pause-after pauses them.
+    port = _GAP_PORT + 4 + 2 * (draft == 22) + (not use_quic)
+    async with _gap_relay(port, use_quic, draft, forward=0,
+                          pause_after=0.3) as (tracks, connect):
+        await until_published(_GAP_NS, list(_GAP_SIZES))
+        viewer = await connect()
+        seen = {name: 0 for name in _GAP_SIZES}
+        by_size = {size: name for name, size in _GAP_SIZES.items()}
+
+        def _on_object(msg, _size, _ts, _group_id, _subgroup_id):
+            name = by_size.get(len(msg.payload or b""))
+            if name is not None:
+                seen[name] += 1
+        viewer.on_object_received = _on_object
+        subs = [await viewer.subscribe(_GAP_NS, name, forward=1,
+                                       wait_response=True)
+                for name in _GAP_SIZES]
+        assert await _gap_until(lambda: all(
+            n > _GAP_PER_GROUP for n in seen.values())), seen
+        for sub in subs:
+            viewer.unsubscribe(sub.request_id)
+        assert await _gap_until(lambda: all(
+            _gap_track(n).lowered and t.finished
+            for n, t in tracks.items()))
+        await asyncio.sleep(0.2)
+        await _check_gap_fetches(await connect(), draft, tracks)
