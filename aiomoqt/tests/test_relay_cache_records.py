@@ -1,7 +1,10 @@
 """aiomoqt-relay cache records hold nothing the cyclic GC tracks, nor
-does the per-group state kept beside them, and what a replay or a
-FETCH sends from them is what was received."""
+does the per-group state kept beside them, what a replay or a FETCH
+sends from them is what was received, and a dropped cache is freed a
+slice per loop pass."""
+import asyncio
 import gc
+import time
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -63,6 +66,36 @@ def test_cached_records_add_no_tracked_objects():
     assert len(t._cache) == 200_000 and t._cache.group_count() == 200_000
     assert len(t._subgroups) <= 2 * relay.STATE_GROUPS
     t._drop_cache()
+
+
+async def test_a_dropped_cache_is_freed_a_slice_per_loop_pass(monkeypatch):
+    monkeypatch.setattr(relay, "RELEASE_SLICE_S", 0.0005)
+    t = relay._RelayedTrack(((b"rel",), b"video"))
+    for i in range(20_000):
+        g, o = divmod(i, 60)
+        if o == 0:
+            t._copy(None, g, 0, 0, False)
+            t._heads.add((g, 0))
+        t._remember(g, 0, o, bytes([i % 251]) * 4096, None, 128,
+                    ObjectStatus.NORMAL, (True, False, False), born=i * 0.03)
+    assert relay._budget.bytes > 80 << 20
+    passes = []
+    free_some = relay._free_some
+
+    def timed():
+        t0 = time.perf_counter()
+        free_some()
+        passes.append(time.perf_counter() - t0)
+    monkeypatch.setattr(relay, "_free_some", timed)
+    t0 = time.perf_counter()
+    t._drop_cache()
+    assert time.perf_counter() - t0 < 0.02
+    assert relay._budget.bytes == 0 and len(t._cache) == 0
+    assert relay._unfreed
+    async with asyncio.timeout(5):
+        while relay._unfreed:
+            await asyncio.sleep(0)
+    assert len(passes) >= 2 and max(passes) < 0.02, (len(passes), max(passes))
 
 
 def test_records_read_back_as_written():
