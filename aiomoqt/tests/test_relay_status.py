@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -780,6 +781,36 @@ async def test_platform_written_less_often_than_status(
     assert written[:2] == ["status.json", "platform.json"]
     assert written.count("platform.json") <= 2
     assert written.count("status.json") >= 6
+
+
+async def test_a_slow_status_write_does_not_pause_the_loop(
+        relay_tables, monkeypatch, tmp_path):
+    monkeypatch.setattr(relay, "STATUS_INTERVAL_S", 0.05)
+    main = threading.get_ident()
+    writers = []
+
+    def slow_write(path, obj):
+        writers.append(threading.get_ident())
+        time.sleep(0.3)
+    monkeypatch.setattr(relay_status, "write_json_atomic", slow_write)
+    background = set(relay._background)
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    runner = asyncio.create_task(status.run())
+    loop = asyncio.get_running_loop()
+    late = 0.0
+    try:
+        for _ in range(40):
+            t = loop.time()
+            await asyncio.sleep(0.02)
+            late = max(late, loop.time() - t - 0.02)
+    finally:
+        runner.cancel()
+        for task in set(relay._background) - background:
+            task.cancel()
+            relay._background.discard(task)
+    assert len(writers) >= 2 and main not in writers, writers
+    assert late < 0.1, late
 
 
 def _tick(status, rows):
