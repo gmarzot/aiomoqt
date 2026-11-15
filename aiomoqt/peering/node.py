@@ -11,7 +11,8 @@ import functools
 import ipaddress
 import ssl
 from collections import Counter
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import (Callable, Dict, Iterator, List, Optional, Sequence, Tuple,
+                    Union, cast)
 
 from aiopquic.asyncio import QuicConnectionProtocol
 from aiopquic.asyncio import connect as quic_connect
@@ -134,17 +135,23 @@ class _PeerProtocol(QuicConnectionProtocol):
         if self._writer is None or self._writer.done():
             self._writer = asyncio.ensure_future(self._drain())
 
+    def _control_stream(self) -> int:
+        sid = self.session.control_stream if self.session else None
+        if sid is None:
+            raise RuntimeError("control write before the control stream")
+        return sid
+
     def _send(self, data: bytes) -> None:
         # Control stream priority 0, as the library sets it.
         self._quic.send_stream_data(
-            self.session.control_stream, data,
+            self._control_stream(), data,
             priority=None if self._priority_set else 0)
         self._priority_set = True
 
     async def _drain(self) -> None:
         while self._pending and not self.terminated.is_set():
             await self._quic.send_stream_data_drained(
-                self.session.control_stream, self._pending[0],
+                self._control_stream(), self._pending[0],
                 priority=None if self._priority_set else 0)
             self._priority_set = True
             self._pending.pop(0)
@@ -207,14 +214,17 @@ class FabricNode:
                  f"contact={self.local.contact!r} metric={self.local.metric} "
                  f"listen={self.listen_text() or 'off'} "
                  f"peers={','.join(_addr_text(h, p) for h, p in self.peers) or '-'}")
-        self._record("start", **{
-            "node": node_id_format(self.node_id), "node_int": self.node_id,
-            "contact": self.local.contact})
+        self._record("start", node=node_id_format(self.node_id),
+                     node_int=self.node_id, contact=self.local.contact)
         if self.port:
+            if self.cert is None or self.key is None:
+                raise ValueError("listening needs cert and key")
             cfg = self._quic_config(client=False)
             cfg.load_cert_chain(self.cert, self.key)
+            # aiopquic takes host None (all interfaces); it annotates str.
             self._server = await quic_serve(
-                self.bind, self.port, configuration=cfg,
+                self.bind,  # ty: ignore[invalid-argument-type]
+                self.port, configuration=cfg,
                 create_protocol=functools.partial(self._new_protocol,
                                                   dialer=False))
         for host, port in self.peers:
@@ -295,9 +305,9 @@ class FabricNode:
         async with asyncio.timeout(self.connect_timeout) as limit:
             async with quic_connect(host, port,
                                     configuration=self._quic_config(True, host),
-                                    create_protocol=factory) as proto:
+                                    create_protocol=factory) as conn:
                 limit.reschedule(None)
-                await proto.terminated.wait()
+                await cast(_PeerProtocol, conn).terminated.wait()
 
     # -- QUIC events -------------------------------------------------
 
@@ -354,6 +364,8 @@ class FabricNode:
         self._close_session(session, reason)
 
     def _flush(self, proto: _PeerProtocol) -> None:
+        if proto.session is None:
+            return
         for data in proto.session.take_output():
             proto.write_control(data)
 

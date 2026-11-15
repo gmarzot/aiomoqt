@@ -182,20 +182,20 @@ class PeerSession:
     def _handle(self, msg: Message, stamp: Stamp,
                 events: List[SessionEvent]) -> str:
         t, body = msg.type, msg.body
-        if t == MsgType.CONNECT:
+        if isinstance(body, Connect):
             return self._up(body.node, stamp, events)
-        if t == MsgType.CONNECT_RESPONSE:
-            if body.code != ConnectCode.OK:
+        if isinstance(body, ConnectResponse):
+            if body.code != ConnectCode.OK or body.node is None:
                 events.append(SessionEvent("connect_error", stamp, body))
                 return f"refused code {body.code}"
             return self._up(body.node, stamp, events)
-        if t in (MsgType.NODE_INFO_ADV, MsgType.NODE_INFO_WD):
+        if isinstance(body, NodeInfo):
             return self._node(body, stamp, events,
                               t == MsgType.NODE_INFO_WD)
-        if t in (MsgType.ANNOUNCE_INFO_ADV, MsgType.ANNOUNCE_INFO_WD):
+        if isinstance(body, AnnounceInfo):
             return self._announce(body, stamp, events,
                                   t == MsgType.ANNOUNCE_INFO_WD)
-        if t in (MsgType.SUBSCRIBE_INFO_ADV, MsgType.SUBSCRIBE_INFO_WD):
+        if isinstance(body, SubscribeInfo):
             return self._subscribe(body, stamp, events,
                                    t == MsgType.SUBSCRIBE_INFO_WD)
         return self._sns(body, stamp, events, t == MsgType.SNS_WD)

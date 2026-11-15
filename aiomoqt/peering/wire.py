@@ -8,7 +8,8 @@ length) is the MoQT leading-ones varint, not the QUIC one.
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (List, Literal, NamedTuple, Optional, Sequence, Tuple,
+                    Union, overload)
 
 ALPN = "moq-peering"
 DEFAULT_PORT = 33434
@@ -382,8 +383,8 @@ def encode_body(msg_type: MsgType, body: Body) -> bytes:
     if not isinstance(body, _BODY[msg_type]):
         raise WireError(f"{msg_type.name} takes {_BODY[msg_type].__name__}, "
                         f"not {type(body).__name__}")
-    if msg_type == MsgType.SNS_WD:
-        return body.encode(withdraw=True)
+    if isinstance(body, NodeSet):
+        return body.encode(withdraw=msg_type == MsgType.SNS_WD)
     return body.encode()
 
 
@@ -503,6 +504,16 @@ class DataHeader:
         if self.type == DataType.EXISTING_STREAM:
             return b""
         raise WireError(f"data type {self.type}")
+
+
+@overload
+def parse_data_header(buf: Bytes, datagram: Literal[True]
+                      ) -> Tuple[DataHeader, int]: ...
+
+
+@overload
+def parse_data_header(buf: Bytes, datagram: bool = False
+                      ) -> Optional[Tuple[DataHeader, int]]: ...
 
 
 def parse_data_header(buf: Bytes, datagram: bool = False
