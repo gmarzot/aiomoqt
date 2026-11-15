@@ -4405,6 +4405,18 @@ def _resolve_against(msg, seen, track):
     return seen
 
 
+def _window_largest(msg, largest, track):
+    """The Largest the subscription's window resolves against: `largest`,
+    except that a Next Object with a fill starts after the Largest the
+    reply reports, where the fill ends (§3.4), so no Object comes on
+    both."""
+    lf = getattr(msg, "location_filter", None)
+    if (lf is not None and lf.type == LocationFilterType.NEXT_OBJECT
+            and D20ParamType.FILL_PARAMETERS in (msg.parameters or {})):
+        return track.largest
+    return largest
+
+
 def _publisher_known(ns: tuple, track_name) -> bool:
     """A publisher could serve this track now: it PUBLISHed the track,
     announced a covering namespace, or the relay dials an origin."""
@@ -4442,7 +4454,7 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     reply and a joining FETCH take the Largest the relay knows now
     (§10.2.11). False when the End Group is already behind, answered
     INVALID_RANGE."""
-    window = _subscription_window(msg, largest)
+    window = _subscription_window(msg, _window_largest(msg, largest, track))
     if (window[1] is not None and track.largest is not None
             and track.largest[0] > window[1]):
         logger.info(f"relay: subscribe {track.key} -> INVALID_RANGE "
