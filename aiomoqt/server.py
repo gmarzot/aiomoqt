@@ -94,6 +94,7 @@ class MOQTServer(MOQTPeer):
         packet_train_mode: bool = False,
         flow_control_window: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
+        idle_timeout: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
         max_connections: Optional[int] = None,
@@ -137,6 +138,9 @@ class MOQTServer(MOQTPeer):
         # frames hold a flow-controlled, consumer-stalled connection
         # open past the idle timeout instead of dropping it.
         self.keep_alive_interval = keep_alive_interval
+        # QUIC idle timeout (seconds) this server offers; a connection uses
+        # the lower of both ends'. None = aiopquic default (30 s).
+        self.idle_timeout = idle_timeout
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
@@ -201,6 +205,8 @@ class MOQTServer(MOQTPeer):
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
                 cfg.keep_alive_interval = self.keep_alive_interval
+            if self.idle_timeout is not None:
+                cfg.idle_timeout = self.idle_timeout
             if self.socket_buffer_size is not None:
                 cfg.socket_buffer_size = self.socket_buffer_size
             if self.stream_ring_cap is not None:
@@ -253,6 +259,8 @@ class MOQTServer(MOQTPeer):
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
             wt_cfg.keep_alive_interval = self.keep_alive_interval
+        if self.idle_timeout is not None:
+            wt_cfg.idle_timeout = self.idle_timeout
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
         if self.stream_ring_cap is not None:
@@ -309,6 +317,8 @@ class MOQTServer(MOQTPeer):
             cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
             cfg.keep_alive_interval = self.keep_alive_interval
+        if self.idle_timeout is not None:
+            cfg.idle_timeout = self.idle_timeout
         if self.socket_buffer_size is not None:
             cfg.socket_buffer_size = self.socket_buffer_size
         if self.stream_ring_cap is not None:
