@@ -4,6 +4,8 @@ both ways on two tracks each, withdraws, re-dial after a close, and the
 moq-peer-probe tool end to end."""
 import asyncio
 import json
+import os
+import signal
 
 import pytest
 
@@ -137,9 +139,7 @@ async def test_redial_after_close_resyncs():
         await a.stop()
         await b.wait_until(lambda: not b.connected(), TIMEOUT)
         assert first.state == "closed" and _tracks(b) == {}
-        closed = [e for e in b.events if e["kind"] == "closed"]
-        assert closed[0]["session"] == first.id
-        assert "announces=1" in closed[0]["note"]
+        assert _withdrawn_before_close(b, first.id) == (1, 0)
 
         a2 = _listener(port, label="A2")
         a2.announce("a/live", "video")
@@ -200,7 +200,7 @@ async def test_peer_probe_tool(tmp_path, capsys):
     listener = peer_probe.parse_args([
         "-p", str(port), "--bind", "127.0.0.1", "--cert", CERT, "--key", KEY,
         "--node-id", "9.9:1", "--announce", "t/a", "--announce", "t/b",
-        "--exit", "subscribe:t/a", "-t", str(TIMEOUT), "-i", "0"])
+        "--exit", "idle:1", "-t", str(TIMEOUT), "-i", "0"])
     dialer = peer_probe.parse_args([
         "--peer", f"127.0.0.1:{port}", "-p", "0", "--subscribe", "t/a",
         "--exit", "announce:t/b", "-t", str(TIMEOUT), "-o", str(out),
@@ -224,6 +224,68 @@ async def test_peer_probe_exit_not_met():
         "--peer", f"127.0.0.1:{port}", "-p", "0", "--exit", "peers-up",
         "-t", "1", "-i", "0", "--no-stats"])
     assert await peer_probe.run(args) == 1
+
+
+def _withdrawn_before_close(node, session_id):
+    kinds = [e["kind"] for e in node.events if e.get("session") == session_id]
+    before = kinds[:kinds.index("closed")]
+    return before.count("announce_withdrawn"), before.count(
+        "subscribe_withdrawn")
+
+
+@pytest.mark.asyncio
+async def test_stop_withdraws_originated():
+    port = _BASE_PORT + 6
+    a, b = _listener(port), _dialer(port)
+    await a.start()
+    await b.start()
+    try:
+        await _up(a, b)
+        for name in ("video", "audio"):
+            a.announce("w/live", name)
+            a.subscribe("w/peer", name)
+        await b.wait_until(lambda: len(_tracks(b)) == 2
+                           and len(_subs(b)) == 2, TIMEOUT)
+        session = b.connected()[0].id
+        await a.stop()
+        await b.wait_until(lambda: not b.connected(), TIMEOUT)
+        assert _withdrawn_before_close(b, session) == (2, 2)
+        wd = [e for e in b.events if e["kind"] == "subscribe_withdrawn"]
+        assert [e["seq"] for e in wd] == [2, 2]
+        mine = [e["kind"] for e in a.events]
+        assert mine.count("announce_withdrawn_originated") == 2
+        assert mine.count("subscribe_withdrawn_originated") == 2
+    finally:
+        await b.stop()
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_peer_probe_withdraws_on_signal(tmp_path):
+    port = _BASE_PORT + 7
+    out = tmp_path / "signal.json"
+    async with _listener(port, label="L") as lst:
+        args = peer_probe.parse_args([
+            "--peer", f"127.0.0.1:{port}", "-p", "0", "--announce", "s/a",
+            "--announce", "s/b", "--subscribe", "s/x", "--subscribe", "s/y",
+            "-o", str(out), "-i", "0", "--no-stats"])
+        probe = asyncio.ensure_future(peer_probe.run(args))
+        await lst.wait_until(lambda: len(_tracks(lst)) == 2
+                             and len(_subs(lst)) == 2, TIMEOUT)
+        session = lst.connected()[0].id
+        # Only with the probe's handler installed: SIGTERM would end pytest.
+        assert signal.SIGTERM in asyncio.get_running_loop()._signal_handlers
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert await asyncio.wait_for(probe, TIMEOUT) == 130
+        await lst.wait_until(lambda: not lst.connected(), TIMEOUT)
+        assert _withdrawn_before_close(lst, session) == (2, 2)
+    report = json.loads(out.read_text())
+    assert report["nodes"][0]["contact"] == "L"
+    assert report["sessions"][0]["state"] == "connected"
+    kinds = [e["kind"] for e in report["events"]]
+    assert kinds.count("announce_withdrawn_originated") == 2
+    assert kinds.count("subscribe_withdrawn_originated") == 2
+    assert report["originated"] == {"announces": [], "subscribes": []}
 
 
 @pytest.mark.parametrize("argv", [

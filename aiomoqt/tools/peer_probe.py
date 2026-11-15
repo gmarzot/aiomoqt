@@ -8,7 +8,8 @@ the fabric sends, checks each announce and subscribe hash, and with
 objects are sent or decoded). It advertises only itself, at metric 2^32,
 and forwards nothing, so no relay routes through it.
 
--o writes the report JSON on exit and every -i seconds. Exit status: 0 when
+On exit (-t, --exit or a signal) it withdraws what it originated. -o writes
+the report JSON on exit and every -i seconds. Exit status: 0 when
 --exit COND is met (or -t elapses with no --exit), 1 when -t elapses
 first, 130 on a signal.
 
@@ -241,6 +242,7 @@ async def run(args) -> int:
                 wakes.append(idle)
             await node.wait_changed(min(wakes) if wakes else None)
         # Before stop(): closing a session forgets what it learned.
+        await node.withdraw_originated()
         if not args.no_stats:
             print(summary_line(node, time.monotonic() - start), flush=True)
         save()

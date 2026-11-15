@@ -37,6 +37,8 @@ REDIAL_INTERVAL = 2.0
 CONNECT_TIMEOUT = 5.0
 MAX_EVENTS = 100_000
 MAX_CLOSED_SESSIONS = 100
+# Longest a stop waits for its withdraws to be sent and acked.
+WITHDRAW_GRACE = 0.25
 
 Name = Union[str, bytes, Sequence[Union[str, bytes]]]
 
@@ -156,6 +158,16 @@ class _PeerProtocol(QuicConnectionProtocol):
             self._priority_set = True
             self._pending.pop(0)
 
+    def control_flushed(self) -> bool:
+        """Every control byte written has left aiopquic's ring and nothing
+        is in flight unacked."""
+        if self._pending:
+            return False
+        sid = self.session.control_stream if self.session else None
+        if sid is not None and self._quic.tx_data_ring_used(sid):
+            return False
+        return not self._quic.path_quality().get("bytes_in_transit")
+
 
 class FabricNode:
     """A moq-peering leaf: dial `peers`, listen on `port` (0: do not)."""
@@ -234,6 +246,7 @@ class FabricNode:
     async def stop(self) -> None:
         if self._stopping:
             return
+        await self.withdraw_originated()
         self._stopping = True
         for task in self._dial_tasks:
             task.cancel()
@@ -446,6 +459,23 @@ class FabricNode:
                      track=track_text(ns, nm), namespace=not nm)
         self._send_all(MsgType.ANNOUNCE_INFO_ADV, ann)
         return ann
+
+    async def withdraw_originated(self, grace: float = WITHDRAW_GRACE) -> None:
+        """Withdraw every announce and subscribe this node originated, on
+        every connected session, and wait up to `grace` seconds for the
+        withdraws to be sent and acked."""
+        for ann in list(self._announces.values()):
+            self.withdraw_announce(ann.namespace, ann.name)
+        for sub in list(self._subscribes.values()):
+            self.unsubscribe(sub.namespace, sub.name)
+        protos = [p for p in self._protocols.values()
+                  if p.session is not None and p.session.state == "connected"]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace
+        while loop.time() < deadline and any(
+                not p.control_flushed() for p in protos
+                if not p.terminated.is_set()):
+            await asyncio.sleep(0.005)
 
     def withdraw_announce(self, namespace: Name,
                           name: Union[str, bytes] = b"") -> None:
