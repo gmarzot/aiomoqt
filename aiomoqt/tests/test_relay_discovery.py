@@ -307,3 +307,96 @@ async def test_d14_forwards_publish_namespace_and_its_withdrawal(
             "DONE", (b"wd", b"b"))
         await asyncio.sleep(0.1)
         assert seen.empty()
+
+
+# -- a subscriber's own tracks ---------------------------------------------
+
+_OWN_NS = (b"own", b"pub")
+
+
+async def _until(cond, tries=250):
+    for _ in range(tries):
+        if cond():
+            return True
+        await asyncio.sleep(0.02)
+    return cond()
+
+
+def _answered(name):
+    """The relay has sent PUBLISH_OK for the track."""
+    t = relay._tracks.get((_OWN_NS, name))
+    return t is not None and t.pending_publish is None and t.upstream is not None
+
+
+async def _accept(sub, got):
+    """Accept the next PUBLISH offer with Forward State 1, collecting its
+    payloads in got[track name]."""
+    offer = await sub.await_publish(timeout=5.0)
+    name = offer.track_name.decode()
+    got[name] = []
+    sub._track_aliases[offer.track_alias] = offer.request_id
+    sub.register_object_handler(
+        offer.track_alias,
+        lambda m, *_, n=name: got[n].append(bytes(m.payload)))
+    sub.publish_ok(offer, forward=1)
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@_TRANSPORTS
+async def test_subscribe_tracks_leaves_out_the_subscribers_own_tracks(
+        draft, use_quic):
+    # d22 §3.6: PUBLISH for matching tracks, excluding tracks published by
+    # the subscriber. Track a is published before the publisher's own
+    # SUBSCRIBE_TRACKS, b after it.
+    port = _BASE_PORT + 50 + 2 * (draft == 22) + (not use_quic)
+    async with _relay(port, use_quic, draft) as (pub, sub):
+        await sub.subscribe_tracks(namespace="own", wait_response=True)
+        got = {}
+        await _Pub(pub, "own/pub", "a").publish()
+        await _accept(sub, got)
+        await pub.subscribe_tracks(namespace="own", wait_response=True)
+        await _Pub(pub, "own/pub", "b").publish()
+        await _accept(sub, got)
+        assert await _until(lambda: all(len(v) >= len(_FRAMES)
+                                        for v in got.values()))
+        assert got == {"a": _FRAMES, "b": _FRAMES}
+        with pytest.raises(TimeoutError):
+            await pub.await_publish(timeout=1.0)
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@_TRANSPORTS
+async def test_a_publisher_alone_on_its_prefix_gets_its_publish_ok(
+        draft, use_quic):
+    # No other SUBSCRIBE_TRACKS subscriber: nothing is offered, so the
+    # relay answers each PUBLISH at once.
+    port = _BASE_PORT + 54 + 2 * (draft == 22) + (not use_quic)
+    async with _relay(port, use_quic, draft) as (pub, _sub):
+        await pub.subscribe_tracks(namespace="own", wait_response=True)
+        for name in ("a", "b"):
+            await _Pub(pub, "own/pub", name).publish()
+        assert await _until(lambda: _answered(b"a") and _answered(b"b"))
+        with pytest.raises(TimeoutError):
+            await pub.await_publish(timeout=1.0)
+
+
+@requires_certs
+@_TRANSPORTS
+async def test_d16_subscribe_namespace_echoes_the_publishers_own_tracks(
+        use_quic):
+    # d16 §6.1: echoing back published Tracks to the endpoint that sent
+    # them. Track a is published before the SUBSCRIBE_NAMESPACE, b after.
+    async with _relay(_BASE_PORT + 58 + (not use_quic), use_quic, 16) as (
+            pub, _sub):
+        await _Pub(pub, "own/pub", "a").publish()
+        await pub.subscribe_namespace("own", subscribe_options=0,
+                                      wait_response=True)
+        await _Pub(pub, "own/pub", "b").publish()
+        names = set()
+        for _ in range(2):
+            offer = await pub.await_publish(timeout=5.0)
+            names.add(offer.track_name.decode())
+            pub.publish_ok(offer, forward=0)
+        assert names == {"a", "b"}

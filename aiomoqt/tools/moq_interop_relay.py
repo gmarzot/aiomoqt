@@ -4094,6 +4094,7 @@ async def _on_publish(session, msg):
     offered = False
     for sub_session, prefix, rid in list(_track_subs):
         if (_prefix_covers(prefix, ns)
+                and not _own_track(sub_session, track)
                 and _track_sub_admits(sub_session, rid, track)):
             offered = True
             asyncio.create_task(
@@ -5237,6 +5238,16 @@ def _prefix_covers(prefix, ns) -> bool:
     return ns[:len(prefix)] == prefix
 
 
+def _own_track(session, track) -> bool:
+    """From d18 SUBSCRIBE_TRACKS excludes tracks published by the
+    subscriber (d22 §3.6); d14 and d16 echo them back."""
+    if not session._profile.two_level_discovery:
+        return False
+    pending = track.pending_publish
+    return (track.feeds_from(session)
+            or (pending is not None and pending[0] is session))
+
+
 def _track_sub_admits(session, request_id, track) -> bool:
     """The track passes the SUBSCRIBE_TRACKS's TRACK_PROPERTY_FILTERs."""
     params = _track_sub_filters.get((id(session), request_id))
@@ -5271,9 +5282,6 @@ async def _offer_track(session, track, key, request_id=None):
         await _resume_for(track, SimpleNamespace(forward=1))
         if not _session_live(session):
             return
-    # A session that subscribed to a prefix gets every track under it,
-    # including one it publishes itself: the subscription is explicit,
-    # and moq-test's publish cases use one session for both roles.
     pub_msg = session.publish(
         namespace=ns,
         track_name=(name.decode() if isinstance(name, bytes) else name),
@@ -5782,6 +5790,11 @@ async def _on_subscribe_tracks(session, msg):
     for key, track in list(_tracks.items()):
         if _prefix_covers(prefix, key[0]) and (
                 track.pending_publish or track.upstream):
+            if _own_track(session, track):
+                logger.info(f"relay: {key} is the subscriber's own track, "
+                            f"not offered to subscribe-tracks request "
+                            f"{msg.request_id}")
+                continue
             if not _track_sub_admits(session, msg.request_id, track):
                 logger.info(f"relay: {key} filtered out of subscribe-tracks "
                             f"request {msg.request_id}")

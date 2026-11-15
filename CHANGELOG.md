@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - aiomoqt-relay refuses a FETCH that reaches past a paused track's cached objects when the publisher cannot serve it, passing on the publisher's refusal; it sent FETCH_OK with the End at the last object received before the pause, so the objects after it read as non-existent. A range the cache holds through its End is still served from it.
+- aiomoqt-relay no longer offers a d18 or later SUBSCRIBE_TRACKS subscriber the tracks its own session publishes (d22 §3.6): a publisher subscribed to its own prefix got them back, and with no other subscriber its PUBLISH_OK waited until it answered them. d14 and d16 still echo them, as their §6.1 requires.
 - aiomoqt-relay applies a REQUEST_UPDATE that arrives with the PUBLISH_OK for a SUBSCRIBE_TRACKS offer; it answered NOT_SUPPORTED and ended the subscription, so a FILL_PARAMETERS update (moq-web's catalog fill) lost the track.
 - aiomoqt-relay answers a FETCH it forwards upstream with the publisher's End Location, capped at the requested End, instead of the last Object it forwarded. The End no longer drops a trailing End of Group, which no FETCH stream carries.
 - From d16, request streams (SUBSCRIBE, FETCH, SUBSCRIBE_NAMESPACE and the other requests, with their replies) take the control band instead of the session's default data band. Data at a declared priority below 128 held back the reply on a saturated path: a SUBSCRIBE_OK sent behind it never arrived and the SUBSCRIBE timed out.
