@@ -24,8 +24,9 @@ from aiomoqt.messages.subscribe import Subscribe
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
-from aiomoqt.types import (FilterType, GroupOrder, MOQTRequestError, ParamType,
-                           RequestErrorCode, StreamResetCode)
+from aiomoqt.types import (FilterType, GroupOrder, MOQTMessageType,
+                           MOQTRequestError, ParamType, RequestErrorCode,
+                           StreamResetCode)
 from aiomoqt.utils.buffer import Buffer
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -364,6 +365,52 @@ def test_range_older_than_the_cache_goes_upstream(monkeypatch):
     assert asked == [(0, 5)]                      # went upstream
     served, _ = s._served[0]
     assert [o.group_id for o in served] == [0, 1, 2, 3, 4, 5]
+
+
+def _upstream_answer(monkeypatch, end, groups=3, objects=4):
+    """_fetch_upstream answers with FETCH_OK End `end` (last Object plus
+    one) and Objects 0..objects-1 of each group."""
+    async def _upstream(ns, track_name, msg):
+        ok = SimpleNamespace(end_of_track=1, largest_group_id=end[0],
+                             largest_object_id=end[1])
+        return ok, [FetchObject(group_id=g, subgroup_id=0, object_id=o,
+                                publisher_priority=128, payload=b"z")
+                    for g in range(groups) for o in range(objects)], None
+    monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
+
+
+def _end(s):
+    ok = s._oks[0]
+    return ok['largest_group_id'], ok['largest_object_id']
+
+
+def test_an_upstream_fetch_ends_at_the_publishers_end(monkeypatch):
+    # The publisher's End counts a trailing End of Group at (2, 4), which
+    # no FETCH stream carries: the relay reports it, not (2, 3).
+    _upstream_answer(monkeypatch, (2, 5))
+    s = _session()
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=2, end_object=0)))
+    assert _end(s) == (2, 5)
+    assert len(s._served[0][0]) == 12
+
+
+def test_an_upstream_fetch_end_stays_within_the_request(monkeypatch):
+    _upstream_answer(monkeypatch, (2, 5), groups=2, objects=3)
+    s = _session()
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=1, end_object=3)))
+    assert _end(s) == (1, 3)
+
+
+def test_an_upstream_whole_group_end_falls_back_to_the_last_object(
+        monkeypatch):
+    # A pre-d20 End of (group, 0) names no Object: the last one served.
+    _upstream_answer(monkeypatch, (2, 0))
+    s = _session()
+    asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
+                                          end_group=2, end_object=0)))
+    assert _end(s) == (2, 4)
 
 
 @pytest.mark.parametrize("draft,does_not_exist,invalid_range,invalid_joining", [
@@ -849,3 +896,58 @@ async def test_a_subscribe_fill_reaches_a_publish_only_publisher(use_quic):
             assert got.get(ok.request_id) == [
                 (1, o, size) for o in range(_GROUP)], name
         assert rx._close_err is None
+
+
+_TAIL_PORT = _E2E_PORT + 20
+_TAIL_NS = "relay/eog"
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_a_fetch_through_the_relay_keeps_the_publishers_end(use_quic):
+    # d22: the publisher's FETCH_OK ends at each track's trailing End of
+    # Group, (2, 4); its fetch stream carries Objects 0..3 only.
+    port = _TAIL_PORT + (not use_quic)
+    relay._tracks.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=22)
+    handle = await server.serve()
+
+    async def on_fetch(session, msg):
+        session.fetch_ok(request_id=msg.request_id, end_of_track=1,
+                         largest_group_id=2, largest_object_id=5)
+        await session.serve_fetch(msg.request_id, [
+            FetchObject(group_id=g, subgroup_id=0, object_id=o,
+                        publisher_priority=128, payload=b"p")
+            for g in range(3) for o in range(4)])
+
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            pub_client = MOQTClient("localhost", port, path="/",
+                                    use_quic=use_quic, verify_tls=False,
+                                    supported_drafts=22)
+            pub_client.register_handler(MOQTMessageType.FETCH, on_fetch)
+            pub = await stack.enter_async_context(pub_client.connect())
+            await pub.client_session_init()
+            await pub.publish_namespace(namespace=_TAIL_NS, parameters={},
+                                        wait_response=True)
+            rx = await stack.enter_async_context(MOQTClient(
+                "localhost", port, path="/", use_quic=use_quic,
+                verify_tls=False, supported_drafts=22).connect())
+            await rx.client_session_init()
+            got = {}
+            rx.on_fetch_object = lambda obj, _n, _ts, rid: got.setdefault(
+                rid, []).append((obj.group_id, obj.object_id))
+            for name in ("video", "audio"):
+                ok = await asyncio.wait_for(rx.fetch(
+                    _TAIL_NS, name, start_group=0, start_object=0,
+                    end_group=2, end_object=0, wait_response=True), 10)
+                assert await rx.await_fetch_done(ok.request_id, timeout=8)
+                assert (ok.largest_group_id, ok.largest_object_id) == (
+                    2, 5), name
+                assert got.get(ok.request_id) == [
+                    (g, o) for g in range(3) for o in range(4)], name
+            assert rx._close_err is None
+    finally:
+        handle.close()
+        relay._tracks.clear()
