@@ -17,7 +17,7 @@ from aiopquic.asyncio.server import serve as aiopquic_serve
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.delivery import SendLane
-from aiomoqt.messages.data import ObjectDatagram
+from aiomoqt.messages.data import ObjectDatagram, SubgroupHeader
 from aiomoqt.types import (
     FilterType, ForwardingPreference, MOQTMessageType, MOQTRequestError,
     ObjectStatus, RequestErrorCode, SubscribeDoneCode,
@@ -1350,6 +1350,103 @@ async def test_delivery_fails_over_to_the_remaining_publisher(how, draft,
     finally:
         for cm, _s, _t in pubs:
             await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+
+
+def _one_object_publisher(port, use_quic, draft, status):
+    """A client answering each SUBSCRIBE with one object on one stream,
+    then FIN and PUBLISH_DONE `status` counting that stream."""
+    async def on_subscribe(session, msg):
+        ok = session.subscribe_ok(request_msg=msg)
+        sid = await session.open_uni_stream()
+        hdr = SubgroupHeader(track_alias=ok.track_alias, group_id=0,
+                             subgroup_id=0, prof=session._profile)
+        session.stream_write(sid, hdr.serialize().data)
+        session.stream_write(sid, hdr.next_object(payload=b"x").data,
+                             end_stream=True)
+        # Long enough for the relay to subscribe every publisher.
+        await asyncio.sleep(0.05)
+        session.subscribe_done(msg.request_id, stream_count=1,
+                               status_code=status)
+
+    client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=draft)
+    client.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
+    return client
+
+
+async def _ended_tracks(port, use_quic, pubs, sub_draft):
+    """Each of `pubs` (draft, status) publishes _DONE_NS; a sub_draft
+    subscriber's PUBLISH_DONE for each of _MP_TRACKS, which must come
+    well inside the relay's TERMINAL_GRACE_S."""
+    async with contextlib.AsyncExitStack() as stack:
+        for draft, status in pubs:
+            pub = await stack.enter_async_context(_one_object_publisher(
+                port, use_quic, draft, status).connect())
+            await pub.client_session_init()
+            await pub.publish_namespace(namespace=_DONE_NS, parameters={},
+                                        wait_response=True)
+        rx = await stack.enter_async_context(MOQTClient(
+            "localhost", port, path="/", use_quic=use_quic,
+            verify_tls=False, supported_drafts=sub_draft).connect())
+        await rx.client_session_init()
+        loop = asyncio.get_running_loop()
+        done = {n: loop.create_future() for n in _MP_TRACKS}
+        for name in _MP_TRACKS:
+            await rx.subscribe(_DONE_NS, name, wait_response=True,
+                               on_done=lambda m, f=done[name]:
+                                   f.done() or f.set_result(m))
+        got = {n: await asyncio.wait_for(done[n], relay.TERMINAL_GRACE_S / 2)
+               for n in _MP_TRACKS}
+        assert rx._close_err is None
+        return got
+
+
+_DONE_NS = "relay/done"
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_publish_done_follows_a_failed_over_publishers_streams(
+        draft, use_quic):
+    # Both publishers end the track; the relay fails over to the second
+    # and counts its stream's end, so PUBLISH_DONE is not held.
+    port = _BASE_PORT + 210 + 2 * (draft == 22) + (not use_quic)
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    try:
+        ended = SubscribeDoneCode.TRACK_ENDED
+        got = await _ended_tracks(port, use_quic,
+                                  [(draft, ended), (draft, ended)], draft)
+        assert {n: m.status_code for n, m in got.items()} == {
+            n: ended for n in _MP_TRACKS}
+    finally:
+        handle.close()
+        _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_a_d18_subscription_ended_reaches_a_d22_subscriber(use_quic):
+    # d20 removed PUBLISH_DONE SUBSCRIPTION_ENDED: a d22 subscriber of a
+    # d18 publisher that ends with it is told TRACK_ENDED.
+    port = _BASE_PORT + 214 + (not use_quic)
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=(22, 18))
+    handle = await server.serve()
+    try:
+        got = await _ended_tracks(
+            port, use_quic, [(18, SubscribeDoneCode.SUBSCRIPTION_ENDED)], 22)
+        assert {n: m.status_code for n, m in got.items()} == {
+            n: SubscribeDoneCode.TRACK_ENDED for n in _MP_TRACKS}
+    finally:
         handle.close()
         _reset_relay_state()
 
