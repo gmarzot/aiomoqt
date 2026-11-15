@@ -2026,8 +2026,8 @@ class _RelayedTrack:
         self._multi = True
         feed.session.register_stream_end_handler(
             feed.sub.track_alias,
-            lambda g, sg, clean=True, code=0, f=feed: self.on_stream_end(
-                g, sg, clean, code, feed=f))
+            lambda g, sg, clean=True, reset_code=0, f=feed:
+            self.on_stream_end(g, sg, clean, reset_code, feed=f))
         largest = feed.sub.largest
         if largest is not None and self._near(largest[0]):
             self.note_largest(largest)
@@ -2319,15 +2319,21 @@ class _RelayedTrack:
         session = d.session
         if (d.lane is not None and d.lane.stop() and reset_code is None):
             reset_code = StreamResetCode.CANCELLED
+        if (status_code == SubscribeDoneCode.SUBSCRIPTION_ENDED
+                and not session._profile.publish_done_subscription_ended):
+            # A pre-d20 upstream's code; d20 has none.
+            status_code = SubscribeDoneCode.TRACK_ENDED
         try:
             self._close_streams(session, reset_code)
             session.subscribe_done(
                 request_id=d.request_id, status_code=status_code,
                 stream_count=self._sent_streams.get(id(session), 0),
                 reason=reason)
+        except ConnectionError:
+            logger.debug("relay: ending a subscription on a closed session")
         except Exception:
-            logger.debug("relay: ending a subscription failed",
-                         exc_info=True)
+            logger.warning("relay: ending a subscription failed",
+                           exc_info=True)
 
     def _enqueue_terminal(self, status, reason, key) -> None:
         """Terminal behind everything already queued."""
