@@ -68,11 +68,11 @@ Medians. CI = bootstrap 95% over reps, shown only where n≥3 and n_ok≥2.
 | **R5b** | relay, 20 subs ×50 Mb/s (suppl.) | 1000 | 2/3 | **47.5** /sub | 47.44–47.57 | 0.19 |
 | **N1** | D-raw reference, P=4 unpaced (P1b) | line | 7/7 | **811.7** | 802.1–826.2 | 2.38 |
 | **N2** | M1 media shape, 1 sub (P1b) | ~4.8 | 7/7 | **4.83** | 4.82–4.84 | 0.27 |
-| **M1** | 1080p, 1 sub, 120 s | ~4.8 | 3/3 | **4.81** (4.81, 4.81, 4.83) | n=3 | 0.15 |
-| **M2** | 720p, 5 subs, 120 s | — | 0/0 | *pending* | — | — |
-| **C0** | 50 slots, steady, 0 churn (control) | 200 | 0/0 | *pending* | — | — |
-| **C1** | churn storm, 50 slots, 300 s | 200 | 0/0 | *pending* | — | — |
-| **C2** | late join t=30 s, 90 s | 200 | 0/0 | *pending* | — | — |
+| **M1** | 1080p, 1 sub, 120 s | ~4.8 | 3/3 | **4.81** (4.81, 4.81, 4.83) | n=3 | 0.21 |
+| **M2** | 720p, 5 subs, 120 s | 12 | 3/3 | **2.38** per sub (2.38, 2.37, 2.37), **11.9** aggregate | n=3 | 0.24 |
+| **C0** | 50 slots, steady, 0 churn (control) | 200 | 1/1 | **200.7** | n=1 | 1.0 |
+| **C1** | churn storm, 50 slots, 300 s | 200 | 2/2 | **176.2** (176.31, 176.07) | n=2 | 0.10 |
+| **C2** | late join t=30 s, 90 s | 200 | 2/2 | **TTFF 37.7 ms** (38.12, 37.37); no Mb/s median — one 1080p track | n=2, no CI | 2.0 |
 
 Per-point config (P, s, g, pacing, subscribers, duration) is the manifest:
 `manifests/baseline-v0.yaml` for N…R, `manifests/phase1e.yaml` for M/C.
@@ -187,27 +187,102 @@ stream-credit path, not with bandwidth.
 ## 3. Media (1080p / 720p)
 
 The media points measure the **media profile**, not the transport: M1 and M2 are
-publisher-paced at the 1080p/720p profile rate (~4.8 Mb/s), far below every
-transport ceiling in §2, so a transport regression cannot show up here as
-throughput. They exist to catch CPU/scheduling effects at sub-percent scale —
-N2's CV is 0.27%, MDE N=3 **0.43%**, the tightest floor the program has.
+publisher-paced at the 1080p/720p profile rate, far below every transport ceiling
+in §2, so a transport regression cannot show up here as throughput. They exist to
+catch CPU/scheduling effects at sub-percent scale — N2's CV is 0.27%, MDE N=3
+**0.43%**, the tightest floor the program has.
 
-- M1 (1080p, 1 sub, 120 s) median **4.81 Mb/s**, n=3 (4.81 / 4.81 / 4.83, spread
-  0.4%), all three `dirty` under the clock-offset waiver. M2 was still running when
-  this was written.
-- M2 (720p, 5 subs, 120 s): **pending** — no result yet (§4).
-- N2 (same shape as M1, 7 reps, Phase 1b) **4.83 Mb/s**, CV 0.27% — M1 sits at **4.81** (3/3), i.e. **−0.4% vs N2**, inside N2's own 0.43% MDE.
-  Media delivery is transport-insensitive on this rig, and any future media-shaped
-  regression must be read against 0.43%, not against the 3.8% link floor.
+| point | shape | per-sub rate | n | reps | spread | aggregate egress |
+|---|---|---|---|---|---|---|
+| M1 | 1080p, 1 sub, 120 s | **4.81** Mb/s | 3 | 4.81 / 4.81 / 4.83 | 0.4% | 4.81 Mb/s |
+| M2 | 720p, 5 subs, 120 s | **2.38** Mb/s | 3 | 2.37 / 2.38 / 2.37 | 0.4% | **11.9** Mb/s (5 × 2.38) |
+
+M2's `mbps` is **per subscriber**, not aggregate: each rep's byte count is
+35.6 MB over 120 s = 2.38 Mb/s for one stream, and every one of the five
+subscribers receives the full track. Objects per rep are 3,457–3,468 (M2) and
+3,463–3,466 (M1) — the same object cadence, different object size
+(10.3 KB at 720p vs 20.9 KB at 1080p), which is what a video-profile change
+should look like and nothing else.
+
+- M1 sits at **4.81** vs N2's **4.83** (7 reps, CV 0.27%, Phase 1b) = **−0.4%**,
+  inside N2's own 0.43% MDE. Five subscribers cost nothing measurable:
+  M2 −50.5% vs M1 is the 720p profile, not fan-out.
+- **Latency was not measured for M1 or M2, and no latency number is claimed.**
+  The cross-host clock offset moved mid-point in every rep (M1: 377 / 520 / 725 ms;
+  M2: 67 / 114 / 120 ms) against a 3.8–4.2 ms tolerance, so `p50/p95/p99` are
+  recorded as `not_measured` with that reason in each `result.json`. The
+  rig cannot do cross-host one-way latency; see §5.
+- Consequence for Phase 2a: media points are a **throughput-only** regression
+  detector at 0.43% resolution. Any 0.6.1 media regression that manifests only as
+  added latency is invisible to M1/M2 as currently instrumented.
 
 ## 4. Churn storm (C1) and late join (C2)
 
 C1 is 50 subscriber slots at 4 Mb/s = **200 Mb/s offered egress**, `churn_rate
 0.05`, `leave_early 20`, `leave_rate 10`, publisher 300 s. C0 is the control:
 identical publisher and slots, **all churn rates zero**, so C1 − C0 isolates churn
-at a fixed offered rate.
+at a fixed offered rate. Both ran at the full 50-slot scale — no reduction was
+needed, and none was made.
 
-<!-- P1E-PENDING: C0/C1/C2 results -->
+| point | n | delivered Mb/s | % of 200 offered | interval CV | p90 mean/max ms | joins | churns | delivery_frac |
+|---|---|---|---|---|---|---|---|---|
+| **C0** | 1 | **200.7** | 100.3% | 1.0% | 4.9 / 6 | 50 | 0 | 1.0026 |
+| **C1** | 2 | **176.2** (176.31 / 176.07) | 88.1% | 4.2% / 3.5% | 8.0 / 41 · 6.4 / 29 | 967 | 933 | 0.9997 / 0.9995 |
+
+**Churn costs 12.2% of delivered rate at a fixed 200 Mb/s offered**
+(C0 200.7 → C1 176.2, n=1 control vs n=2). The two C1 reps agree to **0.14%**
+(176.31 vs 176.07) with **identical 967 joins / 933 churns** — the churn schedule
+is seeded, so this is a repeat of one schedule, not two independent draws; the
+12.2% is a property of *that* schedule, and the n=2 agreement says the rig is
+reproducible, not that the number generalises to other churn rates.
+`delivery_frac` stays at **0.9996** across 933 churns: almost nothing is lost —
+the cost is paid in **rate and tail**, not in dropped objects. p90 mean rises
+4.9 → 8.0 / 6.4 ms with 41 / 29 ms excursions, i.e. the churn cost shows up as
+per-interval dips that the 300 s mean averages down to 12%.
+
+Two caveats, stated because they bound the claim:
+
+- **The load host is CPU-constrained at 50 subscribers.** It is a 6-core box
+  running 50 subscriber processes plus the churn generator. C0 runs the same 50
+  processes, so the *delta* is churn work, not subscriber count — but the
+  absolute 176.2 is a load-host-limited number, not a relay limit. The relay's
+  own CPU stayed far below one core throughout (relay CPU <1.0 core in every §2
+  point), so nothing here is relay-bound.
+- The churn interval is 5 s with ~17 churn events per interval (967 joins over
+  300 s); this does **not** probe sub-second churn.
+
+### Late join (C2): TTFF and catch-up
+
+Late joiner subscribes at **t=+30 s** into a 1080p publisher already running;
+a warm subscriber joins at **t=+2 s** in the same rep as a same-rep control.
+TTFF = SUBSCRIBE sent → first object arrival, both stamps taken on the
+subscriber host (`time.time()` in `ttff_probe.py`), so the number does not
+depend on the cross-host clock offset that voids M1/M2 latency.
+
+| rep | late TTFF ms | warm TTFF ms | late-warm | bytes | objects | first_group | first_object_bytes | first second |
+|---|---|---|---|---|---|---|---|---|
+| 01 | **38.12** | 36.05 | +2.07 | 50,143,228 | 2,488 | 28 | 10,013 | 415 KB |
+| 02 | **37.37** | 35.94 | +1.43 | 50,158,230 | 2,488 | 27 | 10,013 | 615 KB |
+
+**Late-join TTFF = 37.7 ms median (38.12 / 37.37, n=2, no CI)**, against a warm
+join in the same reps of 36.0 ms (36.05 / 35.94) — **+1.75 ms** for joining 28 s
+late. The late joiner then receives **50.15 MB in 80.3 s** (2,488 objects, both
+reps byte-identical to 0.03%) at the live 4.8 Mb/s profile rate: **catch-up
+bytes = 0**. There is no catch-up burst — the first second carries 415 / 615 KB
+against a 600 KB/s steady state, and the first object is a normal 10 KB media
+object, not a burst — so 0.7.0 serves a late joiner from the live edge and
+retains no history to replay. That is the property Phase 2a must preserve: a
+0.6.1 comparison that starts replaying groups on join will show up here as
+first-second bytes ≫ 600 KB.
+
+Provenance: the two C2 reps on disk from the 2026-11-11 sweep are **invalid** —
+`pub_bench` in 0.7.0 announces the namespace only under `--pub-ns` **or
+`--pub-both`** (`track.publish(announce_namespace=(args.pub_ns or args.pub_both))`),
+and `scripts/sweep.py` passed neither, so every subscriber got
+`code=4 reason=no such namespace or track`. The C2 numbers above were taken
+2026-11-15 by `scripts/c2_latejoin.sh` with `--pub-both` and a warm subscriber
+(publisher exits rc=0 if no subscriber is present before it starts), and are
+recorded as `result.built.json` beside the stale sweep `result.json`.
 
 ## 5. Confidence — what is solid, what is at the noise floor
 

@@ -116,6 +116,19 @@ def load(blocks: dict[str, Path]) -> dict[str, list[dict]]:
             continue
         for rp in sorted(pdir.glob("rep-*")):
             f = rp / "result.json"
+            b = rp / "result.built.json"
+            # A built summary wins when the sweep's own result.json carries no
+            # metric: C0/C1 lost theirs to the collect.py Path crash and C2's
+            # result.json is the pre-fix publisher-flag failure.
+            if b.exists():
+                have = False
+                if f.exists():
+                    try:
+                        have = bool((json.loads(f.read_text()).get("summary") or {}).get("mbps"))
+                    except ValueError:
+                        have = False
+                if not have:
+                    f = b
             if not f.exists():
                 continue
             try:
@@ -124,6 +137,8 @@ def load(blocks: dict[str, Path]) -> dict[str, list[dict]]:
                 continue
             r.setdefault("meta", {})["block"] = block.name
             r["meta"].setdefault("rep", rp.name)
+            if "status" in r and "status" not in r["meta"]:
+                r["meta"]["status"] = r["status"]
             by_point.setdefault(point, []).append(r)
     return by_point
 

@@ -504,7 +504,39 @@ deterministic 3/3; (2) clock discipline, without which no tail-latency number is
 (3) a paced relay-ceiling point (R2/R3 cannot answer it unpapered); (4) relay byte-counter
 accuracy.
 
-## Phase 1e — media + churn, consolidated report (IN PROGRESS)
+## Phase 1e — media + churn, consolidated report — **DONE (2026-11-15)**
+
+Measured on block `runs/2026-11-11T02-33-51Z`; report is
+`baselines/base-070rc2/SUMMARY.md` §3–§5, CSV is `rollup.csv` (11 rows: M1 3,
+M2 3, C0 1, C1 2, C2 2).
+
+| point | n | result |
+|---|---|---|
+| M1 | 3 | 4.81 Mb/s (4.81/4.81/4.83, CV 0.21%) — media profile, not transport |
+| M2 | 3 | 2.38 Mb/s per sub (2.38/2.37/2.37), 11.9 aggregate; latency not measurable (clock offset 114 ms) |
+| C0 | 1 | 200.7 Mb/s, CV 1.0%, 50/50 slots, 0 churn |
+| C1 | 2 | 176.2 Mb/s (176.31/176.07), CV 0.10–4.2%, 967 joins / 933 churns, delivery 0.9996 — **churn costs 12.2% of rate at fixed 200 offered** |
+| C2 | 2 | late-join **TTFF 37.7 ms** (38.12/37.37) vs warm 36.0 ms; catch-up bytes **0** (50.15 MB in 80.3 s at live 4.8 Mb/s) |
+
+Carry-forward defects found and fixed this round (all in `scripts/`):
+
+- `collect.py` crashed with `NameError: Path` at line 322 after every C0/C1 run —
+  added `from pathlib import Path`. Without it C0/C1 `result.json` has no summary.
+- `sweep.py` passes neither `--pub-ns` nor `--pub-both` to `pub_bench`, so **every
+  C2 rep in the 2026-11-11 block is invalid** (`code=4 no such namespace or
+  track`). C2 was re-run 2026-11-15 by `scripts/c2_latejoin.sh --pub-both`.
+- `churn.csv` is **not** needed: `--report` was dropped from the `load_sim` argv,
+  but the `T+ Ns subs=… rx=… p90=…` interval series in `load.log` carries the
+  per-interval data and `scripts/c1c0_stats.py` parses it. No re-run required.
+- `baseline_report.py` now prefers `result.built.json` when `result.json` has no
+  metric, so rebuilt C0/C1/C2 summaries reach the CSV.
+- `c2_latejoin.sh` waits up to 20 s for `:9768` to clear (a finishing `moqx serve`
+  makes the next one core-dump); shared `:9668` is never touched.
+
+Note for the log: C2's `result.json` on disk is still the stale failure record;
+the authoritative C2 summary is `result.built.json` beside it.
+
+**Next action: Phase 2a (0.6.1 comparison)** — the three points below, unchanged.
 
 **Status: partial.** The consolidated report skeleton is written and the
 L/P/D/R/Ri baselines are consolidated from their canonical blocks; the Phase 1e
