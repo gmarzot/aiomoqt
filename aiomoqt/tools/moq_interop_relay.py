@@ -4935,6 +4935,7 @@ def transport_settings(args) -> dict:
             "workers": args.workers,
             "stream_ring_cap": args.stream_ring_cap,
             "tx_max_inflight_bytes": args.max_inflight_bytes,
+            "idle_timeout": args.idle_timeout,
             "auth": auth_from_args(args)}
 
 
@@ -5106,6 +5107,11 @@ def parse_args(argv=None):
                         help="SUBSCRIBEs one session may hold; more are "
                              "refused with EXCESSIVE_LOAD. Default: "
                              f"{MAX_SUBSCRIPTIONS_PER_SESSION}")
+    parser.add_argument("--idle-timeout", type=float, default=None,
+                        metavar="SEC",
+                        help="QUIC idle timeout the relay offers, seconds; a "
+                             "connection uses the lower of both ends'. "
+                             "Default: aiopquic's, 30")
     parser.add_argument("--max-subscribers", type=int, default=0,
                         metavar="N",
                         help="Sessions the relay serves SUBSCRIBEs for; new "
@@ -7063,6 +7069,9 @@ async def main():
         sys.exit(2)
     if args.max_subscribers < 0:
         print("Error: --max-subscribers must be 0 or more", file=sys.stderr)
+        sys.exit(2)
+    if args.idle_timeout is not None and args.idle_timeout <= 0:
+        print("Error: --idle-timeout must be above 0", file=sys.stderr)
         sys.exit(2)
     global MAX_SUBSCRIBERS
     MAX_SUBSCRIBERS = args.max_subscribers
