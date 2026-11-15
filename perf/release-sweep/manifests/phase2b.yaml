@@ -1,0 +1,64 @@
+# Phase 2b — media and late-join A/B points, copied verbatim from
+# manifests/phase1e.yaml (M1, C2) and manifests/phase2a.yaml (D3 control).
+#
+#   python3 scripts/sweep.py --manifest manifests/phase2b.yaml --only M1 --reps 1 \
+#     --arm cmp-061 --tag p2b-m1-a1
+#
+# Only `reps` is changed (to 1) so scripts/p2b_driver.sh can interleave the two
+# arms in the PROGRAM §6.2 order instead of running per-arm blocks. Point configs
+# are unchanged from Phase 1e except M1 duration_s, which the Phase 2b card sets
+# to 60 s (Phase 1e used 120 s; both arms see the same window here, so the A/B is
+# internally consistent and no 1e absolute value is compared against it).
+#
+# C2 is declared here for the record but is NOT run through sweep.py: the
+# topology-C2 path cannot hold publishing state (pub_bench returns as soon as
+# PUBLISH is sent with no subscriber attached, so the measured joiner gets
+# "no such namespace or track"). Phase 1e hit the same wall and C2 is therefore
+# driven by scripts/c2_latejoin.sh, which starts a warm subscriber at +2 s. The
+# driver calls that script with the arm in $ARM.
+arm: cmp-061
+cc: bbr1
+gso: true
+hosts:
+  shenzhen: {local: true, root: /home/gmarzot/Projects/marzresearch/perf-sweep, python: 'arms/{arm}/venv/bin/python'}
+  seawolf: {ssh: seawolf, root: /home/gmarzot/perf-sweep, python: venv/bin/python}
+relay: {binary: /home/gmarzot/Projects/marzresearch/moqx/build/moqx, config: perf/release-sweep/moqx-perf.yaml,
+  addr: 10.14.25.173, port: 9768, wt_path: /moq-relay, pub_port: 4434, sub_stagger_s: 0.5, admin_url: 'http://[::1]:9769/metrics'}
+defaults:
+  draft: 16
+  duration_s: 60
+  interval_s: 5
+  warmup_s: 5
+  sub_delay_s: 2.0
+  reps: 1
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  pin: {relay: 0-1, pub: 2-5, sub: 0-3}
+points:
+- id: D3
+  topology: D
+  transport: raw
+  config: {P: 4, s: 4096, g: 200, r: 0}
+  purpose: direct ceiling — block control at both ends
+  reps: 1
+- id: M1
+  topology: M
+  transport: raw
+  video: 1080p
+  duration_s: 60
+  reps: 1
+  subs: 1
+  config: {P: 1, s: 4096, g: 200, r: 0}
+  purpose: 1080p single subscriber, 60 s (media shape, steady state)
+- id: C2
+  topology: C2
+  transport: raw
+  video: 1080p
+  duration_s: 60
+  reps: 1
+  subs: 1
+  sub_delay_s: 30.0
+  expected_sub_s: 20
+  probe: ttff
+  config: {P: 4, s: 4096, g: 200, r: 0}
+  purpose: late join at t=30 s — TTFF and catch-up burst (run via c2_latejoin.sh)

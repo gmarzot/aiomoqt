@@ -2,12 +2,12 @@
 
 | field | value |
 |---|---|
-| phase | **0 — setup, frozen arms, first smoke: COMPLETE** |
+| phase | **2b — media/churn comparison + consolidated verdict: COMPLETE** |
 | program | `perf/release-sweep` (charter: `PROGRAM.md`, this directory) |
 | workspace root | `/home/gmarzot/Projects/marzresearch/perf-sweep` |
 | host | SHENZHEN — Ubuntu 24.04.1 on WSL2, i9-14900KF (16 vCPU) |
-| date | 2026-10-28 |
-| next action | **Phase 1 — harness + baseline matrix v0** (PROGRAM.md §7) |
+| date | 2026-11-15 |
+| next action | **Phase 2c — Rank-1 de-confounding control** (aiopquic v0.7.0 on 0.6.1 picoquic/picotls pins, D3 + C2, N=5/arm; see `regressions/COMPARE.md` §7) |
 
 Arms are frozen and reproducible: `arms/<NAME>/{src,wheels,venv,arm.json,versions.txt,build.log}`,
 built by `scripts/build_arm.sh NAME REF` (which refuses to rebuild an arm that
@@ -627,3 +627,114 @@ reproduce with `python3 scripts/p2a_analysis.py`.
 alternating-A/B protocol, and re-use the D3 control. Do **not** carry R2 forward as a
 ceiling: use a paced relay point (offered ≈ 800 Mb/s) or drop the "relay tax" framing
 until the eviction is fixed.
+
+## Phase 2b — media/churn comparison + consolidated verdict — **DONE (2026-11-15)**
+
+Arms unchanged from 2a: A `cmp-061` = aiopquic `v0.6.1` (wheel `3220fb9f…46f05`),
+B `base-070` = `v0.7.0` (wheel `e7d28cbd…1b9ab`), same aiomoqt tree. Released tags, not rc2
+(operator's 2026-11-02 comment). The `base-070rc2` arm remains on disk and was not measured.
+
+Block: `runs/2026-11-15T18-59-51Z-p2b-d3e-*` … `p2b-d3l-*` + `runs/p2b-c2/C2/c2-*`;
+directory created `18:59:51Z`, first rep logged `19:01:25Z`, last rep `19:45:06Z`
+(43 min 41 s of measurement), 30/30 `rc=0` (`runs/p2b-runs.txt`,
+`runs/p2b-driver.log`). Layout D3×5 early → M1×10 → C2×10 → D3×5 late, arms interleaved
+`A,B,B,A,A,B,B,A,A,B` per point (PROGRAM §6.2), N=5/arm/point, 60 s, D3 control at both ends.
+
+Two 2b deviations, both in `manifests/phase2b.yaml`: M1 uses a **60 s** window (1e used
+120 s — both arms share it, and no 1e M1 absolute is compared against it); and C2 does **not**
+go through `sweep.py` because the topology-C2 path cannot hold publishing state
+(`pub_bench` returns after PUBLISH with no subscriber attached → joiner gets "no such
+namespace or track"). C2 runs via `scripts/c2_latejoin.sh` with `ARM=<arm>` selecting the
+**publisher** arm, subscriber pinned to seawolf's venv — same publisher-side property as
+every other point. Each C2 rep writes `arm.txt`, `versions.txt`, `wheel.sha256`,
+`params.txt`, so arm identity is auditable without trusting the driver.
+
+**Control valid:** D3 early 808.08 vs late 814.39 Mb/s = **+0.78 %** (CI −0.99…+2.32,
+MWU p=0.22), inside the 2b D3 MDE of ±1.11 % → no drift. Arms are interleaved, so any
+residual drift is arm-balanced regardless.
+
+| point | 0.6.1 | 0.7.0 | Δ (B−A) | 95 % CI | MWU | verdict |
+|---|---|---|---|---|---|---|
+| D3 direct ceiling | 808.08 | 818.87 | +1.34 % | −0.45…+2.32 % | reps p=0.095 | no significant difference |
+| D3 tail (iv p99) | 1100.0 | 1100.0 | +0.00 % | −14.73…+10.06 % | p=0.278 | no significant difference |
+| M1 media 1080p | 5.020 | 5.020 | +0.00 % | −0.20…+0.20 % | reps p=0.444 | **no significant difference** |
+| M1 tail (iv p99) | 5.30 | 5.30 | +0.00 % | −2.04…+3.06 % | iv p=0.584 (55v55) | no significant difference |
+| C2 delivered mbps | 4.978 | 4.978 | +0.00 % | −0.05…+0.05 % | p=1.000 | no significant difference |
+| C2 late-join TTFF | 23.02 ms | 32.06 ms | +39.27 % | −56.04…+108.43 % | p=0.548 | no significant difference (MDE ±51 %) |
+| R2 / R3 | — | — | — | — | — | point invalid (stream reset, release-invariant) |
+
+Findings:
+
+1. **M1 is the cleanest null in the program.** All 10 reps sit inside one 0.01 Mb/s
+   quantisation step (A 5.02×5; B 5.01/5.02/5.02/5.03/5.03); every rep has 11 intervals,
+   interval p50 = 5.00 and p99 = 5.27–5.28 Mb/s, zero loss, zero out-of-order. Arm A's
+   per-rep sd is literally 0.000, so the MDE is taken from the **pooled** sd (±0.14 %) and
+   the verdict rests on the 110-interval test (p=0.584), not on the rep-level one.
+2. **C2 delivery is bit-identical across arms**: 12 643 403 B / 629 objects / groups 28–48 /
+   0 missing, in a 20.31–20.32 s window, with a 2-group ~615–625 kB catch-up burst in the
+   first second — in 10/10 reps on both arms. 0.7.0 changed nothing a late joiner receives.
+3. **C2 TTFF is unresolvable at N=5** (CV 51 % / 38 %, pooled 41 % → MDE ±51 %). It must not
+   be read as a slowdown. **C2 has no pre-published noise floor** — unlike M1
+   (`noise-floor.md` N2), this floor is derived post hoc from this block and is labelled so
+   wherever quoted.
+4. **One distributional flag, not a verdict:** the *warm* subscriber (joins at +4 s, during
+   publisher startup) is tight on A (22.68 ms median, sd 0.96) and heavy-tailed on B
+   (69.90 ms median, sd 48.87; 3/5 reps > 50 ms vs 0/5 on A). Post-hoc permutation tests
+   (statistic chosen after seeing the spread → selection bias, **not** the verdict): median
+   p=0.119, mean p=0.032, max p=0.048. The pre-registered late-joiner test shows nothing
+   (median p=0.524, mean p=0.492, max p=1.000). If 0.7.0 has a problem it is a
+   **startup-phase first-object latency tail**, not steady-state late-join behaviour.
+5. **Secondary pooled D3 (2a+2b, n=10/arm, NOT pre-registered):** 807.13 → 817.57 =
+   **+1.29 %**, CI **+0.81…+2.09 %**, p=0.014. The CI excludes zero, so ~1.3 % is real — but
+   it is a **gain**, and §6.4 blocks attributing it to aiopquic (picoquic 1.1.53.0→1.1.54.0,
+   picotls `f06553b8`→`e446233b` move with the release). It is reported separately and does
+   **not** replace either per-block verdict (the two blocks disagree slightly: +1.83 % vs
+   +1.34 %, which is the between-block component pooling can hide).
+6. Hygiene: M1/D3 10/10 `status=dirty` for the single waived rule
+   `seawolf/clock_offset_jump` (527.0→533.3 ms), same waiver as 2a; **latency p50/p99 remain
+   unquotable**. C2 reps are `status=ok` only because the C2 path does not run `hostcheck` —
+   a harness gap, not evidence of cleanliness.
+
+**Consolidated verdict: `regressions/COMPARE.md`** — no regression at any point on either
+release. Raw stats `regressions/phase2b-data.json` (+ `phase2a-data.json`); tables regenerate
+from the JSON via `python3 scripts/p2b_tables.py`; reproduce the measurement with
+`bash scripts/p2b_driver.sh` (45 min) then `python3 scripts/p2b_analysis.py`.
+
+**Ranked bisect plan (executable as written; nothing bisected — no candidate clears the bar):**
+
+1. **De-confound the transport dependency** — the single highest-value measurement, and it
+   answers both open questions at once. Build aiopquic `v0.7.0` code on the **0.6.1 pins**
+   (picoquic 1.1.53.0, picotls `f06553b8`), one knob only; measure **D3** (60 s, N=5/arm) and
+   **C2** (60 s, late=30 s, N=5/arm) alternating against `cmp-061`, D3 control both ends.
+   - D3 rule: delta inside ±1.11 % → the +1.3 % is the transport dep, close it. Delta ≥ +1.0 %
+     with CI excluding zero → aiopquic-layer gain, go to (2a).
+   - C2 rule: metric `fraction(warm_ttff > 50 ms)` (A 0/5, B 3/5 observed). Re-pinned arm
+     returns 0–1/5 → tail is the transport dep, close it. Returns ≥3/5 → aiopquic-layer
+     regression, go to (2b).
+2. **(2a) aiopquic gain, only if (1) says so** — `git bisect` `v0.6.1..v0.7.0`, point **D3**,
+   60 s, **N=5/arm/step**, threshold **≥ +1.0 % with CI excluding zero**. Low yield: 1.3 %
+   effect against a 1.1 % MDE, so steps will be borderline and need the pooled n=10 protocol
+   to confirm. Budget accordingly.
+3. **(2b) aiopquic startup-latency tail, only if (1) implicates aiopquic** — point **C2** as
+   implemented (`scripts/c2_latejoin.sh`, 60 s, late 30 s, warm sub at +4 s); metrics
+   `fraction(warm_ttff > 50 ms)` **and** median warm TTFF; **N=15/arm** (distinguishing
+   0 % from 60 % at α=0.05 two-sided / 80 % power needs n≈14 by Fisher exact; at n=15 the
+   median MDE is ±2.8·41 %/√15 ≈ ±30 % against an observed +208 % difference). Decision:
+   "bad" if fraction > 40 % and median > 45 ms; "good" if fraction ≤ 20 % and median ≤ 30 ms;
+   otherwise re-run that step once. Then `git bisect` `v0.6.1..v0.7.0` with the same point,
+   N=15/arm/step and the same rule. A step that cannot show ≥ +50 % on the median at N=15 is
+   not resolvable → stop the bisect rather than guess.
+4. **Restore the invalid points (harness fix, NOT a bisect)** — moqx evicts the subscriber
+   stream after ~104.6 MB / ~1.1 s (R2) and ~7.6 MB / ~0.1 s (R3), identically on both
+   releases. Until that is fixed or replaced by a paced relay point (offered ≈ 800 Mb/s), no
+   relay comparison can produce a verdict. Separate card.
+
+**Explicitly do NOT bisect:** M1 (+0.00 %, CI ±0.20 % — at the quantisation floor); C2
+delivery (bit-identical bytes/objects/groups, 0 missing in 10/10); D3 as a *regression* (the
+effect is a gain and §6.4 blocks attribution until (1) runs); R2/R3 (invalid points — a
+bisect there measures eviction timing).
+
+**Next action: Phase 2c** — run the Rank-1 de-confounding control above (single knob:
+aiopquic v0.7.0 on the 0.6.1 picoquic/picotls pins, D3 + C2, N=5/arm, 60 s, interleaved
+against `cmp-061`, D3 control both ends). Everything needed is specified in COMPARE.md §7
+and above; no re-analysis is required first.

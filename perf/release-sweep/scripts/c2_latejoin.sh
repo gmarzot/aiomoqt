@@ -5,12 +5,19 @@
 # Flow B and Flow A), so a warm subscriber is required to hold the publishing
 # state. The measured joiner is still late by the configured delay.
 #
-# usage: c2_latejoin.sh <run_block_dir> <rep_name> [late_delay_s] [run_s]
+# usage: ARM=<arm-name> c2_latejoin.sh <run_block_dir> <rep_name> [late_delay_s] [run_s]
+#
+# ARM selects the publisher arm under perf-sweep/arms/ (default base-070rc2, the
+# Phase 1e basis). The subscriber is always seawolf's pinned venv, so this point
+# measures the publisher-side stack; that is the same property as every other
+# point in the program (see regressions/COMPARE.md §1).
 set -u
 RS=/home/gmarzot/Projects/marzresearch/perf-sweep/aiomoqt/perf/release-sweep
 MOQX=/home/gmarzot/Projects/marzresearch/moqx/build/moqx
 CFG=$RS/moqx-perf.yaml
-PY=/home/gmarzot/Projects/marzresearch/perf-sweep/arms/base-070rc2/venv/bin/python
+ARM=${ARM:-base-070rc2}
+ARMS=/home/gmarzot/Projects/marzresearch/perf-sweep/arms
+PY=$ARMS/$ARM/venv/bin/python
 URL=moqt://10.14.25.173:9768
 BLOCK=${1:?run block dir}
 REP=${2:?rep name}
@@ -19,6 +26,12 @@ RUN_S=${4:-140}
 D=$BLOCK/C2/$REP
 mkdir -p "$D"
 cd "$RS" || exit 1
+
+# provenance for this rep: arm identity from the built venv, not from a label
+echo "$ARM" > "$D/arm.txt"
+"$PY" -P -m aiomoqt.versions > "$D/versions.txt" 2>&1
+sha256sum "$ARMS/$ARM"/wheels/*.whl > "$D/wheel.sha256" 2>/dev/null
+echo "RUN_S=$RUN_S LATE=$LATE" > "$D/params.txt"
 
 # never pkill broadly: the shared relay on :9668 is not ours. Only our port.
 # Wait for :9768 rather than sampling once: a previous rep's relay can still be
