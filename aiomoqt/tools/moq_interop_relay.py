@@ -3284,6 +3284,8 @@ def _forget_session(session) -> None:
     for k in [k for k in _track_sub_filters if k[0] == id(session)]:
         del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
+    _ns_offered.difference_update(
+        [k for k in _ns_offered if k[0] is session])
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _dgram_drops.pop(id(session), None)
     _subscribing.pop(id(session), None)
@@ -5676,6 +5678,8 @@ async def _on_subscribe_namespace(session, msg):
         msg, stream_id=session._bidi_streams.get(msg.request_id))
 
     def _drop(rid, s=session, r=msg.request_id):
+        _ns_offered.difference_update(
+            [k for k in _ns_offered if k[0] is s and k[1] == r])
         _ns_subs[:] = [e for e in _ns_subs
                        if not (e[0] is s and e[2] == r)]
         _track_subs[:] = [e for e in _track_subs
@@ -5728,11 +5732,21 @@ def _known_namespaces(prefix) -> list:
     return out
 
 
+# (session, SUBSCRIBE_NAMESPACE request id, namespace) told NAMESPACE and
+# not NAMESPACE_DONE since.
+_ns_offered: set = set()
+
+
 def _offer_namespace(session, request_id, prefix, ns) -> None:
     """One NAMESPACE reply on the SUBSCRIBE_NAMESPACE request stream:
-    the suffix under the subscribed prefix (§10.8)."""
+    the suffix under the subscribed prefix (§10.8), once while the
+    namespace stays (d22 §4.2: as the set changes)."""
+    key = (session, request_id, ns)
+    if key in _ns_offered:
+        return
     try:
         session.namespace(ns[len(prefix):], request_id=request_id)
+        _ns_offered.add(key)
     except Exception:
         logger.debug("relay: NAMESPACE offer failed", exc_info=True)
 
@@ -5770,7 +5784,11 @@ def _retract_namespace(ns) -> None:
     publisher withdraws or its session closes.
     """
     for session, prefix, rid in list(_ns_subs):
-        if _prefix_covers(prefix, ns) and _session_live(session):
+        key = (session, rid, ns)
+        if key not in _ns_offered:
+            continue
+        _ns_offered.discard(key)
+        if _session_live(session):
             try:
                 session.namespace_done(ns[len(prefix):], request_id=rid)
             except Exception:
