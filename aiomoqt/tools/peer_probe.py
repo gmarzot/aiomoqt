@@ -256,7 +256,7 @@ async def run(args) -> int:
 def main(argv=None) -> int:
     args = parse_args(argv)
     grid.apply_logging(args, default=logging.INFO)
-    return asyncio.run(run(args))
+    return grid.run(run(args))
 
 
 def cli():
