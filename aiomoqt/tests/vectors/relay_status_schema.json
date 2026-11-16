@@ -879,6 +879,36 @@
   ".totals.gc.total_ms": [
    "float"
   ],
+  ".totals.gc_totals": [
+   "object"
+  ],
+  ".totals.gc_totals.collected": [
+   "array"
+  ],
+  ".totals.gc_totals.collected[]": [
+   "int"
+  ],
+  ".totals.gc_totals.collections": [
+   "array"
+  ],
+  ".totals.gc_totals.collections[]": [
+   "int"
+  ],
+  ".totals.gc_totals.frozen": [
+   "int"
+  ],
+  ".totals.gc_totals.pending": [
+   "array"
+  ],
+  ".totals.gc_totals.pending[]": [
+   "int"
+  ],
+  ".totals.gc_totals.uncollectable": [
+   "array"
+  ],
+  ".totals.gc_totals.uncollectable[]": [
+   "int"
+  ],
   ".totals.groups_out_per_s": [
    "float"
   ],

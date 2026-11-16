@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import traceback
-from collections import deque
+from collections import Counter, deque
 from typing import Any, Iterable, Optional
 
 # Interfaces whose traffic is not the host's own.
@@ -519,6 +519,44 @@ class GcTimer:
             gc.callbacks.remove(self._callback)
         if GcTimer._shared is self:
             GcTimer._shared = None
+
+
+class GcTotals:
+    """The collector's counts since start: passes, objects collected and
+    uncollectable per generation, objects pending per generation, and the
+    frozen count, read at most once a minute since it walks the frozen
+    objects."""
+
+    FROZEN_EVERY_S = 60.0
+
+    def __init__(self) -> None:
+        self._frozen = 0
+        self._frozen_at: Optional[float] = None
+
+    def take(self, now: float) -> dict:
+        if self._frozen_at is None or now - self._frozen_at >= self.FROZEN_EVERY_S:
+            self._frozen, self._frozen_at = gc.get_freeze_count(), now
+        stats = gc.get_stats()
+        return {"collections": [s["collections"] for s in stats],
+                "collected": [s["collected"] for s in stats],
+                "uncollectable": [s["uncollectable"] for s in stats],
+                "pending": list(gc.get_count()),
+                "frozen": self._frozen}
+
+
+def gc_census(top: int = 40) -> dict:
+    """Objects the collector tracks, by type, most first, with its counts.
+    Walks every tracked object, so the caller's thread holds the GIL for
+    roughly 0.2 ms per 1,000 of them."""
+    count = Counter(f"{type(o).__module__}.{type(o).__qualname__}"
+                    for o in gc.get_objects())
+    return {"time": time.time(),
+            "tracked": sum(count.values()),
+            "generations": [len(gc.get_objects(g)) for g in range(3)],
+            "frozen": gc.get_freeze_count(),
+            "thresholds": list(gc.get_threshold()),
+            **{k: v for k, v in GcTotals().take(0.0).items() if k != "frozen"},
+            "top": count.most_common(max(0, top))}
 
 
 def format_gc_pass(wall: float, gen: int, ms: float, collected: int) -> str:

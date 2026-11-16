@@ -104,6 +104,7 @@ from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
+import gc
 from functools import lru_cache
 import heapq
 import itertools
@@ -120,6 +121,8 @@ import signal
 import sys
 import time
 import tomllib
+from typing import Any
+import urllib.parse
 from collections import Counter
 from types import SimpleNamespace
 
@@ -1605,7 +1608,8 @@ class _RelayLane(SendLane):
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
-        self.d = d
+        # None once the lane has stopped (_ended).
+        self.d: Any = d
         self._catalog = track.key[1] in CATALOG_TRACKS
         _lanes.add(self)
         track._lanes.add(self)
@@ -1717,6 +1721,14 @@ class _RelayLane(SendLane):
                     f"held")
         return (f"{self._behind:.2f} s behind (deadline "
                 f"{self._deadline:.1f} s), {self._held} bytes held")
+
+    def _ended(self, task) -> None:
+        super()._ended(task)
+        if self.stopped:
+            # Its delivery and downstream point back at it: once it has
+            # stopped, those links only keep the session alive for a GC pass.
+            writer = self.writer
+            writer.lane = writer.d = self.d = None
 
     def _exit(self) -> None:
         _lanes.discard(self)
@@ -6243,6 +6255,7 @@ class _Status:
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
         self.gc = relay_status.GcTimer.shared()
+        self.gc_totals = relay_status.GcTotals()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -6545,6 +6558,7 @@ class _Status:
             "loop_lag_ms": lag,
             "send_late_ms": self._send_late_ms(),
             "gc": gc_line,
+            "gc_totals": self.gc_totals.take(now),
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -6743,6 +6757,17 @@ class _Tee(logging.Handler):
         pass
 
 
+def _freeze_startup_heap() -> None:
+    """Move what startup built (modules, functions, types, the listeners)
+    out of the cyclic GC's reach: later full passes walk only what the
+    relay creates while serving. Frozen objects are still freed by
+    reference counting."""
+    gc.collect()
+    gc.freeze()
+    logger.info(f"relay: froze {gc.get_freeze_count()} startup objects "
+                f"out of GC passes")
+
+
 def _stop_log_listener() -> None:
     """Write what relay.log's queue holds and end its thread."""
     global _log_listener
@@ -6861,8 +6886,15 @@ async def _on_control(reader, writer) -> None:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
+        target = urllib.parse.urlsplit(path)
         if path == "/sessions" and method == "GET":
             status, body = "200 OK", _sessions_report()
+        elif target.path == "/gc" and method == "GET":
+            top = urllib.parse.parse_qs(target.query).get("top", ["40"])[0]
+            if top.isdigit():
+                status, body = "200 OK", relay_status.gc_census(int(top))
+            else:
+                status, body = "400 Bad Request", {"error": "top: a count"}
         elif path != "/debug" or method not in ("GET", "POST"):
             status, body = "404 Not Found", {"error": "not found"}
         else:
@@ -7114,6 +7146,7 @@ async def main():
         print(f"  upstream origin: {url}")
 
     _background.add(asyncio.create_task(_watch_lanes()))
+    _freeze_startup_heap()
 
     watchdog = None
     if args.watchdog > 0:
