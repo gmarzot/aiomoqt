@@ -55,6 +55,7 @@ def _clean_tables():
     relay._announced.clear()
     relay._announce_requests.clear()
     relay._ns_subs.clear()
+    relay._ns_offered.clear()
     relay._track_subs.clear()
     relay._announce_subs.clear()
     yield
@@ -64,6 +65,7 @@ def _clean_tables():
     relay._announced.update(announced)
     relay._announce_requests.clear()
     relay._ns_subs.clear()
+    relay._ns_offered.clear()
     relay._track_subs.clear()
     relay._announce_subs.clear()
     relay._watch_session = watch
@@ -119,6 +121,24 @@ def test_d16_namespace_option_reports_namespaces(options):
     assert s._namespaces == [((b"cam1",), 5), ((b"cam9",), 5)]
     publish = [(e[1], e[2]) for e in relay._track_subs]
     assert publish == ([] if options == 1 else [((b"live",), 5)])
+
+
+def test_a_namespace_is_offered_once_until_it_is_withdrawn(monkeypatch):
+    # d22 §4.2: NAMESPACE as the set changes, not on each announcement.
+    monkeypatch.setattr(relay, "_session_live", lambda sess: True)
+    s = _session(22)
+    s._done = []
+    s.namespace_done = lambda suffix, request_id=None: s._done.append(
+        tuple(suffix))
+    asyncio.run(relay._on_subscribe_namespace(s, _sub_ns((b"live",))))
+    for _ in range(3):
+        relay._announce_namespace((b"live", b"cam"))
+    assert s._namespaces == [((b"cam",), 5)]
+    relay._retract_namespace((b"live", b"cam"))
+    relay._retract_namespace((b"live", b"cam"))
+    assert s._done == [(b"cam",)]
+    relay._announce_namespace((b"live", b"cam"))
+    assert s._namespaces == [((b"cam",), 5), ((b"cam",), 5)]
 
 
 # -- end to end: publisher -> relay -> subscriber -------------------------
@@ -400,3 +420,44 @@ async def test_d16_subscribe_namespace_echoes_the_publishers_own_tracks(
             names.add(offer.track_name.decode())
             pub.publish_ok(offer, forward=0)
         assert names == {"a", "b"}
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 22])
+@_TRANSPORTS
+async def test_a_second_publisher_of_a_namespace_does_not_offer_it_again(
+        draft, use_quic):
+    # Two publishers announce one namespace and the first PUBLISHes two
+    # tracks under it: one NAMESPACE; NAMESPACE_DONE once both withdraw.
+    seen: asyncio.Queue = asyncio.Queue()
+
+    async def _ns(session, msg):
+        await seen.put(("NAMESPACE", tuple(msg.namespace_suffix)))
+
+    async def _done(session, msg):
+        await seen.put(("DONE", tuple(msg.namespace_suffix)))
+
+    port = _BASE_PORT + 4 + 2 * (draft == 22) + (not use_quic)
+    async with _relay(port, use_quic, draft) as (pub, sub):
+        sub.register_handler(D16MessageType.NAMESPACE, _ns)
+        sub.register_handler(D16MessageType.NAMESPACE_DONE, _done)
+        await sub.subscribe_namespace("wd", wait_response=True)
+        async with MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                              verify_tls=False,
+                              supported_drafts=draft).connect() as pub2:
+            await pub2.client_session_init()
+            await pub.publish_namespace(namespace="wd/a", wait_response=True)
+            await pub2.publish_namespace(namespace="wd/a",
+                                         wait_response=True)
+            for name in ("video", "audio"):
+                await _Pub(pub, "wd/a", name).publish()
+            assert await asyncio.wait_for(seen.get(), 5.0) == (
+                "NAMESPACE", (b"a",))
+            await asyncio.sleep(0.3)
+            assert seen.empty()
+            pub.publish_namespace_done(namespace="wd/a")
+            await asyncio.sleep(0.3)
+            assert seen.empty()
+            pub2.publish_namespace_done(namespace="wd/a")
+            assert await asyncio.wait_for(seen.get(), 5.0) == (
+                "DONE", (b"a",))

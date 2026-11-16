@@ -566,33 +566,11 @@ async def test_namespace_cases_skip_below_draft_16(name):
     assert r.skip_reason == "NAMESPACE is draft-16; negotiated draft-14"
 
 
-def _offer_each_namespace_once(monkeypatch):
-    """The relay offers a namespace to each prefix subscription once until
-    it is withdrawn (d22 §4.2: NAMESPACE as the set changes)."""
-    offered = set()
-    offer, retract = relay._offer_namespace, relay._retract_namespace
-
-    def _offer(session, request_id, prefix, ns):
-        key = (id(session), request_id, ns)
-        if key not in offered:
-            offered.add(key)
-            offer(session, request_id, prefix, ns)
-
-    def _retract(ns):
-        offered.difference_update({k for k in offered if k[2] == ns})
-        retract(ns)
-
-    monkeypatch.setattr(relay, "_offer_namespace", _offer)
-    monkeypatch.setattr(relay, "_retract_namespace", _retract)
-
-
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 @pytest.mark.parametrize("draft", [16, 18, 20, 22])
-async def test_retention_through_a_relay_offering_each_namespace_once(
-        monkeypatch, draft, use_quic):
-    _offer_each_namespace_once(monkeypatch)
+async def test_retention_through_the_relay(draft, use_quic):
     name = "publish-namespace-multi-publisher-retention"
     r = await _run_case(client.TEST_FUNCTIONS[name],
                         _lifecycle_port(name, draft, use_quic), draft, use_quic)
@@ -600,18 +578,6 @@ async def test_retention_through_a_relay_offering_each_namespace_once(
     assert r.spec_revision == client.PUBLISH_NAMESPACE_RETENTION_REVISION
     assert set(r.sessions) == {"observer", "publisher_1", "publisher_2",
                                "subscriber_1", "subscriber_2"}
-
-
-@requires_certs
-@pytest.mark.asyncio
-@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_retention_fails_on_a_repeated_namespace(use_quic):
-    # aiomoqt-relay offers the namespace again when publisher_2 announces it.
-    r = await _run_case(client.test_publish_namespace_multi_publisher_retention,
-                        _BASE_PORT + 90 + (0 if use_quic else 1), 22, use_quic)
-    assert not r.passed
-    assert r.message.startswith("observer: NAMESPACE shared while present"), \
-        r.message
 
 
 def test_namespace_log_reports_each_deviation():
