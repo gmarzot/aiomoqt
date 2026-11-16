@@ -1013,6 +1013,47 @@ def test_status_carries_the_gc_passes_since_the_last_snapshot(
     assert snap["history"]["gc_max_ms"][-1] == line["max_ms"]
 
 
+def test_status_carries_the_gc_totals(relay_tables, tmp_path):
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    gc.collect()
+    totals = status.snapshot(time.monotonic(), time.time())["totals"]
+    t = totals["gc_totals"]
+    assert t["collections"][2] >= 1, t
+    assert all(len(t[k]) == 3 for k in ("collections", "collected",
+                                         "uncollectable", "pending")), t
+    assert t["frozen"] == gc.get_freeze_count()
+
+
+def test_gc_totals_reads_the_frozen_count_once_a_minute():
+    totals = relay_status.GcTotals()
+    assert totals.take(100.0)["frozen"] == gc.get_freeze_count()
+    keep = [{} for _ in range(1000)]
+    gc.freeze()
+    try:
+        assert totals.take(130.0)["frozen"] < gc.get_freeze_count()
+        assert totals.take(160.0)["frozen"] == gc.get_freeze_count()
+    finally:
+        gc.unfreeze()
+    del keep
+
+
+class _CensusMarker:
+    pass
+
+
+def test_gc_census_counts_tracked_objects_by_type():
+    keep = [_CensusMarker() for _ in range(3000)]
+    census = relay_status.gc_census(top=60)
+    names = dict(census["top"])
+    assert names[f"{__name__}._CensusMarker"] >= 3000, census["top"][:5]
+    assert len(census["top"]) <= 60
+    assert census["tracked"] >= sum(names.values())
+    assert len(census["generations"]) == 3
+    assert census["frozen"] == gc.get_freeze_count()
+    del keep
+
+
 def _block_the_loop(seconds):
     time.sleep(seconds)
 

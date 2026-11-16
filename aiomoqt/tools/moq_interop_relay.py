@@ -122,6 +122,7 @@ import sys
 import time
 import tomllib
 from typing import Any
+import urllib.parse
 from collections import Counter
 from types import SimpleNamespace
 
@@ -6254,6 +6255,7 @@ class _Status:
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
         self.gc = relay_status.GcTimer.shared()
+        self.gc_totals = relay_status.GcTotals()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -6556,6 +6558,7 @@ class _Status:
             "loop_lag_ms": lag,
             "send_late_ms": self._send_late_ms(),
             "gc": gc_line,
+            "gc_totals": self.gc_totals.take(now),
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -6883,8 +6886,15 @@ async def _on_control(reader, writer) -> None:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
+        target = urllib.parse.urlsplit(path)
         if path == "/sessions" and method == "GET":
             status, body = "200 OK", _sessions_report()
+        elif target.path == "/gc" and method == "GET":
+            top = urllib.parse.parse_qs(target.query).get("top", ["40"])[0]
+            if top.isdigit():
+                status, body = "200 OK", relay_status.gc_census(int(top))
+            else:
+                status, body = "400 Bad Request", {"error": "top: a count"}
         elif path != "/debug" or method not in ("GET", "POST"):
             status, body = "404 Not Found", {"error": "not found"}
         else:
