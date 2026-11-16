@@ -17,7 +17,7 @@ broadcast is audio only, a synthesized tone. `--mp4` repeats for several video t
 |---|---|---|---|---|
 | `--mp4 FILE` | mp4 file | H.264, H.265, AV1 | the file's AAC or Opus; tone with `--tone` | sample tables, edit list honoured |
 | `--h264 FILE\|-` | live H.264 Annex B (ffmpeg, OBS) | H.264 | tone; none with `--no-audio` | stamped on arrival |
-| `--ts FILE\|-` | live MPEG-TS | H.264, H.265, every stream | AAC (ADTS), Opus: the first stream | PES timestamps |
+| `--ts FILE\|-\|udp://[@][HOST]:PORT` | live MPEG-TS | H.264, H.265, every stream | AAC (ADTS), Opus: the first stream | PES timestamps |
 | `--input URL` | anything FFmpeg opens: HLS, DASH, files | H.264, H.265, AV1 | AAC, Opus | paced to the source timestamps |
 | none | | | pcm-s16 tone at `--freq` Hz (440) | generated |
 
@@ -51,6 +51,11 @@ Short GOPs and no B-frames keep join latency low: `-g <2×fps> -sc_threshold 0 -
 - **locmaf** (draft-einarsson-moq-locmaf, `locmafVersion` 0.3): the same chunks with the moof
   sent as a compact header, a delta of the previous one in the group. Receivers rebuild the
   CMAF chunk byte for byte.
+- **mpeg2ts** (draft-gregoire-moq-msfts-02, MSFTS), `--ts ... --msfts`: the TS packets
+  themselves, unmodified, as one track (`program-1`, or `mux-1` for a multi-program stream),
+  `--msfts-packets` (7) to an object, sent as they arrive or 5 ms after an object's first packet.
+  Groups start at the first program's random access points, led by the PSI right before them;
+  the PAT and PMT ride the catalog `initDataList`. The catalog matches moq2ts `--unmodified`.
 
 LOC options for receivers that need something different:
 
@@ -246,13 +251,19 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
 files to `--out` (default `./media-out`):
 - `video.h264` (Annex B), or `<name>.h264` per track when there are several;
 - `audio.wav` (pcm-s16);
-- `<role>.mp4` for CMAF and LOCMAF tracks.
+- `<role>.mp4` for CMAF and LOCMAF tracks;
+- `<name>.ts` for an mpeg2ts track, its packets in Group and Object order.
 
 Its other options:
 
 | Flag | Effect |
 |---|---|
 | `--pipe video\|audio` | Streams one track to stdout for a player |
+| `--ts-out udp://HOST:PORT\|FILE\|-` | Writes the mpeg2ts track's packets as its objects arrive, seven to a UDP datagram; LOC tracks are refused |
+| `--ts-playout MS` | With `--ts-out`: each packet at first PCR arrival + MS + (PCR − first PCR) / 27 MHz; a late one is dropped, or with `--ts-late emit` sent at once; a gap of `--break-ms` (200) is an output break |
+| `--analyze` on an mpeg2ts track | JSON lines per `-i` interval and a summary: TS packets, CC errors per PID, PCR interval and jitter, delay variation and the cushion for no late packet, late packets and breaks at the `--ts-playout` buffer and at 100–1000 ms, object loss, and delay from the publisher's wall clock (its LOC TIMESTAMP, or a moq2ts media timeline; the clocks must agree) |
+| `--arrival-log FILE` | A JSON line per PCR: `pcr`, `arrival_ns`, `release_ns` |
+| `--frame-log FILE` | A JSON line per LOC frame: track, group, object, key, size, `sha1` of the payload, `arrival_ns` |
 | `--inspect N` | Prints wire detail for each track's first N frames |
 | `--show-catalog` | Prints the catalog and every update |
 | `--analyze` | Measures delivery instead of writing files: latency, jitter, loss and reorder, group integrity, a playout model; `--report` writes them as CSV |

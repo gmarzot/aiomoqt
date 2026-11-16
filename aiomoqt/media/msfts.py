@@ -1,0 +1,847 @@
+"""MPEG-TS over MoQT: the MSF "mpeg2ts" packaging of
+draft-gregoire-moq-msfts-02 (MSFTS).
+
+An object is a run of whole source packets (§5.1). The publisher here
+uses unmodified carriage (§5.3.1, §5.3.2): every packet of the source in
+arrival order, null packets included, so a subscriber rebuilds the
+source byte for byte. Groups start at the random access points of the
+first program (§5.2); the PAT and PMT ride the catalog initDataList
+(§6.12). The catalog follows moq2ts (openmoq/moq2ts `--unmodified`).
+"""
+from __future__ import annotations
+
+import asyncio
+import binascii
+import logging
+import time
+from dataclasses import dataclass
+from typing import (
+    Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, cast,
+)
+
+from ..types import ObjectStatus
+from .catalog import Catalog, CatalogError, CatalogTrack, PACKAGING_MPEG2TS
+from .loc import LOC_PROP_TIMESTAMP, LocFrame, LocTrackPublisher, LocTrackSubscriber
+
+logger = logging.getLogger(__name__)
+
+TS_PACKET = 188
+M2TS_PACKET = 192
+PACKET_SIZES = (TS_PACKET, M2TS_PACKET)
+MIME_TYPE = "video/mp2t"
+
+MODE_UNMODIFIED_PROGRAM = "unmodified-program"
+MODE_UNMODIFIED_MULTIPLEX = "unmodified-multiplex"
+MODE_PER_PROGRAM = "per-program"
+MODE_ES_PACKETS = "es-packets"
+MODES = (MODE_UNMODIFIED_PROGRAM, MODE_UNMODIFIED_MULTIPLEX,
+         MODE_PER_PROGRAM, MODE_ES_PACKETS)
+_UNMODIFIED = (MODE_UNMODIFIED_PROGRAM, MODE_UNMODIFIED_MULTIPLEX)
+
+# Seven packets, 1316 bytes: an SRT or RIST datagram's payload.
+DEFAULT_PACKETS = 7
+# Longest a partial object waits for more packets, well under a frame
+# interval; a feed above 2.1 Mb/s fills seven packets sooner.
+FLUSH_S = 0.005
+# Longest a later group waits on the open one: long enough for a group
+# tail retransmitted at a few hundred ms RTT. Its stream end releases it.
+HOLD_S = 0.5
+# Without video, groups a second apart (90 kHz).
+_AUDIO_GROUP_PTS = 90_000
+# Warn when no random access point has started a group by then.
+_RAP_WARN_PACKETS = 20_000
+# Longest PSI run held for the next group before it goes to the open one.
+_RUN_PACKETS = 64
+
+_PMT_TABLE = 0x02
+_PAT_TABLE = 0x00
+_NULL_PID = 0x1FFF
+_MAX_PID = 0x1FFF
+# Video stream types: MPEG-1/2, MPEG-4 Part 2, H.264, H.265, H.266.
+_VIDEO_TYPES = frozenset({0x01, 0x02, 0x10, 0x1B, 0x24, 0x33})
+_MPEG2_KEY = (b'\x00\x00\x01\xb3', b'\x00\x00\x01\xb8')
+_START = b'\x00\x00\x01'
+
+
+class MsftsError(ValueError):
+    """An object or catalog entry that breaks draft-gregoire-moq-msfts."""
+
+
+def check_payload(payload, packet_size: int = TS_PACKET) -> None:
+    """Raise MsftsError unless `payload` is whole source packets (§5.1)
+    whose TS packets start with the sync byte."""
+    n, rest = divmod(len(payload), packet_size)
+    if rest or not n:
+        raise MsftsError(f"{len(payload)} bytes is not a whole number of "
+                         f"{packet_size}-byte packets")
+    sync = payload[packet_size - TS_PACKET::packet_size]
+    if sync != b'\x47' * n:
+        bad = next(i for i, b in enumerate(sync) if b != 0x47)
+        raise MsftsError(f"packet {bad} lacks the 0x47 sync byte")
+
+
+# -- catalog (§6) -------------------------------------------------------
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _pid_ok(v) -> bool:
+    return _is_int(v) and 0 <= v <= _MAX_PID
+
+
+def _issues(t: CatalogTrack) -> Tuple[List[str], List[str]]:
+    """(errors, warnings) of an mpeg2ts track entry: errors make a
+    subscriber reject it (§6.2, §6.3, §6.4, §10); warnings break a
+    publisher rule only."""
+    x = t.extra
+    errors: List[str] = []
+    warnings: List[str] = []
+    if t.packaging != PACKAGING_MPEG2TS:
+        errors.append(f"packaging {t.packaging!r} is not {PACKAGING_MPEG2TS!r}")
+    mode = x.get("mpeg2tsMode")
+    if mode not in MODES:
+        errors.append(f"mpeg2tsMode {mode!r} is not one of {', '.join(MODES)}")
+    size = x.get("mpeg2tsPacketSize")
+    if not _is_int(size) or size not in PACKET_SIZES:
+        errors.append(f"mpeg2tsPacketSize {size!r} is not 188 or 192")
+    es = "mpeg2tsEsPid" in x
+    if mode == MODE_ES_PACKETS and not es:
+        errors.append("es-packets track without mpeg2tsEsPid")
+    elif mode in MODES and mode != MODE_ES_PACKETS and es:
+        errors.append(f"mpeg2tsEsPid on a {mode} track")
+    for key in ("mpeg2tsEsPid", "mpeg2tsPcrPid", "mpeg2tsScte35Pid"):
+        if key in x and not _pid_ok(x[key]):
+            errors.append(f"{key} {x[key]!r} is not a PID")
+    prog = x.get("mpeg2tsProgramNumber")
+    if prog is not None and not (_is_int(prog) and 1 <= prog <= 0xFFFF):
+        errors.append(f"mpeg2tsProgramNumber {prog!r} is not 1-65535")
+    rate = x.get("mpeg2tsMuxRate")
+    if rate is not None and not (isinstance(rate, (int, float))
+                                 and not isinstance(rate, bool) and rate > 0):
+        errors.append(f"mpeg2tsMuxRate {rate!r} is not a positive rate")
+    si = x.get("mpeg2tsSiPids")
+    if si is not None and not (isinstance(si, list)
+                               and all(_pid_ok(p) for p in si)
+                               and len(set(si)) == len(si)):
+        errors.append(f"mpeg2tsSiPids {si!r} is not a list of distinct PIDs")
+    ra = x.get("mpeg2tsRandomAccess")
+    if ra is not None and not isinstance(ra, bool):
+        errors.append(f"mpeg2tsRandomAccess {ra!r} is not a boolean")
+    tsm = x.get("mpeg2tsTimestampMode")
+    if tsm is not None and not isinstance(tsm, str):
+        errors.append(f"mpeg2tsTimestampMode {tsm!r} is not a string")
+    if tsm is not None and size == TS_PACKET:
+        warnings.append("mpeg2tsTimestampMode on 188-octet packets")
+    multiplex = mode == MODE_UNMODIFIED_MULTIPLEX
+    if rate is not None and mode in _UNMODIFIED:
+        warnings.append(f"mpeg2tsMuxRate on a {mode} track")
+    if si is not None and (es or multiplex):
+        warnings.append(f"mpeg2tsSiPids on a {mode} track")
+    if "mpeg2tsScte35Pid" in x and (es or multiplex):
+        warnings.append(f"mpeg2tsScte35Pid on a {mode} track")
+    if ra is not None and multiplex and prog is None:
+        warnings.append("mpeg2tsRandomAccess on a multiplex with no "
+                        "reference program")
+    if multiplex and t.altGroup is not None:
+        warnings.append("unmodified-multiplex track in an altGroup")
+    return errors, warnings
+
+
+def track_issues(t: CatalogTrack, catalog: Optional[Catalog] = None) -> List[str]:
+    """Every MSFTS issue of a catalog track entry; with `catalog`, also
+    its initialization data (§6.12)."""
+    errors, warnings = _issues(t)
+    if catalog is not None and t.initRef is not None and not errors:
+        try:
+            init = catalog.resolve_init(t)
+            if init is None:
+                errors.append(f"initRef {t.initRef!r} is not inline data")
+            else:
+                check_payload(init, t.extra["mpeg2tsPacketSize"])
+        except (CatalogError, MsftsError, binascii.Error, ValueError) as e:
+            errors.append(f"initialization data: {e}")
+    return errors + warnings
+
+
+@dataclass
+class MsftsTrack:
+    """The MSFTS fields of a catalog track entry a subscriber may use."""
+    mode: str
+    packet_size: int
+    program_number: Optional[int] = None
+    pcr_pid: Optional[int] = None
+    es_pid: Optional[int] = None
+    random_access: bool = False
+
+    @classmethod
+    def from_entry(cls, t: CatalogTrack) -> "MsftsTrack":
+        """Raise MsftsError for an entry a subscriber must reject."""
+        errors, _ = _issues(t)
+        if errors:
+            raise MsftsError(f"{t.name!r}: {'; '.join(errors)}")
+        x = t.extra
+        return cls(mode=x["mpeg2tsMode"], packet_size=x["mpeg2tsPacketSize"],
+                   program_number=x.get("mpeg2tsProgramNumber"),
+                   pcr_pid=x.get("mpeg2tsPcrPid"),
+                   es_pid=x.get("mpeg2tsEsPid"),
+                   random_access=bool(x.get("mpeg2tsRandomAccess")))
+
+
+def catalog_track(name: str, *, mode: str, packet_size: int = TS_PACKET,
+                  program_number: Optional[int] = None,
+                  pcr_pid: Optional[int] = None,
+                  random_access: Optional[bool] = None,
+                  init_ref: Optional[str] = None,
+                  role: Optional[str] = None,
+                  bitrate: Optional[int] = None,
+                  target_latency: Optional[int] = None) -> CatalogTrack:
+    """A live mpeg2ts track entry; None leaves a field out."""
+    extra: Dict[str, Any] = {"mpeg2tsPacketSize": packet_size,
+                             "mpeg2tsMode": mode}
+    if program_number is not None:
+        extra["mpeg2tsProgramNumber"] = program_number
+    if pcr_pid is not None:
+        extra["mpeg2tsPcrPid"] = pcr_pid
+    if random_access is not None:
+        extra["mpeg2tsRandomAccess"] = random_access
+    return CatalogTrack(name=name, packaging=PACKAGING_MPEG2TS, isLive=True,
+                        role=role, mimeType=MIME_TYPE,
+                        targetLatency=target_latency, bitrate=bitrate,
+                        initRef=init_ref, extra=extra)
+
+
+def init_data_ref(name: str) -> str:
+    """The initDataList id of a track's PAT and PMT, as moq2ts names it."""
+    return f"init-{name}"
+
+
+# -- publisher: packets to objects -------------------------------------
+
+class TsObject(NamedTuple):
+    """One MSFTS object: `key` opens a group; `at_us` is its first
+    packet's arrival, µs since the epoch."""
+    payload: bytes
+    key: bool
+    at_us: int
+
+
+def _pes_pts(data, pos: int, end: int) -> Optional[int]:
+    """PTS of a PES whose header starts at `pos`, if it fits before `end`."""
+    if (pos + 14 > end or data[pos] or data[pos + 1] or data[pos + 2] != 1
+            or not data[pos + 7] & 0x80):
+        return None
+    b = data[pos + 9:pos + 14]
+    return ((((b[0] >> 1) & 7) << 30) | (b[1] << 22) | ((b[2] >> 1) << 15)
+            | (b[3] << 7) | (b[4] >> 1))
+
+
+class TsPackager:
+    """Unmodified MSFTS carriage: whole 188-byte TS packets, in arrival
+    order, `packets` to an object.
+
+    A group opens at each random access point of the first program in
+    the PAT: a video PES start with the random_access_indicator, or with
+    a sequence header (MPEG-1/2 video), SPS or IDR (H.264), or VPS, SPS
+    or IRAP (H.265) in its first packet; without video, the first PES
+    start of the first stream a second after the group's. A run of PSI,
+    SI, null and adaptation-only packets right before it opens the group
+    with it. Packets before the first random access point are dropped
+    (`dropped`); bytes outside a packet are skipped (`resyncs`).
+
+    feed(chunk, now_us) returns the objects the chunk completes;
+    flush(now_us) the partial one once flush_due() has passed; close()
+    the rest at the end of the stream. The PAT, the first program's PMT
+    and the mux rate measured from its PCR are kept for the catalog;
+    `psi_changed` and `bitrate_changed` are raised for the caller to
+    clear."""
+
+    def __init__(self, packets: int = DEFAULT_PACKETS,
+                 flush_s: float = FLUSH_S):
+        if packets < 1:
+            raise ValueError("packets must be positive")
+        self.packets = packets
+        self._obj = packets * TS_PACKET
+        self._flush_us = int(flush_s * 1_000_000)
+        self._buf = bytearray()
+        self._pend = bytearray()
+        # Offset in _pend of a PSI/SI run that may lead the next group,
+        # and its first packet's arrival.
+        self._mark: Optional[int] = None
+        self._mark_at = 0
+        self._old = 0
+        self._pend_at = 0
+        self._now = 0
+        self._key = False
+        self.groups = 0
+        self.packets_in = 0
+        self.dropped = 0
+        self.resyncs = 0
+        # PAT programs as (program_number, PMT PID); the first program's
+        # PMT gives the PCR PID and the streams as (stream_type, PID).
+        self.programs: List[Tuple[int, int]] = []
+        self.program_number: Optional[int] = None
+        self.pcr_pid: Optional[int] = None
+        self.streams: List[Tuple[int, int]] = []
+        self.rap_pid: Optional[int] = None
+        self._rap_type: Optional[int] = None
+        self._pmt_pid: Optional[int] = None
+        self._table_pids: Set[int] = set()
+        self._pat: Optional[Tuple[bytes, List[bytes]]] = None
+        self._pmt: Optional[Tuple[bytes, List[bytes]]] = None
+        self._sections: Dict[int, Tuple[List[bytes], bytearray]] = {}
+        self.psi_changed = False
+        self.bitrate: Optional[int] = None
+        self.bitrate_changed = False
+        self._pcr0: Optional[Tuple[int, int]] = None
+        self._group_pts: Optional[int] = None
+        self._warned = False
+        # The PSI was complete once; a later change raises psi_changed.
+        self._announced = False
+        self._dirty = False
+
+    # -- what the catalog says --
+
+    @property
+    def ready(self) -> bool:
+        """The PAT and the first program's PMT are in."""
+        return self._pat is not None and self._pmt is not None
+
+    @property
+    def init_data(self) -> bytes:
+        """The PAT and the first program's PMT packets, as received."""
+        pkts = (self._pat[1] if self._pat else []) + (
+            self._pmt[1] if self._pmt else [])
+        return b''.join(pkts)
+
+    @property
+    def mode(self) -> str:
+        return (MODE_UNMODIFIED_PROGRAM if len(self.programs) <= 1
+                else MODE_UNMODIFIED_MULTIPLEX)
+
+    @property
+    def video(self) -> bool:
+        return self._rap_type in _VIDEO_TYPES
+
+    def catalog_track(self, name: str, *, bitrate: Optional[int] = None,
+                      target_latency: Optional[int] = None) -> CatalogTrack:
+        """The track entry for this stream. A multiplex names no
+        reference program, so it claims no random access (§6.9) and
+        takes no role, as moq2ts publishes it."""
+        program = self.mode == MODE_UNMODIFIED_PROGRAM
+        return catalog_track(
+            name, mode=self.mode,
+            program_number=self.program_number if program else None,
+            pcr_pid=self.pcr_pid if program else None,
+            random_access=True if program else None,
+            init_ref=init_data_ref(name) if self.ready else None,
+            role=(('video' if self.video else 'audio') if program else None),
+            bitrate=bitrate or self.bitrate, target_latency=target_latency)
+
+    # -- packets --
+
+    def feed(self, chunk, now_us: int) -> List[TsObject]:
+        self._now = now_us
+        self._old = len(self._pend)
+        if self._buf:
+            self._buf += chunk
+            data = self._buf
+        else:
+            data = chunk
+        out: List[TsObject] = []
+        n = len(data)
+        pos = 0
+        P = TS_PACKET
+        while n - pos >= P:
+            if data[pos] != 0x47 or (n - pos >= 2 * P
+                                     and data[pos + P] != 0x47):
+                pos += 1
+                self.resyncs += 1
+                continue
+            self._packet(data, pos, out)
+            pos += P
+        self._buf = bytearray(data[pos:])
+        return out
+
+    def flush_due(self) -> Optional[int]:
+        """When the partial object must go, µs since the epoch; None
+        when there is none, or only a PSI run waits for what follows."""
+        if not self.groups or not self._pend or self._mark == 0:
+            return None
+        return self._pend_at + self._flush_us
+
+    def flush(self, now_us: int) -> List[TsObject]:
+        """The partial object; a PSI run stays for what follows it."""
+        self._now = now_us
+        out: List[TsObject] = []
+        if self.groups:
+            self._emit_full(out)
+            head = len(self._pend) if self._mark is None else self._mark
+            if head:
+                self._emit(head, out)
+            if self._mark is not None:
+                self._pend_at = self._mark_at
+        return out
+
+    def close(self) -> List[TsObject]:
+        """Everything held, at the end of the stream."""
+        self._buf = bytearray()
+        self._mark = None
+        return self.flush(self._now)
+
+    def _packet(self, data, pos: int, out: List[TsObject]) -> None:
+        b1 = data[pos + 1]
+        pid = ((b1 & 0x1F) << 8) | data[pos + 2]
+        self.packets_in += 1
+        if pid < 0x20 or pid in self._table_pids:
+            if pid == 0 or pid == self._pmt_pid:
+                self._table(data, pos, pid, b1 & 0x40)
+            if self._mark is None:
+                if not self.groups:
+                    self._pend.clear()
+                self._mark = len(self._pend)
+                self._mark_at = self._now
+            self._append(data, pos)
+            return
+        if pid == self.pcr_pid and self.bitrate is None:
+            self._pcr(data, pos)
+        if pid != _NULL_PID and data[pos + 3] & 0x10:
+            if pid == self.rap_pid and b1 & 0x40 and self._is_rap(data, pos):
+                self._open_group(data, pos, out)
+                return
+            # Elementary stream data: the PSI run leads no group.
+            self._mark = None
+            if not self.groups:
+                self._pend.clear()
+        if not self.groups and self._mark is None:
+            self.dropped += 1
+            if self.dropped == _RAP_WARN_PACKETS and not self._warned:
+                self._warned = True
+                logger.warning(f"msfts: no random access point in "
+                               f"{_RAP_WARN_PACKETS} packets; nothing sent")
+            return
+        self._append(data, pos)
+        if self.groups:
+            self._emit_full(out)
+
+    def _append(self, data, pos: int) -> None:
+        if not self._pend:
+            self._pend_at = self._now
+        self._pend += data[pos:pos + TS_PACKET]
+
+    def _emit(self, size: int, out: List[TsObject]) -> None:
+        pend = self._pend
+        out.append(TsObject(bytes(pend[:size]), self._key, self._pend_at))
+        del pend[:size]
+        self._key = False
+        if self._mark is not None:
+            self._mark -= size
+        self._old -= size
+        if self._old <= 0:
+            self._old = 0
+            self._pend_at = self._now
+
+    def _emit_full(self, out: List[TsObject]) -> None:
+        obj = self._obj
+        if (self._mark is not None
+                and len(self._pend) - self._mark > _RUN_PACKETS * TS_PACKET):
+            self._mark = None   # no random access point followed the PSI
+        limit = len(self._pend) if self._mark is None else self._mark
+        while limit >= obj:
+            self._emit(obj, out)
+            limit -= obj
+
+    def _open_group(self, data, pos: int, out: List[TsObject]) -> None:
+        """A random access point: what precedes the PSI run before it
+        ends the open group, and the run opens the next with it. Object 0
+        holds the random access point (§5.2), so a run of `packets` or
+        more makes it longer."""
+        head = len(self._pend) if self._mark is None else self._mark
+        if self.groups and head:
+            self._emit(head, out)
+        elif head:
+            del self._pend[:head]
+        self._mark = None
+        self._key = True
+        self.groups += 1
+        self._append(data, pos)
+        if len(self._pend) > self._obj:
+            self._emit(len(self._pend), out)
+        self._emit_full(out)
+
+    def _is_rap(self, data, pos: int) -> bool:
+        end = pos + TS_PACKET
+        off = pos + 4
+        if data[pos + 3] & 0x20:
+            alen = data[off]
+            if alen and data[off + 1] & 0x40 and self.video:
+                return True
+            off += 1 + alen
+        if not self.video:
+            pts = _pes_pts(data, off, end)
+            if pts is None:
+                return False
+            if (self._group_pts is not None
+                    and 0 <= pts - self._group_pts < _AUDIO_GROUP_PTS):
+                return False
+            self._group_pts = pts
+            return True
+        if off + 9 > end:
+            return False
+        es = off + 9 + data[off + 8]
+        seg = bytes(data[es:end])
+        t = self._rap_type
+        if t in (0x01, 0x02):
+            return any(code in seg for code in _MPEG2_KEY)
+        if t not in (0x1B, 0x24):
+            return False
+        i = seg.find(_START)
+        while 0 <= i < len(seg) - 3:
+            h = seg[i + 3]
+            if t == 0x1B and (h & 0x1F) in (5, 7):
+                return True
+            nal = (h >> 1) & 0x3F
+            if t == 0x24 and (16 <= nal <= 23 or nal in (32, 33)):
+                return True
+            i = seg.find(_START, i + 3)
+        return False
+
+    def _pcr(self, data, pos: int) -> None:
+        """Mux rate from the packets between two PCRs a second or more
+        apart."""
+        if not data[pos + 3] & 0x20 or data[pos + 4] < 7:
+            return
+        flags = data[pos + 5]
+        if not flags & 0x10:
+            return
+        b = data[pos + 6:pos + 12]
+        pcr = ((b[0] << 25 | b[1] << 17 | b[2] << 9 | b[3] << 1 | b[4] >> 7)
+               * 300 + ((b[4] & 1) << 8 | b[5]))
+        if self._pcr0 is None or flags & 0x80:
+            self._pcr0 = (pcr, self.packets_in)
+            return
+        pcr0, n0 = self._pcr0
+        dt = pcr - pcr0
+        if not 0 < dt <= 10 * 27_000_000:
+            self._pcr0 = (pcr, self.packets_in)
+        elif dt >= 27_000_000:
+            self.bitrate = ((self.packets_in - n0) * TS_PACKET * 8
+                            * 27_000_000 // dt)
+            self.bitrate_changed = True
+
+    # -- PSI --
+
+    def _table(self, data, pos: int, pid: int, pusi: int) -> None:
+        pkt = bytes(data[pos:pos + TS_PACKET])
+        afc = (pkt[3] >> 4) & 3
+        if not afc & 1:
+            return
+        off = 4 + (1 + pkt[4] if afc & 2 else 0)
+        if off >= TS_PACKET:
+            return
+        payload = pkt[off:]
+        if pusi:
+            sec = bytearray(payload[1 + payload[0]:])
+            pkts = [pkt]
+            self._sections[pid] = (pkts, sec)
+        else:
+            held = self._sections.get(pid)
+            if held is None:
+                return
+            pkts, sec = held
+            pkts.append(pkt)
+            sec += payload
+        if len(sec) < 3:
+            return
+        length = ((sec[1] & 0x0F) << 8) | sec[2]
+        if sec[0] == 0xFF or len(sec) >= 3 + length or length > 1021:
+            del self._sections[pid]
+        if (sec[0] != 0xFF and 9 <= length <= 1021
+                and len(sec) >= 3 + length):
+            self._section(pid, bytes(sec[:3 + length]), pkts)
+
+    def _section(self, pid: int, sec: bytes, pkts: List[bytes]) -> None:
+        if pid == 0 and sec[0] == _PAT_TABLE:
+            if self._pat is not None and self._pat[0] == sec:
+                return
+            programs = []
+            for i in range(8, len(sec) - 4, 4):
+                number = (sec[i] << 8) | sec[i + 1]
+                if number:
+                    programs.append(
+                        (number, ((sec[i + 2] & 0x1F) << 8) | sec[i + 3]))
+            self._pat = (sec, pkts)
+            self.programs = programs
+            self._table_pids = {p for _, p in programs}
+            pmt_pid = programs[0][1] if programs else None
+            if pmt_pid != self._pmt_pid:
+                self._pmt_pid = pmt_pid
+                self._pmt = None
+        elif pid == self._pmt_pid and sec[0] == _PMT_TABLE:
+            if self._pmt is not None and self._pmt[0] == sec:
+                return
+            self._pmt = (sec, pkts)
+            self.program_number = (sec[3] << 8) | sec[4]
+            self.pcr_pid = ((sec[8] & 0x1F) << 8) | sec[9]
+            i = 12 + (((sec[10] & 0x0F) << 8) | sec[11])
+            streams = []
+            while i + 5 <= len(sec) - 4:
+                streams.append((sec[i], ((sec[i + 1] & 0x1F) << 8)
+                                | sec[i + 2]))
+                i += 5 + (((sec[i + 3] & 0x0F) << 8) | sec[i + 4])
+            self.streams = streams
+            first = next((s for s in streams if s[0] in _VIDEO_TYPES),
+                         streams[0] if streams else (None, None))
+            self._rap_type, self.rap_pid = first
+        else:
+            return
+        if self._announced:
+            self._dirty = True
+        if self.ready:
+            self.psi_changed |= self._dirty
+            self._dirty = False
+            self._announced = True
+
+
+# -- subscriber: objects back in order ---------------------------------
+
+class PacketOrder:
+    """Objects of an mpeg2ts track released in Group ID and Object ID
+    order (§5.1), each as soon as that order allows.
+
+    The first object pushed sets the start. Objects of a later group wait
+    while the current group is open; end_group() (its stream ended, or an
+    End of Group) releases them, and so does timeout() once they have
+    waited `hold_s` with no progress, skipping what is missing
+    (`skipped`). An object behind what was released is dropped (`late`).
+    Items are opaque; None stands for a rejected object."""
+
+    def __init__(self, hold_s: float = HOLD_S):
+        self.hold_s = hold_s
+        self._started = False
+        self._group = 0
+        self._next = 0
+        self._done = False
+        self._held: Dict[int, Dict[int, Any]] = {}
+        self._ended: Set[int] = set()
+        self._since: Optional[float] = None
+        self.late = 0
+        self.skipped = 0
+
+    @property
+    def deadline(self) -> Optional[float]:
+        """When timeout() gives up waiting; None when nothing waits."""
+        return None if self._since is None else self._since + self.hold_s
+
+    @property
+    def held(self) -> int:
+        return sum(len(h) for h in self._held.values())
+
+    def push(self, group: int, obj: int, item, now: float) -> List[tuple]:
+        """(group, object, item) of each object this one releases."""
+        out: List[tuple] = []
+        if not self._started:
+            self._started = True
+            self._group, self._next = group, obj
+        cur = self._group
+        if group < cur or (group == cur and obj < self._next):
+            self.late += 1
+            return out
+        if group == cur and obj == self._next:
+            out.append((group, obj, item))
+            self._next += 1
+        elif (self._done and obj == 0 and group > cur
+              and not any(g < group for g in self._held)):
+            self._group, self._next, self._done = group, 1, False
+            out.append((group, obj, item))
+        else:
+            self._held.setdefault(group, {})[obj] = item
+        self._settle(now, out)
+        return out
+
+    def end_group(self, group: int, now: float) -> List[tuple]:
+        """Group `group` delivers nothing more."""
+        out: List[tuple] = []
+        if not self._started or group < self._group:
+            return out
+        if group == self._group:
+            self._done = True
+        else:
+            self._ended.add(group)
+        self._settle(now, out)
+        return out
+
+    def timeout(self, now: float) -> List[tuple]:
+        """Past the deadline, skip to the next object held."""
+        out: List[tuple] = []
+        due = self.deadline
+        if due is None or now < due or not self._held:
+            return out
+        g = min(self._held)
+        if g != self._group:
+            self._group, self._done = g, False
+        self._next = min(self._held[g])
+        self.skipped += 1
+        self._since = None
+        self._settle(now, out)
+        return out
+
+    def drain(self) -> List[tuple]:
+        """Everything held, in order."""
+        out = [(g, o, self._held[g][o]) for g in sorted(self._held)
+               for o in sorted(self._held[g])]
+        self._held.clear()
+        self._since = None
+        return out
+
+    def _settle(self, now: float, out: List[tuple]) -> None:
+        progressed = bool(out)
+        while True:
+            g = self._group
+            h = self._held.get(g)
+            while h and self._next in h:
+                out.append((g, self._next, h.pop(self._next)))
+                self._next += 1
+                progressed = True
+            if h is not None and not h:
+                del self._held[g]
+            if g in self._ended:
+                self._ended.discard(g)
+                self._done = True
+            if self._done and self._held:
+                nxt = min(self._held)
+                if 0 in self._held[nxt]:
+                    self._group, self._next, self._done = nxt, 0, False
+                    continue
+            break
+        self._ended = {e for e in self._ended if e > self._group}
+        if not self._held:
+            self._since = None
+        elif progressed or self._since is None:
+            self._since = now
+
+
+# -- tracks ---------------------------------------------------------------
+
+class MsftsTrackPublisher(LocTrackPublisher):
+    """Publishes an mpeg2ts track: each send_frame() payload is one
+    object of whole TS packets, a key frame opening a group at a random
+    access point. Each object carries LOC TIMESTAMP only, its first
+    packet's arrival (§5.5 leaves such timing to Object properties)."""
+
+    def __init__(self, session, namespace: str, trackname: str, *,
+                 priority: int = 128, fetch_history_bytes: int = 0,
+                 queue_size: int = 1024):
+        super().__init__(session, namespace, trackname, priority=priority,
+                         config_property=None, queue_size=queue_size,
+                         fetch_history_bytes=fetch_history_bytes)
+
+    def _timestamp_ids(self, session) -> tuple:
+        return (LOC_PROP_TIMESTAMP,)
+
+
+class MsftsTrackSubscriber(LocTrackSubscriber):
+    """Subscribes to an mpeg2ts track. on_frame(frame, group_id,
+    object_id) gets the objects in Group ID and Object ID order through
+    a PacketOrder; on_arrival sees them as they arrive. An object that is
+    not whole source packets of `packet_size` is rejected
+    (`objects_rejected`). `order` counts late and skipped objects."""
+
+    def __init__(self, session, namespace: str,
+                 trackname: Optional[str] = None, *,
+                 packet_size: int = TS_PACKET, hold_s: float = HOLD_S,
+                 on_frame: Optional[Callable] = None,
+                 on_arrival: Optional[Callable] = None,
+                 auth_token: Optional[bytes] = None,
+                 timestamp_errors: str = 'cancel'):
+        super().__init__(session, namespace, cast(str, trackname),
+                         on_frame=on_frame, auth_token=auth_token,
+                         on_arrival=on_arrival,
+                         timestamp_errors=timestamp_errors)
+        self.packet_size = packet_size
+        self.order = PacketOrder(hold_s)
+        self._timer = None
+        self._due: Optional[float] = None
+
+    async def subscribe(self, *args, **kwargs):
+        await super().subscribe(*args, **kwargs)
+        self.session.register_stream_end_handler(self.track_alias,
+                                                 self._stream_ended)
+
+    def _stream_ended(self, group_id, subgroup_id, clean=True,
+                      reset_code=0) -> None:
+        self._release(self.order.end_group(group_id, _loop_time()))
+
+    def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:
+        status = getattr(msg, "status", None)
+        super()._on_object(msg, size, recv_us, group_id, subgroup_id)
+        if status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
+            gid = getattr(msg, 'group_id', None)
+            gid = gid if gid is not None else group_id
+            self._release(self.order.end_group(gid, _loop_time()))
+
+    def _unpackage(self, msg, group_id: int) -> Optional[bytes]:
+        payload = bytes(msg.payload)
+        try:
+            check_payload(payload, self.packet_size)
+        except MsftsError as e:
+            self.objects_rejected += 1
+            if self.objects_rejected <= 3:
+                logger.warning(f"msfts: {self.trackname}: object "
+                               f"{group_id}.{msg.object_id} rejected: {e}")
+            self._release(self.order.push(group_id, msg.object_id, None,
+                                          _loop_time()))
+            return None
+        return payload
+
+    def _deliver(self, frame: LocFrame, group_id: int,
+                 object_id: int) -> None:
+        self._release(self.order.push(group_id, object_id, frame,
+                                      _loop_time()))
+
+    def flush(self) -> None:
+        """Release everything held, in order (the track is ending)."""
+        self._release(self.order.drain())
+
+    def _release(self, released: List[tuple]) -> None:
+        if self.on_frame:
+            for g, o, frame in released:
+                if frame is not None:
+                    self.on_frame(frame, g, o)
+        due = self.order.deadline
+        if due == self._due:
+            return
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        self._due = due
+        if due is not None:
+            self._timer = asyncio.get_running_loop().call_at(due,
+                                                             self._on_timer)
+
+    def _on_timer(self) -> None:
+        self._timer = None
+        self._due = None
+        released = self.order.timeout(_loop_time())
+        if released:
+            logger.warning(f"msfts: {self.trackname}: no end of the open "
+                           f"group in {self.order.hold_s:g} s; skipped "
+                           f"ahead")
+        self._release(released)
+
+
+def _loop_time() -> float:
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+__all__ = [
+    "TS_PACKET", "M2TS_PACKET", "MIME_TYPE", "DEFAULT_PACKETS", "FLUSH_S",
+    "HOLD_S", "MODES", "MODE_UNMODIFIED_PROGRAM",
+    "MODE_UNMODIFIED_MULTIPLEX", "MODE_PER_PROGRAM", "MODE_ES_PACKETS",
+    "MsftsError", "MsftsTrack", "TsObject", "TsPackager", "PacketOrder",
+    "MsftsTrackPublisher", "MsftsTrackSubscriber", "check_payload",
+    "catalog_track", "init_data_ref", "track_issues",
+]

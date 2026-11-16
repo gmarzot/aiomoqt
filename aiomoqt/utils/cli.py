@@ -28,6 +28,8 @@ addressing
   --bind, -p/--port, --path      listener address. The path is shared by
                      both transports: WT CONNECT path / raw-QUIC PATH
                      setup parameter.
+  udp://[@][HOST]:PORT  MPEG-TS in or out (pub_media --ts, sub_media
+                     --ts-out), not a MoQT address: no grid flag takes it.
 
 identity          -N/--namespace  -T/--trackname
 publisher media   -s/--object-size -g/--group-size -P/--streams

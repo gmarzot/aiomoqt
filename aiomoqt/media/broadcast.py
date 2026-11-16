@@ -24,13 +24,14 @@ from ..types import (
 from ..utils.logger import get_logger
 from .catalog import (
     Catalog, CatalogError, CATALOG_TRACK_NAME, MEDIA_PACKAGINGS,
-    PACKAGING_LOC, PACKAGING_LOCMAF,
+    PACKAGING_LOC, PACKAGING_LOCMAF, PACKAGING_MPEG2TS,
 )
 from .loc import LocTrackPublisher, LocTrackSubscriber
 from .locmaf import (
     LocmafError, LocmafTrackSubscriber, SUPPORTED_LOCMAF_VERSIONS,
     TrackContext,
 )
+from .msfts import MsftsError, MsftsTrack, MsftsTrackSubscriber
 
 logger = get_logger(__name__)
 
@@ -369,8 +370,10 @@ class MediaPublisher:
 
 class MediaSubscriber:
     """Consumes an MSF broadcast: reads the catalog track, then
-    subscribes every LOC, CMAF and LOCMAF track it describes (a LOCMAF
-    track only with a supported locmafVersion and an init).
+    subscribes every LOC, CMAF, LOCMAF and mpeg2ts track it describes (a
+    LOCMAF track only with a supported locmafVersion and an init, an
+    mpeg2ts track only with valid MSFTS fields; its frames come in Group
+    and Object order, see MsftsTrackSubscriber).
 
     on_frame(track_name, frame, group_id, object_id) receives media;
     on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
@@ -525,7 +528,14 @@ class MediaSubscriber:
 
     async def _subscribe_media(self) -> None:
         for entry in list(self.catalog.tracks):
-            if entry.packaging not in MEDIA_PACKAGINGS:
+            ts = None
+            if entry.packaging == PACKAGING_MPEG2TS:
+                try:
+                    ts = MsftsTrack.from_entry(entry)
+                except MsftsError as e:
+                    logger.warning(f"MediaSubscriber: skipping {e}")
+                    continue
+            elif entry.packaging not in MEDIA_PACKAGINGS:
                 logger.info(f"MediaSubscriber: skipping {entry.name!r} "
                             f"(packaging={entry.packaging!r})")
                 continue
@@ -539,15 +549,21 @@ class MediaSubscriber:
             if not self.track_filter(entry):
                 continue
             name = entry.name
-            callbacks = dict(
-                on_frame=(lambda f, gid, oid, _n=name:
-                          self.on_frame and self.on_frame(_n, f, gid, oid)),
-                on_arrival=(lambda m, rx, gid, sg, f, _n=name:
-                            self.on_arrival
-                            and self.on_arrival(_n, m, rx, gid, sg, f)),
-                timestamp_errors=self.timestamp_errors)
+            def on_frame(f, gid, oid, _n=name):
+                return self.on_frame and self.on_frame(_n, f, gid, oid)
+
+            def on_arrival(m, rx, gid, sg, f, _n=name):
+                return self.on_arrival and self.on_arrival(_n, m, rx, gid,
+                                                           sg, f)
+            callbacks = dict(on_frame=on_frame, on_arrival=on_arrival,
+                             timestamp_errors=self.timestamp_errors)
             namespace = entry.namespace or self.namespace
-            if init is not None:
+            if ts is not None:
+                sub = MsftsTrackSubscriber(
+                    self.session, namespace, name, packet_size=ts.packet_size,
+                    on_frame=on_frame, on_arrival=on_arrival,
+                    timestamp_errors=self.timestamp_errors)
+            elif init is not None:
                 sub = LocmafTrackSubscriber(self.session, namespace, name,
                                             init=init, **callbacks)
             else:

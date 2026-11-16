@@ -35,6 +35,10 @@ frame (loc-04 §2.1.1, §2.1.4) and codec avc3/hev1.
     -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 \\
     -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
 
+  # MPEG-TS contribution as MSFTS: the TS packets themselves, unmodified,
+  # seven to an object as they arrive on UDP port 5000
+  %(prog)s moqt://relay.example:4433/ -N contrib/feed --ts udp://@:5000 --msfts
+
   # HLS/DASH (anything FFmpeg opens) as CMAF tracks; needs the media
   # extra: pip install 'aiomoqt[media]'. --rendition all is experimental.
   %(prog)s https://relay.example/moq-relay -N vod --input https://cdn.example/master.m3u8
@@ -85,8 +89,10 @@ from aiomoqt.media.catalog import (
 from aiomoqt.media.cmaf import CmafChunker, chunk_decode_time, prft_box
 from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
 from aiomoqt.media.loc import LOC_PROP_AUDIO_CONFIG, LOC_PROP_VIDEO_CONFIG
+from aiomoqt.media import msfts
 from aiomoqt.media.locmaf import LOCMAF_VERSION
 from aiomoqt.media.mpegts import TsCadence, TsDemuxer, TsRates
+from aiomoqt.media.udp import UdpInput, is_udp_url, parse_udp_url
 from aiomoqt.media.sources import (
     AnnexBAssembler, HevcAnnexBAssembler, Mp4Reader, avcc_codec_string,
     hevc_sps_info, hvcc_codec_string, pcm_tone_frames, sps_dimensions,
@@ -149,11 +155,30 @@ def parse_args():
                              'stream ("-" = stdin, e.g. an ffmpeg/OBS '
                              'pipe); frames are stamped on arrival')
     parser.add_argument('--ts', type=str, default=None, metavar='FILE',
-                        help='Publish a live MPEG-TS stream ("-" = stdin): '
+                        help='Publish a live MPEG-TS stream ("-" = stdin, '
+                             'or udp://[@][HOST]:PORT to receive datagrams, '
+                             'joining HOST when it is a multicast group): '
                              'H.264 or H.265 video and AAC or Opus audio, '
                              'stamped from the PES timestamps. Each video '
                              'stream is a track: video, video_1, ... in PMT '
-                             'order; audio is the first audio stream.')
+                             'order; audio is the first audio stream. With '
+                             '--msfts, the TS packets themselves.')
+    parser.add_argument('--msfts', action='store_true',
+                        help='With --ts: publish the TS packets unmodified '
+                             'as one mpeg2ts track (draft-gregoire-moq-'
+                             'msfts-02, as moq2ts --unmodified), named '
+                             'program-1, or mux-1 for a multi-program '
+                             'stream (-T names it). Groups start at the '
+                             'first program\'s random access points; the '
+                             'PAT and PMT ride the catalog initDataList. '
+                             'Packets go out as they arrive, no pacing.')
+    parser.add_argument('--msfts-packets', type=int,
+                        default=msfts.DEFAULT_PACKETS, metavar='N',
+                        help='With --msfts: TS packets per object, sent '
+                             'as soon as N have arrived, or a partial '
+                             f'object {msfts.FLUSH_S * 1000:g} ms after '
+                             'its first packet (default: '
+                             f'{msfts.DEFAULT_PACKETS}, 1316 bytes)')
     parser.add_argument('--input', type=str, default=None, metavar='URL',
                         help='Publish anything FFmpeg opens (HLS or DASH '
                              'playlist, file, ...) as CMAF tracks, paced '
@@ -348,6 +373,15 @@ def parse_args():
         args.duration = math.inf
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
+    if is_udp_url(args.ts):
+        try:
+            parse_udp_url(args.ts, listen=True)
+        except ValueError as e:
+            parser.error(f'--ts: {e}')
+    if args.msfts:
+        _check_msfts(parser, args)
+    elif args.msfts_packets != msfts.DEFAULT_PACKETS:
+        parser.error('--msfts-packets applies to --msfts only')
     if args.input:
         if args.packaging == PACKAGING_LOC:
             parser.error('--input publishes cmaf or locmaf packaging')
@@ -424,6 +458,38 @@ def parse_args():
     if args.no_catalog and args.init_data == 'catalog':
         parser.error('--init-data catalog needs a catalog')
     return args
+
+
+# --msfts-packets ceiling: objects under 1 MB.
+_MSFTS_MAX_PACKETS = 5000
+
+
+def _check_msfts(parser, args) -> None:
+    """--msfts takes --ts and no option of the LOC, CMAF or mp4 paths."""
+    if not args.ts:
+        parser.error('--msfts needs --ts')
+    if not 1 <= args.msfts_packets <= _MSFTS_MAX_PACKETS:
+        parser.error(f'--msfts-packets must be 1-{_MSFTS_MAX_PACKETS}')
+    for flag, on in (
+            ('--packaging', args.packaging not in (None, PACKAGING_LOC)),
+            ('--ts-cadence', args.ts_cadence is not None),
+            ('--timestamp-mapping', args.timestamp_mapping),
+            ('--start-at', args.start_at is not None),
+            ('--datagram', args.datagram), ('--no-catalog', args.no_catalog),
+            ('--annexb', args.annexb), ('--init-data', args.init_data),
+            ('--loc-codecstring', args.loc_codecstring),
+            ('--loc-timescale', args.loc_timescale is not None),
+            ('--loc01-compat', args.loc01_compat),
+            ('--no-audio', args.no_audio), ('--tone', args.tone),
+            ('--catalog-audio-bitrate',
+             args.catalog_audio_bitrate is not None),
+            ('--video-alt', args.video_alt), ('--video-label', args.video_label),
+            ('--video-subgroups', args.video_subgroups != 'group'),
+            ('--audio-subgroups', args.audio_subgroups != 'group'),
+            ('--audio-frames-per-group',
+             args.audio_frames_per_group is not None)):
+        if on:
+            parser.error(f'{flag} does not apply to --msfts')
 
 
 def _cadence(text: str) -> TsCadence:
@@ -746,10 +812,22 @@ class _LiveAudio:
                              else f"mp4a.40.{(self.config[0] >> 3) & 0x1F}")
 
 
+def _ts_input(spec: str):
+    """--ts as a byte stream with read1(): stdin, udp://, or a path."""
+    if spec == '-':
+        return sys.stdin.buffer
+    if is_udp_url(spec):
+        try:
+            return UdpInput(spec)
+        except OSError as e:
+            raise _SourceError(f'  error: --ts {spec}: {e}')
+    return open(spec, 'rb')
+
+
 def _open_live_ts(args):
     """Read the stream until the PMT and the codec configs the catalog
     needs are in; returns (fh, demuxer, units-so-far, [video], audio)."""
-    fh = sys.stdin.buffer if args.ts == '-' else open(args.ts, 'rb')
+    fh = _ts_input(args.ts)
     dmx = TsDemuxer()
     first = []
 
@@ -907,6 +985,127 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
             units, eof = dmx.close(), True
     for track in tracks.values():
         await track.finish()
+
+
+# --msfts: refuse a stream with no PAT and PMT in this many packets.
+_MSFTS_PSI_PACKETS = 100_000
+
+
+def _now_us() -> int:
+    return int(time.time() * 1_000_000)
+
+
+def _open_msfts(args):
+    """Read the stream until the PAT and the first program's PMT are in;
+    returns (fh, packager, objects so far)."""
+    fh = _ts_input(args.ts)
+    packager = msfts.TsPackager(args.msfts_packets)
+    first = []
+    while not packager.ready:
+        if packager.packets_in > _MSFTS_PSI_PACKETS:
+            raise _SourceError(f'  error: no PAT and PMT in '
+                               f'{_MSFTS_PSI_PACKETS} packets of --ts')
+        chunk = fh.read1(65536)
+        if not chunk:
+            raise _SourceError('  error: ts stream ended before PAT and PMT')
+        first += packager.feed(chunk, _now_us())
+    return fh, packager, first
+
+
+def _msfts_name(args, packager) -> str:
+    """-T, else moq2ts's name: program-1, or mux-1 for a multiplex."""
+    if args.trackname:
+        return args.trackname
+    return ('mux-1' if packager.mode == msfts.MODE_UNMODIFIED_MULTIPLEX
+            else 'program-1')
+
+
+def _build_msfts_catalog(args, packager) -> Catalog:
+    name = _msfts_name(args, packager)
+    explicit = _as_list(getattr(args, 'catalog_bitrate', None))
+    entry = packager.catalog_track(
+        name, bitrate=explicit[0] if explicit else None,
+        target_latency=args.target_latency)
+    init = [InitData.from_bytes(entry.initRef, packager.init_data)]
+    return Catalog(generatedAt=int(time.time() * 1000), tracks=[entry],
+                   initDataList=init)
+
+
+async def _apply_msfts_change(packager, name: str, pub) -> None:
+    """New PSI or a measured mux rate into the catalog, republished."""
+    cat = pub.catalog_track.catalog
+    entry = cat.find(name) if cat is not None else None
+    if entry is None:
+        return
+    if packager.psi_changed:
+        packager.psi_changed = False
+        fresh = packager.catalog_track(name)
+        for key in ('mpeg2tsMode', 'mpeg2tsProgramNumber'):
+            if fresh.extra.get(key) != entry.extra.get(key):
+                log.warning(f"msfts: the PAT changed {key} to "
+                            f"{fresh.extra.get(key)!r}; track {name} keeps "
+                            f"{entry.extra.get(key)!r}")
+        if 'mpeg2tsPcrPid' in entry.extra and packager.pcr_pid is not None:
+            entry.extra['mpeg2tsPcrPid'] = packager.pcr_pid
+        for item in cat.initDataList or ():
+            if item.id == entry.initRef:
+                item.data = InitData.from_bytes(item.id,
+                                                packager.init_data).data
+        print(f"  {name}: PSI changed, catalog initData updated")
+    if packager.bitrate_changed:
+        packager.bitrate_changed = False
+        if entry.bitrate is None:
+            entry.bitrate = packager.bitrate
+    await _republish(pub)
+
+
+async def _feed_msfts(track, fh, packager, first, args, stats, pub):
+    """Send each object as the packager completes it; a partial one goes
+    once it has waited the packager's flush time."""
+    loop = asyncio.get_running_loop()
+    deadline = time.monotonic() + args.duration
+    name = track.trackname
+    if isinstance(fh, UdpInput):
+        read = fh.read
+    else:
+        pending = None
+
+        async def read(timeout):
+            nonlocal pending
+            if pending is None:
+                pending = loop.run_in_executor(None, fh.read1, 65536)
+            done, _ = await asyncio.wait({pending}, timeout=timeout)
+            if not done:
+                return None
+            fut, pending = pending, None
+            return fut.result()
+    objs = list(first)
+    eof = False
+    while True:
+        if packager.psi_changed or packager.bitrate_changed:
+            await _apply_msfts_change(packager, name, pub)
+        for o in objs:
+            await _send(track, stats, o.payload, o.key, timestamp=o.at_us)
+        left = deadline - time.monotonic()
+        if eof or left <= 0:
+            break
+        due = packager.flush_due()
+        timeout = left if math.isfinite(left) else None
+        if due is not None:
+            wait = max(0.0, (due - _now_us()) / 1e6)
+            timeout = wait if timeout is None else min(timeout, wait)
+        chunk = await read(timeout)
+        now = _now_us()
+        if chunk is None:
+            due = packager.flush_due()
+            objs = packager.flush(now) if due is not None and now >= due else []
+        elif chunk:
+            objs = packager.feed(chunk, now)
+        else:
+            objs, eof = packager.close(), True
+    if isinstance(fh, UdpInput):
+        fh.close()
+    await track.finish()
 
 
 def _cmaf_wrap(chunker: CmafChunker, video: bool):
@@ -1674,7 +1873,11 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     live = _open_live_h264(args) if args.h264 else None
     if live:
         videos = [live[3]]
-    ts = _open_live_ts(args) if args.ts else None
+    msfts_in = (_open_msfts(args) if args.ts and getattr(args, 'msfts', False)
+                else None)
+    if msfts_in:
+        args.no_audio = True
+    ts = _open_live_ts(args) if args.ts and not msfts_in else None
     ts_audio = None
     if ts:
         videos, ts_audio = ts[3], ts[4]
@@ -1706,6 +1909,8 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     ingest = await _open_ingest(args) if args.input else None
     if ingest is not None:
         catalog = _build_ingest_catalog(args, ingest)
+    elif msfts_in:
+        catalog = _build_msfts_catalog(args, msfts_in[1])
     else:
         catalog = _build_catalog(args, videos, mp4_audio or ts_audio,
                                  chunkers)
@@ -1744,6 +1949,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     async with contextlib.AsyncExitStack() as stack:
         if ingest is not None:
             stack.callback(ingest.close)
+        for opened in (msfts_in, ts):
+            if opened and isinstance(opened[0], UdpInput):
+                stack.callback(opened[0].close)
         stack.push_async_callback(_close_endpoints, endpoints)
         # A relay that cannot be reached is left out; the run fails only
         # when none can.
@@ -1805,6 +2013,15 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     MediaTimestamps(wall0)))
                 stats[t.name] = _TrackStats()
             feeders.append(_feed_ingest(ingest, tracks, args, stats))
+        elif msfts_in is not None:
+            fh, packager, first = msfts_in
+            name = _msfts_name(args, packager)
+            tracks = {name: pub.add_track(msfts.MsftsTrackPublisher(
+                session, args.namespace, name,
+                fetch_history_bytes=args.fetch_history))}
+            stats[name] = _TrackStats()
+            feeders.append(_feed_msfts(tracks[name], fh, packager, first,
+                                       args, stats[name], pub))
         elif ts is not None:
             fh, dmx, first, _, _ = ts
             if grid is not None:

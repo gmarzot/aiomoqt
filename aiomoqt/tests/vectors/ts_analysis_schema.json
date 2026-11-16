@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sub_media --analyze, mpeg2ts track: one interval or summary line",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "track", "t0", "t1", "ts_packets", "cc_errors", "cc_errors_total",
+               "cc_dups", "pcr", "delay_ms", "cushion_ms", "playout", "buffers", "objects",
+               "reconnects", "e2e_ms"],
+  "$defs": {
+    "ms": {"type": "number"},
+    "pct": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "patternProperties": {"^p[0-9]+$": {"type": ["number", "null"]}}
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["late", "breaks", "break_ms"],
+      "properties": {
+        "late": {"type": "integer", "minimum": 0},
+        "breaks": {"type": "integer", "minimum": 0},
+        "break_ms": {"$ref": "#/$defs/ms", "minimum": 0}
+      }
+    }
+  },
+  "properties": {
+    "type": {"enum": ["interval", "summary"]},
+    "track": {"type": "string"},
+    "t0": {"type": "number", "minimum": 0},
+    "t1": {"type": "number", "minimum": 0},
+    "ts_packets": {"type": "integer", "minimum": 0},
+    "cc_errors": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[0-9]+$"},
+      "additionalProperties": {"type": "integer", "minimum": 1}
+    },
+    "cc_errors_total": {"type": "integer", "minimum": 0},
+    "cc_dups": {"type": "integer", "minimum": 0},
+    "pcr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "count", "interval_ms", "jitter_ms", "discontinuities"],
+      "properties": {
+        "pid": {"type": ["integer", "null"], "minimum": 0, "maximum": 8191},
+        "count": {"type": "integer", "minimum": 0},
+        "interval_ms": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["mean", "max"],
+          "properties": {"mean": {"$ref": "#/$defs/ms"}, "max": {"$ref": "#/$defs/ms"}}
+        },
+        "jitter_ms": {"$ref": "#/$defs/ms", "minimum": 0},
+        "discontinuities": {"type": "integer", "minimum": 0}
+      }
+    },
+    "delay_ms": {
+      "allOf": [{"$ref": "#/$defs/pct"}],
+      "required": ["p0", "p50", "p99", "p999", "p100"]
+    },
+    "cushion_ms": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["p999", "p100"],
+      "properties": {
+        "p999": {"$ref": "#/$defs/ms", "minimum": 0},
+        "p100": {"$ref": "#/$defs/ms", "minimum": 0}
+      }
+    },
+    "playout": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["buffer_ms", "late_policy", "late", "breaks", "break_ms", "break_list",
+                       "depth_ms"],
+          "properties": {
+            "buffer_ms": {"type": "integer", "minimum": 1},
+            "late_policy": {"enum": ["drop", "emit"]},
+            "late": {"type": "integer", "minimum": 0},
+            "breaks": {"type": "integer", "minimum": 0},
+            "break_ms": {"$ref": "#/$defs/ms", "minimum": 0},
+            "break_list": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["start_ns", "duration_ms"],
+                "properties": {
+                  "start_ns": {"type": "integer"},
+                  "duration_ms": {"$ref": "#/$defs/ms", "minimum": 0}
+                }
+              }
+            },
+            "depth_ms": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": ["min", "mean", "max"],
+              "properties": {
+                "min": {"$ref": "#/$defs/ms"},
+                "mean": {"$ref": "#/$defs/ms"},
+                "max": {"$ref": "#/$defs/ms"}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "buffers": {
+      "type": "object",
+      "required": ["100", "200", "300", "500", "1000"],
+      "propertyNames": {"pattern": "^[0-9]+$"},
+      "additionalProperties": {"$ref": "#/$defs/counts"}
+    },
+    "objects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["received", "lost", "dups", "groups", "groups_missing"],
+      "properties": {
+        "received": {"type": "integer", "minimum": 0},
+        "lost": {"type": "integer", "minimum": 0},
+        "dups": {"type": "integer", "minimum": 0},
+        "groups": {"type": "integer", "minimum": 0},
+        "groups_missing": {"type": "integer", "minimum": 0}
+      }
+    },
+    "reconnects": {"type": "integer", "minimum": 0},
+    "e2e_ms": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "samples", "p50", "p99", "p100"],
+          "properties": {
+            "source": {"enum": ["loc-timestamp", "media-timeline"]},
+            "samples": {"type": "integer", "minimum": 1},
+            "p50": {"$ref": "#/$defs/ms"},
+            "p99": {"$ref": "#/$defs/ms"},
+            "p100": {"$ref": "#/$defs/ms"}
+          }
+        }
+      ]
+    }
+  }
+}
