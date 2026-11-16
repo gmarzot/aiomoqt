@@ -1015,6 +1015,17 @@ class SendLane:
         self._nowait = (getattr(writer, "send_nowait", None)
                         if self.write_through else None)
         self.task = asyncio.ensure_future(self._run())
+        self.task.add_done_callback(self._ended)
+
+    def _ended(self, task) -> None:
+        """The lane's task finished. A cancelled task keeps its
+        CancelledError, whose traceback holds _run's frame and so this
+        lane: taking it from the task frees both without a GC pass."""
+        if task.cancelled():
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
 
     @property
     def session(self):

@@ -3197,7 +3197,7 @@ async def main():
 def cli():
     """Console entry point (moq-adaptive-bench)."""
     try:
-        sys.exit(asyncio.run(main()))
+        sys.exit(_cli.run(main()))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
         sys.exit(130)

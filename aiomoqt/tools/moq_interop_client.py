@@ -43,7 +43,7 @@ from aiomoqt.types import (
     FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
-from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging, run
 
 try:
     from aiomoqt import __version__ as AIOMOQT_VERSION
@@ -3123,7 +3123,7 @@ def main():
         tests = STANDARD_TESTS
 
     try:
-        asyncio.run(
+        run(
             run_tests(tests, host, port, path, use_quic,
                       args.tls_disable_verify, args.debug,
                       supported_drafts=supported_drafts,

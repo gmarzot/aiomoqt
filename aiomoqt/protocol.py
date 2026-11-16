@@ -3383,6 +3383,14 @@ class _MOQTSessionMixin:
         self._published_tracks.clear()
         self._requests.clear()
         self._early_stream_ends.clear()
+        # Callbacks are mostly bound methods of tracks that hold this
+        # session: dropped here, a closed session is freed without a GC pass.
+        for name in ("_request_cancel_handlers", "_timing_watch",
+                     "_object_handlers", "_stream_end_handlers",
+                     "_fetch_object_handlers", "_pending_object_handlers"):
+            table = getattr(self, name, None)
+            if table:
+                table.clear()
         self._reset_early_objects()
 
         if not self._wt_session_setup.done():
@@ -7364,7 +7372,7 @@ class MOQTSessionQuic(_MOQTSessionMixin, _AioPQuicConnectionProtocol):
 class _WTSessionMixin:
     """Shared init for WT-base MOQTSession subclasses.
 
-    Sets self._quic = self so the mixin's transport-agnostic
+    self._quic is the session itself, so the mixin's transport-agnostic
     send-side calls (self._quic.send_stream_data etc.) land on
     WebTransportSession's matching API. Resolves
     self._wt_session_setup once the WT session is established
@@ -7374,8 +7382,13 @@ class _WTSessionMixin:
 
     _is_wt = True
 
+    # The session itself; an attribute holding self would make each
+    # session a reference cycle, freed only by a GC pass.
+    @property
+    def _quic(self):
+        return self
+
     def _moqt_wt_finalize(self) -> None:
-        self._quic = self
         self._note_peer_address()
         if not self._wt_session_setup.done():
             self._wt_session_setup.set_result(True)

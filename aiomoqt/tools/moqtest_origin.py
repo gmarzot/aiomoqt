@@ -39,7 +39,7 @@ from aiomoqt.types import (
 )
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
                                  server_cert_dirs)
-from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging, run
 from aiomoqt.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -437,7 +437,7 @@ async def main():
 
 def cli():
     try:
-        asyncio.run(main())
+        run(main())
     except KeyboardInterrupt:
         pass
 
