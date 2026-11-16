@@ -22,7 +22,7 @@ posix_only = pytest.mark.skipif(not hasattr(signal, "pthread_kill"),
 # Tools whose coroutine installs its own SIGINT handler.
 OWN_SIGINT = {"moq_interop_relay", "pub_media", "abr_ingest", "load_sim"}
 # Tools that take Ctrl-C through asyncio.run.
-ASYNCIO_RUN_SIGINT = {"pub_server", "loopback_bench"}
+ASYNCIO_RUN_SIGINT = {"loopback_bench"}
 
 
 @pytest.fixture(autouse=True)
