@@ -7382,8 +7382,8 @@ class _WTSessionMixin:
 
     _is_wt = True
 
-    # A property: an attribute holding self would make each session a
-    # reference cycle, freed only by a GC pass.
+    # The session itself; an attribute holding self would make each
+    # session a reference cycle, freed only by a GC pass.
     @property
     def _quic(self):
         return self
