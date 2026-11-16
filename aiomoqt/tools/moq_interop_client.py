@@ -420,10 +420,12 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
     )
 
 
-def _publish_reply(session, request_id: int, track=None) -> asyncio.Future:
+def _publish_reply(session, request_id: Optional[int],
+                   track=None) -> asyncio.Future:
     """The future the relay's reply to our PUBLISH resolves. Take it before
     the next await. A d14/d16 PUBLISH_OK goes to the track, not the
     session, so it resolves the future only through `track`."""
+    assert request_id is not None, "PUBLISH not sent"
     fut = session._pending_requests.get(request_id)
     if fut is None:
         fut = session._loop.create_future()
@@ -547,12 +549,11 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                     parameters=_PUB_NS_PARAMS,
                     wait_response=True,
                 )
-                ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
                 # d14/d16 send PUBLISH_NAMESPACE_DONE; d18 has no such
                 # message and withdraws by resetting the announce's
                 # request stream (§3.3.2).
                 withdrew = session.publish_namespace_done(
-                    namespace=ns_tuple,
+                    namespace=INTEROP_NAMESPACE,
                     request_id=response.request_id,
                 )
                 how = ("PUBLISH_NAMESPACE_DONE sent" if withdrew is not None
@@ -2456,8 +2457,7 @@ async def test_publish_namespace_done_track(host, port, path, use_quic,
                     await sub.drain(loop.time() + _DATA_DELIVERY_S)
                     step = "NAMESPACE_DONE"
                     pub.publish_namespace_done(
-                        namespace=pub._make_namespace_tuple(namespace),
-                        request_id=announced.request_id)
+                        namespace=namespace, request_id=announced.request_id)
                     await _until("NAMESPACE_DONE")
                     pub.close()
                 obs.close()
@@ -2533,7 +2533,8 @@ async def test_subscribe_cancel_live(host, port, path, use_quic,
         before.append(loc)
         if len(before) == _CANCEL_AFTER:
             cancel_at = loop.time()
-            live.unsubscribe()
+            if live is not None:
+                live.unsubscribe()
             cancelled.set()
 
     def result(passed, message, **kw):
