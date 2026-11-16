@@ -46,7 +46,7 @@ from aiomoqt.types import (
     parse_draft_spec,
 )
 from aiomoqt.utils.cli import (add_help, add_logging, apply_logging,
-                               endpoint_url)
+                               endpoint_url, run)
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -473,7 +473,7 @@ def _cli():
         args, default=logging.CRITICAL if args.url else logging.INFO)
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
-        rc = asyncio.run(_probe_single_url(
+        rc = run(_probe_single_url(
             args.url, args.timeout, debug=level <= logging.DEBUG,
             verify_tls=VERIFY_TLS))
         raise SystemExit(rc)
@@ -484,7 +484,7 @@ def _cli():
     OUTPUT_FILE = args.output_file
     PROBE_TIMEOUT = args.timeout
     PROBE_INTERVAL = args.interval
-    asyncio.run(run_loop())
+    run(run_loop())
 
 
 if __name__ == "__main__":

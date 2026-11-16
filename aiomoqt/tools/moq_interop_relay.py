@@ -104,6 +104,7 @@ from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
+import gc
 from functools import lru_cache
 import heapq
 import itertools
@@ -120,6 +121,7 @@ import signal
 import sys
 import time
 import tomllib
+from typing import Any
 import urllib.parse
 from collections import Counter
 from types import SimpleNamespace
@@ -1606,7 +1608,8 @@ class _RelayLane(SendLane):
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
-        self.d = d
+        # None once the lane has stopped (_ended).
+        self.d: Any = d
         self._catalog = track.key[1] in CATALOG_TRACKS
         _lanes.add(self)
         track._lanes.add(self)
@@ -1718,6 +1721,14 @@ class _RelayLane(SendLane):
                     f"held")
         return (f"{self._behind:.2f} s behind (deadline "
                 f"{self._deadline:.1f} s), {self._held} bytes held")
+
+    def _ended(self, task) -> None:
+        super()._ended(task)
+        if self.stopped:
+            # Its delivery and downstream point back at it: once it has
+            # stopped, those links only keep the session alive for a GC pass.
+            writer = self.writer
+            writer.lane = writer.d = self.d = None
 
     def _exit(self) -> None:
         _lanes.discard(self)
@@ -6746,6 +6757,17 @@ class _Tee(logging.Handler):
         pass
 
 
+def _freeze_startup_heap() -> None:
+    """Move what startup built (modules, functions, types, the listeners)
+    out of the cyclic GC's reach: later full passes walk only what the
+    relay creates while serving. Frozen objects are still freed by
+    reference counting."""
+    gc.collect()
+    gc.freeze()
+    logger.info(f"relay: froze {gc.get_freeze_count()} startup objects "
+                f"out of GC passes")
+
+
 def _stop_log_listener() -> None:
     """Write what relay.log's queue holds and end its thread."""
     global _log_listener
@@ -7124,6 +7146,7 @@ async def main():
         print(f"  upstream origin: {url}")
 
     _background.add(asyncio.create_task(_watch_lanes()))
+    _freeze_startup_heap()
 
     watchdog = None
     if args.watchdog > 0:

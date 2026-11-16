@@ -491,8 +491,9 @@ async def run_subscriber(args, stats, tracks):
         print(f"  Subscriber error: {e}")
 
 
-async def main():
-    args = parse_args()
+async def main(args=None):
+    if args is None:
+        args = parse_args()
     if _emulated(args) and not os.environ.get(NETNS_ENV):
         return _reexec_in_netns(args)
     _cli.apply_logging(args)
@@ -589,7 +590,11 @@ async def main():
 def cli():
     """Console entry point (moq-loopback-bench)."""
     try:
-        sys.exit(asyncio.run(main()))
+        args = parse_args()
+        if _emulated(args) and not os.environ.get(NETNS_ENV):
+            # Before any event loop, so the child's exit code is ours.
+            sys.exit(_reexec_in_netns(args))
+        sys.exit(_cli.run(main(args)))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
         sys.exit(130)
