@@ -745,7 +745,7 @@ class _Ingest:
             self.ladder.close()
 
     def report(self, final: bool = False) -> None:
-        engine = {}
+        engine: Dict[int, List[int]] = {}
         if self.ladder is not None:
             engine = {i: self.ladder.engine_delays(i)
                       for i in range(len(self.branches))}
@@ -761,7 +761,8 @@ class _Ingest:
                 if q is not None:
                     line += (f"  arrival to hand-off p50 {q[0]:6.2f} "
                              f"p99 {q[1]:6.2f} max {q[2]:7.2f} ms")
-                e = quantiles_ms(engine.get(branch.get(name), ()))
+                b = branch.get(name)
+                e = quantiles_ms(engine.get(b, ()) if b is not None else ())
                 if e is not None:
                     line += f"  (encoder p50 {e[0]:.2f} p99 {e[1]:.2f})"
                 lines.append(line)
