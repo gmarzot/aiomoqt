@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay frees a closed session by reference counting instead of leaving it to the cyclic GC: a send lane drops its task's CancelledError and its links to its delivery and downstream once it stops, a closed session clears its per-request and per-track callback tables, and a WebTransport session's `_quic` is a property instead of a reference to itself. At startup the relay freezes what it has built (`gc.freeze()`), so full GC passes walk only what it creates while serving. Locally, 800 churned sessions under load left 0.4k objects for the GC instead of 45.7k, and a full pass over the startup heap went from 25 ms to 3.4 ms.
 - aiomoqt-relay refuses a FETCH that reaches past a paused track's cached objects when the publisher cannot serve it, passing on the publisher's refusal; it sent FETCH_OK with the End at the last object received before the pause, so the objects after it read as non-existent. A range the cache holds through its End is still served from it.
 - aiomoqt-relay `--idle-timeout SEC` (relay.toml `idle-timeout`) sets the QUIC idle timeout it offers on every listener; `MOQTServer(idle_timeout=)` takes the same. Unset, aiopquic's 30 s default stands. A connection uses the lower of both ends' timeouts.
 - aiomoqt-relay no longer offers a d18 or later SUBSCRIBE_TRACKS subscriber the tracks its own session publishes (d22 §3.6): a publisher subscribed to its own prefix got them back, and with no other subscriber its PUBLISH_OK waited until it answered them. d14 and d16 still echo them, as their §6.1 requires.
