@@ -86,6 +86,9 @@ SIGUSR1.
   at its next await, so keep each object's write whole. A generator track (no `produce()`)
   resets its open streams on `end()` and sends no End of Track.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
+- Ctrl-C under `asyncio.run` cancels the main task wherever the interpreter is, so a callback
+  can fail mid-way (an `Event.set()` raising `InvalidStateError`). `aiomoqt.utils.cli.run(main)`
+  takes its place and cancels from the event loop instead.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
   least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; authorization only with `--auth-key` (SETUP and, from d16, each request), no rate limiting; a per-stream TX budget

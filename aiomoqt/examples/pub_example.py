@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import asyncio
 import logging
 import uuid
 from typing import Any
@@ -9,7 +8,7 @@ from aiomoqt.types import MOQT_DEFAULT_DRAFTS, ForwardingPreference, parse_draft
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import class_name, get_logger, set_log_level, wait_cond_timeout
-from aiomoqt.utils.cli import add_help
+from aiomoqt.utils.cli import add_help, run
 from aiomoqt.utils.url import parse_relay_url
 
 GROUP_SIZE = 30
@@ -154,7 +153,7 @@ if __name__ == "__main__":
 
     try:
         args = parse_args()
-        asyncio.run(main(
+        run(main(
             host=args.host,
             port=args.port,
             path=args.path,

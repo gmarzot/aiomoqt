@@ -49,14 +49,19 @@ fetch history     --fetch-history (long only)
 compat            --compat
 payload check     --verify-payload [N] (long only)
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
+entry point       run(main) in place of asyncio.run: Ctrl-C reaches the
+                  main task through the event loop, between callbacks
 
 split execution (tools that can run one end or both)
   --role both|pub|sub    which end(s) this process runs
   --mp                   spread this role across processes
 """
 import argparse
+import asyncio
 import logging
 import os
+import signal
+import threading
 
 from aiomoqt.cat import DEFAULT_TOKEN_TYPE, CatAuth
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
@@ -124,6 +129,48 @@ def add_help(p):
     add_help=False (make_parser does) so argparse adds no -h of its own."""
     p.add_argument('-h', '-?', '--help', action='help',
                    help='Show this help message and exit')
+
+
+def run(main, *, debug=None):
+    """asyncio.run(main), with Ctrl-C delivered through the event loop.
+
+    asyncio.run cancels the main task from a signal handler, which can run
+    mid-callback (an Event.set() then raises InvalidStateError). Here the
+    first Ctrl-C cancels between callbacks and restores the default
+    handler, so a second one interrupts at once. KeyboardInterrupt follows
+    asyncio.run's rule: raised only if the cancel propagates out of main.
+    Falls back to asyncio.run off the main thread, under a non-default
+    SIGINT handler, or where the loop cannot handle signals."""
+    if (asyncio._get_running_loop() is not None
+            or threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGINT) is not signal.default_int_handler):
+        return asyncio.run(main, debug=debug)
+    with asyncio.Runner(debug=debug) as runner:
+        loop = runner.get_loop()
+        task = None
+        interrupted = False
+
+        def on_sigint():
+            nonlocal interrupted
+            loop.remove_signal_handler(signal.SIGINT)
+            if task is None or task.done():
+                raise KeyboardInterrupt()
+            interrupted = True
+            task.cancel()
+
+        try:
+            loop.add_signal_handler(signal.SIGINT, on_sigint)
+        except (NotImplementedError, RuntimeError, ValueError):
+            return runner.run(main)
+        try:
+            task = loop.create_task(main)
+            return loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            if interrupted and task.uncancel() == 0:
+                raise KeyboardInterrupt()
+            raise
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
 
 
 # -- addressing ------------------------------------------------------
