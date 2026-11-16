@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import asyncio
 import argparse
 import logging
 import time
@@ -8,7 +7,7 @@ import time
 from aiomoqt.types import (MOQT_DEFAULT_DRAFTS, MOQTException, MOQTRequestError,
                            parse_draft_spec)
 from aiomoqt.client import MOQTClient
-from aiomoqt.utils.cli import add_help
+from aiomoqt.utils.cli import add_help, run
 from aiomoqt.utils.url import parse_relay_url
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.utils.stats import send_time_us
@@ -208,7 +207,7 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
 if __name__ == "__main__":
     try:
         args = parse_args()
-        asyncio.run(main(
+        run(main(
             host=args.host,
             port=args.port,
             path=args.path,
