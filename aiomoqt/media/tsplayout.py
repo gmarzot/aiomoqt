@@ -21,6 +21,8 @@ import collections
 import json
 from typing import IO, Any, Deque, Dict, List, Optional, Tuple
 
+from .msfts import Psi
+
 TS_PACKET = 188
 BUFFERS_MS = (100, 200, 300, 500, 1000)
 BREAK_MS = 200
@@ -145,6 +147,7 @@ class _Window:
         self.groups_missing = 0
         self.base = {ms: (0, 0, 0) for ms in buffers}
         self.dups0 = 0
+        self.switches0 = 0
         self.breaks: List[Tuple[int, int]] = []
 
 
@@ -154,8 +157,11 @@ class TsPlayout:
     with `buffer_ms` and `release`, due() / pop() give the packets to
     release.
 
-    `pcr_pid` None takes the first PID seen carrying a PCR. `late` is
-    'drop' or 'emit'. `arrival_log` gets a JSON line per PCR: the PCR,
+    `pcr_pid` (the catalog's mpeg2tsPcrPid) holds until the stream's PMT
+    names one, which takes precedence (msfts-02 §6); None takes the
+    first PID seen carrying a PCR. A PCR PID change is a discontinuity.
+    `late` is 'drop' or 'emit'. switch() moves on to the next track of
+    the stream (`switches`). `arrival_log` gets a JSON line per PCR: the PCR,
     its arrival and its release time, wall-clock ns. Without an object's
     wall clock, `wall_offset_ns` from monotonic stands in."""
 
@@ -181,6 +187,9 @@ class TsPlayout:
         self.queue: Deque[Tuple[int, bytes]] = collections.deque()
         self.dropped = 0
         self.reconnects = 0
+        self.switches = 0
+        self._psi = Psi()
+        self._repcr = False
         self.dups = 0
         self.e2e_source: Optional[str] = None
         self._cc: Dict[int, int] = {}
@@ -231,6 +240,18 @@ class TsPlayout:
             self._release(p, a, t)
         self._held = []
         self._release(payload, avail, taus)
+
+    def switch(self) -> None:
+        """The stream goes on in the next track: its groups start over,
+        and the packets the publisher dropped before its first random
+        access point are no CC error."""
+        self.switches += 1
+        self._loc = None
+        self._cc = {}
+        self._psi = Psi()
+        self._hold = self._lost = True
+        self._groups.clear()
+        self._timeline.clear()
 
     def timeline(self, records) -> None:
         """MSF media timeline records [media ms, [group, object], wall
@@ -292,6 +313,12 @@ class TsPlayout:
             b3 = payload[i + 3]
             af = b3 & 0x20 and payload[i + 4]
             disc = af and payload[i + 5] & 0x80
+            if (pid == 0 or pid == self._psi.pmt_pid) and self._psi.feed(
+                    payload, i, pid, b1 & 0x40):
+                pcr_pid = self._psi.pcr_pid
+                if pcr_pid is not None and pcr_pid != self.pcr_pid:
+                    self._repcr = self._last is not None
+                    self.pcr_pid = pcr_pid
             if b3 & 0x10 and pid != _NULL_PID:
                 cc = b3 & 0x0F
                 last = cc_map.get(pid)
@@ -358,7 +385,8 @@ class TsPlayout:
         if adj < prev - _WRAP // 2:
             self._offset += _WRAP
             adj += _WRAP
-        if (disc or adj < prev
+        repcr, self._repcr = self._repcr, False
+        if (disc or repcr or adj < prev
                 or _ns(adj - prev) > avail - prev_avail + _JUMP_NS):
             w.discontinuities += 1
             expect = prev + int((idx - at) * (self._rate or 0))
@@ -472,6 +500,7 @@ class TsPlayout:
         if self.model is not None:
             nxt.base[None] = self._counts(None)
         nxt.dups0 = self.dups
+        nxt.switches0 = self.switches
         self._win = nxt
         return out
 
@@ -528,6 +557,7 @@ class TsPlayout:
             "objects": {"received": w.objects, "lost": w.lost,
                         "dups": self.dups - w.dups0, "groups": w.groups,
                         "groups_missing": w.groups_missing},
+            "switches": self.switches - w.switches0,
             "reconnects": self.reconnects,
             "e2e_ms": None if e2e is None else {
                 "source": self.e2e_source, "samples": w.e2e.n, **e2e},

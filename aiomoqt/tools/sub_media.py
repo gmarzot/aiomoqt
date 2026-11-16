@@ -74,7 +74,7 @@ from aiomoqt.media.catalog import (
     PACKAGING_MEDIA_TIMELINE, PACKAGING_MPEG2TS,
 )
 from aiomoqt.media.cmaf import init_timescale
-from aiomoqt.media import tsplayout
+from aiomoqt.media import msfts, tsplayout
 from aiomoqt.media.loc import LOC_PROP_TIMESCALE
 from aiomoqt.media.msfts import MODE_ES_PACKETS, TS_PACKET
 from aiomoqt.media.udp import UdpOutput, is_udp_url, parse_udp_url
@@ -120,8 +120,9 @@ def parse_args():
                              'track to udp://HOST:PORT (seven packets a '
                              'datagram), a file, or - for stdout, in Group '
                              'and Object order as objects arrive. Subscribes '
-                             'that track only; -T picks one of several. LOC '
-                             'tracks are refused.')
+                             'that track only, and the one a catalog '
+                             'replaces it with; -T picks one of several. '
+                             'LOC tracks are refused.')
     ts_group = parser.add_argument_group('MPEG-TS (mpeg2ts tracks)')
     ts_group.add_argument(
         '--ts-playout', type=int, default=None, metavar='MS',
@@ -405,7 +406,8 @@ class _TsLane:
     """The one mpeg2ts track a TS run subscribes: its packets to
     --ts-out as objects arrive or, with --ts-playout, at their PCR
     times; with --analyze, --ts-playout or --arrival-log, a TsPlayout
-    model of it."""
+    model of it. When the catalog replaces the track (msfts-02 §6), the
+    lane goes on in the next one once the old one ends (`switches`)."""
 
     def __init__(self, args):
         self.args = args
@@ -419,6 +421,11 @@ class _TsLane:
         self._log = None
         self._wake = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self.switches = 0
+        self.stale = 0
+        self._next = None
+        self._parked: list = []
+        self._park_timer = None
 
     def start(self, entry, track) -> None:
         args = self.args
@@ -437,7 +444,52 @@ class _TsLane:
         if self.player is not None and self.player.release:
             self._task = asyncio.ensure_future(self._play())
 
+    def follow(self, entry, track) -> None:
+        """Go on in `track` (catalog entry `entry`) once the current
+        track ends, or HOLD_S after its first frame."""
+        self._next = (entry, track)
+        old = self.track
+        if old is None or getattr(old, 'ended', True):
+            self._switch()
+        else:
+            old.on_end = self._switch
+
+    def _switch(self) -> None:
+        if self._next is None:
+            return
+        entry, track = self._next
+        self._next = None
+        if self._park_timer is not None:
+            self._park_timer.cancel()
+            self._park_timer = None
+        old = self.track
+        if old is not None:
+            old.on_end = None
+            old.flush()
+        self.name, self.track = entry.name, track
+        self.switches += 1
+        if self.player is not None:
+            self.player.switch()
+        _status(f"  switched to {entry.name}")
+        parked, self._parked = self._parked, []
+        for frame, group_id, object_id in parked:
+            self.on_frame(entry.name, frame, group_id, object_id)
+
+    def timeline(self, name, records) -> None:
+        if name == self.name and self.player is not None:
+            self.player.timeline(records)
+
     def on_frame(self, name, frame, group_id, object_id) -> None:
+        if name != self.name:
+            nxt = self._next
+            if nxt is not None and name == nxt[0].name:
+                self._parked.append((frame, group_id, object_id))
+                if self._park_timer is None:
+                    self._park_timer = asyncio.get_running_loop().call_later(
+                        msfts.HOLD_S, self._switch)
+            else:
+                self.stale += 1
+            return
         payload = frame.payload
         self.objects += 1
         self.bytes += len(payload)
@@ -492,13 +544,14 @@ class _TsLane:
             self._log.close()
 
 
-async def _follow_timeline(session, namespace, catalog, lane) -> None:
-    """Feed lane the MSF media timeline of its track, if the catalog has
-    one (moq2ts publishes <name>.timeline): the publisher's wall clock
-    per group."""
+async def _follow_timeline(session, namespace, catalog, lane,
+                           name: str) -> None:
+    """Feed lane the MSF media timeline of track `name`, if the catalog
+    has one (<name>.timeline, from pub_media or moq2ts): the publisher's
+    wall clock per group."""
     entry = next((t for t in catalog.tracks
                   if t.packaging == PACKAGING_MEDIA_TIMELINE
-                  and lane.name in (t.depends or ())), None)
+                  and name in (t.depends or ())), None)
     if entry is None or lane.player is None:
         return
 
@@ -510,7 +563,7 @@ async def _follow_timeline(session, namespace, catalog, lane) -> None:
         except ValueError:
             return
         if isinstance(records, list):
-            lane.player.timeline(records)
+            lane.timeline(name, records)
     track = SubscribedTrack(session, entry.namespace or namespace,
                             entry.name, on_object=on_object)
     try:
@@ -809,12 +862,37 @@ async def run(args):
             if analysis is not None and not ts_mode:
                 analysis.on_arrival(*a)
 
+        following = set()
+
+        async def _switch_to(entry):
+            if sub is None:
+                return
+            try:
+                track = await sub.subscribe_track(entry)
+            except Exception as e:
+                _status(f"  error: {entry.name}: {e}")
+                return
+            if track is not None:
+                lane.follow(entry, track)
+                await _follow_timeline(session, args.namespace, sub.catalog,
+                                       lane, entry.name)
+
+        def _on_catalog(catalog):
+            if args.show_catalog:
+                _status(catalog.to_json(indent=2))
+            if not ts_mode or lane.track is None or sub is None:
+                return
+            entry = _ts_out_track(args, catalog)[0]
+            if (entry is not None and entry.name != lane.name
+                    and entry.name not in following):
+                following.add(entry.name)
+                asyncio.ensure_future(_switch_to(entry))
+
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
             track_filter=_select,
             timestamp_errors=_timestamp_policy(args),
-            on_catalog=((lambda c: _status(c.to_json(indent=2)))
-                        if args.show_catalog else None))
+            on_catalog=_on_catalog)
         writers = (None if args.analyze or ts_mode
                    else _Writers(args.out, sub, pipe_role=args.pipe,
                                  wanted=functools.partial(_wanted, args)))
@@ -856,7 +934,8 @@ async def run(args):
         if ts_mode:
             entry = _ts_out_track(args, catalog)[0]
             lane.start(entry, sub.tracks[entry.name])
-            await _follow_timeline(session, args.namespace, catalog, lane)
+            await _follow_timeline(session, args.namespace, catalog, lane,
+                                   entry.name)
         if args.pipe == 'audio':
             a = catalog.find('audio')
             if a and (a.codec or '').startswith('mp4a'):
@@ -939,6 +1018,8 @@ def _ts_status(args, lane: _TsLane) -> int:
     if track is not None:
         line += (f", {track.objects_rejected} rejected, "
                  f"{track.order.late} late, {track.order.skipped} skipped")
+    if lane.switches:
+        line += f", {lane.switches} track switches"
     p = lane.player
     if p is not None and p.model is not None:
         line += (f"; playout {p.buffer_ms} ms: {p.model.late} late, "

@@ -294,3 +294,42 @@ def test_wall_clock_is_read_per_object():
     assert recs[-1]['arrival_ns'] == wall + _on_time(8) * MS + 20 * MS
     assert recs[-1]['release_ns'] - recs[-1]['arrival_ns'] == (
         6 * MS + 100 * MS + 60 * MS - _on_time(8) * MS)
+
+
+
+def test_the_pmt_names_the_pcr_pid():
+    from aiomoqt.tests.test_msfts import pat, pmt
+    other = 0x200
+    head = pat() + pmt(((0x02, other),), pcr_pid=other)
+    pkts = []
+    for j in range(200):
+        pcr = j * 27_000 if j % 10 == 0 else None
+        pkts.append(ts(other, b'\x11' * (176 if pcr is not None else 184),
+                       cc=j & 15, pcr=pcr))
+        pkts.append(ts(PID, b'', cc=0, pcr=10 ** 12))   # a decoy PCR
+    p = TsPlayout(100, pcr_pid=PID)          # the catalog said PID
+    p.push(head, BASE, 0, 0)
+    for k, o in enumerate(objects(pkts, 14), 1):
+        p.push(o, BASE + int(_on_time(k) * MS), 0, k)
+    s = p.summary()
+    assert s['pcr']['pid'] == other and s['pcr']['count'] == 20
+    assert s['pcr']['interval_ms'] == {'mean': 10.0, 'max': 10.0}
+
+
+def test_a_switch_starts_the_next_track_clean():
+    p = TsPlayout(300)
+    a = objects(cbr(700))
+    for k, o in enumerate(a):
+        p.push(o, BASE + _on_time(k) * MS, 3, k)
+    # The next track: groups from 0, its counters restarted mid-span.
+    b = objects(cbr(700, start=700 * 27_000))
+    p.switch()
+    for k, o in enumerate(b[20:]):
+        p.push(o, BASE + (_on_time(len(a)) + 140 + 7 * k) * MS, 0, k)
+    s = p.summary()
+    assert s['switches'] == 1
+    assert s['cc_errors_total'] == 0
+    assert s['objects']['lost'] == 0 and s['objects']['groups_missing'] == 0
+    assert s['objects']['groups'] == 2
+    assert s['playout']['late'] == 0
+    assert s['pcr']['discontinuities'] == 0

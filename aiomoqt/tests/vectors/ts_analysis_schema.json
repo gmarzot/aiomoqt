@@ -5,7 +5,7 @@
   "additionalProperties": false,
   "required": ["type", "track", "t0", "t1", "ts_packets", "cc_errors", "cc_errors_total",
                "cc_dups", "pcr", "delay_ms", "cushion_ms", "playout", "buffers", "objects",
-               "reconnects", "e2e_ms"],
+               "switches", "reconnects", "e2e_ms"],
   "$defs": {
     "ms": {"type": "number"},
     "pct": {
@@ -125,6 +125,7 @@
         "groups_missing": {"type": "integer", "minimum": 0}
       }
     },
+    "switches": {"type": "integer", "minimum": 0},
     "reconnects": {"type": "integer", "minimum": 0},
     "e2e_ms": {
       "oneOf": [

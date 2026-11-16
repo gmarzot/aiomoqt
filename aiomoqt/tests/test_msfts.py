@@ -766,3 +766,117 @@ async def test_two_mpeg2ts_tracks_on_one_session(use_quic):
         assert [(g, o) for g, o, _ in rx] == sorted((g, o) for g, o, _ in rx)
         assert b''.join(p for _, _, p in rx) == data[starts[0] * P:], name
         assert sum(1 for _, o, _ in rx if o == 0) == 4
+
+
+# -- PSI changes: a new track for a changed track field (§6) --------------
+
+def changing_stream(segments, frames=6, mid=3):
+    """GOPs whose PSI follows `segments`, a list of (gops, programs,
+    video PID): each segment's PAT and PMT open its GOPs, and the next
+    segment's arrive mid-GOP, `mid` frames into the last GOP before it.
+    Returns (bytes, [(first GOP start, change)], ...) per segment: the
+    packet index of its first GOP's SDT, and of the changed PAT that
+    ends it (None for the last)."""
+    m = Mux()
+    pts = 90_000
+    marks = []
+
+    def psi(programs, vpid):
+        for n, pmt_pid in ((0, None),) + tuple(programs):
+            if pmt_pid is None:
+                m.raw(pat(programs, m.cc.get(0, 0)))
+                m.cc[0] = (m.cc.get(0, 0) + 1) & 0xF
+            else:
+                m.raw(pmt(((0x02, vpid), (0x03, AUDIO_PID)), pcr_pid=vpid,
+                          cc=m.cc.get(pmt_pid, 0), pid=pmt_pid, program=n))
+                m.cc[pmt_pid] = (m.cc.get(pmt_pid, 0) + 1) & 0xF
+
+    for k, (gops, programs, vpid) in enumerate(segments):
+        start = len(m.out)
+        change = None
+        for g in range(gops):
+            m.raw(sdt(m.cc.get(SDT_PID, 0)))
+            m.cc[SDT_PID] = (m.cc.get(SDT_PID, 0) + 1) & 0xF
+            psi(programs, vpid)
+            m.raw(null())
+            for f in range(frames):
+                if (g == gops - 1 and f == mid
+                        and k + 1 < len(segments)):
+                    change = len(m.out)
+                    psi(segments[k + 1][1], segments[k + 1][2])
+                es = (MPEG2_I if f == 0 else MPEG2_P) + bytes(
+                    [k, g, f]) * 300
+                m.pes(vpid, es, pts, rai=f == 0,
+                      pcr=pts * 300 if f == 0 else None)
+                m.pes(AUDIO_PID, b'\xff\xfd' + bytes([f]) * 300, pts,
+                      stream_id=0xC0)
+                m.raw(null())
+                pts += 3600
+        marks.append((start, change))
+    return m.data(), marks
+
+
+ONE = ((1, PMT_PID),)
+TWO = ((1, PMT_PID), (2, PMT_PID + 1))
+
+
+@pytest.mark.parametrize('segments,modes,programs', [
+    ([(3, ONE, VIDEO_PID), (3, ((2, PMT_PID),), VIDEO_PID)],
+     ['unmodified-program'] * 2, [1, 2]),
+    ([(3, ONE, VIDEO_PID), (3, TWO, VIDEO_PID), (3, ONE, VIDEO_PID)],
+     ['unmodified-program', 'unmodified-multiplex', 'unmodified-program'],
+     [1, None, 1]),
+], ids=['program-number', 'pat-gains-and-loses-a-program'])
+def test_a_changed_track_field_starts_the_next_track(segments, modes,
+                                                     programs):
+    data, marks = changing_stream(segments)
+    p = TsPackager(7)
+    objs, entries = [], {}
+    for i in range(0, len(data), 1316):
+        for o in p.feed(data[i:i + 1316], i):
+            objs.append(o)
+            if o.track not in entries:
+                entries[o.track] = p.catalog_track(f't{o.track}').to_dict()
+    objs += p.close()
+    assert sorted(entries) == list(range(1, len(segments) + 1))
+    for gen, (mode, prog) in enumerate(zip(modes, programs), 1):
+        assert entries[gen]['mpeg2tsMode'] == mode
+        assert entries[gen].get('mpeg2tsProgramNumber') == prog
+        mine = [o for o in objs if o.track == gen]
+        # Its groups from 0; its first object a group start.
+        assert mine[0].key and mine[0].group == 0
+        assert [o.group for o in mine if o.key] == list(range(segments[gen - 1][0]))
+        start, change = marks[gen - 1]
+        end = len(data) if change is None else change * P
+        # The old track ends before the changed PAT; the packets from it
+        # to the next GOP are dropped; the next track starts at that GOP.
+        assert b''.join(o.payload for o in mine) == data[start * P:end]
+
+
+def test_an_es_pid_change_keeps_the_track():
+    data, marks = changing_stream([(3, ONE, VIDEO_PID),
+                                   (3, ONE, VIDEO_PID + 0x10)])
+    p, objs = pack(data)
+    assert {o.track for o in objs} == {1}
+    assert p.psi_changed
+    assert p.rap_pid == p.pcr_pid == VIDEO_PID + 0x10
+    # Every packet goes on, the change's included.
+    assert b''.join(o.payload for o in objs) == data
+    assert sum(o.key for o in objs) == 6
+    assert p.catalog_track('t').to_dict()['mpeg2tsPcrPid'] == VIDEO_PID + 0x10
+
+
+def test_a_new_program_in_a_multiplex_keeps_the_track():
+    three = TWO + ((3, PMT_PID + 2),)
+    data, _ = changing_stream([(3, TWO, VIDEO_PID), (3, three, VIDEO_PID)])
+    _, objs = pack(data)
+    assert {o.track for o in objs} == {1}
+    assert b''.join(o.payload for o in objs) == data
+
+
+def test_key_objects_carry_their_pts():
+    data, _ = gop_stream(3, lead=False)
+    _, objs = pack(data)
+    assert [o.pts for o in objs if o.key] == [90_000, 90_000 + 6 * 3600,
+                                              90_000 + 12 * 3600]
+    assert all(o.pts is None for o in objs if not o.key)
