@@ -20,14 +20,22 @@ posix_only = pytest.mark.skipif(not hasattr(signal, "pthread_kill"),
                                 reason="needs POSIX signals")
 
 # Tools whose coroutine installs its own SIGINT handler.
-OWN_SIGINT = {"moq_interop_relay", "pub_media", "abr_ingest", "load_sim"}
+OWN_SIGINT = {"moq_interop_relay", "abr_ingest", "load_sim"}
 
 
 @pytest.fixture(autouse=True)
 def default_sigint():
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    term = signal.getsignal(signal.SIGTERM)
     yield
     signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, term)
+
+
+@pytest.fixture
+def sigterm_as_sigint():
+    """SIGTERM mapped as pub_media maps it, so a miss raises, not kills."""
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
 
 
 @posix_only
@@ -110,6 +118,83 @@ def test_off_main_thread_is_asyncio_run():
     t.start()
     t.join()
     assert out == [3]
+
+
+@posix_only
+def test_sigterm_runs_between_callbacks(sigterm_as_sigint):
+    async def main():
+        signal.raise_signal(signal.SIGTERM)
+        pending = asyncio.current_task().cancelling()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return pending
+    assert cli.run(main(), sigterm=True) == 0
+
+
+@posix_only
+def test_sigterm_raises_after_cleanup(sigterm_as_sigint):
+    cleaned = []
+
+    async def main():
+        asyncio.get_running_loop().call_later(
+            0.05, signal.raise_signal, signal.SIGTERM)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cleaned.append(True)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run(main(), sigterm=True)
+    assert cleaned == [True]
+    assert signal.getsignal(signal.SIGTERM) is signal.default_int_handler
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+@posix_only
+@pytest.mark.parametrize("prev", [signal.SIG_DFL, signal.default_int_handler],
+                         ids=["SIG_DFL", "default_int_handler"])
+def test_sigterm_handler_restored(prev):
+    signal.signal(signal.SIGTERM, prev)
+
+    async def main():
+        return signal.getsignal(signal.SIGTERM)
+    assert cli.run(main(), sigterm=True) not in (prev, None)
+    assert signal.getsignal(signal.SIGTERM) is prev
+
+
+@posix_only
+def test_second_sigterm_interrupts_a_wedged_loop(sigterm_as_sigint):
+    async def main():
+        asyncio.get_running_loop().call_later(
+            0.05, signal.raise_signal, signal.SIGTERM)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            threading.Timer(0.05, os.kill,
+                            (os.getpid(), signal.SIGTERM)).start()
+            time.sleep(10)
+    t0 = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        cli.run(main(), sigterm=True)
+    assert time.monotonic() - t0 < 5
+
+
+@posix_only
+@pytest.mark.parametrize("sigterm", [False, True], ids=["off", "own handler"])
+def test_sigterm_left_alone(sigterm):
+    def mine(*_):
+        pass
+    signal.signal(signal.SIGTERM, mine if sigterm else signal.SIG_DFL)
+    prev = signal.getsignal(signal.SIGTERM)
+
+    async def main():
+        return (signal.getsignal(signal.SIGTERM),
+                signal.getsignal(signal.SIGINT))
+    term, sigint = cli.run(main(), sigterm=sigterm)
+    assert term is prev
+    assert sigint is not signal.default_int_handler
+    assert signal.getsignal(signal.SIGTERM) is prev
 
 
 # Callbacks keep setting an Event the main task waits on, while a helper
