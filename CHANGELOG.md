@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- moq_interop_client runs the interop runner cases xquic runs, under the same names: `fetch` and `join` join the standard set, and `fetch` now needs exactly the fetched group's objects; new `fetch-descending`, `fetch-error-recovery`, `subscribe-cancel-live`, `publish-namespace-done-track` and `publish-namespace-multi-publisher-retention`; and ten more moq-test-* tuples, among them `moq-test-object-fragmentation` (one object in four 24-byte writes) and `moq-test-object-large-id` (IDs above 2^40).
 - aiomoqt-relay refuses a FETCH that reaches past a paused track's cached objects when the publisher cannot serve it, passing on the publisher's refusal; it sent FETCH_OK with the End at the last object received before the pause, so the objects after it read as non-existent. A range the cache holds through its End is still served from it.
 - aiomoqt-relay `--idle-timeout SEC` (relay.toml `idle-timeout`) sets the QUIC idle timeout it offers on every listener; `MOQTServer(idle_timeout=)` takes the same. Unset, aiopquic's 30 s default stands. A connection uses the lower of both ends' timeouts.
 - aiomoqt-relay no longer offers a d18 or later SUBSCRIBE_TRACKS subscriber the tracks its own session publishes (d22 §3.6): a publisher subscribed to its own prefix got them back, and with no other subscriber its PUBLISH_OK waited until it answered them. d14 and d16 still echo them, as their §6.1 requires.
