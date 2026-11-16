@@ -21,8 +21,6 @@ posix_only = pytest.mark.skipif(not hasattr(signal, "pthread_kill"),
 
 # Tools whose coroutine installs its own SIGINT handler.
 OWN_SIGINT = {"moq_interop_relay", "pub_media", "abr_ingest", "load_sim"}
-# Tools that take Ctrl-C through asyncio.run.
-ASYNCIO_RUN_SIGINT = {"loopback_bench"}
 
 
 @pytest.fixture(autouse=True)
@@ -199,5 +197,5 @@ def test_entry_points_use_cli_run(tool):
         src = path.read_text()
         assert ("add_signal_handler" in src
                 or "signal.signal(signal.SIGINT" in src), tool
-    elif tool not in ASYNCIO_RUN_SIGINT:
+    else:
         assert not lines, f"{tool}: asyncio.run at line(s) {lines}; use cli.run"

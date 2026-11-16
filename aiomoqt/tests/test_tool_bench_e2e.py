@@ -276,6 +276,28 @@ def test_loopback_bench_rtt_ms_child_takes_ctrl_c(monkeypatch):
     assert signal.getsignal(signal.SIGINT) is before
 
 
+def test_loopback_bench_rtt_ms_exits_with_the_childs_code(monkeypatch):
+    import signal
+    import subprocess
+    import sys
+    from aiomoqt.tools import loopback_bench
+    real_run = subprocess.run
+    # The child gets Ctrl-C with its parent, as from a terminal, and exits 7.
+    child = ("import os, signal, time; os.kill(os.getppid(), signal.SIGINT);"
+             " time.sleep(0.3); raise SystemExit(7)")
+    monkeypatch.setattr(loopback_bench, "_succeeds", lambda argv: True)
+    monkeypatch.setattr(loopback_bench.shutil, "which", lambda t: "/bin/" + t)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(loopback_bench.subprocess, "run",
+                        lambda argv: real_run([sys.executable, "-c", child]))
+    monkeypatch.setattr(sys, "argv", ["loopback_bench", "--rtt-ms", "50"])
+    monkeypatch.delenv(loopback_bench.NETNS_ENV, raising=False)
+    with pytest.raises(SystemExit) as e:
+        loopback_bench.cli()
+    assert e.value.code == 7
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
 @requires_certs
 def test_loopback_bench_rtt_ms_stops_on_ctrl_c(tmp_path):
     import os
@@ -296,6 +318,8 @@ def test_loopback_bench_rtt_ms_stops_on_ctrl_c(tmp_path):
         time.sleep(1)
         os.killpg(proc.pid, signal.SIGINT)  # as a terminal's Ctrl-C does
         assert proc.wait(timeout=10) == 130, log.read_text()
+        # Only the child reports the interrupt.
+        assert log.read_text().count("Interrupted.") == 1, log.read_text()
     finally:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
