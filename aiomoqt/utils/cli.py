@@ -50,7 +50,8 @@ compat            --compat
 payload check     --verify-payload [N] (long only)
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 entry point       run(main) in place of asyncio.run: Ctrl-C reaches the
-                  main task through the event loop, between callbacks
+                  main task through the event loop, between callbacks;
+                  run(main, sigterm=True) takes SIGTERM the same way
 
 split execution (tools that can run one end or both)
   --role both|pub|sub    which end(s) this process runs
@@ -131,7 +132,7 @@ def add_help(p):
                    help='Show this help message and exit')
 
 
-def run(main, *, debug=None):
+def run(main, *, debug=None, sigterm=False):
     """asyncio.run(main), with Ctrl-C delivered through the event loop.
 
     asyncio.run cancels the main task from a signal handler, which can run
@@ -139,28 +140,48 @@ def run(main, *, debug=None):
     first Ctrl-C cancels between callbacks and restores the default
     handler, so a second one interrupts at once. KeyboardInterrupt follows
     asyncio.run's rule: raised only if the cancel propagates out of main.
-    Falls back to asyncio.run off the main thread, under a non-default
-    SIGINT handler, or where the loop cannot handle signals."""
+    With `sigterm`, SIGTERM is a Ctrl-C too while its handler is SIG_DFL or
+    default_int_handler, which is restored after the first signal and on
+    exit. Falls back to asyncio.run off the main thread, with no signal to
+    take, or where the loop cannot handle signals."""
     if (asyncio._get_running_loop() is not None
-            or threading.current_thread() is not threading.main_thread()
-            or signal.getsignal(signal.SIGINT) is not signal.default_int_handler):
+            or threading.current_thread() is not threading.main_thread()):
+        return asyncio.run(main, debug=debug)
+    sigs = []
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        sigs.append(signal.SIGINT)
+    prev_term = signal.getsignal(signal.SIGTERM)
+    if sigterm and prev_term in (signal.SIG_DFL, signal.default_int_handler):
+        sigs.append(signal.SIGTERM)
+    if not sigs:
         return asyncio.run(main, debug=debug)
     with asyncio.Runner(debug=debug) as runner:
         loop = runner.get_loop()
         task = None
         interrupted = False
+        added = []
 
-        def on_sigint():
+        def release():
+            while added:
+                sig = added.pop()
+                loop.remove_signal_handler(sig)
+                if sig == signal.SIGTERM:
+                    signal.signal(sig, prev_term)
+
+        def on_signal():
             nonlocal interrupted
-            loop.remove_signal_handler(signal.SIGINT)
+            release()
             if task is None or task.done():
                 raise KeyboardInterrupt()
             interrupted = True
             task.cancel()
 
         try:
-            loop.add_signal_handler(signal.SIGINT, on_sigint)
+            for sig in sigs:
+                loop.add_signal_handler(sig, on_signal)
+                added.append(sig)
         except (NotImplementedError, RuntimeError, ValueError):
+            release()
             return runner.run(main)
         try:
             task = loop.create_task(main)
@@ -170,7 +191,7 @@ def run(main, *, debug=None):
                 raise KeyboardInterrupt()
             raise
         finally:
-            loop.remove_signal_handler(signal.SIGINT)
+            release()
 
 
 # -- addressing ------------------------------------------------------

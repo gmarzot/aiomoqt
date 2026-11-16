@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - The tools and examples take Ctrl-C through the event loop (`aiomoqt.utils.cli.run`, in place of `asyncio.run`): the cancel lands between callbacks, so an `Event.set()` in a callback can no longer raise `InvalidStateError` on Ctrl-C. Exit codes and a second Ctrl-C's forced exit are unchanged.
+- pub_media takes Ctrl-C and SIGTERM through the event loop for the whole run (`cli.run(main, sigterm=True)`): until it started publishing, Ctrl-C went through `asyncio.run`'s handler and SIGTERM raised KeyboardInterrupt wherever the interpreter was. Exit codes and the `--stats-json` `done` reason are unchanged.
 - aiomoqt-relay refuses a FETCH that reaches past a paused track's cached objects when the publisher cannot serve it, passing on the publisher's refusal; it sent FETCH_OK with the End at the last object received before the pause, so the objects after it read as non-existent. A range the cache holds through its End is still served from it.
 - aiomoqt-relay `--idle-timeout SEC` (relay.toml `idle-timeout`) sets the QUIC idle timeout it offers on every listener; `MOQTServer(idle_timeout=)` takes the same. Unset, aiopquic's 30 s default stands. A connection uses the lower of both ends' timeouts.
 - aiomoqt-relay no longer offers a d18 or later SUBSCRIBE_TRACKS subscriber the tracks its own session publishes (d22 §3.6): a publisher subscribed to its own prefix got them back, and with no other subscriber its PUBLISH_OK waited until it answered them. d14 and d16 still echo them, as their §6.1 requires.
