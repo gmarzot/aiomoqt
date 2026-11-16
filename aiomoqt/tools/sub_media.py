@@ -548,7 +548,7 @@ async def run(args):
 
 def main():
     try:
-        sys.exit(asyncio.run(run(parse_args())))
+        sys.exit(_cli.run(run(parse_args())))
     except KeyboardInterrupt:
         pass
 

@@ -139,6 +139,9 @@ WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALP
 `-t` defaults to 0, no limit, on every tool and example (also tested); a tool may add an exit condition with `--exit COND`.
 `-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
 all three). Write `-h` in docs: `-?` is a shell glob.
+Entry points run their coroutine with `cli.run`, not `asyncio.run`: Ctrl-C cancels the main
+task from the event loop, between callbacks (`test_cli_run.py`). Tools that install their own
+SIGINT handler are listed there.
 
 **Fan-out layering.** Peer mechanics live in `PublishedTrack` and `aiomoqt/delivery.py`.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single
