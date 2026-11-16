@@ -12,7 +12,7 @@ SOURCE_FPS with a key frame every SOURCE_GOP frames, and ADTS AAC-LC
 import os
 import threading
 import time
-from typing import List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 _SC = b'\x00\x00\x00\x01'
 
@@ -51,11 +51,36 @@ def have_encoder(name: str) -> bool:
     return True
 
 
+class Branch(NamedTuple):
+    filter: str
+    encoder: str
+    options: Dict[str, str] = {}
+    strip_filler: bool = False
+
+
+def _branch(r: Rung, fps, codec: str) -> Branch:
+    return Branch(f"scale=w={r.width}:h={r.height}", f"{codec}_fake")
+
+
+CODECS = ('h264', 'av1')
+PROFILES = {'nvenc': ('cuda', _branch), 'videotoolbox': ('videotoolbox', _branch),
+            'cpu': (None, _branch)}
+
+
 class Graph:
-    def __init__(self, nbranches: int, realtime: bool = True, codec: str = 'h264'):
+    """`branches` is a list of Branch, its codec read from the encoder
+    name, or a branch count, all of `codec`."""
+
+    def __init__(self, branches, hwaccel=None, fps=(60, 1), realtime: bool = True,
+                 codec: str = 'h264', **kw):
+        if isinstance(branches, int):
+            self.codecs = [codec] * branches
+        else:
+            self.codecs = ['av1' if b.encoder.startswith('av1') else 'h264'
+                           for b in branches]
+        nbranches = len(self.codecs)
         self.nbranches = nbranches
         self.realtime = realtime
-        self.codec = codec
         self._r, self._w = os.pipe()
         os.set_blocking(self._r, False)
         self._queued: List[Output] = []
@@ -75,7 +100,7 @@ class Graph:
         self.packets_in += 1
         for b in range(self.nbranches):
             body = bytes([b, obj & 0xFF]) + bytes(data[:8])
-            if self.codec == 'av1':
+            if self.codecs[b] == 'av1':
                 frame = bytes([0x32, len(body)]) + body
                 au = _AV1_TD + (AV1_SEQUENCE_HEADER if start else b'') + frame
             else:

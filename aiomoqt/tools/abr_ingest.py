@@ -35,6 +35,16 @@ encoder's share. --no-ladder measures the hand-off alone.
 --packaging cmaf publishes every output track as CMSF: one CMAF chunk
 per object, led by a prft, with the CMAF header in the catalog.
 
+--output NS[,packaging=P][,codec=C][,rung=WxH:BPS]..., repeated, publishes
+several namespaces from one source subscription and one decode, each with
+its own catalog, for instance an H.264 CMAF ladder and an AV1 LOC one.
+Fields left out take --packaging, --codec and --rung. Rungs of one size,
+rate and codec share an encoder:
+
+  python -m aiomoqt.tools.abr_ingest --source moqt://relay:4433 -N live/x \\
+      --output live/x-cmaf,packaging=cmaf,rung=1280x720:2500k \\
+      --output live/x-av1,codec=av1,rung=1280x720:1800k moqt://relay:4433
+
 --head-trace logs, per relay, each video group's first object: when it
 was written, its stream opened and its bytes went into packets, with the
 connection's cwin, bytes in flight, pacing rate, RTT and losses.
@@ -46,7 +56,7 @@ import importlib
 import signal
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.fanout import FanoutPublisher
@@ -101,6 +111,36 @@ def _rung(value: str) -> Rung:
         raise argparse.ArgumentTypeError(str(e))
 
 
+class OutputSpec(NamedTuple):
+    """One published namespace; None and () take the global flags."""
+    namespace: str
+    packaging: Optional[str] = None
+    codec: Optional[str] = None
+    rungs: Tuple[Rung, ...] = ()
+
+
+def _output(value: str) -> OutputSpec:
+    ns, *fields = value.split(',')
+    if not ns or '=' in ns:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: NS[,packaging=P][,codec=C][,rung=WxH:BPS]...")
+    packaging = codec = None
+    rungs = []
+    for field in fields:
+        key, _, val = field.partition('=')
+        if key == 'packaging' and val in (PACKAGING_LOC, PACKAGING_CMAF):
+            packaging = val
+        elif key == 'codec' and val in CODECS:
+            codec = val
+        elif key == 'rung':
+            rungs.append(_rung(val))
+        else:
+            raise argparse.ArgumentTypeError(
+                f"{value!r}: {field!r} is none of packaging=loc|cmaf, "
+                f"codec={'|'.join(CODECS)}, rung=WxH:BPS")
+    return OutputSpec(ns, packaging, codec, tuple(rungs))
+
+
 def parse_args(argv=None):
     parser = _cli.make_parser(
         'ABR ingester: a LOC broadcast plus an ABR ladder, one catalog',
@@ -138,6 +178,12 @@ def parse_args(argv=None):
                         default=PACKAGING_LOC,
                         help='Output packaging (default: loc); cmaf = CMSF, '
                              'one CMAF chunk per object')
+    parser.add_argument('--output', metavar='NS[,KEY=VALUE]...', type=_output,
+                        action='append',
+                        help='Publish namespace NS, with packaging=, codec= '
+                             'and rung= (repeated) in place of --packaging, '
+                             '--codec and --rung; repeat for several outputs '
+                             'from one source subscription and decode')
     parser.add_argument('--head-trace', action='store_true',
                         help="Log each video group's first object per relay: "
                              "when it was written, its stream opened and its "
@@ -155,8 +201,23 @@ def parse_args(argv=None):
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args(argv)
-    if args.profile == 'videotoolbox' and args.codec != 'h264':
+    if args.output and args.out_ns:
+        parser.error('--out-ns names the only output; with --output, name '
+                     'each output there')
+    args.outputs = [
+        OutputSpec(o.namespace, o.packaging or args.packaging,
+                   o.codec or args.codec, o.rungs or tuple(args.rung or ()))
+        for o in args.output or [OutputSpec(args.out_ns or args.namespace)]]
+    names = [o.namespace for o in args.outputs]
+    if len(set(names)) < len(names):
+        parser.error('two --output name one namespace')
+    if args.profile == 'videotoolbox' and any(o.codec != 'h264'
+                                              for o in args.outputs):
         parser.error('--profile videotoolbox encodes H.264 only')
+    if args.no_ladder and any(o.rungs for o in args.outputs):
+        parser.error('--no-ladder takes no rungs')
+    if any(len({r.name for r in o.rungs}) < len(o.rungs) for o in args.outputs):
+        parser.error('two rungs of one height would share a track name')
     if args.source and (args.quic or args.wt):
         parser.error('--source dials the source and -Q/-W listen for it: '
                      'pick one')
@@ -164,10 +225,6 @@ def parse_args(argv=None):
         parser.error('--input reads the source itself: no --source or -Q/-W')
     if args.input_option and not args.input:
         parser.error('--input-option needs --input')
-    if args.no_ladder and args.rung:
-        parser.error('--no-ladder takes no --rung')
-    if args.rung and len({r.name for r in args.rung}) < len(args.rung):
-        parser.error('two rungs of one height would share a track name')
     if not (args.source or args.input) and not (args.cert and args.key):
         parser.error('listening needs --cert and --key, or certs/')
     return args
@@ -394,28 +451,61 @@ class _Output:
         await self.track.finish()
 
 
+class _Publication:
+    """One output namespace: its rungs, catalog, publisher and tracks."""
+
+    def __init__(self, spec: OutputSpec, rungs: List[Rung]):
+        self.namespace = spec.namespace
+        self.packaging = spec.packaging
+        self.codec = spec.codec
+        self.rungs = rungs
+        self.branches: List[int] = []  # the ladder branch of each rung
+        self.outputs: Dict[str, _Output] = {}
+        self.pub: Optional[FanoutPublisher] = None
+        self.left_out: Set[str] = set()
+
+    def hand(self, name: str, frame: LocFrame, group_id: int,
+             t0: Optional[int]) -> bool:
+        """False for a track not published yet."""
+        out = self.outputs.get(name)
+        if out is None:
+            return name in self.left_out
+        out.put(frame, group_id, t0)
+        return True
+
+
 class _Ingest:
     def __init__(self, args, sub: Union[MediaSubscriber, SourceInput],
                  catalog: Catalog):
         self.args = args
         self.sub = sub
         self.catalog = catalog
-        self.out_ns = args.out_ns or args.namespace
         self.video = _video_entry(catalog, args.trackname)
         self.video_name: str = self.video.name or ''
-        self.rungs: List[Rung] = (
-            [] if args.no_ladder
-            else args.rung or rungs_below(self.video.height or 0))
-        if not args.no_ladder and not self.rungs:
+        default = rungs_below(self.video.height or 0)
+        self.pubs = [_Publication(o, [] if args.no_ladder
+                                  else list(o.rungs) or default)
+                     for o in args.outputs]
+        if not args.no_ladder and not all(p.rungs for p in self.pubs):
             raise SystemExit(f"  error: no default rung below the "
                              f"source's {self.video.height}p; give --rung")
+        # One ladder branch per distinct (rung, codec), and who takes it.
+        self.branches: List[Tuple[Rung, str]] = []
+        self._targets: List[List[Tuple[_Publication, str]]] = []
+        for p in self.pubs:
+            for r in p.rungs:
+                key = (r, p.codec or 'h264')
+                if key not in self.branches:
+                    self.branches.append(key)
+                    self._targets.append([])
+                i = self.branches.index(key)
+                p.branches.append(i)
+                self._targets[i].append((p, r.name))
+        self._video_targets = [(p, self.video_name) for p in self.pubs]
         self.fps: Tuple[int, int] = frame_rate(_FALLBACK_FPS)
         self._first_key: Optional[int] = None
         self.ladder: Optional[AbrLadder] = None
-        self.outputs: Dict[str, _Output] = {}
-        self.pub: Optional[FanoutPublisher] = None
         self.before_start = 0
-        self.left_out: Set[str] = set()
         self.keyed = asyncio.Event()
         self._feeders: List[asyncio.Task] = []
         self._republishing: Set[asyncio.Task] = set()
@@ -425,18 +515,22 @@ class _Ingest:
         now = time.monotonic_ns()
         if (name == self.video_name and frame.key_frame
                 and not self.keyed.is_set() and self._rate_known(now)):
-            if self.rungs:
+            if self.branches:
                 self._start_ladder()
             self.keyed.set()
-        if name == self.video_name and self.ladder is not None:
-            self.ladder.push(frame, group_id, object_id)
-        self._hand(name, frame, group_id, now)
+        if name == self.video_name:
+            if self.ladder is not None:
+                self.ladder.push(frame, group_id, object_id)
+            targets = self._video_targets
+        else:
+            targets = [(p, name) for p in self.pubs]
+        self._hand(targets, frame, group_id, now)
 
     def _rate_known(self, now: int) -> bool:
         """Whether the ladder can start: the catalog gives a framerate, or
         _FPS_WAIT_S has passed since the first key frame (then
         _FALLBACK_FPS)."""
-        if not self.rungs:
+        if not self.branches:
             return True
         if self.video.framerate:
             self.fps = frame_rate(self.video.framerate)
@@ -459,10 +553,14 @@ class _Ingest:
         src = {t.name: t for t in catalog.tracks
                if t.packaging == PACKAGING_LOC}
         self.video = src.get(self.video_name, self.video)
-        if self.pub is None:
+        for p in self.pubs:
+            self._republish(p, src)
+
+    def _republish(self, p: _Publication, src: Dict) -> None:
+        if p.pub is None:
             return
-        out = Catalog.from_json(self.pub.catalog_track.catalog.to_json())
-        rungs = {r.name for r in self.rungs}
+        out = Catalog.from_json(p.pub.catalog_track.catalog.to_json())
+        rungs = {r.name for r in p.rungs}
         changed = []
         for t in out.tracks:
             rung = t.name in rungs
@@ -477,9 +575,10 @@ class _Ingest:
         if not changed:
             return
         out.generatedAt = int(time.time() * 1000)
-        logger.info(f"abr_ingest: catalog republished: {', '.join(changed)}")
+        logger.info(f"abr_ingest: '{p.namespace}' catalog republished: "
+                    f"{', '.join(changed)}")
         task = asyncio.ensure_future(
-            self.pub.catalog_track.publish_catalog(out))
+            p.pub.catalog_track.publish_catalog(out))
         self._republishing.add(task)
         task.add_done_callback(self._republishing.discard)
 
@@ -488,52 +587,57 @@ class _Ingest:
         cymedia.set_ffmpeg_log_level(32 if self.args.debug else 16)
         src = self.sub.tracks[self.video_name]
         ladder = self.ladder = AbrLadder(
-            self.rungs, config=src.config, fps=self.fps,
-            profile=self.args.profile, codec=self.args.codec,
+            [r for r, _ in self.branches], config=src.config, fps=self.fps,
+            profile=self.args.profile, codec=[c for _, c in self.branches],
             timescale=src.timescale, on_frame=self._on_rung)
         ladder.start()
 
     def _on_rung(self, i: int, frame: LocFrame, group_id: int,
                  object_id: int, pushed_ns: Optional[int]) -> None:
-        out = self.outputs.get(self.rungs[i].name)
-        if (out is not None and out.cmaf is None
-                and self.ladder is not None):
-            out.track.config = self.ladder.configs[i]
-        self._hand(self.rungs[i].name, frame, group_id, pushed_ns)
+        targets = self._targets[i]
+        if self.ladder is not None:
+            for p, name in targets:
+                out = p.outputs.get(name)
+                if out is not None and out.cmaf is None:
+                    out.track.config = self.ladder.configs[i]
+        self._hand(targets, frame, group_id, pushed_ns)
 
-    def _hand(self, name: str, frame: LocFrame, group_id: int,
+    def _hand(self, targets, frame: LocFrame, group_id: int,
               t0: Optional[int]) -> None:
-        out = self.outputs.get(name)
-        if out is None:
-            if name not in self.left_out:
-                self.before_start += 1
-            return
-        out.put(frame, group_id, t0)
+        if not all([p.hand(name, frame, group_id, t0)
+                    for p, name in targets]):
+            self.before_start += 1
 
     async def start_outputs(self, sessions) -> None:
         """Publish once the source has a key frame and every rung its
-        decoder config, so the catalog is complete from the first."""
+        decoder config, so each catalog is complete from the first."""
         await asyncio.wait_for(self.keyed.wait(), _cli.setup_timeout(self.args))
         configs: List[bytes] = []
         if self.ladder is not None:
             await asyncio.wait_for(self.ladder.ready.wait(), _LADDER_READY_S)
             configs = self.ladder.rung_configs()
+        for p in self.pubs:
+            await self._start(p, sessions, [configs[b] for b in p.branches])
+
+    async def _start(self, p: _Publication, sessions,
+                     configs: List[bytes]) -> None:
+        if p.rungs:
             catalog = ladder_catalog(self.catalog, self.video_name,
-                                     self.rungs, configs)
+                                     p.rungs, configs)
         else:
             catalog = Catalog.from_json(self.catalog.to_json())
         catalog.tracks = [t for t in catalog.tracks
                           if t.packaging == PACKAGING_LOC
                           and (t.name in self.sub.tracks
-                               or t.name in {r.name for r in self.rungs})]
-        if self.out_ns != self.args.namespace:
+                               or t.name in {r.name for r in p.rungs})]
+        if p.namespace != self.args.namespace:
             for t in catalog.tracks:
                 t.namespace = None
         timescale = self.sub.tracks[self.video_name].timescale
-        as_cmaf = self.args.packaging == PACKAGING_CMAF
-        cmaf = (self._cmaf_catalog(catalog, configs, timescale)
+        as_cmaf = p.packaging == PACKAGING_CMAF
+        cmaf = (self._cmaf_catalog(p, catalog, configs, timescale)
                 if as_cmaf else {})
-        self.pub = FanoutPublisher(sessions, self.out_ns, catalog)
+        p.pub = FanoutPublisher(sessions, p.namespace, catalog)
         video_props = {k: v for k, v in
                        self.sub.properties(self.video_name).items()
                        if k != LOC_PROP_VIDEO_CONFIG}
@@ -543,16 +647,16 @@ class _Ingest:
             src = self.sub.tracks.get(name)
             if src is not None:
                 track = LocTrackPublisher(
-                    self.pub.session, self.out_ns, name,
+                    p.pub.session, p.namespace, name,
                     config=None if as_cmaf else src.config,
                     timescale=src.timescale,
                     media_kind='audio' if entry.role == 'audio' else 'video',
                     codec_string=None if as_cmaf else src.codec_string)
                 props = self.sub.properties(name)
             else:
-                i = next(k for k, r in enumerate(self.rungs) if r.name == name)
+                i = next(k for k, r in enumerate(p.rungs) if r.name == name)
                 track = LocTrackPublisher(
-                    self.pub.session, self.out_ns, name,
+                    p.pub.session, p.namespace, name,
                     config=None if as_cmaf else configs[i], timescale=timescale,
                     media_kind='video')
                 props = video_props
@@ -564,21 +668,22 @@ class _Ingest:
         for track in tracks:
             track.trace_heads = (self.args.head_trace
                                  and track.media_kind == 'video')
-            self.pub.add_track(track)
-        await self.pub.start(forward=0)
+            p.pub.add_track(track)
+        await p.pub.start(forward=0)
         for track in tracks:
-            out = self.outputs[track.trackname] = _Output(
+            out = p.outputs[track.trackname] = _Output(
                 track, cmaf.get(track.trackname))
             self._feeders.append(asyncio.ensure_future(out.feed()))
-        print(f"  publishing '{self.out_ns}': "
+        print(f"  publishing '{p.namespace}': "
               f"{', '.join(t.trackname for t in tracks)}")
 
-    def _cmaf_catalog(self, catalog: Catalog, configs: List[bytes],
+    def _cmaf_catalog(self, p: _Publication, catalog: Catalog,
+                      configs: List[bytes],
                       timescale: Optional[int]) -> Dict[str, _Cmaf]:
         """Turn `catalog` into a CMSF one in place: each track packaged
         cmaf, its CMAF header in initDataList, codec from that header.
         A track no CMAF header can carry is left out."""
-        rungs = {r.name: i for i, r in enumerate(self.rungs)}
+        rungs = {r.name: i for i, r in enumerate(p.rungs)}
         out: Dict[str, _Cmaf] = {}
         kept, init = [], []
         for entry in catalog.tracks:
@@ -593,8 +698,8 @@ class _Ingest:
                                 src.timescale, None)
             if pkg is None or pkg.codec is None:
                 logger.warning(f"abr_ingest: '{name}' ({entry.codec}) left "
-                               f"out: no CMAF header for it")
-                self.left_out.add(name)
+                               f"out of '{p.namespace}': no CMAF header for it")
+                p.left_out.add(name)
                 continue
             ref = f"cmaf{len(init)}"
             entry.packaging, entry.initRef, entry.codec = (
@@ -609,20 +714,24 @@ class _Ingest:
         if self.ladder is not None:
             with contextlib.suppress(Exception):
                 await self.ladder.flush()
-        for out in self.outputs.values():
-            with contextlib.suppress(asyncio.QueueFull):
-                out.queue.put_nowait(None)
+        for p in self.pubs:
+            for out in p.outputs.values():
+                with contextlib.suppress(asyncio.QueueFull):
+                    out.queue.put_nowait(None)
         if self._feeders:
             await asyncio.wait(self._feeders, timeout=_SHUTDOWN_DRAIN_S)
-        if self.pub is None:
+        pubs = [p.pub for p in self.pubs if p.pub is not None]
+        if not pubs:
             return
         for s in sessions:
             s.drain()
         if self._republishing:
             await asyncio.wait(self._republishing, timeout=_SHUTDOWN_DRAIN_S)
-        await self.pub.catalog_track.finish()
+        for pub in pubs:
+            await pub.catalog_track.finish()
         deadline = time.monotonic() + _SHUTDOWN_DRAIN_S
-        tracks = [*self.pub.tracks.values(), *self.pub.catalog_track.members]
+        tracks = [t for pub in pubs
+                  for t in (*pub.tracks.values(), *pub.catalog_track.members)]
         while time.monotonic() < deadline and not all(
                 sub.done or (sub.request_id is None
                              and sub.subscribe_request_id is None)
@@ -638,28 +747,35 @@ class _Ingest:
     def report(self, final: bool = False) -> None:
         engine = {}
         if self.ladder is not None:
-            engine = {r.name: self.ladder.engine_delays(i)
-                      for i, r in enumerate(self.rungs)}
+            engine = {i: self.ladder.engine_delays(i)
+                      for i in range(len(self.branches))}
+        many = len(self.pubs) > 1
         lines = []
-        for name, out in self.outputs.items():
-            q = quantiles_ms(out.meter.take())
-            line = (f"  {name:12s} {out.frames:7d} frames {out.idle:6d} idle "
-                    f"{out.dropped:4d} dropped")
-            if q is not None:
-                line += (f"  arrival to hand-off p50 {q[0]:6.2f} "
-                         f"p99 {q[1]:6.2f} max {q[2]:7.2f} ms")
-            e = quantiles_ms(engine.get(name, ()))
-            if e is not None:
-                line += f"  (encoder p50 {e[0]:.2f} p99 {e[1]:.2f})"
-            lines.append(line)
+        for p in self.pubs:
+            branch = {r.name: b for r, b in zip(p.rungs, p.branches)}
+            for name, out in p.outputs.items():
+                label = f"{p.namespace} {name}" if many else name
+                q = quantiles_ms(out.meter.take())
+                line = (f"  {label:12s} {out.frames:7d} frames "
+                        f"{out.idle:6d} idle {out.dropped:4d} dropped")
+                if q is not None:
+                    line += (f"  arrival to hand-off p50 {q[0]:6.2f} "
+                             f"p99 {q[1]:6.2f} max {q[2]:7.2f} ms")
+                e = quantiles_ms(engine.get(branch.get(name), ()))
+                if e is not None:
+                    line += f"  (encoder p50 {e[0]:.2f} p99 {e[1]:.2f})"
+                lines.append(line)
         if final and self.ladder is not None:
-            st = self.ladder.stats()
+            abandoned = [b['groups_abandoned']
+                         for b in self.ladder.stats()['branches']]
+            per = (', '.join(f"{c} {r.name} {n}" for (r, c), n
+                             in zip(self.branches, abandoned))
+                   if many else abandoned)
             lines.append(
                 f"  ladder: {self.ladder.frames_in} in, "
                 f"{self.ladder.input_dropped} dropped at input, "
                 f"{self.ladder.late_dropped} late, groups "
-                f"abandoned per rung "
-                f"{[b['groups_abandoned'] for b in st['branches']]}")
+                f"abandoned per {'branch' if many else 'rung'} {per}")
         if final and self.before_start:
             lines.append(f"  {self.before_start} frames before publishing "
                          f"started")
@@ -712,9 +828,12 @@ async def run(args) -> int:
         print(f"  source tracks: {', '.join(sub.tracks)}; video "
               f"'{ingest.video.name}' {ingest.video.width}x"
               f"{ingest.video.height}")
-        if ingest.rungs:
-            print(f"  ladder ({args.profile}, {args.codec}): "
-                  f"{', '.join(r.name for r in ingest.rungs)}")
+        many = len(ingest.pubs) > 1
+        for p in ingest.pubs:
+            if p.rungs:
+                print(f"  ladder ({args.profile}, {p.codec})"
+                      f"{f' for {p.namespace!r}' if many else ''}: "
+                      f"{', '.join(r.name for r in p.rungs)}")
         sessions = []
         for url in args.url:
             try:

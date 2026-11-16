@@ -18,7 +18,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ..utils.logger import get_logger
 from .catalog import PACKAGING_LOC, Catalog, CatalogTrack, InitData
@@ -180,9 +180,10 @@ def quantiles_ms(ns: Sequence[int]) -> Optional[Tuple[float, float, float]]:
 class AbrLadder:
     """Encodes a LOC H.264 video track into H.264 or AV1 rungs with cymedia.
 
-    push() takes each source frame with its group and object IDs; the
-    payload is length-prefixed when `config` (avcC) is given, else Annex B.
-    After start(), on_frame(rung, frame, group_id, object_id, pushed_ns)
+    `codec` is one codec for every rung or one per rung; either way the
+    source is decoded once. push() takes each source frame with its group
+    and object IDs; the payload is length-prefixed when `config` (avcC) is
+    given, else Annex B. After start(), on_frame(rung, frame, group_id, object_id, pushed_ns)
     gets each rung frame with its source frame's IDs, timestamp and
     extensions, and a key frame at each group start. pushed_ns is the
     source frame's monotonic push time, or None. configs[i] is rung i's
@@ -195,14 +196,20 @@ class AbrLadder:
 
     def __init__(self, rungs: Sequence[Rung], *, config: Optional[bytes],
                  fps: Tuple[int, int], on_frame: Callable,
-                 profile: str = 'nvenc', codec: str = 'h264',
+                 profile: str = 'nvenc', codec: Union[str, Sequence[str]] = 'h264',
                  timescale: Optional[int] = None, realtime: bool = True):
         cymedia = _cymedia("the ABR ladder")
         if not rungs:
             raise ValueError("no rungs")
-        if codec not in CODECS:
-            raise ValueError(f"codec {codec!r}: one of {', '.join(CODECS)}")
-        self.codec = codec
+        codecs = [codec] * len(rungs) if isinstance(codec, str) else list(codec)
+        if len(codecs) != len(rungs):
+            raise ValueError(f"{len(codecs)} codecs for {len(rungs)} rungs")
+        for c in codecs:
+            if c not in CODECS:
+                raise ValueError(f"codec {c!r}: one of {', '.join(CODECS)}")
+        if profile not in cymedia.PROFILES:
+            raise ValueError(f"profile {profile!r}: one of {', '.join(cymedia.PROFILES)}")
+        self.codecs = codecs
         self.rungs = list(rungs)
         self.timescale = timescale
         self.on_frame = on_frame
@@ -211,10 +218,11 @@ class AbrLadder:
         self.frames_in = 0
         self.input_dropped = 0
         self.late_dropped = 0
-        self._graph = cymedia.ladder(
-            [cymedia.Rung(r.width, r.height, r.bit_rate) for r in self.rungs],
-            profile=profile, fps=fps, extradata=config, realtime=realtime,
-            **({'codec': codec} if codec != 'h264' else {}))
+        hwaccel, branch = cymedia.PROFILES[profile]
+        self._graph = cymedia.Graph(
+            [branch(cymedia.Rung(r.width, r.height, r.bit_rate), fps, c)
+             for r, c in zip(self.rungs, codecs)],
+            hwaccel=hwaccel, fps=fps, extradata=config, realtime=realtime)
         # (group, object) -> [timestamp, extensions, push ns, rungs to go]
         self._pending: Dict[Tuple[int, int], list] = {}
         self._group = -1
@@ -272,7 +280,7 @@ class AbrLadder:
     def _drain(self) -> None:
         for out in self._graph.read(0):
             i = out.branch
-            config = self._package(out.data)
+            config = self._package(self.codecs[i], out.data)
             payload = config[0]
             if config[1] is not None:
                 self.configs[i] = config[1]
@@ -292,9 +300,10 @@ class AbrLadder:
                                       group_id=out.group),
                           out.group, out.object, pushed)
 
-    def _package(self, data: bytes) -> Tuple[bytes, Optional[bytes]]:
+    @staticmethod
+    def _package(codec: str, data: bytes) -> Tuple[bytes, Optional[bytes]]:
         """A rung frame's LOC payload, and its decoder config if it has one."""
-        if self.codec == 'av1':
+        if codec == 'av1':
             payload, seq = loc_from_obus(data)
             return payload, (av1c_from_sequence_header(seq) if seq is not None else None)
         payload, sps, pps = loc_from_annexb(data)
