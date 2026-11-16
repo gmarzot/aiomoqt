@@ -190,6 +190,62 @@ def session_json(node, s) -> Dict[str, Any]:
     }
 
 
+def _percentiles(values: Sequence[float]) -> Dict[str, Optional[float]]:
+    s = sorted(values)
+    if not s:
+        return {"n": 0, "p50": None, "p90": None, "p99": None}
+
+    def pct(p: float) -> float:
+        return round(s[min(len(s) - 1, int(p / 100 * len(s)))], 3)
+    return {"n": len(s), "p50": pct(50), "p90": pct(90), "p99": pct(99)}
+
+
+def rx_json(node, rx) -> Dict[str, Any]:
+    """A received track: TrackStats' counts and latency (wall clock at
+    the receiving chunk minus the object's LOC TIMESTAMP), stream ends."""
+    st = rx.stats
+    lat = _percentiles(st._lat_res.items)
+    if st.lat_count:
+        lat.update(mean=round(st.lat_sum / st.lat_count, 3),
+                   min=round(st.lat_min, 3), max=round(st.lat_max, 3))
+    return {
+        "hash": hash_text(rx.fullname_hash),
+        "ns": [text(t) for t in rx.namespace],
+        "name": text(rx.name),
+        "objects": st.total_objects,
+        "bytes": st.total_bytes,
+        "groups": st.total_groups,
+        "lost": st.total_lost,
+        "dups": st.total_dups,
+        "ooo": st.total_ooo,
+        "datagrams": rx.datagrams,
+        "latency_ms": lat,
+        "jitter_ms": round(st.jitter, 3),
+        "ts_source": st.ts_source,
+        "header_to_first_object_ms": _percentiles(rx.header_gap_ms),
+        "statuses": dict(rx.statuses),
+        "stream_ends": dict(rx.ends),
+        "payload_bad": rx.check.bad if rx.check is not None else None,
+        "per_session": {str(k): v for k, v in rx.per_session.items()},
+    }
+
+
+def published_json(track) -> Dict[str, Any]:
+    o = track.origin
+    return {
+        "hash": hash_text(o.fullname_hash),
+        "ns": [text(t) for t in o.namespace],
+        "name": text(o.name),
+        "objects": track.objects,
+        "bytes": track.bytes,
+        "streams": track.streams,
+        "datagrams": track.datagrams,
+        "datagrams_dropped": track.datagrams_dropped,
+        "sns": [dict(sns_json(sns), session=sid)
+                for sid, sns in o.sns.items()],
+    }
+
+
 def _best_paths(node) -> List[Dict[str, Any]]:
     """Each learned node once, on the session with the best path: lowest
     metric sum, then fewest hops, then lowest srtt sum."""
@@ -271,6 +327,8 @@ def build_report(node) -> Dict[str, Any]:
         "subscribes": subscribes,
         "sns_in": sns_in,
         "data_in": data_in,
+        "tracks": [rx_json(node, rx) for rx in node.receiving()],
+        "published": [published_json(t) for t in node.published()],
         "events": list(node.events),
     }
 

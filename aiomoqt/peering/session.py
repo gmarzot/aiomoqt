@@ -7,9 +7,12 @@ through this peer and forwards none of it: the node is a leaf.
 import time
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (Any, Callable, Container, Dict, List, NamedTuple,
+                    Optional, Tuple)
 
 from aiomoqt.peering.hashing import node_id_format, track_hashes
+from aiomoqt.peering.ib import subscribe_outcome
+from aiomoqt.peering.inner import SubgroupReader, decode_datagram
 from aiomoqt.peering.report import describe, hash_text
 from aiomoqt.peering.wire import (AnnounceInfo, Connect, ConnectCode,
                                   ConnectResponse, ControlReader, DataHeader,
@@ -59,21 +62,33 @@ class DataFlow:
     bytes: int = 0
 
 
+_MAX_SNS_ID = 0xFFFFFFFE
+
+
+class Inbound(NamedTuple):
+    """Where and when an inner object arrived: the chunk's stamp, and for
+    a stream the stamp of its NEW_STREAM header."""
+    session: "PeerSession"
+    stream_id: Optional[int]
+    sns_id: int
+    fullname_hash: int
+    stamp: Stamp
+    header_stamp: Optional[Stamp]
+
+
 class _InStream:
-    __slots__ = ("buf", "header", "bad")
+    __slots__ = ("buf", "header", "bad", "reader", "header_stamp")
 
     def __init__(self):
         self.buf = bytearray()
         self.header: Optional[DataHeader] = None
         self.bad = False
+        self.reader: Optional[SubgroupReader] = None
+        self.header_stamp: Optional[Stamp] = None
 
 
 def _client_bidi(stream_id: int) -> bool:
     return stream_id & 3 == 0
-
-
-def _seq_newer(new: int, old: int) -> bool:
-    return 1 <= (new - old) % 65536 <= 32767
 
 
 class PeerSession:
@@ -93,6 +108,13 @@ class PeerSession:
         # Takes control events as they happen; unset, control_data()
         # returns them.
         self.on_event = on_event
+        # Inner objects of the hashes in `decode` go to on_object; their
+        # streams' ends ("fin", "reset" or "bad") to on_stream_end.
+        self.decode: Container[int] = ()
+        self.on_object: Optional[Callable[[Inbound, Any], None]] = None
+        self.on_stream_end: Optional[
+            Callable[["PeerSession", int, int, str], None]] = None
+        self._last_sns_id = 0
         self.start_mono_ns, self.start_unix_ns = start or clock()
         self.state = "quic-up"
         self.remote: Optional[NodeInfo] = None
@@ -261,20 +283,19 @@ class PeerSession:
             return "withdrawn"
         if not ok:
             self.hash_mismatches += 1
-        if prev is not None:
-            old = prev.body
-            if old == sub:
-                self.duplicates += 1
-                return "duplicate"
-            if old.epoch != sub.epoch or not _seq_newer(sub.seq, old.seq):
-                self.stale += 1
-                return f"stale (have epoch {old.epoch} seq {old.seq})"
+        outcome = subscribe_outcome(prev.body if prev else None, sub)
+        if outcome == "duplicate":
+            self.duplicates += 1
+            return outcome
+        if outcome == "stale" and prev is not None:
+            self.stale += 1
+            return (f"stale (have epoch {prev.body.epoch} "
+                    f"seq {prev.body.seq})")
         self.subscribes[key] = Learned(
             sub, *stamp, hash_ok=ok,
             updates=prev.updates + 1 if prev else 0)
         events.append(SessionEvent("subscribe", stamp, sub, ok,
                                    note="update" if prev else ""))
-        outcome = "updated" if prev else "learned"
         return outcome + ("" if ok else f" HASH MISMATCH {self._want(sub)}")
 
     @staticmethod
@@ -300,7 +321,13 @@ class PeerSession:
         return ("updated" if prev else "learned") + (
             "" if mine else f", {node_id_format(self.local.node_id)} not in set")
 
-    # -- data plane: headers counted, inner bytes not decoded ---------
+    def next_sns_id(self) -> int:
+        """This session's next egress SNS id: from 1, skipping 0 on wrap."""
+        self._last_sns_id = (self._last_sns_id + 1
+                             if self._last_sns_id < _MAX_SNS_ID else 1)
+        return self._last_sns_id
+
+    # -- data plane in ----------------------------------------------
 
     def _flow(self, hdr: DataHeader, stamp: Stamp, events) -> DataFlow:
         flow = self.flows.get(hdr.fullname_hash)
@@ -319,10 +346,13 @@ class PeerSession:
         if log.isEnabledFor(TRACE):
             log.log(TRACE, f"peering data chunk: {self.tag} "
                     f"stream={stream_id} len={len(data)} fin={fin}")
+        stamp = self._clock()
+        inner = data
         if st.header is not None:
             self.flows[st.header.fullname_hash].bytes += len(data)
         elif not st.bad:
             st.buf += data
+            inner = b""
             try:
                 parsed = parse_data_header(st.buf)
             except WireError as e:
@@ -334,16 +364,57 @@ class PeerSession:
             if parsed is not None:
                 hdr, offset = parsed
                 st.header = hdr
-                flow = self._flow(hdr, self._clock(), events)
+                st.header_stamp = stamp
+                flow = self._flow(hdr, stamp, events)
                 flow.streams += 1
-                flow.bytes += len(st.buf) - offset
+                inner = bytes(st.buf[offset:])
+                flow.bytes += len(inner)
                 st.buf = bytearray()
+                if self.on_object is not None and hdr.fullname_hash in self.decode:
+                    st.reader = SubgroupReader()
+        if st.reader is not None and inner:
+            self._decode(st, stream_id, inner, stamp)
         if fin:
+            if st.reader is not None:
+                try:
+                    st.reader.finish()
+                    self._stream_end(st, stream_id, "fin")
+                except WireError as e:
+                    self._bad_inner(st, stream_id, e)
             self._streams.pop(stream_id, None)
         return events
 
+    def _decode(self, st: _InStream, stream_id: int, data, stamp: Stamp
+                ) -> None:
+        hdr = st.header
+        reader = st.reader
+        if hdr is None or reader is None or self.on_object is None:
+            return
+        try:
+            objects = reader.feed(data)
+        except WireError as e:
+            self._bad_inner(st, stream_id, e)
+            return
+        if objects:
+            where = Inbound(self, stream_id, hdr.sns_id, hdr.fullname_hash,
+                            stamp, st.header_stamp)
+            for obj in objects:
+                self.on_object(where, obj)
+
+    def _bad_inner(self, st: _InStream, stream_id: int, error) -> None:
+        self.bad_data += 1
+        log.warning(f"peering: {self.tag} data stream {stream_id}: {error}")
+        self._stream_end(st, stream_id, "bad")
+        st.bad, st.reader = True, None
+
+    def _stream_end(self, st: _InStream, stream_id: int, how: str) -> None:
+        if self.on_stream_end is not None and st.header is not None:
+            self.on_stream_end(self, st.header.fullname_hash, stream_id, how)
+
     def stream_reset(self, stream_id: int) -> None:
-        self._streams.pop(stream_id, None)
+        st = self._streams.pop(stream_id, None)
+        if st is not None and st.reader is not None:
+            self._stream_end(st, stream_id, "reset")
 
     def datagram(self, data) -> List[SessionEvent]:
         events: List[SessionEvent] = []
@@ -353,9 +424,19 @@ class PeerSession:
             self.bad_data += 1
             log.debug(f"peering: {self.tag} datagram ignored: {e}")
             return events
-        flow = self._flow(hdr, self._clock(), events)
+        stamp = self._clock()
+        flow = self._flow(hdr, stamp, events)
         flow.datagrams += 1
         flow.bytes += len(data) - offset
+        if self.on_object is not None and hdr.fullname_hash in self.decode:
+            try:
+                obj = decode_datagram(data[offset:])
+            except WireError as e:
+                self.bad_data += 1
+                log.debug(f"peering: {self.tag} datagram ignored: {e}")
+                return events
+            self.on_object(Inbound(self, None, hdr.sns_id, hdr.fullname_hash,
+                                   stamp, None), obj)
         return events
 
     # -- close -------------------------------------------------------
