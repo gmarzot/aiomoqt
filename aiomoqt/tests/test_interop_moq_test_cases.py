@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiomoqt.context import profile_for
+from aiomoqt.messages import SubgroupHeader
 from aiomoqt.tools import moq_interop_client as client
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools.moqtest_origin import priority_for
@@ -34,23 +36,41 @@ async def _run_case(name, port, draft, use_quic):
         relay._tracks.clear()
 
 
-def test_cases_run_by_default_under_moq_rs_names():
+def test_cases_run_by_default_under_moq_rs_and_xquic_names():
     assert _NAMES == [
-        "moq-test-subgroup-per-group-eog", "moq-test-subgroup-per-object",
-        "moq-test-two-subgroups-eog", "moq-test-datagram",
-        "moq-test-datagram-eog", "moq-test-extensions",
-        "moq-test-increments", "moq-test-forward-zero"]
+        "moq-test-subgroup-per-group-eog",
+        "moq-test-subgroup-per-group-no-eog",
+        "moq-test-subgroup-per-group-nonzero-start",
+        "moq-test-subgroup-per-object",
+        "moq-test-subgroup-per-object-sparse-ids",
+        "moq-test-two-subgroups-eog", "moq-test-two-subgroups-no-eog",
+        "moq-test-datagram", "moq-test-datagram-nonzero-start",
+        "moq-test-datagram-sparse-ids", "moq-test-datagram-eog",
+        "moq-test-extensions", "moq-test-extensions-integer-only",
+        "moq-test-extensions-variable-only", "moq-test-object-fragmentation",
+        "moq-test-object-large-id", "moq-test-increments",
+        "moq-test-forward-zero"]
     assert client.STANDARD_TESTS[-len(_NAMES):] == _NAMES
     assert all(name in client.TEST_FUNCTIONS for name in _NAMES)
 
 
 @pytest.mark.parametrize("name, counts", [
     ("moq-test-subgroup-per-group-eog", (15, 3, 3)),
+    ("moq-test-subgroup-per-group-no-eog", (18, 0, 3)),
+    ("moq-test-subgroup-per-group-nonzero-start", (6, 3, 3)),
     ("moq-test-subgroup-per-object", (8, 0, 8)),
+    ("moq-test-subgroup-per-object-sparse-ids", (3, 0, 3)),
     ("moq-test-two-subgroups-eog", (18, 3, 6)),
+    ("moq-test-two-subgroups-no-eog", (21, 0, 6)),
     ("moq-test-datagram", (15, 0, 0)),
+    ("moq-test-datagram-nonzero-start", (9, 0, 0)),
+    ("moq-test-datagram-sparse-ids", (9, 0, 0)),
     ("moq-test-datagram-eog", (15, 3, 0)),
     ("moq-test-extensions", (15, 3, 3)),
+    ("moq-test-extensions-integer-only", (15, 3, 3)),
+    ("moq-test-extensions-variable-only", (15, 3, 3)),
+    ("moq-test-object-fragmentation", (1, 0, 1)),
+    ("moq-test-object-large-id", (6, 0, 2)),
     ("moq-test-increments", (9, 0, 3)),
     ("moq-test-forward-zero", (6, 0, 2)),
 ])
@@ -60,6 +80,58 @@ def test_expected_delivery(name, counts):
     assert (len(data), len(markers), streams) == counts
 
 
+@pytest.mark.parametrize("name, ids", [
+    ("moq-test-extensions", {2, 5}),
+    ("moq-test-extensions-integer-only", {2}),
+    ("moq-test-extensions-variable-only", {5}),
+])
+def test_extension_variants_carry_their_property_types(name, ids):
+    assert client._moq_test_extension_ids(_params(name)) == ids
+
+
+def test_large_id_case_crosses_2_to_the_40():
+    data, _, _ = client._moq_test_expected(_params("moq-test-object-large-id"))
+    big = 1 << 40
+    assert sorted(data) == [(g, o) for g in (big, big + 1)
+                            for o in (big + 5, big + 7, big + 9)]
+
+
+class _WriteLog:
+    """Just enough of a session for _send_fragmented."""
+
+    def __init__(self, draft):
+        self._profile = profile_for(draft)
+        self.writes, self.fins = [], []
+
+    async def open_uni_stream(self):
+        return 2
+
+    def subgroup_header(self, **kw):
+        return SubgroupHeader(prof=self._profile, **kw)
+
+    async def stream_write_drain(self, sid, data):
+        self.writes.append(bytes(data))
+
+    def stream_fin(self, sid):
+        self.fins.append(sid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+async def test_fragmentation_writes_one_object_in_four_pieces(draft):
+    p = _params("moq-test-object-fragmentation")
+    assert client._MOQ_TEST_SENDER_FOR["moq-test-object-fragmentation"] \
+        is client._send_fragmented
+    s = _WriteLog(draft)
+    assert await client._send_fragmented(s, 0, p) == 1
+    header, *pieces = s.writes
+    assert len(pieces) == 4 and s.fins == [2]
+    assert [len(x) for x in pieces[1:]] == [24, 24, 24]
+    # The first piece also carries the object header.
+    assert pieces[0].endswith(b"t" * 24) and len(pieces[0]) > 24
+    assert b"".join(pieces).endswith(b"t" * 96)
+
+
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
@@ -67,7 +139,7 @@ def test_expected_delivery(name, counts):
 @pytest.mark.parametrize("name", _NAMES)
 async def test_case_passes_through_the_relay(name, draft, use_quic):
     port = (_BASE_PORT + 2 * _NAMES.index(name) + (0 if use_quic else 1)
-            + (0 if draft == 18 else 20))
+            + (0 if draft == 18 else 2 * len(_NAMES)))
     r = await _run_case(name, port, draft, use_quic)
     assert r.passed and not r.skipped, r.message
     assert set(r.sessions) == {"subscriber", "publisher"}
