@@ -224,7 +224,11 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
   `video_<height>p` and join the source video's catalog altGroup.
 - **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
   each group start. A rung that falls behind ends that group early and resumes at the next group
-  start, so a group never has a hole in it.
+  start, so a group never has a hole in it. Equally numbered groups line up across the source
+  video and its rungs, so a player, or a stitcher building one track from several rungs, can
+  switch at any group start; each rung has its own init data in the catalog. With
+  `--packaging cmaf`, tfdt follows the source timestamps on every track (audio to within half a
+  frame), and a frame at or behind its track's last tfdt is dropped.
 - **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default), `videotoolbox` (macOS,
   H.264 only) or `cpu` (software).
 - **Codec.** `--codec h264` (default) or `av1`: `av1_nvenc` on `nvenc`, libaom in realtime mode
