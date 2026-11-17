@@ -1,14 +1,17 @@
 """Data stream bands. Every session, client and server, raw QUIC and WT,
 starts undeclared data streams in MoQT's neutral band; a published track's
 streams, and the relay's downstream copies of them, take the band of the
-track's publisher priority. FIFO within a band by default, so a track's
-groups stay in order; stream_scheduling selects round_robin."""
+track's publisher priority. stream_scheduling selects fifo or
+round_robin within a band; chain, the default, is in
+test_stream_chain_mode."""
 import asyncio
 
 import pytest
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.protocol import _RAW_WRITE_PRIORITY, _MOQTSessionMixin
+from aiomoqt.protocol import (
+    _RAW_WRITE_PRIORITY, _STREAM_CHAINS, _MOQTSessionMixin,
+)
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 from aiomoqt.types import STREAM_BAND_CONTROL, to_stream_priority
 from aiomoqt.tools import moq_interop_relay as relay
@@ -192,6 +195,7 @@ async def test_datagrams_share_the_neutral_band(use_quic, monkeypatch):
             await asyncio.sleep(0.1)
     finally:
         handle.close()
-    band = to_stream_priority(128, discipline="fifo")
+    band = to_stream_priority(
+        128, discipline="chain" if _STREAM_CHAINS else "fifo")
     assert len(calls) == 2, calls                       # client and relay
     assert all(c == (band, True) for c in calls), calls
