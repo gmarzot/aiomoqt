@@ -1123,7 +1123,8 @@ class _MsftsRun:
         at = o.at_us if frindell is None else frindell.wall_us(o.pcr, o.at_us)
         sent = await _send(self.track, self.stats[self.name], o.payload,
                            o.key, timestamp=at,
-                           group_id=o.group if o.key else None)
+                           group_id=o.group if o.key else None,
+                           arrival_us=o.at_us)
         if (sent and o.key and self.timeline is not None
                 and o.pts is not None):
             await _send(self.timeline_track, self._timeline_stats,
@@ -1573,11 +1574,13 @@ async def _pace(start: float, ts_us: int, pace: bool):
 
 async def _send(track, stats, payload: bytes, key: bool,
                 timestamp: Optional[Union[int, Fraction]] = None,
-                group_id: Optional[int] = None, end: bool = False):
+                group_id: Optional[int] = None, end: bool = False,
+                arrival_us: Optional[int] = None):
     """Send one frame, or drop it while no subscriber has started
     generation: a paced feeder stays on the clock instead of queueing a
     backlog for a late joiner. `end` makes it its group's last frame.
-    True when it was sent.
+    True when it was sent. `arrival_us`, when the timestamp is not the
+    frame's arrival, is what its send lag counts from.
 
     LOC timestamps without a TIMESCALE property are µs since the Unix
     epoch — players schedule against the wall clock. Paced sources pass
@@ -1601,8 +1604,9 @@ async def _send(track, stats, payload: bytes, key: bool,
                            group_id=group_id, **kw)
     # lag: how late the frame already was when we got it (source, pipe,
     # demux). tx: what handing it to the track cost us.
-    stats.count(payload, round_us(entry_us - timestamp),
-                int(time.time() * 1_000_000) - entry_us)
+    stats.count(payload, round_us(entry_us - (
+        timestamp if arrival_us is None else arrival_us)),
+        int(time.time() * 1_000_000) - entry_us)
     if key:
         stats.groups += 1
     return True

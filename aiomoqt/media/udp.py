@@ -56,7 +56,8 @@ def _multicast(host: str) -> bool:
 class UdpInput:
     """A TS byte stream from UDP datagrams. read1() blocks for the next
     datagrams and returns every one queued (b'' once closed); read()
-    waits up to `timeout` s on the event loop (None on timeout)."""
+    waits up to `timeout` s on the event loop (None on timeout), its
+    reader registered once and drained into a queue as datagrams land."""
 
     def __init__(self, url: str):
         host, port = parse_udp_url(url, listen=True)
@@ -84,6 +85,12 @@ class UdpInput:
         self.sock = sock
         self.address = sock.getsockname()
         self.closed = False
+        self._queue: list = []
+        self._queued = 0
+        # read() holds at most what the socket itself would.
+        self._cap = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        self._waiter: Optional[asyncio.Future] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _drain(self) -> bytes:
         parts = []
@@ -113,30 +120,59 @@ class UdpInput:
                     return data
         return b''
 
-    async def read(self, timeout: Optional[float] = None) -> Optional[bytes]:
+    def _readable(self) -> None:
         data = self._drain()
-        if data or self.closed:
-            return data
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
+        if data:
+            self._queue.append(data)
+            self._queued += len(data)
+            if self._queued > self._cap:
+                # The reader is behind: leave the rest to the socket.
+                self._unregister()
+        self._wake()
 
-        def readable():
-            if not fut.done():
-                fut.set_result(None)
-        fd = self.sock.fileno()
-        loop.add_reader(fd, readable)
+    def _wake(self) -> None:
+        w = self._waiter
+        if w is not None and not w.done():
+            w.set_result(None)
+
+    def _unregister(self) -> None:
+        loop, self._loop = self._loop, None
+        if loop is not None and not loop.is_closed():
+            loop.remove_reader(self.sock.fileno())
+
+    def _take(self) -> bytes:
+        data = b''.join(self._queue)
+        self._queue.clear()
+        self._queued = 0
+        return data
+
+    async def read(self, timeout: Optional[float] = None) -> Optional[bytes]:
+        if self.closed:
+            return b''
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+            self._loop.add_reader(self.sock.fileno(), self._readable)
+        if self._queue:
+            return self._take()
+        self._waiter = self._loop.create_future()
+        expiry = (None if timeout is None
+                  else self._loop.call_later(timeout, self._wake))
         try:
-            await asyncio.wait({fut}, timeout=timeout)
+            await self._waiter
         finally:
-            loop.remove_reader(fd)
-        if not fut.done():
-            return None
-        return self._drain() or (b'' if self.closed else None)
+            self._waiter = None
+            if expiry is not None:
+                expiry.cancel()
+        if self._queue:
+            return self._take()
+        return b'' if self.closed else None
 
     def close(self) -> None:
         if not self.closed:
             self.closed = True
+            self._unregister()
             self.sock.close()
+            self._wake()
 
 
 class UdpOutput:

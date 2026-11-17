@@ -30,8 +30,9 @@ goes to stderr; the other track still writes to --out):
 MPEG-TS out (--ts-out): the packets of one mpeg2ts track, in Group and
 Object order as its objects arrive, to a file, stdout (-) or UDP, seven
 packets to a datagram; with --ts-playout MS, each at its PCR time behind
-an MS buffer. --analyze on that track writes a JSON line per -i interval
-and a summary: CC errors, PCR, delay variation, late packets and output
+an MS buffer. --analyze on that track writes a JSON line per -i interval,
+each followed by the summary so far, and the run's summary at the end
+(SIGTERM too): CC errors, PCR, delay variation, late packets and output
 breaks at the buffer and at 100 to 1000 ms, object loss, and the delay
 from the publisher's wall clock when it gives one (clocks must agree).
 
@@ -61,6 +62,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import sys
 import time
 import wave
@@ -537,12 +539,16 @@ class _TsLane:
             if data:
                 sink.write(data)
 
-    def report(self, kind: str, t0: float, t1: float) -> dict:
+    def report(self, kind: str, t0: float, t1: float,
+               final: bool = True) -> dict:
+        """An interval, or the summary: of the run, or with `final`
+        False, of the intervals reported so far."""
         p = self.player
         assert p is not None
         if self.track is not None:
             p.dups = self.track.order.late
-        body = p.interval() if kind == 'interval' else p.summary()
+        body = (p.interval() if kind == 'interval' else
+                p.summary() if final else p.totals())
         return {"type": kind, "track": self.name, "t0": round(t0, 3),
                 "t1": round(t1, 3), **body}
 
@@ -783,8 +789,9 @@ def _ts_forced(args) -> bool:
 
 
 async def _ts_run(args, lane: _TsLane, closed, report) -> None:
-    """--analyze on an mpeg2ts track: a JSON line per -i interval, then
-    a summary; else wait for the run to end."""
+    """--analyze on an mpeg2ts track: a JSON line per -i interval and the
+    summary so far, then the run's summary; else wait for the run to
+    end."""
     out = report[0] if report else sys.stdout
     start = time.monotonic()
     end = start + args.duration if args.duration else math.inf
@@ -801,6 +808,8 @@ async def _ts_run(args, lane: _TsLane, closed, report) -> None:
             now = time.monotonic() - start
             if lane.player is not None and args.analyze:
                 print(json.dumps(lane.report('interval', last, now)),
+                      file=out)
+                print(json.dumps(lane.report('summary', 0.0, now, False)),
                       file=out, flush=True)
             last = now
     except asyncio.CancelledError:
@@ -1055,10 +1064,23 @@ def _ts_status(args, lane: _TsLane) -> int:
     return 0
 
 
+async def _main(args):
+    """run() as the program: SIGTERM stops it as Ctrl-C does, so the
+    summaries still print."""
+    task = asyncio.current_task()
+    try:
+        if task is not None:
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, task.cancel)
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass
+    return await run(args)
+
+
 def main():
     try:
-        sys.exit(asyncio.run(run(parse_args())))
-    except KeyboardInterrupt:
+        sys.exit(asyncio.run(_main(parse_args())))
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 
 

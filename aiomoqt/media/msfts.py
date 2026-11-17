@@ -63,8 +63,10 @@ _PAT_TABLE = 0x00
 _NULL_PID = 0x1FFF
 _MAX_PID = 0x1FFF
 _PCR_WRAP = (1 << 33) * 300
-# A PCR time this far behind its packet's arrival is a new timebase.
-_PCR_REANCHOR_US = 5_000_000
+# PcrTimestamps keeps the least arrival-minus-PCR offset of this bucket
+# and the last; an offset this far above it starts them over.
+_OFFSET_WINDOW_US = 5_000_000
+_OFFSET_RESET_US = 1_000_000
 # Video stream types: MPEG-1/2, MPEG-4 Part 2, H.264, H.265, H.266.
 _VIDEO_TYPES = frozenset({0x01, 0x02, 0x10, 0x1B, 0x24, 0x33})
 _MPEG2_KEY = (b'\x00\x00\x01\xb3', b'\x00\x00\x01\xb8')
@@ -359,7 +361,9 @@ class TsPackager:
     across generations.
 
     Each object's first packet is placed on the PCR timeline: between
-    the PCRs around it, or past the last at the last two PCRs' rate.
+    the PCRs around it, or past the last at the last two PCRs' rate. The
+    timeline is continuous: a PCR wrap is unwrapped, and a discontinuity
+    (flagged, or a PCR going back) goes on from the last two PCRs.
 
     feed(chunk, now_us) returns the objects the chunk completes;
     flush(now_us) the partial one once flush_due() has passed; close()
@@ -728,9 +732,8 @@ class TsPackager:
         return False
 
     def _pcr(self, data, pos: int) -> None:
-        """Keep the PCR, unwrapped; measure the mux rate from the packets
-        between two a second or more apart. A discontinuity starts the
-        timeline over."""
+        """Keep the PCR on a continuous timeline; measure the mux rate
+        from the packets between two a second or more apart."""
         if not data[pos + 3] & 0x20 or data[pos + 4] < 7:
             return
         flags = data[pos + 5]
@@ -745,8 +748,14 @@ class TsPackager:
         if pcrs and full < pcrs[-1][0] - _PCR_WRAP // 2:
             self._pcr_base += _PCR_WRAP
             full += _PCR_WRAP
-        if flags & 0x80 or (pcrs and full < pcrs[-1][0]):
-            pcrs.clear()
+        if pcrs and (flags & 0x80 or full < pcrs[-1][0]):
+            # A discontinuity: go on where the last two PCRs put it.
+            last, at = pcrs[-1]
+            step = ((last - pcrs[-2][0]) / (at - pcrs[-2][1])
+                    if len(pcrs) > 1 and at > pcrs[-2][1] else 0)
+            expect = last + int((idx - at) * step)
+            self._pcr_base += expect - full
+            full = expect
         pcrs.append((full, idx))
         if self.bitrate is not None:
             return
@@ -891,10 +900,11 @@ class PcrTimestamps:
     TIMESCALE 90 kHz, the PTS clock and the PCR base. TIMESTAMP_MAPPING
     (first group, W0, 0, 0) anchors every object at W0, the track's
     creation; each object's OBJECT_TIMESTAMP is the signed correction
-    to its own time. The first PCR maps to its arrival; the mapping
-    moves earlier when a packet arrives ahead of it, so a time is never
-    later than its arrival, and starts over at an arrival far past it
-    (a new timebase)."""
+    to its own time: its PCR plus the least arrival-minus-PCR offset of
+    the last 5 to 10 s. A time is thus never later than its arrival,
+    and follows a wall clock that steps or a source clock that drifts
+    within that window. An arrival more than 1 s past its time (the
+    source stalled, or a new timebase) starts the window over."""
 
     TIMESCALE = 90_000
     mapped = True
@@ -903,7 +913,9 @@ class PcrTimestamps:
     def __init__(self, first_group: int, wall0_us: int):
         self.first_group = first_group
         self.base = wall0_us * self.TIMESCALE // 1_000_000
-        self._anchor: Optional[Tuple[int, int]] = None
+        self._bucket = -1
+        self._min = 0
+        self._prev: Optional[int] = None
 
     def track_properties(self, vi64: bool) -> Dict[int, Any]:
         return {TIMESCALE: self.TIMESCALE,
@@ -915,14 +927,20 @@ class PcrTimestamps:
         (27 MHz) when it has one, else its arrival."""
         if pcr is None:
             return at_us
-        if self._anchor is None:
-            self._anchor = (pcr, at_us)
-        p0, w0 = self._anchor
-        us = w0 + (pcr - p0) // 27
-        if us > at_us or at_us - us > _PCR_REANCHOR_US:
-            self._anchor = (pcr, at_us)
-            us = at_us
-        return us
+        us = pcr // 27
+        off = at_us - us
+        bucket = at_us // _OFFSET_WINDOW_US
+        if bucket != self._bucket:
+            self._prev = self._min if bucket == self._bucket + 1 else None
+            self._bucket, self._min = bucket, off
+        elif off < self._min:
+            self._min = off
+        prev = self._prev
+        low = self._min if prev is None else min(self._min, prev)
+        if off - low > _OFFSET_RESET_US:
+            self._prev, self._min = None, off
+            low = off
+        return us + low
 
     def group_for(self, capture_us) -> None:
         return None
@@ -948,6 +966,22 @@ class MsftsTrackPublisher(LocTrackPublisher):
 
     def _timestamp_ids(self, session) -> tuple:
         return ()
+
+    def _prepare(self, frame: LocFrame, group_id: int,
+                 obj_id: int) -> Optional[bytes]:
+        if self.frindell is not None and frame.capture_us is not None:
+            frame.extensions = self.frindell.object_properties(
+                group_id, obj_id, frame.capture_us)
+        return frame.payload
+
+    def _object_extensions(self, frame: LocFrame, group_start: bool,
+                           session=None) -> Dict[int, Any]:
+        """The object's own properties, shared by every peer; none on
+        d14, which has no TIMESCALE to give OBJECT_TIMESTAMP."""
+        exts = frame.extensions
+        if not exts or not (session or self.session)._profile.track_properties:
+            return {}
+        return exts
 
 
 class MsftsTrackSubscriber(LocTrackSubscriber):

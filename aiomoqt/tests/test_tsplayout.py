@@ -227,6 +227,34 @@ def test_object_loss_groups_and_end_to_end_delay():
     assert e2e['p100'] == pytest.approx(30.1)
 
 
+def test_a_long_media_timeline_dates_every_group():
+    # The publisher's window (300 s) outgrows the receiver's 256 records:
+    # each update repeats it whole, and every new group still gets its
+    # sample.
+    q = TsPlayout(None, wall_offset_ns=0)
+    pkt = objects(cbr(7))[0]
+    recs = []
+    for g in range(400):
+        q.push(pkt, BASE + g * 1000 * MS, g, 0)
+        recs = (recs + [[g * 1000, [g, 0], (BASE + g * 1000 * MS) // MS
+                         - 20]])[-300:]
+        q.timeline(recs)
+    e2e = q.summary()['e2e_ms']
+    assert e2e['samples'] == 400
+    assert e2e['p50'] == pytest.approx(20, abs=0.5)
+
+
+def test_totals_are_the_intervals_so_far():
+    p = TsPlayout(300, wall_offset_ns=1)
+    objs = objects(cbr(700))
+    feed(p, objs[:50], _on_time)
+    first = p.interval()
+    assert p.totals()['ts_packets'] == first['ts_packets']
+    feed(p, objs[50:], lambda k: _on_time(k + 50))
+    assert p.totals()['ts_packets'] == first['ts_packets']
+    assert p.summary()['ts_packets'] == 700
+
+
 def test_arrival_log_has_a_line_per_pcr():
     log = io.StringIO()
     p = TsPlayout(200, arrival_log=log, wall_offset_ns=7)

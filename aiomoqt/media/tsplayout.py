@@ -212,6 +212,7 @@ class TsPlayout:
         self._groups: 'collections.OrderedDict[int, int]' = (
             collections.OrderedDict())
         self._timeline: Dict[Tuple[int, int], int] = {}
+        self._timeline_floor = 0
         self.total = _Window(self.buffers)
         self._win = _Window(self.buffers)
 
@@ -252,25 +253,31 @@ class TsPlayout:
         self._hold = self._lost = True
         self._groups.clear()
         self._timeline.clear()
+        self._timeline_floor = 0
 
     def timeline(self, records) -> None:
         """MSF media timeline records [media ms, [group, object], wall
         ms] (msf-01 §7.1.1): the publisher's wall clock per Location."""
+        known, floor = self._timeline, self._timeline_floor
         for rec in records:
             try:
                 (g, o), wall = rec[1], int(rec[2])
+                g, o = int(g), int(o)
             except (TypeError, ValueError, IndexError):
                 continue
-            if not wall or (g, o) in self._timeline:
+            if not wall or g < floor or (g, o) in known:
                 continue
-            self._timeline[(g, o)] = wall
+            known[(g, o)] = wall
             if self.e2e_source != 'frindell' and o == 0:
                 at = self._groups.get(g)
                 if at is not None:
                     self.e2e_source = 'media-timeline'
                     self._e2e(at - wall * 1_000_000)
-        while len(self._timeline) > _TIMELINE_GROUPS:
-            self._timeline.pop(next(iter(self._timeline)))
+        if len(known) > _TIMELINE_GROUPS:
+            # Keep the newest Locations; older records are skipped after.
+            keep = sorted(known)[-_TIMELINE_GROUPS:]
+            self._timeline = {k: known[k] for k in keep}
+            self._timeline_floor = keep[0][0]
 
     def _e2e(self, ns: int) -> None:
         self._win.e2e.add(ns)
@@ -507,6 +514,10 @@ class TsPlayout:
     def summary(self) -> Dict[str, Any]:
         """The whole run; the open interval is folded in unreported."""
         self.interval()
+        return self.totals()
+
+    def totals(self) -> Dict[str, Any]:
+        """The run up to the last interval."""
         t = self.total
         t.base = {ms: (0, 0, 0) for ms in self.buffers}
         t.base[None] = (0, 0, 0)

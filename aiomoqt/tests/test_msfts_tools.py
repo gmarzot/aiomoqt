@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import signal
 import socket
 import threading
 import time
@@ -36,8 +37,9 @@ _PORT = 32010
 
 
 async def _through_relay(monkeypatch, port, use_quic, pub_argv, sub_argv,
-                         seconds=20):
-    """pub_media and sub_media through the relay; sub_media's exit code."""
+                         seconds=20, sigterm=False):
+    """pub_media and sub_media through the relay; sub_media's exit code.
+    sub_media stops on a cancel, or with `sigterm` on a SIGTERM."""
     url = _url(port, use_quic)
     ns = f'msfts/{port}'
     pub_args = _argv(monkeypatch, 'pub_media', url, '-k', '--draft', '18',
@@ -45,15 +47,24 @@ async def _through_relay(monkeypatch, port, use_quic, pub_argv, sub_argv,
                      '0', *pub_argv)
     sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '18',
                      '-N', ns, *sub_argv)
+    if sigterm:
+        # One loop serves both: pub_media must leave SIGTERM to sub_media.
+        monkeypatch.setattr(pub_media, '_STOP_SIGNALS', (signal.SIGINT,))
     srv, handle = await _serve(port, use_quic, 18)
     rc = None
     try:
         pub = asyncio.ensure_future(pub_media.run(pub_args))
         await _until(lambda: relay._announced or pub.done(), 10)
-        sub = asyncio.ensure_future(sub_media.run(sub_args))
+        sub = asyncio.ensure_future(
+            (sub_media._main if sigterm else sub_media.run)(sub_args))
         await asyncio.wait_for(pub, seconds + 15)
         await asyncio.sleep(0.5)
-        sub.cancel()
+        if sigterm:
+            # Never the default action: that would end the test run.
+            assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            sub.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             rc = await sub
     finally:
@@ -108,7 +119,8 @@ async def test_playout_and_analysis(monkeypatch, capsys, tmp_path, use_quic):
     assert summary['type'] == 'summary' and len(lines) >= 3
     assert summary['track'] == 'program-1'
     assert summary['ts_packets'] > 0
-    assert summary['ts_packets'] == sum(x['ts_packets'] for x in lines[:-1])
+    intervals = [x for x in lines if x['type'] == 'interval']
+    assert summary['ts_packets'] == sum(x['ts_packets'] for x in intervals)
     assert summary['cc_errors_total'] == 0
     assert summary['pcr']['pid'] == 256 and summary['pcr']['count'] > 50
     assert summary['playout']['buffer_ms'] == 300
@@ -370,6 +382,26 @@ async def test_udp_input_reads_queued_datagrams_and_closes():
     tx.close()
 
 
+async def test_udp_input_stops_reading_past_its_cap():
+    rx = UdpInput('udp://127.0.0.1:0')
+    rx._cap = 5 * 7 * P
+    tx = UdpOutput(f'udp://127.0.0.1:{rx.address[1]}')
+    sent = b''.join(bytes([0x47, k]) * (7 * P // 2) for k in range(20))
+    assert await rx.read(0.01) is None
+    tx.write(sent)
+    await asyncio.sleep(0.05)
+    assert rx._loop is None and rx._queued <= rx._cap + 65536
+    got = b''
+    while len(got) < len(sent):
+        data = await rx.read(1.0)
+        assert data
+        got += data
+    assert got == sent
+    rx.close()
+    tx.close()
+    assert await rx.read(0.01) == b''
+
+
 # -- wall-clock references --------------------------------------------------
 
 def test_media_timeline_keeps_its_window():
@@ -411,12 +443,25 @@ async def test_end_to_end_delay(monkeypatch, capsys, tmp_path, pub_argv,
         timings.append(track.timing)
     monkeypatch.setattr(sub_media._TsLane, 'start', spy)
     data, _ = gop_stream(10, frames=10, lead=False)
-    await _through_relay(
-        monkeypatch, _PORT + 10, True,
-        ['--ts', _paced_fifo(tmp_path, data, 2), '--msfts', *pub_argv],
-        ['--analyze', '-i', '1', '-t', '30'])
+    loop = asyncio.get_running_loop()
+    try:
+        await _through_relay(
+            monkeypatch, _PORT + 10, True,
+            ['--ts', _paced_fifo(tmp_path, data, 2), '--msfts', *pub_argv],
+            ['--analyze', '-i', '1', '-t', '30'], sigterm=True)
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
     lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines()
              if ln.startswith('{')]
+    # Each interval is followed by the summary so far, then the run's.
+    kinds = [x['type'] for x in lines]
+    assert kinds[-1] == 'summary' and kinds.count('interval') >= 2
+    for i, kind in enumerate(kinds[:-1]):
+        if kind == 'interval':
+            assert kinds[i + 1] == 'summary'
+            assert lines[i + 1]['t1'] == lines[i]['t1']
+    running = [x['ts_packets'] for x in lines if x['type'] == 'summary']
+    assert running == sorted(running)
     summary = lines[-1]
     assert summary['ts_packets'] > 0
     e2e = summary['e2e_ms']
@@ -429,7 +474,10 @@ async def test_end_to_end_delay(monkeypatch, capsys, tmp_path, pub_argv,
         assert e2e['samples'] == summary['objects']['received']
     else:
         assert not timings[0].declared
-        assert e2e['samples'] <= summary['objects']['groups']
+        # One per group: a group's record may still be on its way.
+        groups = summary['objects']['groups']
+        assert groups >= 8
+        assert groups - 1 <= e2e['samples'] <= groups
 
 
 # -- a PSI change: the receiver follows the next track ---------------------

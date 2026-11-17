@@ -917,6 +917,66 @@ def test_objects_are_placed_on_the_pcr_timeline():
         at += len(o.payload) // P
 
 
+@pytest.mark.parametrize('back,disc', [
+    (True, True), (True, False), (False, True)],
+    ids=['back-flagged', 'back-unflagged', 'ahead-flagged'])
+def test_the_pcr_timeline_goes_on_across_a_discontinuity(back, disc):
+    """At packet 200 the PCR starts over (or leaps ahead); the objects'
+    PCRs go on at the rate before it."""
+    m = Mux()
+    m.raw(pat())
+    m.raw(pmt())
+    tick = 27_000
+    m.put(VIDEO_PID, [b''], pcr=0, pusi=False)
+    for j in range(1, 400):
+        pcr = None
+        if j % 10 == 0:
+            pcr = j * tick if j < 200 else (
+                (j - 200) * tick if back else (j + 5000) * tick)
+        rai = j % 60 == 1
+        size = 176 if pcr is not None else 182 if rai else 184
+        m.out.append(ts(VIDEO_PID, b'\x05' * size, pusi=rai, cc=j & 15,
+                        pcr=pcr, rai=rai, disc=disc and j == 200))
+    data = m.data()
+    p = TsPackager(7)
+    objs = []
+    for i in range(0, len(data), 7 * P):
+        objs += p.feed(data[i:i + 7 * P], i)
+    objs += p.close()
+    at = 0
+    for o in objs:
+        assert o.pcr == max(0, at - 2) * tick
+        at += len(o.payload) // P
+
+
+def test_pcr_timestamps_follow_a_wall_clock_step():
+    """A PCR every 100 ms, a third arriving on time and the rest 5 ms
+    late; the wall clock steps back 50 ms at 10 s and ahead 100 ms at
+    20 s. A time is never later than its arrival, follows a step back
+    at once and a step ahead within two 5 s windows."""
+    t = msfts.PcrTimestamps(0, 0)
+    w0 = 1_800_000_000_000_000
+    for k in range(400):
+        at = w0 + k * 100_000 + (5_000 if k % 3 else 0)
+        at += (-50_000 if k >= 100 else 0) + (100_000 if k >= 200 else 0)
+        us = t.wall_us(k * 2_700_000, at)
+        assert us <= at
+        if k < 200 or k >= 310:
+            assert us >= at - 5_000, k
+
+
+def test_pcr_timestamps_start_over_after_a_stall():
+    """The source stops 3 s and resumes at the PCR it stopped at: the
+    times after it start over at their arrival."""
+    t = msfts.PcrTimestamps(0, 0)
+    w0 = 1_800_000_000_000_000
+    for k in range(100):
+        at = w0 + k * 10_000 + (3_000_000 if k >= 50 else 0)
+        pcr = (k if k < 50 else k - 1) * 270_000
+        us = t.wall_us(pcr, at)
+        assert us == at, k
+
+
 def test_pcr_timestamps_round_trip_through_a_subscriber():
     from aiomoqt.utils.timing import (
         OBJECT_TIMESTAMP, TIMESCALE, TrackTiming, capture_time_us,
@@ -928,8 +988,9 @@ def test_pcr_timestamps_round_trip_through_a_subscriber():
     assert decode_mapping(props[TIMESTAMP_MAPPING], True) == (
         12, 1_800_000_000_000_000 * 9 // 100, 0, 0)
     timing = TrackTiming.from_properties(props, vi64=True)
-    # The first PCR at its arrival; later ones on the PCR's clock; one
-    # arriving early moves the anchor; a far-behind one starts over.
+    # The first PCR at its arrival, later ones at their PCR plus the
+    # window's least offset: an early one lowers it, one far ahead
+    # takes its arrival.
     arrivals = [(0, 1_799_999_999_000_000), (27_000_000, 1_800_000_000_100_000),
                 (54_000_000, 1_800_000_000_900_000),
                 (81_000_000, 1_800_000_001_950_000),
