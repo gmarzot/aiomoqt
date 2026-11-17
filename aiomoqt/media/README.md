@@ -232,6 +232,11 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
   The source passes through as H.264.
 - **Track Properties** pass through, timing ones to the rungs as well.
 - **Packaging.** `--packaging cmaf` publishes every output track as CMSF: one CMAF chunk per object, led by a `prft` with the capture time, the CMAF header in the catalog `initDataList`. Tracks whose codec no header covers (H.264, H.265, AV1, AAC and Opus do) are left out.
+- **Several outputs.** `--output NS[,packaging=loc|cmaf][,codec=h264|av1][,rung=WxH:BPS]...`,
+  repeated, publishes each namespace with its own catalog from one source subscription and one
+  decode: for instance an H.264 CMAF ladder for one player and an AV1 LOC one for another. Fields
+  left out take `--packaging`, `--codec` and `--rung`; rungs of one size, rate and codec share an
+  encoder. A source group dropped at the decoder is missing from every output.
 - **Report.** Every `-i` seconds, per output track: frames, frames skipped while no subscriber
   took the track (`idle`), drops, and the delay from a source frame's arrival to its hand-off to
   the output track; rungs also show the encoder's share. `--no-ladder` passes the source
