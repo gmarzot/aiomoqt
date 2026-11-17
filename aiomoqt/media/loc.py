@@ -452,5 +452,9 @@ class LocTrackSubscriber(SubscribedTrack):
         self.frames_received += 1
         if self.on_arrival:
             self.on_arrival(msg, recv_us, gid, subgroup_id, frame)
+        self._deliver(frame, gid, msg.object_id)
+
+    def _deliver(self, frame: LocFrame, group_id: int, object_id: int) -> None:
+        """Hand a received frame to on_frame."""
         if self.on_frame:
-            self.on_frame(frame, gid, msg.object_id)
+            self.on_frame(frame, group_id, object_id)
