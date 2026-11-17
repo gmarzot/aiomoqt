@@ -1528,14 +1528,30 @@ async def _eot_publisher(stack, port, use_quic, draft, epoch):
     return tracks
 
 
+def _handle_data_late(session, delay):
+    """`session` handles data on every stream but control `delay` late."""
+    handle = session._on_stream_data
+    loop = asyncio.get_running_loop()
+
+    def late(stream_id, data, end_stream):
+        if stream_id == session._control_stream_id:
+            return handle(stream_id, data, end_stream)
+        loop.call_later(delay, handle, stream_id, data, end_stream)
+    session._on_stream_data = late
+
+
 @requires_certs
 @pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True])
 @_MP_DRAFTS
 @_TRANSPORTS
-async def test_no_failover_past_a_forwarded_end_of_track(draft, use_quic):
+async def test_no_failover_past_a_forwarded_end_of_track(late, draft,
+                                                         use_quic):
     # The serving publisher's End of Track ends the track downstream: a
     # standby still producing does not take over, and nothing follows it.
-    port = _BASE_PORT + 190 + 2 * (draft == 22) + (not use_quic)
+    # With `late`, its PUBLISH_DONE overtakes the End of Track stream.
+    port = (_BASE_PORT + 190 + 26 * late + 2 * (draft == 22)
+            + (not use_quic))
     _reset_relay_state()
     server = relay._build_server("localhost", port, CERT, KEY,
                                  use_quic=use_quic, draft=draft)
@@ -1583,6 +1599,8 @@ async def test_no_failover_past_a_forwarded_end_of_track(draft, use_quic):
             assert await _until(lambda: all(
                 primary[n]._largest[0] >= standby[n]._largest[0]
                 for n in _MP_TRACKS))
+            if late:
+                _handle_data_late(_mp_tracks()[0].upstream.session, 0.2)
             for t in primary.values():
                 t.end()
             assert await _until(lambda: all(done.values())), (ends, done)

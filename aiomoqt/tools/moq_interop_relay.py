@@ -2390,14 +2390,21 @@ class _RelayedTrack:
         status, reason, key, need = self._pending_done
         logger.info(f"relay: PUBLISH_DONE {key} released on grace "
                     f"({self._upstream_ended}/{need} streams)")
-        self._enqueue_terminal(status, reason, key)
+        self._release_done(status, reason, key)
 
     def _check_pending_done(self) -> None:
         if self._pending_done is None:
             return
         status, reason, key, need = self._pending_done
         if self._upstream_ended >= need:
-            self._enqueue_terminal(status, reason, key)
+            self._release_done(status, reason, key)
+
+    def _release_done(self, status, reason, key) -> None:
+        """The held PUBLISH_DONE: a standby takes over unless an End of
+        Track came first, else the terminal."""
+        if self.standby and self.fail_over(key):
+            return
+        self._enqueue_terminal(status, reason, key)
 
     def on_stream_end(self, group_id, subgroup_id, clean=True, reset_code=0,
                       feed=None):
@@ -4002,6 +4009,12 @@ def _upstream_done(track, key, done, feed=None) -> None:
                 f"-> {len(track.downstream)} subscriber(s), objects "
                 f"in={track._objects_in} out={track._objects_out}, "
                 f"upstream streams ended={track._upstream_ended}")
+    need = int(getattr(done, "stream_count", 0) or 0)
+    if track.standby and track._upstream_ended < need:
+        # Its End of Track may be on a stream still in flight: fail over,
+        # or not, once Stream Count streams have ended.
+        track.note_upstream_done(status, reason, key, need)
+        return
     if track.fail_over(key):
         return
     if track.task is None and not track.attaching:
