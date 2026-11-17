@@ -456,9 +456,9 @@ async def test_ladder_mixes_codecs_on_one_decode(impl, clip):
                                group, obj)
             obj += 1
         assert await ladder.flush(10)
+        assert ladder.stats()['packets_in'] == len(frames)
     finally:
         ladder.close()
-    assert ladder.stats()['packets_in'] == len(frames)
     for i, codec in enumerate(codecs):
         assert len(got[i]) == len(frames)
         assert all(_rung_payload_ok(codec, p, key) for _, _, key, p in got[i])
