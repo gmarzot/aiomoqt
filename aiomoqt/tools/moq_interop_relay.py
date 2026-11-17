@@ -1805,16 +1805,21 @@ class _Feed:
         """The handlers under `alias` are still this feed's."""
         return True
 
-    def update(self, forward) -> None:
-        """REQUEST_UPDATE its Forward State, no reply awaited."""
+    def update(self, forward, reply=False):
+        """REQUEST_UPDATE its Forward State; with `reply`, returns a task
+        for its REQUEST_OK, else None."""
         session, rid = self.session, getattr(self.sub, "request_id", None)
         if rid is None or not _session_live(session):
-            return
+            return None
         try:
-            session.request_update(rid, forward=forward, **self._location())
+            sent = session.request_update(rid, forward=forward,
+                                          wait_response=reply,
+                                          **self._location())
         except Exception:
             logger.debug("relay: updating a standby upstream failed",
                          exc_info=True)
+            return None
+        return asyncio.ensure_future(sent) if reply else None
 
     def release(self, cancel=False) -> None:
         """Drop its handlers, once; with `cancel`, its request too."""
@@ -1856,15 +1861,24 @@ class _PushedFeed(_Feed):
 
     def _on_object(self, msg, size, ts, group_id, subgroup_id):
         track = self.track
-        if not self.in_step and self.bound and track.largest_current():
-            self.in_step = True
+        if not self.in_step and self.bound:
             gid = getattr(msg, "group_id", None)
             gid = group_id if gid is None else gid
-            if not track._near(gid):
+            current = track.largest_current()
+            if track._behind(gid) or (current and not track._near(gid)):
                 _supersede(track, self, (gid, msg.object_id)).on_object(
                     msg, size, ts, group_id, subgroup_id)
                 return
+            self.in_step = current
         track.on_object(msg, size, ts, group_id, subgroup_id, feed=self)
+
+    def settle(self, largest) -> None:
+        """Its resume REQUEST_OK reports `largest`: below the track's, it
+        is a restarted publisher. Otherwise its objects decide, since a
+        paused publisher's reported Largest may not have advanced."""
+        if (not self.in_step and self.bound and largest is not None
+                and self.track._behind(largest[0])):
+            _supersede(self.track, self, largest, sent=False)
 
     def _location(self) -> dict:
         return _publish_ok_location(self.msg)
@@ -2136,6 +2150,11 @@ class _RelayedTrack:
         """Group `gid` is within one of Largest's, once Largest is known."""
         return self.largest is not None and abs(gid - self.largest[0]) <= 1
 
+    def _behind(self, gid) -> bool:
+        """Group `gid` is more than one below Largest. Decisive even while
+        Largest is stale: a live track's groups only rise."""
+        return self.largest is not None and gid < self.largest[0] - 1
+
     def largest_current(self) -> bool:
         """Largest tracks the serving publisher's numbering: known, not
         paused, and objects taken since the last resume or RESUME_REPLY_S
@@ -2180,9 +2199,11 @@ class _RelayedTrack:
             self.upstream_alias = None
             self.upstream_request_id = nxt.msg.request_id
             self.publish_msg = nxt.msg
+            alias = nxt.msg.track_alias
         else:
             self.upstream = nxt.sub
-            self.upstream_alias = nxt.sub.track_alias
+            alias = nxt.sub.track_alias
+            self.upstream_alias = alias
             self.upstream_request_id = None
             self.publish_msg = None
         self.feed = nxt
@@ -2194,7 +2215,7 @@ class _RelayedTrack:
         self._pending_done = None
         self._uncarry(old)
         logger.info(f"relay: upstream {key} failed over to another "
-                    f"publisher, alias={nxt.sub.track_alias}, "
+                    f"publisher, alias={alias}, "
                     f"{len(self.standby)} standby, {self._copies} copies "
                     f"dropped")
         return True
@@ -4243,22 +4264,30 @@ def _takes_publisher(track) -> bool:
 def _numbers_far(track, msg) -> bool:
     """The PUBLISH's Largest is far from the track's: its publisher
     restarted the numbering."""
-    return (bool(getattr(msg, "content_exists", 0))
-            and track.largest_current()
-            and not track._near(msg.largest_group_id))
+    if not getattr(msg, "content_exists", 0):
+        return False
+    gid = msg.largest_group_id
+    return track._behind(gid) or (track.largest_current()
+                                  and not track._near(gid))
 
 
-def _supersede(track, feed, location):
-    """`feed`'s first object, at `location`, is far from `track`'s
-    Largest: its publisher restarted the numbering, and its PUBLISH
-    replaces the track as a new one would. Returns the new track."""
+def _supersede(track, feed, location, sent=True):
+    """`feed`'s first object at `location`, or with `sent` False its
+    reported Largest, is far from `track`'s Largest: its publisher
+    restarted the numbering, and its PUBLISH replaces the track as a new
+    one would. Returns the new track."""
     key = track.key
     session, msg = feed.session, feed.msg
-    logger.info(f"relay: publish {key} alias={msg.track_alias} sent "
-                f"{location}, far from Largest {track.largest}: a restarted "
-                f"publisher; retiring the track registered for {key}")
+    logger.info(f"relay: publish {key} alias={msg.track_alias} "
+                f"{'sent' if sent else 'reports Largest'} {location}, far "
+                f"from Largest {track.largest}: a restarted publisher; "
+                f"retiring the track registered for {key}")
     track.standby.remove(feed)
     feed.bound = False
+    # A subscriber held on the resume is answered from the new track.
+    resume = _resuming.pop(key, None)
+    if resume is not None:
+        resume.cancel()
     track.finish(reason="superseded by a new publisher")
     track.close()
     _drop_track(key, track)
@@ -4271,7 +4300,12 @@ def _supersede(track, feed, location):
     new.publish_msg = msg
     new.publish_alias = msg.track_alias
     new.properties = feed.props
-    new.complete_from = location
+    if sent:
+        new.complete_from = location
+    else:
+        new.note_largest(location)
+        # Complete from its first object.
+        new._resync = True
     session.register_object_handler(msg.track_alias, new.on_object)
     session.register_stream_end_handler(msg.track_alias, new.on_stream_end)
     _ensure_pause_sweep()
@@ -4426,7 +4460,9 @@ def _upstream_request(track):
 def _resume_paused(track, wanted=False):
     """Raise a paused upstream's Forward State once a subscriber
     forwards, or is about to (`wanted`). With `wanted`, returns the
-    awaitable reply when the upstream draft has one (d16+), else None."""
+    awaitable reply when the upstream draft has one (d16+) and the
+    (feed, reply task) of each further publisher whose numbering is
+    unsettled, else None."""
     if not track.paused or not (wanted or _forwarding(track)):
         return None
     req = _upstream_request(track)
@@ -4453,13 +4489,18 @@ def _resume_paused(track, wanted=False):
                                        **location)
         logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
                     f"forward=1 request {rid}")
+        settling = []
         for f in track.standby:
-            f.update(1)
+            ask = (wait and isinstance(f, _PushedFeed) and not f.in_step
+                   and not f.session._profile.update_has_location)
+            sent = f.update(1, reply=ask)
+            if sent is not None:
+                settling.append((f, sent))
     except Exception:
         logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
         return None
-    return reply if wait else None
+    return (reply, settling) if wait else None
 
 
 # Track key -> task taking the Largest from a resume's REQUEST_OK.
@@ -4477,11 +4518,12 @@ async def _resume_for(track, msg) -> None:
     if task is None:
         paused_at = track.pause_largest
         pause_reply = track.pause_reply if paused_at is None else None
-        reply = _resume_paused(track, wanted=True)
-        if reply is None:
+        replies = _resume_paused(track, wanted=True)
+        if replies is None:
             return
+        reply, settling = replies
         task = asyncio.create_task(_take_live_largest(
-            track, reply, paused_at, pause_reply))
+            track, reply, paused_at, pause_reply, settling))
         _resuming[track.key] = task
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
@@ -4491,45 +4533,63 @@ async def _resume_for(track, msg) -> None:
     track.attaching = True
     try:
         await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancelled by _supersede; the caller re-reads the track.
+        if not task.cancelled():
+            raise
     finally:
         track.attaching = False
         track._ensure_drain()
 
 
 async def _take_live_largest(track, reply, paused_at=None,
-                             pause_reply=None) -> None:
+                             pause_reply=None, settling=()) -> None:
     """Note the Largest a resume's REQUEST_OK reports, waiting at most
     RESUME_REPLY_S. Past the publisher's Largest at the pause
     (`paused_at`, else what `pause_reply` resolves to), its group is live
-    and the fence stops before it."""
+    and the fence stops before it. Then settle each further publisher in
+    `settling` by its own reply."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + RESUME_REPLY_S
     try:
-        ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
-    except TimeoutError:
-        logger.warning(f"relay: resume {track.key}: no REQUEST_OK within "
-                       f"{RESUME_REPLY_S:g}s; answering with the cached "
-                       f"Largest {track.largest}")
-        return
-    except MOQTRequestError as e:
-        logger.info(f"relay: resume {track.key}: upstream refused the "
-                    f"update: {e}")
-        return
-    live = _update_largest(ok)
-    track.note_largest(live)
-    if paused_at is None and pause_reply is not None:
-        # The pause's REQUEST_OK precedes this one on the same request.
         try:
-            paused_at = await asyncio.wait_for(
-                asyncio.shield(pause_reply),
-                max(deadline - loop.time(), 0))
+            ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
         except TimeoutError:
-            paused_at = None
-        if paused_at is not None and track.fence is not None:
-            track.fence = max(track.fence, paused_at[0])
-    if (track.fence is not None and paused_at is not None
-            and live is not None and live > tuple(paused_at)):
-        track.fence = min(track.fence, live[0] - 1)
+            logger.warning(f"relay: resume {track.key}: no REQUEST_OK "
+                           f"within {RESUME_REPLY_S:g}s; answering with the "
+                           f"cached Largest {track.largest}")
+            return
+        except MOQTRequestError as e:
+            logger.info(f"relay: resume {track.key}: upstream refused the "
+                        f"update: {e}")
+            return
+        live = _update_largest(ok)
+        track.note_largest(live)
+        if paused_at is None and pause_reply is not None:
+            # The pause's REQUEST_OK precedes this one on the same request.
+            try:
+                paused_at = await asyncio.wait_for(
+                    asyncio.shield(pause_reply),
+                    max(deadline - loop.time(), 0))
+            except TimeoutError:
+                paused_at = None
+            if paused_at is not None and track.fence is not None:
+                track.fence = max(track.fence, paused_at[0])
+        if (track.fence is not None and paused_at is not None
+                and live is not None and live > tuple(paused_at)):
+            track.fence = min(track.fence, live[0] - 1)
+        for feed, sent in settling:
+            try:
+                ok = await asyncio.wait_for(
+                    sent, max(deadline - loop.time(), 0))
+            except (TimeoutError, MOQTRequestError):
+                continue
+            feed.settle(_update_largest(ok))
+            if track._closed:
+                return
+    finally:
+        for _feed, sent in settling:
+            sent.cancel()
 
 
 def _update_largest(reply):
@@ -5060,6 +5120,8 @@ async def _relay_subscribe(session, msg):
         track = None
     if track is not None and track.paused and track.upstream is not None:
         await _resume_for(track, msg)
+        # A restarted publisher may have superseded it meanwhile.
+        track = _tracks.get((ns, msg.track_name))
     # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
     seen = None if track is None else track.largest
     if track is not None and (track.pending_publish or track.upstream):
@@ -5476,7 +5538,8 @@ async def _offer_track(session, track, key, request_id=None):
         # As for a SUBSCRIBE: resume first, so the offer carries the
         # publisher's live Largest and the subscriber takes the fence.
         await _resume_for(track, SimpleNamespace(forward=1))
-        if not _session_live(session):
+        # A superseding track is offered on its own.
+        if track._closed or not _session_live(session):
             return
     pub_msg = session.publish(
         namespace=ns,

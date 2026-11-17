@@ -1703,13 +1703,19 @@ async def test_a_restarted_pusher_supersedes_the_track(decide, old, draft,
 
 @requires_certs
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decide", ["publish", "reply", "object"])
 @_MP_DRAFTS
 @_TRANSPORTS
-async def test_a_restarted_pusher_supersedes_a_paused_track(draft, use_quic):
+async def test_a_restarted_pusher_supersedes_a_paused_track(decide, draft,
+                                                            use_quic):
     # The old publisher went silent with its session open and the track
-    # paused; a restarted one joins it. Once a subscriber resumes the track
-    # and the old one stays silent, the restarted one replaces it.
-    port = _push_port(22 + (draft == 22), use_quic)
+    # paused; a restarted one, numbered below Largest, PUBLISHes it. The
+    # Largest in its PUBLISH or in its reply to the resume replaces the
+    # track, and the next subscriber is served by it with no PUBLISH_DONE.
+    # Having produced nothing, only its first object decides: that
+    # subscriber gets PUBLISH_DONE, and the next is served by it.
+    case = ("publish", "reply", "object").index(decide)
+    port = _push_port(22 + (draft == 22) + 2 * case, use_quic)
     _reset_relay_state()
     relay._pause_after = 0.3
     server = relay._build_server("localhost", port, CERT, KEY,
@@ -1729,21 +1735,33 @@ async def test_a_restarted_pusher_supersedes_a_paused_track(draft, use_quic):
         for t in pubs[0][2].values():
             t.stopped = True
         olds = _mp_tracks()
-        pubs.append(await _mp_pusher(port, use_quic, draft, now))
-        assert await _until(lambda: all(len(t.standby) == 1 for t in olds))
+        pubs.append(await _mp_pusher(port, use_quic, draft, now,
+                                     largest=decide == "publish"))
+        if decide == "publish":
+            assert await _until(lambda: all(
+                t is not None and t not in olds for t in _mp_tracks()))
+        else:
+            assert await _until(lambda: all(len(t.standby) == 1
+                                            for t in olds))
+        if decide == "reply":
+            # Produced while not forwarded: its REQUEST_OK reports it.
+            gid = int((asyncio.get_running_loop().time() - now)
+                      / _MP_PERIOD)
+            for t in pubs[1][2].values():
+                t._largest = (gid, 0)
         async with contextlib.AsyncExitStack() as stack:
             rx = _MpRx()
             await rx.subscribe(port, use_quic, draft, stack)
-            assert await _until(lambda: all(rx.done.values())), rx.done
-            assert await _until(lambda: all(
-                t is not None and t not in olds and not t.standby
-                for t in _mp_tracks()))
-            rx = _MpRx()
-            await rx.subscribe(port, use_quic, draft, stack)
+            if decide == "object":
+                assert await _until(lambda: all(rx.done.values())), rx.done
+                rx = _MpRx()
+                await rx.subscribe(port, use_quic, draft, stack)
             assert await _until(lambda: all(rx.groups(n) >= 4
                                             for n in _MP_TRACKS))
+            assert all(t not in olds and not t.standby for t in _mp_tracks())
             for objs in rx.objects.values():
                 assert max(g for g, _sg, _o in objs) < 60 / _MP_PERIOD - 10
+            assert not any(rx.done.values()), rx.done
             rx.assert_clean()
     finally:
         relay._pause_after = relay.PAUSE_AFTER_S
