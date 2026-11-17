@@ -222,7 +222,7 @@ class TsPlayout:
              wall_ns: Optional[int] = None) -> None:
         """One object of whole TS packets, available at `avail`, at
         `wall_ns` on the wall clock; `wall_us` is the publisher's wall
-        clock for it (LOC TIMESTAMP), if known."""
+        clock for it (its draft-frindell timestamp), if known."""
         self._wall = avail + self.wall_offset_ns if wall_ns is None else wall_ns
         self._off = self._wall - avail
         w = self._win
@@ -230,7 +230,7 @@ class TsPlayout:
                 group, obj, avail, w):
             self._hold = self._lost = True
         if wall_us is not None:
-            self.e2e_source = 'loc-timestamp'
+            self.e2e_source = 'frindell'
             self._e2e(self._wall - wall_us * 1000)
         taus = self._packets(payload, avail, w)
         if self._hold:
@@ -264,7 +264,7 @@ class TsPlayout:
             if not wall or (g, o) in self._timeline:
                 continue
             self._timeline[(g, o)] = wall
-            if self.e2e_source != 'loc-timestamp' and o == 0:
+            if self.e2e_source != 'frindell' and o == 0:
                 at = self._groups.get(g)
                 if at is not None:
                     self.e2e_source = 'media-timeline'
@@ -292,7 +292,7 @@ class TsPlayout:
                 while len(self._groups) > _TIMELINE_GROUPS:
                     self._groups.popitem(last=False)
                 wall = self._timeline.get((g, 0))
-                if wall is not None and self.e2e_source != 'loc-timestamp':
+                if wall is not None and self.e2e_source != 'frindell':
                     self.e2e_source = 'media-timeline'
                     self._e2e(self._wall - wall * 1_000_000)
         elif g == last[0] and o > last[1] + 1:

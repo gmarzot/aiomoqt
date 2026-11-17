@@ -15,13 +15,18 @@ import binascii
 import logging
 import time
 from dataclasses import dataclass
+from collections import deque
 from typing import (
-    Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, cast,
+    Any, Callable, Deque, Dict, List, NamedTuple, Optional, Set, Tuple, cast,
 )
 
 from ..types import ObjectStatus
+from ..utils.timing import (
+    OBJECT_TIMESTAMP, TIMESCALE, TIMESTAMP_MAPPING, encode_mapping,
+    zigzag_encode,
+)
 from .catalog import Catalog, CatalogError, CatalogTrack, PACKAGING_MPEG2TS
-from .loc import LOC_PROP_TIMESTAMP, LocFrame, LocTrackPublisher, LocTrackSubscriber
+from .loc import LocFrame, LocTrackPublisher, LocTrackSubscriber
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,9 @@ _PMT_TABLE = 0x02
 _PAT_TABLE = 0x00
 _NULL_PID = 0x1FFF
 _MAX_PID = 0x1FFF
+_PCR_WRAP = (1 << 33) * 300
+# A PCR time this far behind its packet's arrival is a new timebase.
+_PCR_REANCHOR_US = 5_000_000
 # Video stream types: MPEG-1/2, MPEG-4 Part 2, H.264, H.265, H.266.
 _VIDEO_TYPES = frozenset({0x01, 0x02, 0x10, 0x1B, 0x24, 0x33})
 _MPEG2_KEY = (b'\x00\x00\x01\xb3', b'\x00\x00\x01\xb8')
@@ -219,16 +227,18 @@ def init_data_ref(name: str) -> str:
 # -- publisher: packets to objects -------------------------------------
 
 class TsObject(NamedTuple):
-    """One MSFTS object of track generation `track`: `key` opens group
-    `group`, at a random access point whose PES PTS (90 kHz, unwrapped)
-    is `pts`; `at_us` is its first packet's arrival, µs since the
-    epoch."""
+    """One MSFTS object of track generation `track`, in group `group`
+    (numbered across generations): `key` opens it, at a random access
+    point whose PES PTS (90 kHz, unwrapped) is `pts`. `at_us` is its
+    first packet's arrival, µs since the epoch, and `pcr` that packet's
+    place on the PCR timeline (27 MHz), None before any PCR."""
     payload: bytes
     key: bool
     at_us: int
     track: int = 1
     group: int = 0
     pts: Optional[int] = None
+    pcr: Optional[int] = None
 
 
 def _pes_pts(data, pos: int, end: int) -> Optional[int]:
@@ -345,7 +355,11 @@ class TsPackager:
     or several) or an unmodified-program's program number, starts the
     next track generation (§6: a new track, not a changed one): the
     objects so far end the old one, and the new one starts as a live
-    start would, at the next random access point, its groups from 0.
+    start would, at the next random access point. Group IDs go on
+    across generations.
+
+    Each object's first packet is placed on the PCR timeline: between
+    the PCRs around it, or past the last at the last two PCRs' rate.
 
     feed(chunk, now_us) returns the objects the chunk completes;
     flush(now_us) the partial one once flush_due() has passed; close()
@@ -371,8 +385,13 @@ class TsPackager:
         self._pend_at = 0
         self._now = 0
         self._key = False
+        self._pend_idx = 0
         self.generation = 1
         self.groups = 0
+        self.group_id = -1
+        # Recent PCRs as (27 MHz ticks, unwrapped, packet index).
+        self._pcrs: Deque[Tuple[int, int]] = deque(maxlen=8)
+        self._pcr_base = 0
         self.packets_in = 0
         self.dropped = 0
         self.resyncs = 0
@@ -522,7 +541,7 @@ class TsPackager:
                 self._mark_at = self._now
             self._append(data, pos)
             return
-        if pid == self.pcr_pid and self.bitrate is None:
+        if pid == self.pcr_pid:
             self._pcr(data, pos)
         if pid != _NULL_PID and data[pos + 3] & 0x10:
             if (pid == self.rap_pid and b1 & 0x40 and self.ready
@@ -570,7 +589,7 @@ class TsPackager:
         if self.groups and head:
             self._emit(head, out)
         else:
-            del self._pend[:head]
+            self._drop(head)
         self._mark = 0 if self._pend else None
         self.generation += 1
         self.groups = 0
@@ -584,14 +603,40 @@ class TsPackager:
     def _append(self, data, pos: int) -> None:
         if not self._pend:
             self._pend_at = self._now
+            self._pend_idx = self.packets_in - 1
         self._pend += data[pos:pos + TS_PACKET]
+
+    def _drop(self, size: int) -> None:
+        del self._pend[:size]
+        self._pend_idx += size // TS_PACKET
+
+    def _pcr_at(self, idx: int) -> Optional[int]:
+        """Packet `idx` on the PCR timeline: between the PCRs around it,
+        else at the rate of the last two."""
+        pcrs = self._pcrs
+        if not pcrs:
+            return None
+        after = next((k for k, (_, i) in enumerate(pcrs) if i >= idx), None)
+        if after is not None and pcrs[after][1] == idx:
+            return pcrs[after][0]
+        if after is None:
+            a, b = (pcrs[-2], pcrs[-1]) if len(pcrs) > 1 else (None, pcrs[-1])
+        elif after == 0:
+            a, b = (pcrs[0], pcrs[1]) if len(pcrs) > 1 else (None, pcrs[0])
+        else:
+            a, b = pcrs[after - 1], pcrs[after]
+        if a is None or b[1] == a[1]:
+            return b[0]
+        return a[0] + (idx - a[1]) * (b[0] - a[0]) // (b[1] - a[1])
 
     def _emit(self, size: int, out: List[TsObject]) -> None:
         pend = self._pend
         pts = self._rap_pts if self._key else None
         out.append(TsObject(bytes(pend[:size]), self._key, self._pend_at,
-                            self.generation, self.groups - 1, pts))
+                            self.generation, self.group_id, pts,
+                            self._pcr_at(self._pend_idx)))
         del pend[:size]
+        self._pend_idx += size // TS_PACKET
         self._key = False
         if self._mark is not None:
             self._mark -= size
@@ -619,10 +664,11 @@ class TsPackager:
         if self.groups and head:
             self._emit(head, out)
         elif head:
-            del self._pend[:head]
+            self._drop(head)
         self._mark = None
         self._key = True
         self.groups += 1
+        self.group_id += 1
         self._append(data, pos)
         if len(self._pend) > self._obj:
             self._emit(len(self._pend), out)
@@ -682,8 +728,9 @@ class TsPackager:
         return False
 
     def _pcr(self, data, pos: int) -> None:
-        """Mux rate from the packets between two PCRs a second or more
-        apart."""
+        """Keep the PCR, unwrapped; measure the mux rate from the packets
+        between two a second or more apart. A discontinuity starts the
+        timeline over."""
         if not data[pos + 3] & 0x20 or data[pos + 4] < 7:
             return
         flags = data[pos + 5]
@@ -692,6 +739,17 @@ class TsPackager:
         b = data[pos + 6:pos + 12]
         pcr = ((b[0] << 25 | b[1] << 17 | b[2] << 9 | b[3] << 1 | b[4] >> 7)
                * 300 + ((b[4] & 1) << 8 | b[5]))
+        idx = self.packets_in - 1
+        pcrs = self._pcrs
+        full = pcr + self._pcr_base
+        if pcrs and full < pcrs[-1][0] - _PCR_WRAP // 2:
+            self._pcr_base += _PCR_WRAP
+            full += _PCR_WRAP
+        if flags & 0x80 or (pcrs and full < pcrs[-1][0]):
+            pcrs.clear()
+        pcrs.append((full, idx))
+        if self.bitrate is not None:
+            return
         if self._pcr0 is None or flags & 0x80:
             self._pcr0 = (pcr, self.packets_in)
             return
@@ -825,23 +883,71 @@ class PacketOrder:
 
 # -- tracks ---------------------------------------------------------------
 
+class PcrTimestamps:
+    """draft-frindell-moq-timestamp timing for an mpeg2ts track, its
+    objects placed by the PCR at their first packet on the ingest wall
+    clock (POSIX, no CLOCK_ID).
+
+    TIMESCALE 90 kHz, the PTS clock and the PCR base. TIMESTAMP_MAPPING
+    (first group, W0, 0, 0) anchors every object at W0, the track's
+    creation; each object's OBJECT_TIMESTAMP is the signed correction
+    to its own time. The first PCR maps to its arrival; the mapping
+    moves earlier when a packet arrives ahead of it, so a time is never
+    later than its arrival, and starts over at an arrival far past it
+    (a new timebase)."""
+
+    TIMESCALE = 90_000
+    mapped = True
+    group_multiplier = 0
+
+    def __init__(self, first_group: int, wall0_us: int):
+        self.first_group = first_group
+        self.base = wall0_us * self.TIMESCALE // 1_000_000
+        self._anchor: Optional[Tuple[int, int]] = None
+
+    def track_properties(self, vi64: bool) -> Dict[int, Any]:
+        return {TIMESCALE: self.TIMESCALE,
+                TIMESTAMP_MAPPING: encode_mapping(self.first_group,
+                                                  self.base, 0, 0)}
+
+    def wall_us(self, pcr: Optional[int], at_us: int) -> int:
+        """An object's time on the ingest wall clock, µs: by its PCR
+        (27 MHz) when it has one, else its arrival."""
+        if pcr is None:
+            return at_us
+        if self._anchor is None:
+            self._anchor = (pcr, at_us)
+        p0, w0 = self._anchor
+        us = w0 + (pcr - p0) // 27
+        if us > at_us or at_us - us > _PCR_REANCHOR_US:
+            self._anchor = (pcr, at_us)
+            us = at_us
+        return us
+
+    def group_for(self, capture_us) -> None:
+        return None
+
+    def object_properties(self, group_id: int, object_id: int,
+                          capture_us: int) -> Dict[int, Any]:
+        c = capture_us * self.TIMESCALE // 1_000_000 - self.base
+        return {OBJECT_TIMESTAMP: zigzag_encode(c)}
+
+
 class MsftsTrackPublisher(LocTrackPublisher):
     """Publishes an mpeg2ts track: each send_frame() payload is one
     object of whole TS packets, a key frame opening a group at a random
-    access point. With `stamped`, each object carries LOC TIMESTAMP, its
-    first packet's arrival (§5.5 leaves such timing to Object
-    properties); otherwise no property."""
+    access point. No LOC property rides the objects; `frindell` (a
+    PcrTimestamps) adds the draft-frindell-moq-timestamp ones."""
 
     def __init__(self, session, namespace: str, trackname: str, *,
-                 stamped: bool = True, priority: int = 128,
-                 fetch_history_bytes: int = 0, queue_size: int = 1024):
+                 priority: int = 128, fetch_history_bytes: int = 0,
+                 queue_size: int = 1024):
         super().__init__(session, namespace, trackname, priority=priority,
                          config_property=None, queue_size=queue_size,
                          fetch_history_bytes=fetch_history_bytes)
-        self.stamped = stamped
 
     def _timestamp_ids(self, session) -> tuple:
-        return (LOC_PROP_TIMESTAMP,) if self.stamped else ()
+        return ()
 
 
 class MsftsTrackSubscriber(LocTrackSubscriber):
@@ -960,6 +1066,7 @@ __all__ = [
     "HOLD_S", "MODES", "MODE_UNMODIFIED_PROGRAM",
     "MODE_UNMODIFIED_MULTIPLEX", "MODE_PER_PROGRAM", "MODE_ES_PACKETS",
     "MsftsError", "MsftsTrack", "TsObject", "TsPackager", "PacketOrder",
-    "MsftsTrackPublisher", "MsftsTrackSubscriber", "check_payload",
+    "PcrTimestamps", "MsftsTrackPublisher", "MsftsTrackSubscriber",
+    "check_payload",
     "catalog_track", "init_data_ref", "track_issues",
 ]

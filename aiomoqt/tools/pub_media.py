@@ -170,23 +170,15 @@ def parse_args():
                         help='With --ts: publish the TS packets unmodified '
                              'as one mpeg2ts track (draft-gregoire-moq-'
                              'msfts-02, as moq2ts --unmodified), named '
-                             'program-1, or mux-1 for a multi-program '
-                             'stream (-T names it). Groups start at the '
-                             'first program\'s random access points; the '
-                             'PAT and PMT ride the catalog initDataList. '
-                             'Packets go out as they arrive, no pacing. A '
-                             'PSI change to the program number, or from one '
-                             'program to several or back, ends the track '
-                             'and publishes the next, program-2 and on.')
-    parser.add_argument('--msfts-timestamps',
-                        choices=('timeline', 'object', 'both', 'none'),
-                        default='timeline',
-                        help='With --msfts: where the publisher\'s wall '
-                             'clock goes. timeline (default) = an MSF media '
-                             'timeline track, <name>.timeline, a record a '
-                             'group at its first packet\'s arrival, 300 s '
-                             'kept (msf-01 §7, as moq2ts); object = LOC '
-                             'TIMESTAMP on every object; both; none')
+                             'program-<PAT program number>, or mux for a '
+                             'multi-program stream (-T NAME prefixes it), '
+                             'and its MSF media timeline <name>.timeline. '
+                             'Groups start at the first program\'s random '
+                             'access points; the PAT and PMT ride the '
+                             'catalog initDataList. Packets go out as they '
+                             'arrive, no pacing. A PSI change to the program '
+                             'number, or from one program to several or '
+                             'back, ends the track and publishes the next.')
     parser.add_argument('--msfts-packets', type=int,
                         default=msfts.DEFAULT_PACKETS, metavar='N',
                         help='With --msfts: TS packets per object, sent '
@@ -352,7 +344,10 @@ def parse_args():
              'object of each group. Sources without a fixed GOP (live '
              'inputs, irregular keyframes; see --ts-cadence) send '
              'OBJECT_TIMESTAMP on every object instead. LOC timestamps '
-             'are unchanged.')
+             'are unchanged. With --msfts: TIMESCALE 90 kHz and '
+             'TIMESTAMP_MAPPING anchored at the track\'s start, and on '
+             'every object an OBJECT_TIMESTAMP, its first packet\'s PCR '
+             'time on the ingest wall clock.')
     ts_group.add_argument(
         '--ts-cadence', type=_cadence, default=None,
         metavar='fps=N[/D],gop=M',
@@ -395,13 +390,8 @@ def parse_args():
             parser.error(f'--ts: {e}')
     if args.msfts:
         _check_msfts(parser, args)
-    else:
-        for flag, on in (
-                ('--msfts-packets',
-                 args.msfts_packets != msfts.DEFAULT_PACKETS),
-                ('--msfts-timestamps', args.msfts_timestamps != 'timeline')):
-            if on:
-                parser.error(f'{flag} applies to --msfts only')
+    elif args.msfts_packets != msfts.DEFAULT_PACKETS:
+        parser.error('--msfts-packets applies to --msfts only')
     if args.input:
         if args.packaging == PACKAGING_LOC:
             parser.error('--input publishes cmaf or locmaf packaging')
@@ -493,7 +483,6 @@ def _check_msfts(parser, args) -> None:
     for flag, on in (
             ('--packaging', args.packaging not in (None, PACKAGING_LOC)),
             ('--ts-cadence', args.ts_cadence is not None),
-            ('--timestamp-mapping', args.timestamp_mapping),
             ('--start-at', args.start_at is not None),
             ('--datagram', args.datagram), ('--no-catalog', args.no_catalog),
             ('--annexb', args.annexb), ('--init-data', args.init_data),
@@ -1032,14 +1021,16 @@ def _open_msfts(args):
     return fh, packager, first
 
 
-def _msfts_name(args, generation: int, mode: str) -> str:
-    """moq2ts's naming convention, program-N or mux-N for the N-th track
-    of the run; with -T, NAME then NAME-N."""
-    if args.trackname:
-        return (args.trackname if generation == 1
-                else f'{args.trackname}-{generation}')
-    kind = 'mux' if mode == msfts.MODE_UNMODIFIED_MULTIPLEX else 'program'
-    return f'{kind}-{generation}'
+def _msfts_name(args, packager) -> str:
+    """The track name the stream's PSI gives: program-<PAT program
+    number>, or mux for a multiplex; -T NAME prefixes it, NAME-program-N
+    or NAME-mux."""
+    if packager.mode == msfts.MODE_UNMODIFIED_MULTIPLEX:
+        name = 'mux'
+    else:
+        programs = packager.programs
+        name = f'program-{programs[0][0] if programs else 1}'
+    return f'{args.trackname}-{name}' if args.trackname else name
 
 
 # A new track's objects wait this long for its first subscriber, so a
@@ -1048,10 +1039,11 @@ _SWITCH_HOLD_S = 2.0
 
 
 class _MsftsRun:
-    """--msfts: the mpeg2ts track of the stream's current PSI and, by
-    --msfts-timestamps, its media timeline track. A PSI change to a
-    field the track declares ends both and opens the next pair (msfts-02
-    §6), listed alone in a new independent catalog."""
+    """--msfts: the mpeg2ts track of the stream's current PSI and its
+    media timeline track; with --timestamp-mapping, frindell timing on
+    the media track. A PSI change to a field the track declares ends
+    both and opens the next pair (msfts-02 §6), listed alone in a new
+    independent catalog, its groups numbered on from the last."""
 
     def __init__(self, args, packager, session):
         self.args = args
@@ -1059,11 +1051,8 @@ class _MsftsRun:
         self.session = session
         self.pub: Any = None
         self.stats: dict = {}
-        mode = getattr(args, 'msfts_timestamps', 'timeline')
-        self.stamped = mode in ('object', 'both')
-        self.timelined = mode in ('timeline', 'both')
         self.generation = packager.generation
-        self.name = _msfts_name(args, self.generation, packager.mode)
+        self.name = _msfts_name(args, packager)
         self.track: Any = None
         self.timeline_track: Any = None
         self.timeline: Optional[MediaTimeline] = None
@@ -1078,34 +1067,33 @@ class _MsftsRun:
         entry = self.packager.catalog_track(
             self.name, bitrate=explicit[0] if explicit else None,
             target_latency=self.args.target_latency)
-        tracks = [entry]
-        if self.timelined:
-            tracks.append(timeline_track(timeline_name(self.name),
-                                         [self.name]))
+        tracks = [entry, timeline_track(timeline_name(self.name),
+                                        [self.name])]
         return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
                        initDataList=[InitData.from_bytes(
                            entry.initRef, self.packager.init_data)])
 
-    def add_tracks(self, pub) -> list:
-        """Build this generation's tracks into `pub`."""
+    def add_tracks(self, pub, first_group: int = 0) -> list:
+        """Build this generation's tracks into `pub`; `first_group` is the
+        group its objects start at."""
         self.pub = pub
         history = self.args.fetch_history
         self.track = pub.add_track(msfts.MsftsTrackPublisher(
             self.session, self.args.namespace, self.name,
-            stamped=self.stamped, fetch_history_bytes=history))
+            fetch_history_bytes=history))
+        if self.args.timestamp_mapping:
+            self.track.frindell = msfts.PcrTimestamps(first_group,
+                                                      _now_us())
         self.stats[self.name] = _TrackStats()
-        added = [self.track]
-        if self.timelined:
-            self.timeline = MediaTimeline()
-            self.timeline_track = pub.add_track(MediaTimelinePublisher(
-                self.session, self.args.namespace, timeline_name(self.name),
-                fetch_history_bytes=history))
-            added.append(self.timeline_track)
-        return added
+        self.timeline = MediaTimeline()
+        self.timeline_track = pub.add_track(MediaTimelinePublisher(
+            self.session, self.args.namespace, timeline_name(self.name),
+            fetch_history_bytes=history))
+        return [self.track, self.timeline_track]
 
     async def send(self, o) -> None:
         if o.track != self.generation:
-            await self._next(o.track)
+            await self._next(o.track, o.group)
         if self._backlog is not None:
             self._backlog.append(o)
             await self.drain()
@@ -1131,8 +1119,10 @@ class _MsftsRun:
         return self._backlog is not None
 
     async def _send(self, o) -> None:
+        frindell = getattr(self.track, 'frindell', None)
+        at = o.at_us if frindell is None else frindell.wall_us(o.pcr, o.at_us)
         sent = await _send(self.track, self.stats[self.name], o.payload,
-                           o.key, timestamp=o.at_us,
+                           o.key, timestamp=at,
                            group_id=o.group if o.key else None)
         if (sent and o.key and self.timeline is not None
                 and o.pts is not None):
@@ -1141,7 +1131,7 @@ class _MsftsRun:
                                           o.at_us // 1000),
                         True, group_id=o.group, end=True)
 
-    async def _next(self, generation: int) -> None:
+    async def _next(self, generation: int, first_group: int) -> None:
         """End this generation's tracks and publish the next's."""
         old = self.name
         for t in (self.track, self.timeline_track):
@@ -1150,9 +1140,9 @@ class _MsftsRun:
                 self.pub.remove_track(t.trackname)
         self.stats.pop(old, None)
         self.generation = generation
-        self.name = _msfts_name(self.args, generation, self.packager.mode)
+        self.name = _msfts_name(self.args, self.packager)
         self.timeline_track = self.timeline = None
-        for t in self.add_tracks(self.pub):
+        for t in self.add_tracks(self.pub, first_group):
             await self.pub.publish_track(t)
         cat = self.pub.catalog_track.catalog
         fresh = self.catalog()
@@ -1699,8 +1689,9 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
     a stats event per interval; each track's `forwarding` counts its
     peers taking objects (Forward State 1, not idle)."""
     t0 = time.monotonic()
-    prev_obj = {name: 0 for name in stats}
-    prev_bytes = {name: 0 for name in stats}
+    # Per name: the stats last seen and their counts; a name's new
+    # stats (a returning --msfts track) count from 0.
+    prev: dict = {}
     while True:
         await asyncio.sleep(interval)
         parts = []
@@ -1709,10 +1700,12 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
             track = pub.tracks.get(name)
             discarded = getattr(track, 'frames_dropped', 0)
             objects = st.objects - discarded
-            ops = (objects - prev_obj.get(name, 0)) / interval
-            kbps = (st.bytes - prev_bytes.get(name, 0)) * 8 / interval / 1000
-            prev_obj[name] = objects
-            prev_bytes[name] = st.bytes
+            last = prev.get(name)
+            last_obj, last_bytes = ((0, 0) if last is None or last[0] is not st
+                                    else last[1:])
+            ops = (objects - last_obj) / interval
+            kbps = (st.bytes - last_bytes) * 8 / interval / 1000
+            prev[name] = (st, objects, st.bytes)
             forwarding = sum(1 for sub in getattr(track, 'subscriptions', ())
                              if sub.forward and sub.generating)
             tracks[name] = dict(objects=objects, groups=st.groups,

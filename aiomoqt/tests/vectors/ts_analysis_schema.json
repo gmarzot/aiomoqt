@@ -135,7 +135,7 @@
           "additionalProperties": false,
           "required": ["source", "samples", "p50", "p99", "p100"],
           "properties": {
-            "source": {"enum": ["loc-timestamp", "media-timeline"]},
+            "source": {"enum": ["frindell", "media-timeline"]},
             "samples": {"type": "integer", "minimum": 1},
             "p50": {"$ref": "#/$defs/ms"},
             "p99": {"$ref": "#/$defs/ms"},

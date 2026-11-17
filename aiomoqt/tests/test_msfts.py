@@ -839,13 +839,18 @@ def test_a_changed_track_field_starts_the_next_track(segments, modes,
                 entries[o.track] = p.catalog_track(f't{o.track}').to_dict()
     objs += p.close()
     assert sorted(entries) == list(range(1, len(segments) + 1))
+    first = 0
     for gen, (mode, prog) in enumerate(zip(modes, programs), 1):
         assert entries[gen]['mpeg2tsMode'] == mode
         assert entries[gen].get('mpeg2tsProgramNumber') == prog
         mine = [o for o in objs if o.track == gen]
-        # Its groups from 0; its first object a group start.
-        assert mine[0].key and mine[0].group == 0
-        assert [o.group for o in mine if o.key] == list(range(segments[gen - 1][0]))
+        # Its first object a group start; group IDs go on from the last
+        # track's.
+        assert mine[0].key
+        gops = segments[gen - 1][0]
+        assert [o.group for o in mine if o.key] == list(range(first,
+                                                              first + gops))
+        first += gops
         start, change = marks[gen - 1]
         end = len(data) if change is None else change * P
         # The old track ends before the changed PAT; the packets from it
@@ -880,3 +885,78 @@ def test_key_objects_carry_their_pts():
     assert [o.pts for o in objs if o.key] == [90_000, 90_000 + 6 * 3600,
                                               90_000 + 12 * 3600]
     assert all(o.pts is None for o in objs if not o.key)
+
+
+def test_objects_are_placed_on_the_pcr_timeline():
+    """CBR packets, a PCR every 10th on the video PID: an object's first
+    packet sits between the PCRs around it, or past the last at their
+    rate."""
+    m = Mux()
+    m.raw(pat())
+    m.raw(pmt())
+    tick = 27_000                                   # 1 ms a packet
+    m.put(VIDEO_PID, [b''], pcr=0, pusi=False)
+    for j in range(1, 400):
+        pcr = j * tick if j % 10 == 0 else None
+        rai = j % 60 == 1
+        size = 176 if pcr is not None else 182 if rai else 184
+        m.out.append(ts(VIDEO_PID, b'\x05' * size, pusi=rai, cc=j & 15,
+                        pcr=pcr, rai=rai))
+    data = m.data()
+    p = TsPackager(7)
+    objs = []
+    for i in range(0, len(data), 7 * P):
+        objs += p.feed(data[i:i + 7 * P], i)
+    objs += p.close()
+    assert objs and b''.join(o.payload for o in objs) == data
+    at = 0
+    for o in objs:
+        first = at - 2                               # packet 2 is PCR 0
+        # Before a second PCR gives the rate, the first PCR's time.
+        assert o.pcr == max(0, first) * tick, (first, o.pcr)
+        at += len(o.payload) // P
+
+
+def test_pcr_timestamps_round_trip_through_a_subscriber():
+    from aiomoqt.utils.timing import (
+        OBJECT_TIMESTAMP, TIMESCALE, TrackTiming, capture_time_us,
+        decode_mapping, TIMESTAMP_MAPPING,
+    )
+    t = msfts.PcrTimestamps(first_group=12, wall0_us=1_800_000_000_000_000)
+    props = t.track_properties(vi64=True)
+    assert props[TIMESCALE] == 90_000
+    assert decode_mapping(props[TIMESTAMP_MAPPING], True) == (
+        12, 1_800_000_000_000_000 * 9 // 100, 0, 0)
+    timing = TrackTiming.from_properties(props, vi64=True)
+    # The first PCR at its arrival; later ones on the PCR's clock; one
+    # arriving early moves the anchor; a far-behind one starts over.
+    arrivals = [(0, 1_799_999_999_000_000), (27_000_000, 1_800_000_000_100_000),
+                (54_000_000, 1_800_000_000_900_000),
+                (81_000_000, 1_800_000_001_950_000),
+                (10 ** 12, 1_800_000_009_000_000)]
+    want = [1_799_999_999_000_000, 1_800_000_000_000_000,
+            1_800_000_000_900_000, 1_800_000_001_900_000,
+            1_800_000_009_000_000]
+    for (pcr, at), w in zip(arrivals, want):
+        us = t.wall_us(pcr, at)
+        assert us == w
+        exts = t.object_properties(12, 0, us)
+        assert set(exts) == {OBJECT_TIMESTAMP}
+        got, source = capture_time_us(timing, 12, 3, exts)
+        assert source == 'frindell' and abs(got - us) <= 11
+    assert t.wall_us(None, 5) == 5
+
+
+def test_track_names_follow_the_pat():
+    from types import SimpleNamespace as NS
+    from aiomoqt.tools.pub_media import _msfts_name
+    names = []
+    for programs in (ONE, ((2, PMT_PID),), TWO, ONE):
+        p = TsPackager()
+        p.feed(pat(programs), 0)
+        names.append((_msfts_name(NS(trackname=None), p),
+                      _msfts_name(NS(trackname='feed'), p)))
+    assert names == [('program-1', 'feed-program-1'),
+                     ('program-2', 'feed-program-2'),
+                     ('mux', 'feed-mux'),
+                     ('program-1', 'feed-program-1')]

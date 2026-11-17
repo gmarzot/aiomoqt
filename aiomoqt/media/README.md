@@ -52,16 +52,18 @@ Short GOPs and no B-frames keep join latency low: `-g <2×fps> -sc_threshold 0 -
   sent as a compact header, a delta of the previous one in the group. Receivers rebuild the
   CMAF chunk byte for byte.
 - **mpeg2ts** (draft-gregoire-moq-msfts-02, MSFTS), `--ts ... --msfts`: the TS packets
-  themselves, unmodified, as one track (`program-1`, or `mux-1` for a multi-program stream),
-  `--msfts-packets` (7) to an object, sent as they arrive or 5 ms after an object's first packet.
-  Groups start at the first program's random access points, led by the PSI right before them;
-  the PAT and PMT ride the catalog `initDataList`. The catalog matches moq2ts `--unmodified`.
-  `--msfts-timestamps timeline` (default) adds an MSF media timeline track, `<name>.timeline`,
-  with a record per group at its first packet's arrival on the wall clock, 300 s kept; `object`
-  puts the arrival in each object's LOC TIMESTAMP instead; `both`; `none`. A PSI change to a field
-  the track declares (program number, or one program against several) ends the track and
-  publishes the next, `program-2` and on (moq2ts's naming), alone in a new catalog; it starts at
-  the next random access point, like a live start, and waits up to 2 s for its first subscriber.
+  themselves, unmodified, as one track named from the PAT (`program-<number>`, or `mux` for a
+  multi-program stream; `-T NAME` prefixes it), `--msfts-packets` (7) to an object, sent as they
+  arrive or 5 ms after an object's first packet. Groups start at the first program's random
+  access points, led by the PSI right before them; the PAT and PMT ride the catalog
+  `initDataList`. The catalog matches moq2ts `--unmodified`, with an MSF media timeline track,
+  `<name>.timeline`: a record per group at its first packet's arrival on the wall clock, 300 s
+  kept. `--timestamp-mapping` adds draft-frindell timing: TIMESCALE 90 kHz, TIMESTAMP_MAPPING
+  anchored at the track's start, and on every object an OBJECT_TIMESTAMP, its first packet's PCR
+  time on the ingest wall clock. A PSI change to a field the track declares (program number, or
+  one program against several) ends the track and publishes the next alone in a new catalog; it
+  starts at the next random access point, like a live start, its group IDs going on from the
+  last, and waits up to 2 s for its first subscriber.
 
 LOC options for receivers that need something different:
 
@@ -268,7 +270,7 @@ Its other options:
 | `--pipe video\|audio` | Streams one track to stdout for a player |
 | `--ts-out udp://HOST:PORT\|FILE\|-` | Writes the mpeg2ts track's packets as its objects arrive, seven to a UDP datagram; LOC tracks are refused |
 | `--ts-playout MS` | With `--ts-out`: each packet at first PCR arrival + MS + (PCR − first PCR) / 27 MHz; a late one is dropped, or with `--ts-late emit` sent at once; a gap of `--break-ms` (200) is an output break |
-| `--analyze` on an mpeg2ts track | JSON lines per `-i` interval and a summary: TS packets, CC errors per PID, PCR interval and jitter, delay variation and the cushion for no late packet, late packets and breaks at the `--ts-playout` buffer and at 100–1000 ms, object loss, track switches, and delay from the publisher's wall clock (LOC TIMESTAMP when the objects carry it, else the media timeline track; the clocks must agree) |
+| `--analyze` on an mpeg2ts track | JSON lines per `-i` interval and a summary: TS packets, CC errors per PID, PCR interval and jitter, delay variation and the cushion for no late packet, late packets and breaks at the `--ts-playout` buffer and at 100–1000 ms, object loss, track switches, and delay from the publisher's wall clock (draft-frindell timing when the track declares it, else the media timeline track; the clocks must agree) |
 | `--arrival-log FILE` | A JSON line per PCR: `pcr`, `arrival_ns`, `release_ns` |
 | `--frame-log FILE` | A JSON line per LOC frame: track, group, object, key, size, `sha1` of the payload, `arrival_ns` |
 | `--inspect N` | Prints wire detail for each track's first N frames |

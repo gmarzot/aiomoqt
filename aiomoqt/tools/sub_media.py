@@ -88,7 +88,9 @@ from aiomoqt.utils.media_stats import (
     interval_header, wall_clock_us,
 )
 from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
-from aiomoqt.utils.timing import TimestampMalformed, capture_time_us
+from aiomoqt.utils.timing import (
+    SOURCE_FRINDELL, TimestampMalformed, capture_time_us,
+)
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -475,6 +477,19 @@ class _TsLane:
         for frame, group_id, object_id in parked:
             self.on_frame(entry.name, frame, group_id, object_id)
 
+    def _frindell_us(self, frame, group_id, object_id) -> Optional[int]:
+        """The object's draft-frindell time on the publisher's wall
+        clock, µs; None when the track declares none."""
+        timing = getattr(self.track, 'timing', None)
+        if timing is None or not timing.declared:
+            return None
+        try:
+            us, source = capture_time_us(timing, group_id, object_id,
+                                         frame.extensions)
+        except TimestampMalformed:
+            return None
+        return us if source == SOURCE_FRINDELL else None
+
     def timeline(self, name, records) -> None:
         if name == self.name and self.player is not None:
             self.player.timeline(records)
@@ -496,7 +511,8 @@ class _TsLane:
         p = self.player
         if p is not None:
             p.push(payload, time.monotonic_ns(), group_id, object_id,
-                   frame.timestamp, time.time_ns())
+                   self._frindell_us(frame, group_id, object_id),
+                   time.time_ns())
             if p.release:
                 self._wake.set()
                 return
@@ -867,11 +883,17 @@ async def run(args):
         async def _switch_to(entry):
             if sub is None:
                 return
+            # A name the stream comes back to: its old track has ended.
+            old = sub.tracks.get(entry.name)
+            if old is not None and getattr(old, 'ended', False):
+                sub.tracks.pop(entry.name)
             try:
                 track = await sub.subscribe_track(entry)
             except Exception as e:
                 _status(f"  error: {entry.name}: {e}")
                 return
+            finally:
+                following.discard(entry.name)
             if track is not None:
                 lane.follow(entry, track)
                 await _follow_timeline(session, args.namespace, sub.catalog,

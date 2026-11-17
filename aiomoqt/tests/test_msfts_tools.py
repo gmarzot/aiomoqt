@@ -183,7 +183,7 @@ async def test_sub_media_writes_the_track_without_ts_out(monkeypatch,
         monkeypatch, _PORT + 5, False,
         ['--ts', _paced_fifo(tmp_path, data, 2), '--msfts', '-T', 'feed'],
         ['--out', str(out), '-t', '30'])
-    _check_suffix(data, (out / 'feed.ts').read_bytes(), 2)
+    _check_suffix(data, (out / 'feed-program-1.ts').read_bytes(), 2)
 
 
 @requires_certs
@@ -274,8 +274,10 @@ def _sub(monkeypatch, *argv):
 
 def test_flag_defaults(monkeypatch):
     a = _pub(monkeypatch, '--ts', 'udp://@:5000', '--msfts')
-    assert (a.ts, a.msfts, a.msfts_packets, a.msfts_timestamps) == (
-        'udp://@:5000', True, 7, 'timeline')
+    assert (a.ts, a.msfts, a.msfts_packets, a.timestamp_mapping) == (
+        'udp://@:5000', True, 7, False)
+    a = _pub(monkeypatch, '--ts', '-', '--msfts', '--timestamp-mapping')
+    assert a.timestamp_mapping
     a = _pub(monkeypatch, '--ts', '-', '--msfts', '--msfts-packets', '348')
     assert a.msfts_packets == 348
     s = _sub(monkeypatch)
@@ -295,12 +297,11 @@ def test_flag_defaults(monkeypatch):
 @pytest.mark.parametrize('argv', [
     ['--msfts'],
     ['--ts', '-', '--msfts-packets', '8'],
-    ['--ts', '-', '--msfts-timestamps', 'object'],
-    ['--ts', '-', '--msfts', '--msfts-timestamps', 'pcr'],
+    ['--ts', '-', '--msfts', '--msfts-timestamps', 'timeline'],
+    ['--ts', '-', '--msfts', '--timestamp-mapping', '--start-at', '1'],
     ['--ts', '-', '--msfts', '--msfts-packets', '0'],
     ['--ts', '-', '--msfts', '--msfts-packets', '5001'],
     ['--ts', '-', '--msfts', '--ts-cadence', 'fps=25,gop=25'],
-    ['--ts', '-', '--msfts', '--timestamp-mapping'],
     ['--ts', '-', '--msfts', '-D'],
     ['--ts', '-', '--msfts', '--no-catalog'],
     ['--ts', '-', '--msfts', '--annexb'],
@@ -381,49 +382,54 @@ def test_media_timeline_keeps_its_window():
         [3000, [3, 0], 13_000]]
 
 
-@pytest.mark.parametrize('mode,tracks', [
-    ('timeline', ['program-1', 'program-1.timeline']),
-    ('object', ['program-1']), ('both', ['program-1', 'program-1.timeline']),
-    ('none', ['program-1'])])
-def test_catalog_by_timestamp_mode(monkeypatch, mode, tracks):
+def test_the_catalog_lists_the_media_timeline(monkeypatch):
     data, _ = gop_stream(2, lead=False)
     p = TsPackager()
     p.feed(data, 0)
-    args = _pub(monkeypatch, '--ts', '-', '--msfts', '--msfts-timestamps',
-                mode)
+    args = _pub(monkeypatch, '--ts', '-', '--msfts')
     cat = pub_media._MsftsRun(args, p, None).catalog()
-    assert [t.name for t in cat.tracks] == tracks
-    if len(tracks) == 2:
-        t = cat.tracks[1].to_dict()
-        assert t == {'name': 'program-1.timeline',
-                     'packaging': 'mediatimeline', 'isLive': True,
-                     'depends': ['program-1'],
-                     'mimeType': 'application/json'}
+    assert [t.name for t in cat.tracks] == ['program-1',
+                                            'program-1.timeline']
+    assert cat.tracks[1].to_dict() == {
+        'name': 'program-1.timeline', 'packaging': 'mediatimeline',
+        'isLive': True, 'depends': ['program-1'],
+        'mimeType': 'application/json'}
     assert cat.validate() == ['program-1: video track requires bitrate']
 
 
 @requires_certs
-@pytest.mark.parametrize('mode,source', [
-    ('timeline', 'media-timeline'), ('object', 'loc-timestamp'),
-    ('both', 'loc-timestamp'), ('none', None)])
-async def test_end_to_end_delay_by_timestamp_mode(monkeypatch, capsys,
-                                                  tmp_path, mode, source):
+@pytest.mark.parametrize('pub_argv,source', [
+    ([], 'media-timeline'), (['--timestamp-mapping'], 'frindell')],
+    ids=['timeline', 'frindell'])
+async def test_end_to_end_delay(monkeypatch, capsys, tmp_path, pub_argv,
+                                source):
+    timings = []
+    orig = sub_media._TsLane.start
+
+    def spy(self, entry, track):
+        orig(self, entry, track)
+        timings.append(track.timing)
+    monkeypatch.setattr(sub_media._TsLane, 'start', spy)
     data, _ = gop_stream(10, frames=10, lead=False)
     await _through_relay(
         monkeypatch, _PORT + 10, True,
-        ['--ts', _paced_fifo(tmp_path, data, 2), '--msfts',
-         '--msfts-timestamps', mode],
+        ['--ts', _paced_fifo(tmp_path, data, 2), '--msfts', *pub_argv],
         ['--analyze', '-i', '1', '-t', '30'])
     lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines()
              if ln.startswith('{')]
     summary = lines[-1]
     assert summary['ts_packets'] > 0
-    if source is None:
-        assert summary['e2e_ms'] is None
+    e2e = summary['e2e_ms']
+    assert e2e['source'] == source and e2e['samples'] > 0
+    assert -100 < e2e['p50'] < 1000
+    if source == 'frindell':
+        assert timings[0].timescale == 90_000
+        assert timings[0].mapping[2:] == (0, 0)
+        # Every object carries one.
+        assert e2e['samples'] == summary['objects']['received']
     else:
-        assert summary['e2e_ms']['source'] == source
-        assert summary['e2e_ms']['samples'] > 0
-        assert -1000 < summary['e2e_ms']['p50'] < 1000
+        assert not timings[0].declared
+        assert e2e['samples'] <= summary['objects']['groups']
 
 
 # -- a PSI change: the receiver follows the next track ---------------------
@@ -459,7 +465,7 @@ def _tables(packets: bytes) -> bytes:
 @pytest.mark.parametrize('second,name,program,use_quic', [
     (((2, PMT_PID),), 'program-2', 2, True),
     (((2, PMT_PID),), 'program-2', 2, False),
-    (_TWO, 'mux-2', None, True),
+    (_TWO, 'mux', None, True),
 ], ids=['program-number-quic', 'program-number-wt', 'pat-gains-a-program'])
 async def test_the_receiver_follows_a_track_change(
         monkeypatch, capsys, tmp_path, catalogs, second, name, program,
@@ -532,3 +538,45 @@ async def test_an_es_and_pcr_pid_change_keeps_the_track(
     (_, change), _ = marks
     assert _tables(cat.resolve_init(cat.tracks[0])) == _tables(
         data[change * P:(change + 2) * P])
+
+
+@requires_certs
+async def test_a_name_comes_back_and_group_ids_go_on(monkeypatch, capsys,
+                                                    tmp_path, catalogs):
+    """Program 1, then 2, then 1 again: the names follow the PAT, the
+    group IDs never go back, and the receiver follows both changes."""
+    seen = []
+    orig = sub_media._TsLane.on_frame
+
+    def spy(self, name, frame, group_id, object_id):
+        if name == self.name:
+            seen.append((name, group_id, object_id))
+        orig(self, name, frame, group_id, object_id)
+    monkeypatch.setattr(sub_media._TsLane, 'on_frame', spy)
+    two = ((2, PMT_PID),)
+    data, marks = changing_stream([(4, ONE, VIDEO_PID), (4, two, VIDEO_PID),
+                                   (4, ONE, VIDEO_PID)], frames=10)
+    out = tmp_path / 'out.ts'
+    rc = await _through_relay(
+        monkeypatch, _PORT + 15, True,
+        ['--ts', _paced_fifo(tmp_path, data, 5), '--msfts'],
+        ['--ts-out', str(out), '--analyze', '-i', '1', '-t', '30'])
+    assert rc == 0
+    err = capsys.readouterr()
+    summary = [json.loads(ln) for ln in err.out.splitlines()
+               if ln.startswith('{')][-1]
+    assert summary['switches'] == 2
+    names = [c['tracks'][0]['name'] for c in catalogs]
+    assert names[-1] == 'program-1' and 'program-2' in names
+    runs = [names[0]] + [b for a, b in zip(names, names[1:]) if a != b]
+    assert runs == ['program-1', 'program-2', 'program-1']
+    # Group IDs only go up, across the three tracks.
+    groups = [g for _, g, o in seen if o == 0]
+    assert groups == sorted(groups) and len(set(groups)) == len(groups)
+    assert [n for n, _, _ in seen][-1] == 'program-1'
+    # Each track from its first random access point; only the spans
+    # from each changed PAT to the next GOP are missing.
+    got = out.read_bytes()
+    (_, c1), (s2, c2), (s3, _) = marks
+    tail = data[s2 * P:c2 * P] + data[s3 * P:]
+    assert got.endswith(tail) and data[:c1 * P].endswith(got[:-len(tail)])

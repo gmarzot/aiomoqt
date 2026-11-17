@@ -212,7 +212,7 @@ def test_object_loss_groups_and_end_to_end_delay():
     s = p.summary()
     assert s['objects'] == {'received': 4, 'lost': 2, 'dups': 0,
                             'groups': 2, 'groups_missing': 1}
-    assert s['e2e_ms']['source'] == 'loc-timestamp'
+    assert s['e2e_ms']['source'] == 'frindell'
     assert s['e2e_ms']['samples'] == 1
     assert s['e2e_ms']['p100'] == pytest.approx(25.1)
 
