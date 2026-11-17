@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- The `abr` extra takes cymedia 0.1.4 or later: in realtime mode a rung keeps its first group, where most NVENC rungs lost it at every start.
 - `abr_ingest --output NS[,packaging=…][,codec=…][,rung=…]`, repeated, publishes several ladders, each under its own namespace and catalog, from one source subscription and one decode; rungs of one size, rate and codec share an encoder. `AbrLadder(codec=)` takes a codec per rung.
 - aiomoqt-relay sends a prefix subscriber NAMESPACE once per namespace until it is withdrawn (d22 §4.2), instead of again on each PUBLISH_NAMESPACE or PUBLISH of it, and NAMESPACE_DONE only after a NAMESPACE. A second publisher of a namespace repeated it, which failed the interop runner's multi-publisher retention case.
 - aiomoqt-relay's `status.json` carries `totals.gc_totals`: GC passes, objects collected and uncollectable per generation since start, objects pending per generation, and the frozen count. The `--control` socket answers `GET /gc[?top=N]` with the tracked objects counted by type, most first, plus the same counts; the census walks every tracked object, about 0.2 ms per 1,000.
