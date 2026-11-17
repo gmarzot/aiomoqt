@@ -1578,6 +1578,11 @@ async def test_no_failover_past_a_forwarded_end_of_track(draft, use_quic):
                 t.gate.clear()
             await asyncio.wait_for(asyncio.gather(
                 *(t.parked.wait() for t in standby.values())), 3)
+            # End of Track must land past the standby's last Location, or
+            # the relay drops it as a copy.
+            assert await _until(lambda: all(
+                primary[n]._largest[0] >= standby[n]._largest[0]
+                for n in _MP_TRACKS))
             for t in primary.values():
                 t.end()
             assert await _until(lambda: all(done.values())), (ends, done)

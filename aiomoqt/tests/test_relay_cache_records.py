@@ -70,6 +70,8 @@ def test_cached_records_add_no_tracked_objects():
 
 async def test_a_dropped_cache_is_freed_a_slice_per_loop_pass(monkeypatch):
     monkeypatch.setattr(relay, "RELEASE_SLICE_S", 0.0005)
+    # A block per record: the drop must cost nothing per block.
+    monkeypatch.setattr(relay, "CACHE_BLOCK_BYTES", 4096)
     t = relay._RelayedTrack(((b"rel",), b"video"))
     for i in range(20_000):
         g, o = divmod(i, 60)
@@ -89,7 +91,7 @@ async def test_a_dropped_cache_is_freed_a_slice_per_loop_pass(monkeypatch):
     monkeypatch.setattr(relay, "_free_some", timed)
     t0 = time.perf_counter()
     t._drop_cache()
-    assert time.perf_counter() - t0 < 0.02
+    assert time.perf_counter() - t0 < 0.005
     assert relay._budget.bytes == 0 and len(t._cache) == 0
     assert relay._unfreed
     async with asyncio.timeout(5):
