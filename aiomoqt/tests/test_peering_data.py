@@ -301,7 +301,8 @@ async def test_unsubscribe_withdraws_sns_and_ends_streams():
 
 
 @pytest.mark.asyncio
-async def test_peer_bench_role_both_through_via(tmp_path, monkeypatch):
+@pytest.mark.parametrize("attempt", range(20))
+async def test_peer_bench_role_both_through_via(tmp_path, monkeypatch, attempt):
     port = _BASE_PORT + 5
     out = tmp_path / "bench.json"
     trace = tmp_path / "objects.jsonl"
