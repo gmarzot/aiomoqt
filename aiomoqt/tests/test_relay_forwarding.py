@@ -1105,9 +1105,11 @@ _MP_DRAFTS = pytest.mark.parametrize("draft", [18, 22])
 class _Clocked(PublishedTrack):
     """One subgroup of _MP_OBJECTS objects per group, groups numbered off
     a clock every publisher shares: each publisher's copy of the track
-    holds the same Locations."""
+    holds the same Locations. Groups due at Forward State 0, or once
+    `stopped`, are skipped."""
 
     epoch = 0.0
+    stopped = False
 
     async def generate(self, session, track_alias):
         from aiomoqt.messages import SubgroupHeader
@@ -1119,6 +1121,9 @@ class _Clocked(PublishedTrack):
                                     - loop.time()))
             if sub.done or not relay._session_live(session):
                 return
+            if not sub.forward or self.stopped:
+                group += 1
+                continue
             try:
                 sid = await session.open_uni_stream()
                 hdr = SubgroupHeader(
@@ -1486,6 +1491,391 @@ async def test_a_restarted_publisher_is_not_failed_over_to(draft, use_quic):
             await cm.__aexit__(None, None, None)
         handle.close()
         _reset_relay_state()
+
+
+_PUSH_PORT = 21700
+
+
+def _push_port(case, use_quic):
+    return _PUSH_PORT + 2 * case + (not use_quic)
+
+
+async def _mp_pusher(port, use_quic, draft, epoch, largest=False):
+    """A session PUBLISHing both _MP_TRACKS under _MP_NS, announcing no
+    namespace; with `largest`, each PUBLISH carries the clock's Largest.
+    Returns its connection context, session and tracks."""
+    client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                        verify_tls=False, supported_drafts=draft)
+    cm = client.connect()
+    s = await cm.__aenter__()
+    await s.client_session_init()
+    tracks = {}
+    now = asyncio.get_running_loop().time()
+    for name in _MP_TRACKS:
+        tracks[name] = _Clocked(s, _MP_NS, name)
+        tracks[name].epoch = epoch
+        if largest:
+            tracks[name]._largest = (int((now - epoch) / _MP_PERIOD), 0)
+        await tracks[name].publish(announce_namespace=False,
+                                   publish_track=True)
+    return cm, s, tracks
+
+
+async def _push_two(pubs, port, use_quic, draft, epochs):
+    """Two pushers onto `pubs`, the first serving, the second each track's
+    standby."""
+    pubs.append(await _mp_pusher(port, use_quic, draft, epochs[0]))
+    await until_published(_MP_NS, _MP_TRACKS)
+    pubs.append(await _mp_pusher(port, use_quic, draft, epochs[1]))
+    assert await _until(lambda: all(
+        t is not None and len(t.standby) == 1 for t in _mp_tracks()))
+
+
+def _forwards(pubs) -> list:
+    return [t._subs[0].forward for _cm, _s, ts in pubs for t in ts.values()]
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", ["first", "second"])
+@pytest.mark.parametrize("how", ["publish_done", "close"])
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_pushed_tracks_merge_and_fail_over(which, how, draft,
+                                                 use_quic):
+    # §7.3: two sessions PUBLISH the same tracks; each Location reaches the
+    # subscriber once. Either one ending its tracks or its session leaves
+    # delivery to the other with no PUBLISH_DONE downstream; the last one
+    # ending ends the tracks.
+    port = _push_port(4 * (which == "second") + 2 * (how == "close")
+                      + (draft == 22), use_quic)
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    epoch = asyncio.get_running_loop().time()
+    pubs, closed = [], []
+    try:
+        await _push_two(pubs, port, use_quic, draft, (epoch, epoch))
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(_generating(p[2]) for p in pubs))
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            # Both deliver: the overlap is dropped as copies.
+            assert await _until(lambda: all(t._copies for t in _mp_tracks()))
+            gone, kept = pubs if which == "first" else pubs[::-1]
+            dropped_at = max(g for objs in rx.objects.values()
+                             for g, _sg, _o in objs)
+            if how == "close":
+                closed.append(gone)
+                await gone[0].__aexit__(None, None, None)
+            else:
+                for t in gone[2].values():
+                    t.end()
+            assert await _until(lambda: all(
+                not t.standby and (t.feed is not None) == (which == "first")
+                for t in _mp_tracks()))
+            seen = {n: rx.groups(n) for n in _MP_TRACKS}
+            assert await _until(lambda: all(rx.groups(n) >= seen[n] + 6
+                                            for n in _MP_TRACKS))
+            assert not any(rx.done.values()), rx.done
+            rx.assert_clean()
+            rx.assert_complete_after(dropped_at + 1)
+            for t in kept[2].values():
+                t.end()
+            assert await _until(lambda: all(rx.done.values())), rx.done
+    finally:
+        for cm, _s, _t in [p for p in pubs if p not in closed]:
+            await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_pause_and_resume_reach_every_pushed_feed(draft, use_quic):
+    # --pause-after lowers the Forward State of each publisher of an
+    # unwatched track; the next subscriber raises it on each.
+    port = _push_port(8 + (draft == 22), use_quic)
+    _reset_relay_state()
+    relay._pause_after = 0.3
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    epoch = asyncio.get_running_loop().time()
+    pubs = []
+    try:
+        await _push_two(pubs, port, use_quic, draft, (epoch, epoch))
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(_forwards(pubs)))
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            assert await _until(lambda: all(t._copies for t in _mp_tracks()))
+        assert await _until(lambda: all(t.paused for t in _mp_tracks()))
+        assert await _until(lambda: not any(_forwards(pubs))), _forwards(pubs)
+        await asyncio.sleep(2 * _MP_PERIOD)
+        taken = [(t._objects_in, t._copies) for t in _mp_tracks()]
+        await asyncio.sleep(4 * _MP_PERIOD)
+        assert [(t._objects_in, t._copies) for t in _mp_tracks()] == taken
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(_forwards(pubs))), \
+                _forwards(pubs)
+            assert all(not t.paused and len(t.standby) == 1
+                       for t in _mp_tracks())
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            assert await _until(lambda: all(
+                t._copies > c for t, (_n, c) in zip(_mp_tracks(), taken)))
+            rx.assert_clean()
+    finally:
+        relay._pause_after = relay.PAUSE_AFTER_S
+        for cm, _s, _t in pubs:
+            await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decide", ["publish", "object"])
+@pytest.mark.parametrize("old", ["sending", "silent"])
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_a_restarted_pusher_supersedes_the_track(decide, old, draft,
+                                                       use_quic):
+    # A second session PUBLISHing the track numbered far from Largest is a
+    # restarted publisher, its old session still open: it replaces the
+    # track, by its PUBLISH's Largest or else its first object, and the
+    # next subscriber's objects all come from it.
+    port = _push_port(10 + (draft == 22) + 2 * (old == "silent")
+                      + 4 * (decide == "object"), use_quic)
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    now = asyncio.get_running_loop().time()
+    pubs = []
+    try:
+        pubs.append(await _mp_pusher(port, use_quic, draft, now - 60))
+        await until_published(_MP_NS, _MP_TRACKS)
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            if old == "silent":
+                for t in pubs[0][2].values():
+                    t.stopped = True
+            olds = _mp_tracks()
+            old_up = {id(relay._upstream_session(t)) for t in olds}
+            pubs.append(await _mp_pusher(port, use_quic, draft, now,
+                                         largest=decide == "publish"))
+            assert await _until(lambda: all(rx.done.values())), rx.done
+            assert await _until(lambda: all(
+                t is not None and t not in olds and not t.standby
+                and id(relay._upstream_session(t)) not in old_up
+                for t in _mp_tracks()))
+            for objs in rx.objects.values():
+                assert min(g for g, _sg, _o in objs) > 60 / _MP_PERIOD - 10
+            rx.assert_clean()
+            rx2 = _MpRx()
+            await rx2.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(rx2.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            for objs in rx2.objects.values():
+                assert max(g for g, _sg, _o in objs) < 60 / _MP_PERIOD - 10
+            rx2.assert_clean()
+            assert pubs[0][1]._close_err is None
+    finally:
+        for cm, _s, _t in pubs:
+            await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_a_restarted_pusher_supersedes_a_paused_track(draft, use_quic):
+    # The old publisher went silent with its session open and the track
+    # paused; a restarted one joins it. Once a subscriber resumes the track
+    # and the old one stays silent, the restarted one replaces it.
+    port = _push_port(22 + (draft == 22), use_quic)
+    _reset_relay_state()
+    relay._pause_after = 0.3
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    now = asyncio.get_running_loop().time()
+    pubs = []
+    try:
+        pubs.append(await _mp_pusher(port, use_quic, draft, now - 60))
+        await until_published(_MP_NS, _MP_TRACKS)
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+        assert await _until(lambda: all(t.paused for t in _mp_tracks()))
+        for t in pubs[0][2].values():
+            t.stopped = True
+        olds = _mp_tracks()
+        pubs.append(await _mp_pusher(port, use_quic, draft, now))
+        assert await _until(lambda: all(len(t.standby) == 1 for t in olds))
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(rx.done.values())), rx.done
+            assert await _until(lambda: all(
+                t is not None and t not in olds and not t.standby
+                for t in _mp_tracks()))
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            for objs in rx.objects.values():
+                assert max(g for g, _sg, _o in objs) < 60 / _MP_PERIOD - 10
+            rx.assert_clean()
+    finally:
+        relay._pause_after = relay.PAUSE_AFTER_S
+        for cm, _s, _t in pubs:
+            await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_a_pusher_joining_a_paused_track_is_not_taken_for_a_restart(
+        draft, use_quic):
+    # A paused track's Largest falls behind a clock-numbered publisher: a
+    # further PUBLISH then joins as a feed rather than superseding the
+    # track, and both feed the next subscriber.
+    port = _push_port(20 + (draft == 22), use_quic)
+    _reset_relay_state()
+    relay._pause_after = 0.3
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    epoch = asyncio.get_running_loop().time()
+    pubs = []
+    try:
+        pubs.append(await _mp_pusher(port, use_quic, draft, epoch))
+        await until_published(_MP_NS, _MP_TRACKS)
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+        assert await _until(lambda: all(t.paused for t in _mp_tracks()))
+        olds = _mp_tracks()
+        await asyncio.sleep(10 * _MP_PERIOD)
+        pubs.append(await _mp_pusher(port, use_quic, draft, epoch,
+                                     largest=True))
+        assert await _until(lambda: all(
+            t is not None and len(t.standby) == 1 for t in _mp_tracks()))
+        assert _mp_tracks() == olds
+        copies = [t._copies for t in olds]
+        async with contextlib.AsyncExitStack() as stack:
+            rx = _MpRx()
+            await rx.subscribe(port, use_quic, draft, stack)
+            assert await _until(lambda: all(_forwards(pubs)))
+            assert await _until(lambda: all(rx.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            assert await _until(lambda: all(
+                t._copies > c for t, c in zip(olds, copies)))
+            assert _mp_tracks() == olds
+            assert all(len(t.standby) == 1 for t in olds)
+            assert not any(rx.done.values()), rx.done
+            rx.assert_clean()
+    finally:
+        relay._pause_after = relay.PAUSE_AFTER_S
+        for cm, _s, _t in pubs:
+            await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_MP_DRAFTS
+@_TRANSPORTS
+async def test_pushers_starting_together_both_feed_an_offered_track(
+        draft, use_quic):
+    # Two sessions PUBLISH the same tracks back to back while the first's
+    # PUBLISH_OK is held for a SUBSCRIBE_TRACKS offer: the second joins,
+    # one offer goes out per track, each Location arrives once, and the
+    # serving one closing fails over.
+    port = _push_port(18 + (draft == 22), use_quic)
+    _reset_relay_state()
+    relay._track_subs.clear()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    epoch = asyncio.get_running_loop().time()
+    pubs, closed = [], []
+    got = _MpRx()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            rx = await stack.enter_async_context(MOQTClient(
+                "localhost", port, path="/", use_quic=use_quic,
+                verify_tls=False, supported_drafts=draft).connect())
+            await rx.client_session_init()
+            await rx.subscribe_tracks(namespace=_MP_NS)
+            assert await _until(lambda: relay._track_subs)
+            pubs.append(await _mp_pusher(port, use_quic, draft, epoch))
+            pubs.append(await _mp_pusher(port, use_quic, draft, epoch))
+            assert await _until(lambda: all(
+                t is not None and len(t.standby) == 1 for t in _mp_tracks()))
+            for _ in _MP_TRACKS:
+                msg = await rx.await_publish(timeout=5.0)
+                name = msg.track_name.decode()
+                rx._track_aliases[msg.track_alias] = msg.request_id
+                rx.register_object_handler(
+                    msg.track_alias,
+                    lambda m, _s, _t, g, sg, n=name:
+                        got.objects[n].append((g, sg, m.object_id)))
+                rx.register_publish_done_handler(
+                    msg.request_id, lambda d, n=name: got.done[n].append(d))
+                rx.publish_ok(msg, forward=1)
+            assert await _until(lambda: all(_generating(p[2]) for p in pubs))
+            assert await _until(lambda: all(got.groups(n) >= 4
+                                            for n in _MP_TRACKS))
+            assert await _until(lambda: all(t._copies for t in _mp_tracks()))
+            assert rx._publish_announcements.empty()
+            dropped_at = max(g for objs in got.objects.values()
+                             for g, _sg, _o in objs)
+            closed.append(pubs[0])
+            await pubs[0][0].__aexit__(None, None, None)
+            assert await _until(lambda: all(
+                t.feed is not None and not t.standby for t in _mp_tracks()))
+            seen = {n: got.groups(n) for n in _MP_TRACKS}
+            assert await _until(lambda: all(got.groups(n) >= seen[n] + 6
+                                            for n in _MP_TRACKS))
+            assert not any(got.done.values()), got.done
+            got.assert_clean()
+            got.assert_complete_after(dropped_at + 1)
+            for t in pubs[1][2].values():
+                t.end()
+            assert await _until(lambda: all(got.done.values())), got.done
+            assert rx._close_err is None
+    finally:
+        for cm, _s, _t in [p for p in pubs if p not in closed]:
+            await cm.__aexit__(None, None, None)
+        handle.close()
+        _reset_relay_state()
+        relay._track_subs.clear()
 
 
 class _ProduceClocked(PublishedTrack):
