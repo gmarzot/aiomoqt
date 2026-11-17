@@ -885,11 +885,12 @@ class _ObjectCache:
     def __init__(self) -> None:
         self.clear()
 
-    def detach(self) -> list:
-        """Empty the cache; its payload blocks, for the caller to free."""
-        pay = self._pay
+    def detach(self) -> tuple:
+        """Empty the cache; its blocks (payloads, columns, arrival times,
+        properties), for the caller to free."""
+        blocks = (self._pay, self._cols, self._born, self._props)
         self.clear()
-        return pay
+        return blocks
 
     def clear(self) -> None:
         # Per block; a sealed block's lists become a tuple and bytes, a
@@ -1411,7 +1412,7 @@ class _CacheBudget:
 
 _budget = _CacheBudget()
 
-# Payloads of dropped caches, newest last, freed a slice per loop pass:
+# Blocks of dropped caches, newest last, freed a slice per loop pass:
 # freeing a whole track's cache at once pauses the loop for its size.
 _unfreed: deque = deque()
 RELEASE_SLICE_S = 0.002
@@ -1419,15 +1420,16 @@ _releasing = None
 
 
 def _free_later(blocks) -> None:
-    """Free these payload blocks a slice per loop pass, newest first; at
-    once without a running loop."""
+    """Free a dropped cache's blocks (detach()) a slice per loop pass,
+    newest first; at once without a running loop. Takes them as they
+    are: the caller pays nothing per block."""
     global _releasing
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _unfreed.extend(list(b) for b in blocks if b)
-    if _unfreed and _releasing is not loop:
+    _unfreed.append(blocks)
+    if _releasing is not loop:
         _releasing = loop
         loop.call_soon(_free_some)
 
@@ -1436,9 +1438,17 @@ def _free_some() -> None:
     global _releasing
     end = time.perf_counter() + RELEASE_SLICE_S
     while _unfreed:
-        block = _unfreed[-1]
-        while block:
-            del block[-32:]
+        pay, *columns = _unfreed[-1]
+        while pay:
+            block = pay[-1]
+            if block:
+                if block.__class__ is not list:
+                    block = pay[-1] = list(block)
+                del block[-32:]
+            else:
+                pay.pop()
+                for col in columns:
+                    col.pop()
             if time.perf_counter() >= end:
                 asyncio.get_running_loop().call_soon(_free_some)
                 return
