@@ -1,4 +1,4 @@
-"""Two in-process FabricNodes over localhost raw QUIC (moq-peering has no
+"""Two in-process FabricNodes over localhost raw QUIC (moq-fabric has no
 WebTransport mapping): CONNECT, node learning, announces and subscribes
 both ways on two tracks each, withdraws, re-dial after a close, and the
 moq-peer-probe tool end to end."""

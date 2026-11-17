@@ -1,4 +1,4 @@
-"""Sans-I/O moq-peering session: one QUIC connection to one peer.
+"""Sans-I/O moq-fabric session: one QUIC connection to one peer.
 
 Bytes and stream events go in; parsed state, SessionEvents and control
 bytes to send (take_output) come out. The session records what it learns

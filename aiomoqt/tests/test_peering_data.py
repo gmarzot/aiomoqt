@@ -1,4 +1,4 @@
-"""moq-peering data plane over localhost raw QUIC: a publishing
+"""moq-fabric data plane over localhost raw QUIC: a publishing
 FabricNode, a receiving one, and between them a pure via (a test helper
 here, not product logic). Two tracks, datagrams and their cap, FIN, reset
 and end of group, SNS withdraw, and the information base's rules. Zero

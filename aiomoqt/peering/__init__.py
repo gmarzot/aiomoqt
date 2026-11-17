@@ -1,6 +1,6 @@
-"""moq-peering (Quicr/moq-peering) fabric support: wire codec, hashes and a
-leaf FabricNode that observes a moqx / LAPS fabric and originates
-announces and subscribes. Control plane only."""
+"""moq-fabric (Quicr/moq-fabric) support: wire codec, hashes, MoQT d18
+inner framing, and a leaf FabricNode that joins a moqx / LAPS fabric,
+originates announces and subscribes, and publishes and receives objects."""
 from aiomoqt.peering.hashing import (city64, fresh_node_id, hash_combine,
                                      libstdcxx_hash, node_id_format,
                                      node_id_parse, track_hashes)

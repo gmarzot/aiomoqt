@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moq-peer-bench: send and measure a track through a moq-peering fabric.
+"""moq-peer-bench: send and measure a track through a moq-fabric mesh.
 
 --role pub announces -N/-T into the fabric and, once a node subscribes,
 sends -s byte bench objects, -g per group, striped over -P subgroup
@@ -67,7 +67,7 @@ def bench_payload(group_id: int, object_id: int, size: int) -> bytes:
 
 def parse_args(argv=None):
     p = grid.make_parser(
-        description="Send and measure a track through a moq-peering fabric",
+        description="Send and measure a track through a moq-fabric mesh",
         epilog=__doc__)
     grid.add_peering(p, port=0)
     grid.add_identity(p, trackname="t0")

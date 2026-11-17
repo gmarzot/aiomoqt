@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""moq-peer-probe: join a moq-peering fabric (moqx, LAPS) as a leaf node.
+"""moq-peer-probe: join a moq-fabric mesh (moqx, LAPS) as a leaf node.
 
-Dials each --peer over raw QUIC (ALPN moq-peering) and, with -p, accepts
+Dials each --peer over raw QUIC (ALPN moq-fabric) and, with -p, accepts
 peers' dials. Logs and records every node, announce, subscribe and SNS set
 the fabric sends, checks each announce and subscribe hash, and with
 --announce / --subscribe originates its own (control plane only: no
@@ -123,7 +123,7 @@ def subscribe_arg(value: str):
 
 def parse_args(argv=None):
     p = grid.make_parser(
-        description="Join a moq-peering fabric as a leaf node: observe it "
+        description="Join a moq-fabric mesh as a leaf node: observe it "
                     "and originate announces and subscribes",
         epilog=__doc__)
     grid.add_peering(p)

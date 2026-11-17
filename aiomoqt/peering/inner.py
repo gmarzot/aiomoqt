@@ -1,4 +1,4 @@
-"""MoQT draft-18 framing inside moq-peering data, as moqx writes it.
+"""MoQT draft-18 framing inside moq-fabric data, as moqx writes it.
 
 A NEW_STREAM's inner bytes are one d18 subgroup stream: header type 0x51
 (subgroup 0) or 0x55, FIRST_OBJECT set, track alias = the track's
@@ -24,7 +24,7 @@ P18 = profile_for(18)
 # moqx drops larger objects.
 MAX_OBJECT = 1 << 20
 # A peering datagram frame (header + inner) stays within aiopquic's
-# 1200-byte datagram payload cap; moq-peering peers accept 1280.
+# 1200-byte datagram payload cap; moq-fabric peers accept 1280.
 DATAGRAM_MAX_FRAME = 1200
 DATAGRAM_MAX_INNER = DATAGRAM_MAX_FRAME - DATAGRAM_HEADER_LEN
 DEFAULT_PRIORITY = 128
