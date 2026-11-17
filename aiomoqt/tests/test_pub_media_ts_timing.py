@@ -4,6 +4,7 @@ placement of decoder config, and --no-catalog, end to end through the
 interop relay into sub_media --analyze."""
 import asyncio
 import json
+import time
 from types import SimpleNamespace as NS
 
 import pytest
@@ -79,6 +80,16 @@ def _catalogs(err: str):
     return out
 
 
+async def _wall_steps(spread):
+    """Keep spread[0] at the range of wall clock minus monotonic, in ms."""
+    lo = hi = time.time() - time.monotonic()
+    while True:
+        await asyncio.sleep(0.05)
+        off = time.time() - time.monotonic()
+        lo, hi = min(lo, off), max(hi, off)
+        spread[0] = (hi - lo) * 1000
+
+
 # -- --ts-cadence ---------------------------------------------------------
 
 @requires_certs
@@ -89,8 +100,16 @@ async def test_ts_cadence_maps_timing(tmp_path, monkeypatch, received,
     port = _BASE_PORT + 2 * cadence + (not use_quic)
     flags = (['--ts-cadence', 'fps=30,gop=30'] if cadence
              else ['--timestamp-mapping'])
-    rows = await _analyze(monkeypatch, tmp_path, port,
-                          ['--ts', _ts(tmp_path), *flags], use_quic=use_quic)
+    spread = [0.0]
+    watch = asyncio.create_task(_wall_steps(spread))
+    try:
+        rows = await _analyze(monkeypatch, tmp_path, port,
+                              ['--ts', _ts(tmp_path), *flags],
+                              use_quic=use_quic)
+    finally:
+        watch.cancel()
+    # Pacing is monotonic, latency wall clock: a clock step shifts latency.
+    floor = -1000 if spread[0] > 5 else 0
     for name, scale in (('video', 30000), ('audio', 48000)):
         props = received['track'][name]
         objects = received['objects'][name]
@@ -100,7 +119,7 @@ async def test_ts_cadence_maps_timing(tmp_path, monkeypatch, received,
         if cadence:
             assert props[TIMESCALE] == scale and TIMESTAMP_MAPPING in props
             assert stamped == []              # on schedule throughout
-            assert 0 <= float(rows[name]['lat_p50_ms']) < 1000
+            assert floor <= float(rows[name]['lat_p50_ms']) < 1000
         else:
             assert props[TIMESCALE] == 1_000_000
             assert TIMESTAMP_MAPPING not in props
