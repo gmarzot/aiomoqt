@@ -5,6 +5,7 @@ and end of group, SNS withdraw, and the information base's rules. Zero
 objects received fails every data test."""
 import asyncio
 import json
+import logging
 import time
 
 import pytest
@@ -126,6 +127,17 @@ def _dialer(port, label):
 
 def _ext():
     return {LOC_TIMESTAMP: time.time_ns() // 1000}
+
+
+def _story(nodes) -> str:
+    """The nodes' events in one timeline, for a failure message."""
+    skip = ("t_ms", "t_unix_ns", "kind", "node_int", "path")
+    rows = sorted(
+        (ev["t_unix_ns"], f"{n.local.contact} {ev['kind']} "
+         f"{ {k: v for k, v in ev.items() if k not in skip} }"[:160])
+        for n in nodes for ev in n.events)
+    t0 = rows[0][0] if rows else 0
+    return "\n".join(f"{(t - t0) / 1e6:9.1f} ms {line}" for t, line in rows)
 
 
 async def _send_groups(track, groups, per_group, lanes=1, size=64):
@@ -289,17 +301,32 @@ async def test_unsubscribe_withdraws_sns_and_ends_streams():
 
 
 @pytest.mark.asyncio
-async def test_peer_bench_role_both_through_via(tmp_path):
+async def test_peer_bench_role_both_through_via(tmp_path, monkeypatch):
     port = _BASE_PORT + 5
     out = tmp_path / "bench.json"
     trace = tmp_path / "objects.jsonl"
-    async with _listener(_Via, port, "via"):
-        args = peer_bench.parse_args([
-            "--peer", f"127.0.0.1:{port}", "--role", "both", "-s", "512",
-            "-g", "10", "-P", "2", "-r", "200", "-t", "2", "-i", "0",
-            "--verify-payload", "-o", str(out),
-            "--trace-objects", str(trace)])
-        assert await peer_bench.run(args) == 0
+    nodes = []
+
+    class _Kept(FabricNode):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            nodes.append(self)
+    monkeypatch.setattr(peer_bench, "FabricNode", _Kept)
+    # DEBUG reaches the captured stderr a failure prints.
+    peering = logging.getLogger("aiomoqt.peering")
+    level = peering.level
+    peering.setLevel(logging.DEBUG)
+    try:
+        async with _listener(_Via, port, "via") as via:
+            args = peer_bench.parse_args([
+                "--peer", f"127.0.0.1:{port}", "--role", "both", "-s", "512",
+                "-g", "10", "-P", "2", "-r", "200", "-t", "2", "-i", "0",
+                "--verify-payload", "-o", str(out),
+                "--trace-objects", str(trace)])
+            rc = await peer_bench.run(args)
+    finally:
+        peering.setLevel(level)
+    assert rc == 0, _story([via, *nodes])
     report = json.loads(out.read_text())
     (track,) = report["sub"]["tracks"]
     assert track["objects"] > 0 and track["lost"] == 0
