@@ -1923,13 +1923,19 @@ class _ProduceClocked(PublishedTrack):
             last = gid
 
 
-async def _eot_publisher(stack, port, use_quic, draft, epoch):
+async def _eot_publisher(stack, port, use_quic, draft, epoch, push=False):
+    """Both _MP_TRACKS, under PUBLISH_NAMESPACE or, with `push`, each
+    PUBLISHed."""
     client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
                         verify_tls=False, supported_drafts=draft)
     s = await stack.enter_async_context(client.connect())
     await s.client_session_init()
     tracks = {n: _ProduceClocked(s, _MP_NS, n, epoch=epoch)
               for n in _MP_TRACKS}
+    if push:
+        for t in tracks.values():
+            await t.publish(announce_namespace=False, publish_track=True)
+        return tracks
     for t in tracks.values():
         t.attach()
     await s.publish_namespace(namespace=_MP_NS, wait_response=True)
@@ -1950,15 +1956,17 @@ def _handle_data_late(session, delay):
 
 @requires_certs
 @pytest.mark.asyncio
+@pytest.mark.parametrize("push", [False, True])
 @pytest.mark.parametrize("late", [False, True])
 @_MP_DRAFTS
 @_TRANSPORTS
-async def test_no_failover_past_a_forwarded_end_of_track(late, draft,
+async def test_no_failover_past_a_forwarded_end_of_track(late, push, draft,
                                                          use_quic):
     # The serving publisher's End of Track ends the track downstream: a
     # standby still producing does not take over, and nothing follows it.
-    # With `late`, its PUBLISH_DONE overtakes the End of Track stream.
-    port = (_BASE_PORT + 190 + 26 * late + 2 * (draft == 22)
+    # With `late`, its PUBLISH_DONE overtakes the End of Track stream;
+    # with `push`, both publishers PUBLISH the tracks.
+    port = (_BASE_PORT + 190 + 26 * late + 4 * push + 2 * (draft == 22)
             + (not use_quic))
     _reset_relay_state()
     server = relay._build_server("localhost", port, CERT, KEY,
@@ -1971,10 +1979,15 @@ async def test_no_failover_past_a_forwarded_end_of_track(late, draft,
     malformed = []
     try:
         async with contextlib.AsyncExitStack() as stack:
-            standby = await _eot_publisher(stack, port, use_quic, draft,
-                                           epoch)
-            primary = await _eot_publisher(stack, port, use_quic, draft,
-                                           epoch)
+            # The newest announcer serves a subscribed track, the first
+            # PUBLISH a pushed one.
+            first = await _eot_publisher(stack, port, use_quic, draft,
+                                         epoch, push)
+            if push:
+                await until_published(_MP_NS, _MP_TRACKS)
+            second = await _eot_publisher(stack, port, use_quic, draft,
+                                          epoch, push)
+            primary, standby = (first, second) if push else (second, first)
             rx = await stack.enter_async_context(MOQTClient(
                 "localhost", port, path="/", use_quic=use_quic,
                 verify_tls=False, supported_drafts=draft).connect())
@@ -2008,7 +2021,8 @@ async def test_no_failover_past_a_forwarded_end_of_track(late, draft,
                 primary[n]._largest[0] >= standby[n]._largest[0]
                 for n in _MP_TRACKS))
             if late:
-                _handle_data_late(_mp_tracks()[0].upstream.session, 0.2)
+                _handle_data_late(
+                    relay._upstream_session(_mp_tracks()[0]), 0.2)
             for t in primary.values():
                 t.end()
             assert await _until(lambda: all(done.values())), (ends, done)

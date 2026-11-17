@@ -4161,7 +4161,11 @@ async def _on_publish_done(session, msg):
                     f"streams={getattr(msg, 'stream_count', 0)} -> "
                     f"{len(track.downstream)} subscriber(s), objects "
                     f"in={track._objects_in} out={track._objects_out}")
-        if track.fail_over(key):
+        need = int(getattr(msg, "stream_count", 0) or 0)
+        if track.standby and track._upstream_ended < need:
+            # As in _upstream_done: decide once its streams have ended.
+            track.note_upstream_done(status, reason, key, need)
+        elif track.fail_over(key):
             pass
         elif track.task is None:
             # Nothing queued and no subscriber attached.
