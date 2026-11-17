@@ -6732,7 +6732,7 @@ LOG_FILE_BACKUPS = 4
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 # faulthandler's target with --log-dir (crash.log); stderr otherwise.
 _crash_file = None
-# The thread writing relay.log with --log-dir.
+# The thread writing relay.log and stderr with --log-dir.
 _log_listener = None
 
 
@@ -6759,16 +6759,23 @@ class _MirrorFormatter(logging.Formatter):
         return super().format(record)
 
 
-class _Tee(logging.Handler):
-    """Hands each record to several handlers."""
+class _Shown(logging.Handler):
+    """stderr, each record by the handler that showed it before: the
+    aiomoqt loggers' own, else the root's."""
 
-    def __init__(self, *targets):
+    def __init__(self, aiomoqt, root):
         super().__init__()
-        self.targets = targets
+        self.aiomoqt = aiomoqt
+        self.root = root
 
     def handle(self, record):
-        for target in self.targets:
-            target.handle(record)
+        if logging.getLogger(record.name).propagate:
+            targets = self.root
+        else:
+            targets = () if self.aiomoqt is None else (self.aiomoqt,)
+        for target in targets:
+            if record.levelno >= target.level:
+                target.handle(record)
         return True
 
     def emit(self, record):
@@ -6800,27 +6807,35 @@ def _versions_line() -> str:
 
 
 def _start_log_dir(log_dir: str) -> None:
-    """DIR/relay.log: the stderr log, rotated. DIR/crash.log: a start
-    line, then faulthandler's crash and stall dumps (it takes one file,
-    so they no longer reach stderr)."""
+    """DIR/relay.log: the stderr log, rotated; a thread writes both.
+    DIR/crash.log: a start line, then faulthandler's crash and stall
+    dumps (it takes one file, so they no longer reach stderr)."""
     global _crash_file, _log_listener
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o755)
-    shown = logger.handlers[0] if logger.handlers else None
+    shown = next((h for h in logger.handlers
+                  if type(h) is logging.StreamHandler), None)
     log_file = _LogFile(os.path.join(log_dir, "relay.log"),
                         maxBytes=LOG_FILE_BYTES, backupCount=LOG_FILE_BACKUPS)
     log_file.setFormatter(_MirrorFormatter(
         shown.formatter if shown is not None and shown.formatter
         else logging.Formatter(LOG_FORMAT)))
-    # A thread writes relay.log: a filesystem stall must not pause the loop.
+    # One thread writes relay.log and stderr, in order: a stalled
+    # filesystem or a full stderr pipe must not pause the loop.
+    root = logging.getLogger()
+    root_shown = [h for h in root.handlers
+                  if type(h) is logging.StreamHandler]
+    for h in root_shown:
+        root.removeHandler(h)
     records = queue.SimpleQueue()
     _log_listener = QueueListener(records, log_file,
+                                  _Shown(shown, root_shown),
                                   respect_handler_level=True)
     _log_listener.start()
     atexit.register(_stop_log_listener)
-    to_file = QueueHandler(records)
-    logging.getLogger().addHandler(to_file)
-    set_log_handler(_Tee(shown, to_file) if shown is not None else to_file)
+    queued = QueueHandler(records)
+    root.addHandler(queued)
+    set_log_handler(queued)
 
     path = os.path.join(log_dir, "crash.log")
     _crash_file = open(path, "a")

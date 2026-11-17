@@ -1,6 +1,7 @@
-"""--log-dir: relay.log mirrors the stderr log with rotation, written by
-a thread so a slow write never holds the logging caller, and crash.log
-takes a start line before faulthandler's dumps."""
+"""--log-dir: relay.log mirrors the stderr log with rotation, both
+written by a thread so a slow write never holds the logging caller, and
+crash.log takes a start line before faulthandler's dumps."""
+import io
 import logging
 from logging.handlers import QueueHandler
 import os
@@ -39,10 +40,13 @@ def log_dir(tmp_path, monkeypatch):
     finally:
         os.umask(old_umask)
         relay._stop_log_listener()
-        for h in root.handlers:
+        for h in list(root.handlers):
             if h not in handlers:
                 root.removeHandler(h)
                 h.close()
+        for h in handlers:
+            if h not in root.handlers:
+                root.addHandler(h)
         aiomoqt_logger.set_log_handler(shown)
         relay.logger.setLevel(level)
         if relay._crash_file is not None:
@@ -53,8 +57,9 @@ def log_dir(tmp_path, monkeypatch):
 def test_relay_log_rotates_and_mirrors_stderr(log_dir):
     path, _enabled = log_dir
     relay._start_log_dir(str(path))
-    files = list(relay._log_listener.handlers)
-    assert len(files) == 1 and isinstance(files[0], relay._LogFile)
+    listener = relay._log_listener
+    files = [h for h in listener.handlers if isinstance(h, relay._LogFile)]
+    assert len(files) == 1
     assert (files[0].maxBytes, files[0].backupCount) == (10 * 1024 * 1024, 4)
     queued = [h for h in logging.getLogger().handlers
               if isinstance(h, QueueHandler)]
@@ -70,8 +75,9 @@ def test_relay_log_rotates_and_mirrors_stderr(log_dir):
                      r"aiopquic \S+ pid \d+$", text, re.M), text
     assert re.search(r"^\S+ \S+ WARNING other\.lib: from the root$",
                      text, re.M), text
-    # The stderr handler still gets every aiomoqt record.
-    assert any(t is not queued[0] for t in aiomoqt_logger._handler.targets)
+    # aiomoqt records go through the same queue, to stderr too.
+    assert aiomoqt_logger._handler is queued[0]
+    assert any(isinstance(h, relay._Shown) for h in listener.handlers)
 
     assert _mode(path) == 0o755
     assert _mode(path / "relay.log") == 0o644
@@ -100,6 +106,35 @@ def test_a_slow_relay_log_write_does_not_hold_the_caller(log_dir,
     text = (path / "relay.log").read_text()
     for i in range(3):
         assert f"relay: line {i}" in text and f"root line {i}" in text, text
+
+
+class _SlowStream(io.StringIO):
+    def write(self, s):
+        time.sleep(0.2)
+        return super().write(s)
+
+
+def test_a_blocked_stderr_does_not_hold_the_caller(log_dir):
+    path, _enabled = log_dir
+    shown, root_shown = _SlowStream(), _SlowStream()
+    handler = aiomoqt_logger._handler
+    stream = handler.setStream(shown)
+    logging.getLogger().addHandler(logging.StreamHandler(root_shown))
+    try:
+        relay._start_log_dir(str(path))
+        t0 = time.monotonic()
+        for i in range(3):
+            relay.logger.info(f"relay: line {i}")
+            logging.getLogger("other.lib").warning(f"root line {i}")
+        assert time.monotonic() - t0 < 0.1
+        relay._stop_log_listener()
+    finally:
+        handler.setStream(stream)
+    lines = [x for x in shown.getvalue().splitlines() if "relay: line" in x]
+    assert len(lines) == 3 and all(
+        line.endswith(f" relay: line {i}") for i, line in enumerate(lines)), lines
+    assert root_shown.getvalue().splitlines() == [
+        f"root line {i}" for i in range(3)], root_shown.getvalue()
 
 
 def test_crash_log_start_line_precedes_faulthandler(log_dir, monkeypatch):
