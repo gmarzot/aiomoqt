@@ -104,6 +104,7 @@ from collections import OrderedDict, deque
 import contextlib
 import datetime
 import faulthandler
+import gc
 from functools import lru_cache
 import heapq
 import itertools
@@ -120,6 +121,8 @@ import signal
 import sys
 import time
 import tomllib
+from typing import Any
+import urllib.parse
 from collections import Counter
 from types import SimpleNamespace
 
@@ -882,11 +885,12 @@ class _ObjectCache:
     def __init__(self) -> None:
         self.clear()
 
-    def detach(self) -> list:
-        """Empty the cache; its payload blocks, for the caller to free."""
-        pay = self._pay
+    def detach(self) -> tuple:
+        """Empty the cache; its blocks (payloads, columns, arrival times,
+        properties), for the caller to free."""
+        blocks = (self._pay, self._cols, self._born, self._props)
         self.clear()
-        return pay
+        return blocks
 
     def clear(self) -> None:
         # Per block; a sealed block's lists become a tuple and bytes, a
@@ -1408,7 +1412,7 @@ class _CacheBudget:
 
 _budget = _CacheBudget()
 
-# Payloads of dropped caches, newest last, freed a slice per loop pass:
+# Blocks of dropped caches, newest last, freed a slice per loop pass:
 # freeing a whole track's cache at once pauses the loop for its size.
 _unfreed: deque = deque()
 RELEASE_SLICE_S = 0.002
@@ -1416,15 +1420,16 @@ _releasing = None
 
 
 def _free_later(blocks) -> None:
-    """Free these payload blocks a slice per loop pass, newest first; at
-    once without a running loop."""
+    """Free a dropped cache's blocks (detach()) a slice per loop pass,
+    newest first; at once without a running loop. Takes them as they
+    are: the caller pays nothing per block."""
     global _releasing
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _unfreed.extend(list(b) for b in blocks if b)
-    if _unfreed and _releasing is not loop:
+    _unfreed.append(blocks)
+    if _releasing is not loop:
         _releasing = loop
         loop.call_soon(_free_some)
 
@@ -1433,9 +1438,17 @@ def _free_some() -> None:
     global _releasing
     end = time.perf_counter() + RELEASE_SLICE_S
     while _unfreed:
-        block = _unfreed[-1]
-        while block:
-            del block[-32:]
+        pay, *columns = _unfreed[-1]
+        while pay:
+            block = pay[-1]
+            if block:
+                if block.__class__ is not list:
+                    block = pay[-1] = list(block)
+                del block[-32:]
+            else:
+                pay.pop()
+                for col in columns:
+                    col.pop()
             if time.perf_counter() >= end:
                 asyncio.get_running_loop().call_soon(_free_some)
                 return
@@ -1605,7 +1618,8 @@ class _RelayLane(SendLane):
         super().__init__(writer, max_bytes=LANE_BYTES)
         writer.lane = self
         self.track = track
-        self.d = d
+        # None once the lane has stopped (_ended).
+        self.d: Any = d
         self._catalog = track.key[1] in CATALOG_TRACKS
         _lanes.add(self)
         track._lanes.add(self)
@@ -1717,6 +1731,14 @@ class _RelayLane(SendLane):
                     f"held")
         return (f"{self._behind:.2f} s behind (deadline "
                 f"{self._deadline:.1f} s), {self._held} bytes held")
+
+    def _ended(self, task) -> None:
+        super()._ended(task)
+        if self.stopped:
+            # Its delivery and downstream point back at it: once it has
+            # stopped, those links only keep the session alive for a GC pass.
+            writer = self.writer
+            writer.lane = writer.d = self.d = None
 
     def _exit(self) -> None:
         _lanes.discard(self)
@@ -3272,6 +3294,8 @@ def _forget_session(session) -> None:
     for k in [k for k in _track_sub_filters if k[0] == id(session)]:
         del _track_sub_filters[k]
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
+    _ns_offered.difference_update(
+        [k for k in _ns_offered if k[0] is session])
     _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _dgram_drops.pop(id(session), None)
     _subscribing.pop(id(session), None)
@@ -5664,6 +5688,8 @@ async def _on_subscribe_namespace(session, msg):
         msg, stream_id=session._bidi_streams.get(msg.request_id))
 
     def _drop(rid, s=session, r=msg.request_id):
+        _ns_offered.difference_update(
+            [k for k in _ns_offered if k[0] is s and k[1] == r])
         _ns_subs[:] = [e for e in _ns_subs
                        if not (e[0] is s and e[2] == r)]
         _track_subs[:] = [e for e in _track_subs
@@ -5716,11 +5742,21 @@ def _known_namespaces(prefix) -> list:
     return out
 
 
+# (session, SUBSCRIBE_NAMESPACE request id, namespace) told NAMESPACE and
+# not NAMESPACE_DONE since.
+_ns_offered: set = set()
+
+
 def _offer_namespace(session, request_id, prefix, ns) -> None:
     """One NAMESPACE reply on the SUBSCRIBE_NAMESPACE request stream:
-    the suffix under the subscribed prefix (§10.8)."""
+    the suffix under the subscribed prefix (§10.8), once while the
+    namespace stays (d22 §4.2: as the set changes)."""
+    key = (session, request_id, ns)
+    if key in _ns_offered:
+        return
     try:
         session.namespace(ns[len(prefix):], request_id=request_id)
+        _ns_offered.add(key)
     except Exception:
         logger.debug("relay: NAMESPACE offer failed", exc_info=True)
 
@@ -5758,7 +5794,11 @@ def _retract_namespace(ns) -> None:
     publisher withdraws or its session closes.
     """
     for session, prefix, rid in list(_ns_subs):
-        if _prefix_covers(prefix, ns) and _session_live(session):
+        key = (session, rid, ns)
+        if key not in _ns_offered:
+            continue
+        _ns_offered.discard(key)
+        if _session_live(session):
             try:
                 session.namespace_done(ns[len(prefix):], request_id=rid)
             except Exception:
@@ -6243,6 +6283,7 @@ class _Status:
         self.host = relay_status.HostSampler(udp_port=relay.get("port"))
         self.lag = relay_status.LoopLag()
         self.gc = relay_status.GcTimer.shared()
+        self.gc_totals = relay_status.GcTotals()
         length = int(STATUS_HISTORY_S / STATUS_INTERVAL_S)
         self.history = relay_status.History(_HISTORY_KEYS, length)
         self.platform_history = relay_status.History(_PLATFORM_KEYS, length)
@@ -6545,6 +6586,7 @@ class _Status:
             "loop_lag_ms": lag,
             "send_late_ms": self._send_late_ms(),
             "gc": gc_line,
+            "gc_totals": self.gc_totals.take(now),
             "queue_ms": {"p50": relay_status.percentile(queue_ms, 50),
                          "p90": relay_status.percentile(queue_ms, 90),
                          "max": max(queue_ms, default=None)},
@@ -6700,7 +6742,7 @@ LOG_FILE_BACKUPS = 4
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 # faulthandler's target with --log-dir (crash.log); stderr otherwise.
 _crash_file = None
-# The thread writing relay.log with --log-dir.
+# The thread writing relay.log and stderr with --log-dir.
 _log_listener = None
 
 
@@ -6727,20 +6769,38 @@ class _MirrorFormatter(logging.Formatter):
         return super().format(record)
 
 
-class _Tee(logging.Handler):
-    """Hands each record to several handlers."""
+class _Shown(logging.Handler):
+    """stderr, each record by the handler that showed it before: the
+    aiomoqt loggers' own, else the root's."""
 
-    def __init__(self, *targets):
+    def __init__(self, aiomoqt, root):
         super().__init__()
-        self.targets = targets
+        self.aiomoqt = aiomoqt
+        self.root = root
 
     def handle(self, record):
-        for target in self.targets:
-            target.handle(record)
+        if logging.getLogger(record.name).propagate:
+            targets = self.root
+        else:
+            targets = () if self.aiomoqt is None else (self.aiomoqt,)
+        for target in targets:
+            if record.levelno >= target.level:
+                target.handle(record)
         return True
 
     def emit(self, record):
         pass
+
+
+def _freeze_startup_heap() -> None:
+    """Move what startup built (modules, functions, types, the listeners)
+    out of the cyclic GC's reach: later full passes walk only what the
+    relay creates while serving. Frozen objects are still freed by
+    reference counting."""
+    gc.collect()
+    gc.freeze()
+    logger.info(f"relay: froze {gc.get_freeze_count()} startup objects "
+                f"out of GC passes")
 
 
 def _stop_log_listener() -> None:
@@ -6757,27 +6817,35 @@ def _versions_line() -> str:
 
 
 def _start_log_dir(log_dir: str) -> None:
-    """DIR/relay.log: the stderr log, rotated. DIR/crash.log: a start
-    line, then faulthandler's crash and stall dumps (it takes one file,
-    so they no longer reach stderr)."""
+    """DIR/relay.log: the stderr log, rotated; a thread writes both.
+    DIR/crash.log: a start line, then faulthandler's crash and stall
+    dumps (it takes one file, so they no longer reach stderr)."""
     global _crash_file, _log_listener
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o755)
-    shown = logger.handlers[0] if logger.handlers else None
+    shown = next((h for h in logger.handlers
+                  if type(h) is logging.StreamHandler), None)
     log_file = _LogFile(os.path.join(log_dir, "relay.log"),
                         maxBytes=LOG_FILE_BYTES, backupCount=LOG_FILE_BACKUPS)
     log_file.setFormatter(_MirrorFormatter(
         shown.formatter if shown is not None and shown.formatter
         else logging.Formatter(LOG_FORMAT)))
-    # A thread writes relay.log: a filesystem stall must not pause the loop.
+    # One thread writes relay.log and stderr, in order: a stalled
+    # filesystem or a full stderr pipe must not pause the loop.
+    root = logging.getLogger()
+    root_shown = [h for h in root.handlers
+                  if type(h) is logging.StreamHandler]
+    for h in root_shown:
+        root.removeHandler(h)
     records = queue.SimpleQueue()
     _log_listener = QueueListener(records, log_file,
+                                  _Shown(shown, root_shown),
                                   respect_handler_level=True)
     _log_listener.start()
     atexit.register(_stop_log_listener)
-    to_file = QueueHandler(records)
-    logging.getLogger().addHandler(to_file)
-    set_log_handler(_Tee(shown, to_file) if shown is not None else to_file)
+    queued = QueueHandler(records)
+    root.addHandler(queued)
+    set_log_handler(queued)
 
     path = os.path.join(log_dir, "crash.log")
     _crash_file = open(path, "a")
@@ -6861,8 +6929,15 @@ async def _on_control(reader, writer) -> None:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5.0)
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
+        target = urllib.parse.urlsplit(path)
         if path == "/sessions" and method == "GET":
             status, body = "200 OK", _sessions_report()
+        elif target.path == "/gc" and method == "GET":
+            top = urllib.parse.parse_qs(target.query).get("top", ["40"])[0]
+            if top.isdigit():
+                status, body = "200 OK", relay_status.gc_census(int(top))
+            else:
+                status, body = "400 Bad Request", {"error": "top: a count"}
         elif path != "/debug" or method not in ("GET", "POST"):
             status, body = "404 Not Found", {"error": "not found"}
         else:
@@ -7114,6 +7189,7 @@ async def main():
         print(f"  upstream origin: {url}")
 
     _background.add(asyncio.create_task(_watch_lanes()))
+    _freeze_startup_heap()
 
     watchdog = None
     if args.watchdog > 0:

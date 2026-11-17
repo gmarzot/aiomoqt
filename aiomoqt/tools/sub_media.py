@@ -1079,7 +1079,7 @@ async def _main(args):
 
 def main():
     try:
-        sys.exit(asyncio.run(_main(parse_args())))
+        sys.exit(_cli.run(_main(parse_args())))
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 

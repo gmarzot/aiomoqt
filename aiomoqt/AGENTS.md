@@ -30,10 +30,12 @@ plain ints (`draft=18`, `supported_drafts=[18, 16]`). Clients offer newest-first
 ## CLI tools
 
 Console scripts: `moq-pub-bench`, `moq-sub-bench`, `moq-loopback-bench`, `moq-adaptive-bench`,
-`moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-interop-client`,
-`moq-interop-relay`, `aiomoqt-versions`. Others run as modules: `python -m
-aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--ts --msfts` and `--ts-out` carry MPEG-TS
-as MSFTS, `--ts-playout` plays it out on its PCR; `--input` ingest needs the `media` extra),
+`moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-peer-probe` (a leaf node on a
+moq-peering fabric), `moq-peer-bench` (sends and measures a track through one),
+`moq-interop-client`, `moq-interop-relay`, `aiomoqt-versions`. Others run as
+modules: `python -m aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--ts --msfts` and
+`--ts-out` carry MPEG-TS as MSFTS, `--ts-playout` plays it out on its PCR; `--input` ingest needs
+the `media` extra),
 `aiomoqt.tools.abr_ingest` (ABR ladder; needs the `abr` extra), `aiomoqt.tools.moqtest_origin`.
 
 Most tools share one flag grid from `aiomoqt.utils.cli` (listed in its module docstring):
@@ -50,8 +52,9 @@ Levels: ERROR, WARNING, INFO (one line per session event and control message), D
 views, transport plumbing, per-stream lifecycle; bounded however many objects flow) and TRACE
 (`aiomoqt.utils.logger.TRACE`, 5: per object, per chunk, per datagram, wire hex). Category
 loggers, stable names: `aiomoqt.control`, `aiomoqt.data`, `aiomoqt.fetch`, `aiomoqt.transport`,
-`aiomoqt.relay`; other lines use module loggers (`aiomoqt.protocol`, ...). aiomoqt loggers do not
-propagate to the root logger: attach a handler with `aiomoqt.utils.logger.set_log_handler()`.
+`aiomoqt.relay`, `aiomoqt.peering`; other lines use module loggers (`aiomoqt.protocol`, ...).
+aiomoqt loggers do not propagate to the root logger: attach a handler with
+`aiomoqt.utils.logger.set_log_handler()`.
 
 Tools take `--log-level {error,warning,info,debug,trace}` (`-d` = `debug`) and `--log
 CAT=LEVEL[,...]`, e.g. `--log data=trace`. The `AIOMOQT_LOG` environment variable takes the same
@@ -87,6 +90,9 @@ SIGUSR1.
   at its next await, so keep each object's write whole. A generator track (no `produce()`)
   resets its open streams on `end()` and sends no End of Track.
 - `moq-relay-probe --relays-file` reads its own relay-list schema; use `--url` for a single probe.
+- Ctrl-C under `asyncio.run` cancels the main task wherever the interpreter is, so a callback
+  can fail mid-way (an `Event.set()` raising `InvalidStateError`). `aiomoqt.utils.cli.run(main)`
+  takes its place and cancels from the event loop instead.
 - `aiomoqt-relay` (also `moq-interop-relay`) is a MoQT relay in Python: a bounded
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
   least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; authorization only with `--auth-key` (SETUP and, from d16, each request), no rate limiting; a per-stream TX budget

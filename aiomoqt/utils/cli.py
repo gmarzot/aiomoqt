@@ -50,17 +50,29 @@ keepalive         --keepalive
 fetch history     --fetch-history (long only)
 compat            --compat
 payload check     --verify-payload [N] (long only)
+peering           --peer HOST[:PORT] (repeatable) --bind -p/--port
+                  --node-id --node-metric --cert --key: a moq-peering
+                  fabric node. Dials raw QUIC, ALPN moq-peering; no -k,
+                  peering never verifies certificates
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
+entry point       run(main) in place of asyncio.run: Ctrl-C reaches the
+                  main task through the event loop, between callbacks;
+                  run(main, sigterm=True) takes SIGTERM the same way
 
 split execution (tools that can run one end or both)
   --role both|pub|sub    which end(s) this process runs
   --mp                   spread this role across processes
 """
 import argparse
+import asyncio
 import logging
 import os
+import signal
+import threading
 
 from aiomoqt.cat import DEFAULT_TOKEN_TYPE, CatAuth
+from aiomoqt.peering.node import LEAF_METRIC
+from aiomoqt.peering.wire import DEFAULT_PORT as PEERING_PORT
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
 from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
                                   parse_log_spec)
@@ -126,6 +138,68 @@ def add_help(p):
     add_help=False (make_parser does) so argparse adds no -h of its own."""
     p.add_argument('-h', '-?', '--help', action='help',
                    help='Show this help message and exit')
+
+
+def run(main, *, debug=None, sigterm=False):
+    """asyncio.run(main), with Ctrl-C delivered through the event loop.
+
+    asyncio.run cancels the main task from a signal handler, which can run
+    mid-callback (an Event.set() then raises InvalidStateError). Here the
+    first Ctrl-C cancels between callbacks and restores the default
+    handler, so a second one interrupts at once. KeyboardInterrupt follows
+    asyncio.run's rule: raised only if the cancel propagates out of main.
+    With `sigterm`, SIGTERM is a Ctrl-C too while its handler is SIG_DFL or
+    default_int_handler, which is restored after the first signal and on
+    exit. Falls back to asyncio.run off the main thread, with no signal to
+    take, or where the loop cannot handle signals."""
+    if (asyncio._get_running_loop() is not None
+            or threading.current_thread() is not threading.main_thread()):
+        return asyncio.run(main, debug=debug)
+    sigs = []
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        sigs.append(signal.SIGINT)
+    prev_term = signal.getsignal(signal.SIGTERM)
+    if sigterm and prev_term in (signal.SIG_DFL, signal.default_int_handler):
+        sigs.append(signal.SIGTERM)
+    if not sigs:
+        return asyncio.run(main, debug=debug)
+    with asyncio.Runner(debug=debug) as runner:
+        loop = runner.get_loop()
+        task = None
+        interrupted = False
+        added = []
+
+        def release():
+            while added:
+                sig = added.pop()
+                loop.remove_signal_handler(sig)
+                if sig == signal.SIGTERM:
+                    signal.signal(sig, prev_term)
+
+        def on_signal():
+            nonlocal interrupted
+            release()
+            if task is None or task.done():
+                raise KeyboardInterrupt()
+            interrupted = True
+            task.cancel()
+
+        try:
+            for sig in sigs:
+                loop.add_signal_handler(sig, on_signal)
+                added.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            release()
+            return runner.run(main)
+        try:
+            task = loop.create_task(main)
+            return loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            if interrupted and task.uncancel() == 0:
+                raise KeyboardInterrupt()
+            raise
+        finally:
+            release()
 
 
 # -- addressing ------------------------------------------------------
@@ -488,6 +562,53 @@ def add_timestamp_checking(p, default='cancel', default_help=None):
                    help='Malformed timestamp properties: cancel the '
                         'subscription (MOQT §12.1) or report them and keep '
                         f'receiving (default: {default_help or default})')
+
+
+# -- peering ---------------------------------------------------------
+
+def peer_address(value):
+    """argparse type for --peer HOST[:PORT], [V6]:PORT for IPv6:
+    (host, port)."""
+    host, port = value, str(PEERING_PORT)
+    if value.startswith('['):
+        host, sep, rest = value[1:].partition(']')
+        if not sep or (rest and not rest.startswith(':')):
+            raise argparse.ArgumentTypeError(f'bad peer {value!r}')
+        port = rest[1:] or port
+    elif value.count(':') == 1:
+        host, port = value.split(':')
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise argparse.ArgumentTypeError(
+            f'bad peer {value!r}: HOST[:PORT] or [V6]:PORT')
+    return host, int(port)
+
+
+def add_peering(p, port=PEERING_PORT):
+    """moq-peering fabric node: peers to dial, listener, identity."""
+    p.add_argument('--peer', action='append', type=peer_address,
+                   default=None, metavar='HOST[:PORT]',
+                   help=f'Peer to dial, raw QUIC (ALPN moq-peering); '
+                        f'repeatable. Re-dialed after a close. Default '
+                        f'port {PEERING_PORT}')
+    p.add_argument('--bind', type=str, default=None,
+                   help='Bind address (default: all interfaces, IPv4 and IPv6)')
+    p.add_argument('-p', '--port', type=int, default=port,
+                   help=f'Listen port; 0: do not listen (default: {port})')
+    p.add_argument('--node-id', type=str, default=None, metavar='ID|LABEL',
+                   help='Node id as high:low (each a uint32 or u16.u16, '
+                        'e.g. 9.9:1), or a contact LABEL. Default: label '
+                        'aiomoqt-peer; without an ID the id is fresh on '
+                        'every start')
+    p.add_argument('--node-metric', type=int, default=LEAF_METRIC,
+                   help=f'Metric advertised for this node; peers prefer '
+                        f'lower path sums (default: {LEAF_METRIC}, so no '
+                        f'path runs through it)')
+    p.add_argument('--cert', type=str, default=None,
+                   help='Listener TLS certificate (default: certs/cert.pem '
+                        'in the source tree, else a generated self-signed '
+                        'one)')
+    p.add_argument('--key', type=str, default=None,
+                   help='Listener TLS key (default: beside --cert)')
 
 
 # -- validation ------------------------------------------------------

@@ -295,13 +295,13 @@ async def main():
 def cli():
     """Console entry point (moq-pub-server)."""
     try:
-        asyncio.run(main())
+        _cli.run(main())
     except KeyboardInterrupt:
         print("\n  Interrupted.")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        _cli.run(main())
     except KeyboardInterrupt:
         print("\nInterrupted.")

@@ -182,6 +182,9 @@ class Track:
     the publisher or subscriber side of the protocol.
     """
 
+    # True suppresses the track's own stats and status prints.
+    _quiet: bool = False
+
     def __init__(
         self,
         session,  # MOQTSession
@@ -1904,7 +1907,7 @@ class PublishedTrack(Track):
         group_id = first_group - 1
         cur_obj_id = self.group_size  # force group roll on first object
         prof = session._profile
-        report = not getattr(self, '_quiet', False)
+        report = not self._quiet
         sub = self._sub_for(session)
         stamp = self._stamper(session)
         ts_charge = _LOC_TS_CHARGE if stamp is None else None
@@ -2020,7 +2023,7 @@ class PublishedTrack(Track):
 
         # Only subgroup 0 prints stats (unless _quiet is set)
         report = (subgroup_id == 0
-                  and not getattr(self, '_quiet', False))
+                  and not self._quiet)
 
         cur_obj_id = subgroup_id
         sub = self._sub_for(session)
@@ -2440,7 +2443,7 @@ class SubscribedTrack(Track):
             tracks_reply = asyncio.ensure_future(self.session.subscribe_tracks(
                 namespace=full_ns, parameters=ns_params, wait_response=True))
 
-        if not getattr(self, '_quiet', False):
+        if not self._quiet:
             if self.trackname is None:
                 print(f"  Waiting for publisher on "
                       f"'{self.namespace}'...")
@@ -2733,7 +2736,7 @@ class VideoTrack(PublishedTrack):
         group_id = first_group - 1
 
         report = (subgroup_id == 0
-                  and not getattr(self, '_quiet', False))
+                  and not self._quiet)
 
         cur_obj_id = subgroup_id
         sub = self._sub_for(session)

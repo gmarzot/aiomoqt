@@ -2353,10 +2353,10 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
 
 
 def main():
-    # Until run() takes over the signal, SIGTERM stops a run as SIGINT does.
+    # SIGTERM stops a run as SIGINT does, through the loop once it runs.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
-        asyncio.run(run(parse_args()))
+        _cli.run(run(parse_args()), sigterm=True)
     except KeyboardInterrupt:
         pass
     except _SourceError as e:

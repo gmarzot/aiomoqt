@@ -403,23 +403,28 @@ async def _run_case(case, port, draft, use_quic):
         relay._tracks.clear()
 
 
+_HISTORY = ["fetch", "join", "fetch-descending", "fetch-error-recovery"]
+# Objects each FETCH case must return: whole groups of five.
+_FETCHED = {"fetch": 5, "fetch-descending": 10, "fetch-error-recovery": 5}
+
+
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
 @pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
-@pytest.mark.parametrize("name", ["fetch", "join"])
+@pytest.mark.parametrize("name", _HISTORY)
 async def test_history_cases_deliver_objects(name, draft, use_quic):
     port = (_BASE_PORT + 100 + 2 * draft + (0 if use_quic else 1)
-            + (0 if name == "fetch" else 50))
+            + 50 * _HISTORY.index(name))
     r = await _run_case(client.TEST_FUNCTIONS[name], port, draft, use_quic)
     assert r.passed, r.message
     n = int(r.message.split()[0])
-    assert n > 0, r.message
+    assert n == _FETCHED.get(name, n) and n > 0, r.message
 
 
 @requires_certs
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", ["fetch", "join"])
+@pytest.mark.parametrize("name", _HISTORY)
 async def test_history_case_without_objects_fails(monkeypatch, name):
     # A structured refusal fails: the case needs objects.
     async def refuse(session, msg):
@@ -427,6 +432,169 @@ async def test_history_case_without_objects_fails(monkeypatch, name):
                             "no history")
 
     monkeypatch.setattr(relay, "_on_fetch", refuse)
-    port = _BASE_PORT + 99 + (0 if name == "fetch" else 1)
+    port = _BASE_PORT + 96 + _HISTORY.index(name)
     r = await _run_case(client.TEST_FUNCTIONS[name], port, 18, True)
     assert not r.passed, r.message
+
+
+def _whole(*groups):
+    return [(g, o, ObjectStatus.NORMAL) for g in groups for o in range(5)]
+
+
+def test_fetch_verifier_accepts_whole_groups_and_status_objects():
+    eog = [(2, 5, ObjectStatus.END_OF_GROUP)]
+    assert client._fetch_problems(_whole(2) + eog, [2]) == []
+    descending = _whole(3) + _whole(2)
+    assert client._fetch_problems(descending, [2, 3], descending=True) == []
+
+
+def test_fetch_verifier_reports_each_deviation():
+    objs = _whole(1)
+    del objs[3]
+    objs += [objs[0], (2, 0, ObjectStatus.NORMAL)]
+    assert client._fetch_problems(objs, [1]) == [
+        "duplicate object 1.0", "unexpected object 2.0",
+        "missing 1 object(s): 1.3"]
+
+
+def test_fetch_verifier_checks_descending_order():
+    ascending = _whole(2) + _whole(3)
+    assert client._fetch_problems(ascending, [2, 3], descending=True) == [
+        "object 3.0 after 2.4 in descending order"]
+    swapped = _whole(3) + _whole(2)
+    swapped[0], swapped[1] = swapped[1], swapped[0]
+    assert client._fetch_problems(swapped, [2, 3], descending=True) == [
+        "object 3.0 after 3.1 in descending order"]
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_fetch_error_recovery_needs_invalid_range(monkeypatch):
+    # The relay refuses the FETCH past Largest with another code.
+    on_fetch = relay._on_fetch
+
+    async def wrong_code(session, msg):
+        if (msg.start_group or 0) < client._FETCH_BEYOND:
+            return await on_fetch(session, msg)
+        session.fetch_error(msg.request_id, RequestErrorCode.DOES_NOT_EXIST,
+                            "no such range")
+
+    monkeypatch.setattr(relay, "_on_fetch", wrong_code)
+    r = await _run_case(client.test_fetch_error_recovery, _BASE_PORT + 95,
+                        18, True)
+    assert not r.passed
+    assert r.message == ("FETCH past the Largest Object answered "
+                         "REQUEST_ERROR code=0x10"), r.message
+
+
+_LIFECYCLE = ["subscribe-cancel-live", "publish-namespace-done-track",
+              "publish-namespace-multi-publisher-retention"]
+
+
+def _lifecycle_port(name, draft, use_quic):
+    return (24400 + 20 * _LIFECYCLE.index(name) + 2 * (draft - 14)
+            + (0 if use_quic else 1))
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+async def test_subscribe_cancel_live_through_the_relay(draft, use_quic):
+    name = "subscribe-cancel-live"
+    r = await _run_case(client.TEST_FUNCTIONS[name],
+                        _lifecycle_port(name, draft, use_quic), draft, use_quic)
+    assert r.passed, r.message
+    assert r.message.startswith("2 objects before the cancel, 0 after it"), \
+        r.message
+    assert set(r.sessions) == {"publisher", "subscriber"}
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [16, 18])
+async def test_a_relay_that_keeps_forwarding_after_a_cancel_fails(
+        monkeypatch, draft):
+    # UNSUBSCRIBE (d16) or the request stream's reset (d18) is ignored.
+    monkeypatch.setattr(relay._RelayedTrack, "drop_session",
+                        lambda self, session: None)
+    r = await _run_case(client.test_subscribe_cancel_live,
+                        _BASE_PORT + 93 + (draft - 16) // 2, draft, True)
+    assert not r.passed
+    assert "after the cancel; 2 objects before the cancel" in r.message, \
+        r.message
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
+async def test_publish_namespace_done_track_through_the_relay(draft,
+                                                              use_quic):
+    name = "publish-namespace-done-track"
+    r = await _run_case(client.TEST_FUNCTIONS[name],
+                        _lifecycle_port(name, draft, use_quic), draft, use_quic)
+    assert r.passed, r.message
+    assert r.message.startswith("objects 1/1, Stream Count 1/1; observer "
+                                "saw NAMESPACE"), r.message
+    assert r.message.endswith("PUBLISH_DONE, NAMESPACE_DONE"), r.message
+    assert set(r.sessions) == {"observer", "publisher"}
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_done_track_fails_when_publish_done_trails_the_withdrawal(
+        monkeypatch):
+    # The relay holds PUBLISH_DONE until the publisher's session ends.
+    monkeypatch.setattr(relay._RelayedTrack, "_enqueue_terminal",
+                        lambda self, *args: None)
+    monkeypatch.setattr(client, "_DATA_DELIVERY_S", 1.0)
+    r = await _run_case(client.test_publish_namespace_done_track,
+                        _BASE_PORT + 92, 18, True)
+    assert not r.passed
+    assert ("NAMESPACE_DONE, PUBLISH_DONE, expected NAMESPACE, PUBLISH_DONE, "
+            "NAMESPACE_DONE in that order") in r.message, r.message
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", _LIFECYCLE[1:])
+async def test_namespace_cases_skip_below_draft_16(name):
+    r = await _run_case(client.TEST_FUNCTIONS[name],
+                        _lifecycle_port(name, 14, True), 14, True)
+    assert r.passed and r.skipped
+    assert r.skip_reason == "NAMESPACE is draft-16; negotiated draft-14"
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
+async def test_retention_through_the_relay(draft, use_quic):
+    name = "publish-namespace-multi-publisher-retention"
+    r = await _run_case(client.TEST_FUNCTIONS[name],
+                        _lifecycle_port(name, draft, use_quic), draft, use_quic)
+    assert r.passed, f"{r.message} | {r.received}"
+    assert r.spec_revision == client.PUBLISH_NAMESPACE_RETENTION_REVISION
+    assert set(r.sessions) == {"observer", "publisher_1", "publisher_2",
+                               "subscriber_1", "subscriber_2"}
+
+
+def test_namespace_log_reports_each_deviation():
+    log = client._NamespaceLog("subscriber_1", withdrawn=(b"sync",))
+    log.record((b"shared",), True)
+    log.record((b"shared",), True)
+    log.record((b"other",), True)
+    log.record((b"sync",), False)
+    log.record((b"shared",), False)
+    log.removable.add(b"shared")
+    log.record((b"shared",), False)
+    log.record((b"sync",), True)
+    assert log.problems == [
+        "subscriber_1: NAMESPACE shared while present",
+        "subscriber_1: NAMESPACE for unexpected suffix (b'other',)",
+        "subscriber_1: NAMESPACE_DONE sync while absent",
+        "subscriber_1: premature NAMESPACE_DONE shared",
+        "subscriber_1: NAMESPACE_DONE shared while absent",
+        "subscriber_1: NAMESPACE sync after its withdrawal",
+    ]

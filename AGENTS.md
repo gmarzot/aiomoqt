@@ -16,6 +16,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/track.py` | `Track`, `PublishedTrack`, `SubscribedTrack`, `VideoTrack` |
 | `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `SendLane`, `FanoutDelivery` |
 | `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
+| `aiomoqt/peering/` | moq-peering fabric (moqx, LAPS) as a leaf node: wire codec, track hashes, `FabricNode`, d18 inner framing (`inner.py`), SNS per session (`ib.py`); `moq-peer-probe` (`tools/peer_probe.py`) observes and originates; `moq-peer-bench` (`tools/peer_bench.py`) sends and measures a track through the fabric |
 | `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
 | `aiomoqt/cat.py` | CAT credentials in the format moqx verifies: mint, verify, grants |
@@ -139,6 +140,9 @@ WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALP
 `-t` defaults to 0, no limit, on every tool and example (also tested); a tool may add an exit condition with `--exit COND`.
 `-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
 all three). Write `-h` in docs: `-?` is a shell glob.
+Entry points run their coroutine with `cli.run`, not `asyncio.run`: Ctrl-C cancels the main
+task from the event loop, between callbacks (`test_cli_run.py`). Tools that install their own
+SIGINT handler are listed there.
 
 **Fan-out layering.** Peer mechanics live in `PublishedTrack` and `aiomoqt/delivery.py`.
 Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single
@@ -174,8 +178,9 @@ tolerated peer deviation or a bound hit; ERROR ends a session.
 Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
 (subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
 `aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the
-relay). A line that belongs to none uses its module logger. Tools take `--log-level
-{error,warning,info,debug,trace}` (`-d`/`--debug` = `debug`) and `--log CAT=LEVEL[,…]` from the
+relay), `aiomoqt.peering` (moq-peering fabric sessions). A line that belongs to none uses its
+module logger. Tools take `--log-level {error,warning,info,debug,trace}` (`-d`/`--debug` =
+`debug`) and `--log CAT=LEVEL[,…]` from the
 grid (`add_logging`, `apply_logging`); `AIOMOQT_LOG` takes the same spec, where a bare `LEVEL`
 sets every logger, and the flags win. `MOQTServer(quiet_peers=…)` logs a health probe's sessions
 at DEBUG. The relay's SIGUSR1 steps INFO → DEBUG → TRACE → INFO; its `--control` socket's
