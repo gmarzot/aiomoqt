@@ -2337,6 +2337,9 @@ def _moq_test_case(name: str):
 # publish-namespace-done-track: one 1-byte object on one subgroup stream.
 _DONE_TRACK_CASE = ("moq-test-00", "0", "0", "0", "0", "0", "1", "1", "1",
                     "0", "1", "1", "0", "-1", "-1", "0")
+# How long the observer waits, once the publisher has closed, for a
+# PUBLISH_DONE not yet seen.
+_DONE_TRAIL_S = 1.0
 
 
 def _namespace_options(draft: int) -> int:
@@ -2380,9 +2383,9 @@ async def test_publish_namespace_done_track(host, port, path, use_quic,
         sub.on_done(msg)
         _event("PUBLISH_DONE")
 
-    async def _until(kind) -> bool:
+    async def _until(kind, wait=_LIFECYCLE_STEP_S) -> bool:
         try:
-            async with asyncio.timeout(_LIFECYCLE_STEP_S):
+            async with asyncio.timeout(wait):
                 while kind not in events:
                     changed.clear()
                     await changed.wait()
@@ -2460,6 +2463,9 @@ async def test_publish_namespace_done_track(host, port, path, use_quic,
                         namespace=namespace, request_id=announced.request_id)
                     await _until("NAMESPACE_DONE")
                     pub.close()
+                # A relay may send it when the publisher's session ends:
+                # reported out of order, not missing.
+                await _until("PUBLISH_DONE", _DONE_TRAIL_S)
                 obs.close()
     except TimeoutError:
         return result(False, f"timed out waiting for {step}")

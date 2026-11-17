@@ -17,7 +17,7 @@ broadcast is audio only, a synthesized tone. `--mp4` repeats for several video t
 |---|---|---|---|---|
 | `--mp4 FILE` | mp4 file | H.264, H.265, AV1 | the file's AAC or Opus; tone with `--tone` | sample tables, edit list honoured |
 | `--h264 FILE\|-` | live H.264 Annex B (ffmpeg, OBS) | H.264 | tone; none with `--no-audio` | stamped on arrival |
-| `--ts FILE\|-` | live MPEG-TS | H.264, H.265, every stream | AAC (ADTS), Opus: the first stream | PES timestamps |
+| `--ts FILE\|-\|udp://[@][HOST]:PORT` | live MPEG-TS | H.264, H.265, every stream | AAC (ADTS), Opus: the first stream | PES timestamps |
 | `--input URL` | anything FFmpeg opens: HLS, DASH, files | H.264, H.265, AV1 | AAC, Opus | paced to the source timestamps |
 | none | | | pcm-s16 tone at `--freq` Hz (440) | generated |
 
@@ -51,6 +51,19 @@ Short GOPs and no B-frames keep join latency low: `-g <2×fps> -sc_threshold 0 -
 - **locmaf** (draft-einarsson-moq-locmaf, `locmafVersion` 0.3): the same chunks with the moof
   sent as a compact header, a delta of the previous one in the group. Receivers rebuild the
   CMAF chunk byte for byte.
+- **mpeg2ts** (draft-gregoire-moq-msfts-02, MSFTS), `--ts ... --msfts`: the TS packets
+  themselves, unmodified, as one track named from the PAT (`program-<number>`, or `mux` for a
+  multi-program stream; `-T NAME` prefixes it), `--msfts-packets` (7) to an object, sent as they
+  arrive or 5 ms after an object's first packet. Groups start at the first program's random
+  access points, led by the PSI right before them; the PAT and PMT ride the catalog
+  `initDataList`. The catalog matches moq2ts `--unmodified`, with an MSF media timeline track,
+  `<name>.timeline`: a record per group at its first packet's arrival on the wall clock, 300 s
+  kept. `--timestamp-mapping` adds draft-frindell timing: TIMESCALE 90 kHz, TIMESTAMP_MAPPING
+  anchored at the track's start, and on every object an OBJECT_TIMESTAMP, its first packet's PCR
+  time on the ingest wall clock. A PSI change to a field the track declares (program number, or
+  one program against several) ends the track and publishes the next alone in a new catalog; it
+  starts at the next random access point, like a live start, its group IDs going on from the
+  last, and waits up to 2 s for its first subscriber.
 
 LOC options for receivers that need something different:
 
@@ -224,7 +237,11 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
   `video_<height>p` and join the source video's catalog altGroup.
 - **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
   each group start. A rung that falls behind ends that group early and resumes at the next group
-  start, so a group never has a hole in it.
+  start, so a group never has a hole in it. Equally numbered groups line up across the source
+  video and its rungs, so a player, or a stitcher building one track from several rungs, can
+  switch at any group start; each rung has its own init data in the catalog. With
+  `--packaging cmaf`, tfdt follows the source timestamps on every track (audio to within half a
+  frame), and a frame at or behind its track's last tfdt is dropped.
 - **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default), `videotoolbox` (macOS,
   H.264 only) or `cpu` (software).
 - **Codec.** `--codec h264` (default) or `av1`: `av1_nvenc` on `nvenc`, libaom in realtime mode
@@ -232,6 +249,11 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
   The source passes through as H.264.
 - **Track Properties** pass through, timing ones to the rungs as well.
 - **Packaging.** `--packaging cmaf` publishes every output track as CMSF: one CMAF chunk per object, led by a `prft` with the capture time, the CMAF header in the catalog `initDataList`. Tracks whose codec no header covers (H.264, H.265, AV1, AAC and Opus do) are left out.
+- **Several outputs.** `--output NS[,packaging=loc|cmaf][,codec=h264|av1][,rung=WxH:BPS]...`,
+  repeated, publishes each namespace with its own catalog from one source subscription and one
+  decode: for instance an H.264 CMAF ladder for one player and an AV1 LOC one for another. Fields
+  left out take `--packaging`, `--codec` and `--rung`; rungs of one size, rate and codec share an
+  encoder. A source group dropped at the decoder is missing from every output.
 - **Report.** Every `-i` seconds, per output track: frames, frames skipped while no subscriber
   took the track (`idle`), drops, and the delay from a source frame's arrival to its hand-off to
   the output track; rungs also show the encoder's share. `--no-ladder` passes the source
@@ -246,13 +268,20 @@ python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --
 files to `--out` (default `./media-out`):
 - `video.h264` (Annex B), or `<name>.h264` per track when there are several;
 - `audio.wav` (pcm-s16);
-- `<role>.mp4` for CMAF and LOCMAF tracks.
+- `<role>.mp4` for CMAF and LOCMAF tracks;
+- `<name>.ts` for an mpeg2ts track, its packets in Group and Object order; with `--ts-out`, a
+  catalog that replaces the track is followed into the next one.
 
 Its other options:
 
 | Flag | Effect |
 |---|---|
 | `--pipe video\|audio` | Streams one track to stdout for a player |
+| `--ts-out udp://HOST:PORT\|FILE\|-` | Writes the mpeg2ts track's packets as its objects arrive, seven to a UDP datagram; LOC tracks are refused |
+| `--ts-playout MS` | With `--ts-out`: each packet at first PCR arrival + MS + (PCR − first PCR) / 27 MHz; a late one is dropped, or with `--ts-late emit` sent at once; a gap of `--break-ms` (200) is an output break |
+| `--analyze` on an mpeg2ts track | JSON lines per `-i` interval, each followed by the summary so far, and the run's summary: TS packets, CC errors per PID, PCR interval and jitter, delay variation and the cushion for no late packet, late packets and breaks at the `--ts-playout` buffer and at 100–1000 ms, object loss, track switches, and delay from the publisher's wall clock (draft-frindell timing when the track declares it, else the media timeline track; the clocks must agree) |
+| `--arrival-log FILE` | A JSON line per PCR: `pcr`, `arrival_ns`, `release_ns` |
+| `--frame-log FILE` | A JSON line per LOC frame: track, group, object, key, size, `sha1` of the payload, `arrival_ns` |
 | `--inspect N` | Prints wire detail for each track's first N frames |
 | `--show-catalog` | Prints the catalog and every update |
 | `--analyze` | Measures delivery instead of writing files: latency, jitter, loss and reorder, group integrity, a playout model; `--report` writes them as CSV |
