@@ -4432,13 +4432,20 @@ class _MOQTSessionMixin:
         """The transport keeps stream chains."""
         return _STREAM_CHAINS
 
+    # stream_scheduling, fixed at setup.
+    _sched: Optional[str] = None
+
     @property
     def stream_scheduling(self) -> str:
-        """The peer's MOQTPeer.stream_scheduling, "fifo" for "chain"
-        without stream chains."""
-        sched = getattr(getattr(self, '_session', None), 'stream_scheduling',
-                        "fifo")
-        return "fifo" if sched == "chain" and not _STREAM_CHAINS else sched
+        """The peer's MOQTPeer.stream_scheduling as of setup, "fifo" for
+        "chain" without stream chains."""
+        sched = self._sched
+        if sched is None:
+            sched = getattr(getattr(self, '_session', None),
+                            'stream_scheduling', "fifo")
+            if sched == "chain" and not _STREAM_CHAINS:
+                sched = "fifo"
+        return sched
 
     def data_stream_band(self, publisher_priority: int) -> int:
         """Transport band for a data stream of this publisher priority."""
@@ -4449,6 +4456,7 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT session: setup complete: "
                     f"draft-{self.negotiated_draft} "
                     f"({'WT' if self._is_wt else 'raw QUIC'})")
+        self._sched = self.stream_scheduling
         band = self.data_stream_band(128)
         self.set_default_stream_priority(band)
         # Datagrams share the neutral band instead of picoquic's 9, which

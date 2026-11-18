@@ -3114,9 +3114,11 @@ class _RelayedTrack:
                 else:
                     initial += first
         self._count_tx(session, len(initial))
-        band = _stream_band(session, prio)
+        sched = getattr(session, 'stream_scheduling', None)
+        band = _band_of(prio if prio is not None and 0 <= prio <= 255 else 128,
+                        sched or STREAM_SCHEDULING)
         try:
-            if getattr(session, 'stream_scheduling', None) == "chain":
+            if sched == "chain":
                 stream_id = await session.open_uni_stream(
                     initial=initial, priority=band, end_stream=whole,
                     chain=alias + 1, order=gid)

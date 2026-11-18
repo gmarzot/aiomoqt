@@ -49,7 +49,7 @@ def test_chain_is_the_default():
 @pytest.mark.parametrize("chains", [True, False])
 def test_chain_runs_as_fifo_without_stream_chains(chains, monkeypatch):
     monkeypatch.setattr(protocol, "_STREAM_CHAINS", chains)
-    session = NS(_session=NS(stream_scheduling="chain"))
+    session = NS(_sched=None, _session=NS(stream_scheduling="chain"))
     sched = _MOQTSessionMixin.stream_scheduling.fget(session)
     assert sched == ("chain" if chains else "fifo")
     for track_sched, peer_sched in (("chain", "fifo"), (None, sched)):
