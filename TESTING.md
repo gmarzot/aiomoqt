@@ -238,9 +238,9 @@ aiomoqt ships a TAP v14-emitting client at
 `aiomoqt.tools.moq_interop_client` (the same module used internally
 by `relay-ctrl-msg`). The Dockerfile at the repo root builds an image
 consumable by [englishm/moq-interop-runner](https://github.com/englishm/moq-interop-runner).
-The published image is `ghcr.io/gmarzot/aiomoqt:<version>` and
-`:latest`; our `implementations.json` entry is wired up in an upstream
-PR. No local action is required to keep this path green — the release
+The published image is `ghcr.io/gmarzot/aiomoqt:<version>`, plus
+`:latest` (the highest stable release) and `:interop` (the highest
+release, pre-releases included; the runner's aiomoqt entries track it). No local action is required to keep this path green — the release
 workflow pushes a fresh image on every tag.
 
 ## Contribution conformance (publisher)

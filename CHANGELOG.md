@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.15.0 (unreleased)
+
+- Release images: `ghcr.io/gmarzot/aiomoqt:interop` is the highest release, pre-releases included, and the interop runner tracks it; `:latest` is the highest stable release, and a patch to an older line no longer moves it.
+
 ## v0.15.0rc2
 
 - moq_interop_client: a moq-test datagram case that loses some but not all of its datagrams runs again, up to 3 attempts; it passes only on a clean attempt and names each earlier attempt's losses.
