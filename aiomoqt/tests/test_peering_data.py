@@ -45,10 +45,19 @@ class _Via(FabricNode):
         # (ingress session, ingress stream) -> {egress session: stream}
         self.pipes = {}
         self._heads = {}
+        # Flooded messages in arrival order: (ingress session id, type,
+        # body), replayed to a peer that connects later.
+        self.flooded = []
 
     def _event(self, session, ev):
         super()._event(session, ev)
-        if ev.kind in _FLOOD:
+        if ev.kind == "connected":
+            for origin, kind, body in self.flooded:
+                if origin != session.id:
+                    session.send(kind, body)
+            self._flush(self._protocols[session.id])
+        elif ev.kind in _FLOOD:
+            self.flooded.append((session.id, _FLOOD[ev.kind], ev.body))
             for other in self.connected():
                 if other is not session:
                     other.send(_FLOOD[ev.kind], ev.body)
@@ -300,14 +309,33 @@ async def test_unsubscribe_withdraws_sns_and_ends_streams():
     assert rx.stats.total_objects == 3
 
 
+class _PubLate(FabricNode):
+    """The bench's publisher dials 50 ms after its subscriber."""
+
+    async def _dial_loop(self, host, port):
+        if self.local.contact.endswith("-pub"):
+            await asyncio.sleep(0.05)
+        await super()._dial_loop(host, port)
+
+
+@pytest.mark.asyncio
+async def test_a_peer_connecting_late_learns_what_was_flooded(
+        tmp_path, monkeypatch):
+    await _bench_through_via(tmp_path, monkeypatch, _PubLate)
+
+
 @pytest.mark.asyncio
 async def test_peer_bench_role_both_through_via(tmp_path, monkeypatch):
+    await _bench_through_via(tmp_path, monkeypatch, FabricNode)
+
+
+async def _bench_through_via(tmp_path, monkeypatch, node_cls):
     port = _BASE_PORT + 5
     out = tmp_path / "bench.json"
     trace = tmp_path / "objects.jsonl"
     nodes = []
 
-    class _Kept(FabricNode):
+    class _Kept(node_cls):
         def __init__(self, **kw):
             super().__init__(**kw)
             nodes.append(self)
