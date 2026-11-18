@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.15.0 (unreleased)
+## v0.15.0rc2
 
 - moq_interop_client: a moq-test datagram case that loses some but not all of its datagrams runs again, up to 3 attempts; it passes only on a clean attempt and names each earlier attempt's losses.
 - Tracks of one priority on a session share its bandwidth, and each still sends its groups in order: `stream_scheduling` (`MOQTPeer`, `PublishedTrack`, aiomoqt-relay `--stream-scheduling`) gains `chain`, now the default, which puts each track's streams to a session in one aiopquic stream chain ordered by group. Under `fifo`, the previous default, audio published at video's priority went silent for seconds behind the open video group when the congestion window was the limit. Where aiopquic has no stream chains, `chain` runs as `fifo`.
