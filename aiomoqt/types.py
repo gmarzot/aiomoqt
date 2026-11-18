@@ -684,7 +684,10 @@ STREAM_BAND_CONTROL = 8
 STREAM_BAND_DATA_FLOOR = 10
 STREAM_BAND_PADDING = 255
 
-SCHEDULING = ("round_robin", "fifo")
+# chain: one transport stream chain per track per session, ordered by
+# group, in a round-robin band. round_robin: every stream shares the band.
+# fifo: the band goes to its lowest stream id.
+SCHEDULING = ("chain", "round_robin", "fifo")
 
 
 def to_stream_priority(moqt_priority: int, *,
@@ -695,7 +698,8 @@ def to_stream_priority(moqt_priority: int, *,
     the MoQT value: it selects picoquic's tiebreak among equals rather than
     adding resolution, so carrying it through would make adjacent priorities
     differ in kind. round_robin shares a band fairly; fifo hands the whole
-    band to its lowest stream id, which no caller can steer.
+    band to its lowest stream id, which no caller can steer; chain shares it
+    as round_robin, each track's chain taking one turn.
 
     Clamped to STREAM_BAND_DATA_FLOOR so declared data can never rise above
     the control band — a greedy track at a lower band would starve the
