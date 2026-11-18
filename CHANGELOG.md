@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - Logging: once a track is found malformed, its later streams are refused at DEBUG (the first ERROR line stays); the "at or past end of group" reason names what ended the group, an END_OF_GROUP object or a stream header's END_OF_GROUP bit with the header byte; aiomoqt-relay logs a PUBLISH_DONE it cannot send to a closing session at DEBUG instead of a WARNING with a traceback.
+- Release images: `ghcr.io/gmarzot/aiomoqt:interop` is the highest release, pre-releases included, and the interop runner tracks it; `:latest` is the highest stable release, and a patch to an older line no longer moves it.
 
 ## v0.15.0rc2
 

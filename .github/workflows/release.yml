@@ -265,12 +265,28 @@ jobs:
         VERSION="${{ needs.tag.outputs.version }}"
         IMAGE=ghcr.io/${{ github.repository }}
         TAGS=(-t "$IMAGE:$VERSION")
-        # :latest tracks stable only. Interop CI and the runner pull it,
-        # so a pre-release must not become everyone's default image.
-        if [[ "$VERSION" =~ (a|b|rc)[0-9]+$ ]]; then
-          echo "pre-release $VERSION — leaving :latest untouched"
-        else
-          TAGS+=(-t "$IMAGE:latest")
-        fi
+        # :interop = highest release, pre-releases included (the interop
+        # runner tracks it); :latest = highest stable. A patch to an older
+        # line moves neither.
+        read -r TOP TOP_STABLE < <(python3 - "$VERSION" $(git tag -l) <<'EOF'
+        import re, sys
+        def key(v):
+            m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?", v)
+            if not m:
+                return None
+            x, y, z, pre, n = m.groups()
+            return (int(x), int(y), int(z),
+                    {"a": 0, "b": 1, "rc": 2, None: 3}[pre], int(n or 0))
+        new = key(sys.argv[1])
+        tags = [k for k in map(key, sys.argv[2:]) if k]
+        top = new is not None and all(new >= k for k in tags)
+        top_stable = new is not None and new[3] == 3 and all(
+            new >= k for k in tags if k[3] == 3)
+        print(int(top), int(top_stable))
+        EOF
+        )
+        [ "$TOP" = 1 ] && TAGS+=(-t "$IMAGE:interop")
+        [ "$TOP_STABLE" = 1 ] && TAGS+=(-t "$IMAGE:latest")
+        echo "tags: ${TAGS[*]}"
         docker buildx build --platform linux/amd64,linux/arm64 \
           --build-arg VERSION="$VERSION" "${TAGS[@]}" --push .
