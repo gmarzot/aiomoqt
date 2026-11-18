@@ -82,6 +82,10 @@ _WT_CREATE_WITH_DATA = "initial" in inspect.signature(
 _RAW_WRITE_PRIORITY = "priority" in inspect.signature(
     _AioPQuicConnection.send_stream_data_drained).parameters
 
+# The transport keeps stream chains (set_stream_chain).
+_STREAM_CHAINS = "chain" in inspect.signature(
+    _AioPQuicConnection.send_stream_data_drained).parameters
+
 # WebTransport stream header wire constants (draft-ietf-webtrans-http3).
 # Every WT stream is prefixed with <type, session_id> as two QUIC varints.
 logger = get_logger(__name__)
@@ -170,13 +174,16 @@ class MOQTPeer:
         # streams (both in QuicConfiguration). Pass None to opt out
         # entirely.
         self.tx_max_inflight_bytes = tx_max_inflight_bytes
-        self._stream_scheduling = "fifo"
+        self._stream_scheduling = "chain"
 
     @property
     def stream_scheduling(self) -> str:
-        """picoquic's tiebreak within a data stream band: "fifo" (lowest
-        stream id first, keeping a track's groups in order) or
-        "round_robin". Applies to sessions set up after the change."""
+        """Order among data streams of one band: "chain" (each track's
+        streams to a session in one transport stream chain, by group:
+        tracks of one priority share the band and each keeps its groups in
+        order), "fifo" (lowest stream id first) or "round_robin" (every
+        stream shares the band). "chain" runs as "fifo" where aiopquic has
+        no stream chains. Applies to sessions set up after the change."""
         return self._stream_scheduling
 
     @stream_scheduling.setter
@@ -3652,12 +3659,17 @@ class _MOQTSessionMixin:
 
     async def open_uni_stream(self, initial: bytes = b"",
                               priority: Optional[int] = None,
-                              end_stream: bool = False) -> int:
+                              end_stream: bool = False,
+                              chain: Optional[int] = None,
+                              order: int = 0) -> int:
         """Open a unidirectional data stream, set its transport priority
         and write `initial` to it, ending the stream with it when
         `end_stream`. Returns the stream ID. Over WebTransport all of it
         travels with the create, so the stream header and the first
-        object leave in one send."""
+        object leave in one send. `chain` (nonzero) and `order` place the
+        stream in a transport stream chain (set_stream_chain)."""
+        if chain is not None and not _STREAM_CHAINS:
+            chain = None
         if not self._is_wt:
             sid = self._quic.get_next_available_stream_id(is_unidirectional=True)
         else:
@@ -3667,6 +3679,10 @@ class _MOQTSessionMixin:
             create = self.create_stream
             # aiopquic-WT: round-trip to picoquic for stream-id allocation
             try:
+                if with_data and chain is not None:
+                    return await create(
+                        bidir=False, initial=initial, priority=priority,
+                        end_stream=end_stream, chain=chain, order=order)
                 if with_data:
                     return await create(
                         bidir=False, initial=initial, priority=priority,
@@ -3685,11 +3701,15 @@ class _MOQTSessionMixin:
                 or not (initial or end_stream)):
             self.set_stream_priority(sid, priority)
             priority = None
+        if chain is not None and (self._is_wt or not (initial or end_stream)):
+            self.set_stream_chain(sid, chain, order)
+            chain = None
         if initial or end_stream:
             try:
                 await self.stream_write_drain(sid, initial,
                                               end_stream=end_stream,
-                                              priority=priority)
+                                              priority=priority,
+                                              chain=chain, order=order)
             except BaseException:
                 # The caller never learns the id: reset the stream here.
                 self.stream_reset(sid, StreamResetCode.CANCELLED)
@@ -3748,8 +3768,8 @@ class _MOQTSessionMixin:
             return
         self.set_stream_priority(stream_id, STREAM_BAND_CONTROL)
 
-    def _transport_priority_setter(self):
-        """The transport's set_stream_priority, or None.
+    def _transport_priority_setter(self, name: str = 'set_stream_priority'):
+        """The transport's set_stream_priority (or `name`), or None.
 
         On WebTransport `self._quic` is the session itself, so looking the
         name up there finds this method and recurses. The transport API
@@ -3759,8 +3779,8 @@ class _MOQTSessionMixin:
         """
         quic = getattr(self, '_quic', None)
         if quic is not self:
-            return getattr(quic, 'set_stream_priority', None)
-        return getattr(super(), 'set_stream_priority', None)
+            return getattr(quic, name, None)
+        return getattr(super(), name, None)
 
     def set_stream_priority(self, stream_id: int, priority: int) -> bool:
         """Set the transport send priority for one stream.
@@ -3784,6 +3804,22 @@ class _MOQTSessionMixin:
             return setter(stream_id, priority) == 0
         except Exception as e:
             transport_log.debug(f"stream({stream_id}): priority not applied: {e}")
+            return False
+
+    def set_stream_chain(self, stream_id: int, chain: int,
+                         order: int) -> bool:
+        """Place a stream in transport stream chain `chain` (nonzero) at
+        rank `order`: the chain's streams go one at a time by (order,
+        stream id), sharing their band as one stream. Advisory
+        like set_stream_priority; False when the transport has no chains
+        or did not take the post."""
+        setter = self._transport_priority_setter('set_stream_chain')
+        if setter is None:
+            return False
+        try:
+            return setter(stream_id, chain, order) == 0
+        except Exception as e:
+            transport_log.debug(f"stream({stream_id}): chain not applied: {e}")
             return False
 
     def set_datagram_priority(self, priority: int) -> bool:
@@ -3848,8 +3884,11 @@ class _MOQTSessionMixin:
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
                                   end_stream: bool = False,
-                                  priority: Optional[int] = None) -> None:
-        """Write bytes with backpressure; `priority` applies with them.
+                                  priority: Optional[int] = None,
+                                  chain: Optional[int] = None,
+                                  order: int = 0) -> None:
+        """Write bytes with backpressure; `priority` and `chain` (with
+        `order`) apply with them.
 
         aiomoqt-owned policy: optional per-stream byte-budget cap
         with hysteresis (MOQTPeer.tx_max_inflight_bytes). The
@@ -3879,7 +3918,8 @@ class _MOQTSessionMixin:
                 await self.stream_write_drain(
                     stream_id, bytes(view[at:at + piece]),
                     end_stream=end_stream and at + piece >= len(data),
-                    priority=None if at else priority)
+                    priority=None if at else priority,
+                    chain=None if at else chain, order=order)
             return
         quic = self._quic
         max_bytes = self._session.tx_max_inflight_bytes
@@ -3904,7 +3944,11 @@ class _MOQTSessionMixin:
                 await sc_event.wait()
         # Delegate wire-level send + backpressure to aiopquic.
         try:
-            if priority is None:
+            if chain is not None:
+                await quic.send_stream_data_drained(
+                    stream_id, data, end_stream=end_stream,
+                    priority=priority, chain=chain, order=order)
+            elif priority is None:
                 await quic.send_stream_data_drained(
                     stream_id, data, end_stream=end_stream)
             else:
@@ -4385,10 +4429,24 @@ class _MOQTSessionMixin:
     DEFAULT_DATA_STREAM_PRIORITY = to_stream_priority(128, discipline="fifo")
 
     @property
+    def stream_chains(self) -> bool:
+        """The transport keeps stream chains."""
+        return _STREAM_CHAINS
+
+    # stream_scheduling, fixed at setup.
+    _sched: Optional[str] = None
+
+    @property
     def stream_scheduling(self) -> str:
-        """The peer's MOQTPeer.stream_scheduling."""
-        return getattr(getattr(self, '_session', None), 'stream_scheduling',
-                       "fifo")
+        """The peer's MOQTPeer.stream_scheduling as of setup, "fifo" for
+        "chain" without stream chains."""
+        sched = self._sched
+        if sched is None:
+            sched = getattr(getattr(self, '_session', None),
+                            'stream_scheduling', "fifo")
+            if sched == "chain" and not _STREAM_CHAINS:
+                sched = "fifo"
+        return sched
 
     def data_stream_band(self, publisher_priority: int) -> int:
         """Transport band for a data stream of this publisher priority."""
@@ -4399,6 +4457,7 @@ class _MOQTSessionMixin:
         logger.info(f"MOQT session: setup complete: "
                     f"draft-{self.negotiated_draft} "
                     f"({'WT' if self._is_wt else 'raw QUIC'})")
+        self._sched = self.stream_scheduling
         band = self.data_stream_band(128)
         self.set_default_stream_priority(band)
         # Datagrams share the neutral band instead of picoquic's 9, which

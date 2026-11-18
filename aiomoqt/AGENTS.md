@@ -80,6 +80,10 @@ SIGUSR1.
   receiver buffers that much per stream.
 - Loopback timing: picoquic's BBRv3 is reported to freeze cwnd below 128 µs RTT (upstream
   #2118), not reproduced on the current pin. Use `cubic` or `newreno` for loopback timing runs.
+- Stream scheduling: `stream_scheduling` (`MOQTPeer`, `PublishedTrack`, aiomoqt-relay
+  `--stream-scheduling`) defaults to `chain`: tracks of one priority share a session's bandwidth
+  and each sends its groups in order. It needs aiopquic with stream chains and runs as `fifo`
+  (the oldest stream takes the band) without them. A track given `stream_priority` is not chained.
 - Many sessions in one process: `MOQTClient(shared_transport=SharedTransport(sockets=N))` puts them on
   one picoquic worker, far cheaper than one each. Give it one socket per session on Linux: sessions sharing
   a source port all land on one worker thread of a relay that hashes ports to threads (mvfst).

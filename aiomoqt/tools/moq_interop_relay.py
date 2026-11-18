@@ -472,8 +472,8 @@ _subscribing: Counter = Counter()
 # (id(session), cap) already warned about.
 _cap_warned: set = set()
 
-# Tiebreak within a data stream band (--stream-scheduling).
-STREAM_SCHEDULING = "fifo"
+# Order among data streams of one band (--stream-scheduling).
+STREAM_SCHEDULING = "chain"
 
 
 @lru_cache(maxsize=None)
@@ -3236,10 +3236,17 @@ class _RelayedTrack:
                 else:
                     initial += first
         self._count_tx(session, len(initial))
+        sched = getattr(session, 'stream_scheduling', None)
+        band = _band_of(prio if prio is not None and 0 <= prio <= 255 else 128,
+                        sched or STREAM_SCHEDULING)
         try:
-            stream_id = await session.open_uni_stream(
-                initial=initial, priority=_stream_band(session, prio),
-                end_stream=whole)
+            if sched == "chain":
+                stream_id = await session.open_uni_stream(
+                    initial=initial, priority=band, end_stream=whole,
+                    chain=alias + 1, order=gid)
+            else:
+                stream_id = await session.open_uni_stream(
+                    initial=initial, priority=band, end_stream=whole)
         except MOQTStreamStopped:
             self._stopped.add(skey)
             return True
@@ -5419,8 +5426,11 @@ def parse_args(argv=None):
     parser.add_argument("--stream-scheduling", choices=SCHEDULING,
                         default=STREAM_SCHEDULING,
                         help="Order among data streams of one priority: "
-                             "fifo keeps each track's groups in order, "
-                             "round_robin shares the band. Default: fifo")
+                             "chain shares the band between tracks and "
+                             "keeps each track's groups in order (fifo "
+                             "where aiopquic has no stream chains), fifo "
+                             "gives it to the oldest stream, round_robin "
+                             "shares it between all streams. Default: chain")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "

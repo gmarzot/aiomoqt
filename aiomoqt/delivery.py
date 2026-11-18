@@ -496,13 +496,16 @@ class SubgroupDelivery:
 
     def __init__(self, session, track_alias: int, *, priority: int = 128,
                  mapping: StreamMapping = StreamMapping.PER_GROUP,
-                 stream_priority: Optional[int] = None):
+                 stream_priority: Optional[int] = None,
+                 chain: Optional[int] = None):
         self.session = session
         self.track_alias = track_alias
         self.priority = priority
         # Transport band for this track's streams, precomputed by the
         # caller; None leaves the session default.
         self.stream_priority = stream_priority
+        # Transport stream chain for this track's streams, ranked by group.
+        self.chain = chain
         self.mapping = mapping
         # Group whose PER_GROUP stream open is in flight.
         self._opening: Optional[int] = None
@@ -606,10 +609,16 @@ class SubgroupDelivery:
                       status=ObjectStatus.END_OF_TRACK)
             await self.session.dgram_write_drain(msg.serialize(prof=prof).data)
             return
-        sid = await self.session.open_uni_stream()
+        if self.chain is None:
+            sid = await self.session.open_uni_stream()
+            if self.stream_priority is not None:
+                self.session.set_stream_priority(sid, self.stream_priority)
+        else:
+            # In the chain, so it follows the track's last group.
+            sid = await self.session.open_uni_stream(
+                priority=self.stream_priority, chain=self.chain,
+                order=group_id)
         self.stream_count += 1
-        if self.stream_priority is not None:
-            self.session.set_stream_priority(sid, self.stream_priority)
         hdr = SubgroupHeader(
             track_alias=self.track_alias, group_id=group_id, subgroup_id=0,
             publisher_priority=self.priority, extensions_present=True,
@@ -664,9 +673,14 @@ class SubgroupDelivery:
                 # The header and the object open the stream together.
                 first = hdr.serialize().data + self._object_bytes(
                     hdr, object_id, payload, extensions, encoded)
-                sid = await self.session.open_uni_stream(
-                    initial=first, priority=self.stream_priority,
-                    end_stream=True)
+                if self.chain is None:
+                    sid = await self.session.open_uni_stream(
+                        initial=first, priority=self.stream_priority,
+                        end_stream=True)
+                else:
+                    sid = await self.session.open_uni_stream(
+                        initial=first, priority=self.stream_priority,
+                        end_stream=True, chain=self.chain, order=group_id)
                 self.stream_count += 1
                 if lane is not None:
                     lane.sid, lane.parked = sid, "object"
@@ -691,9 +705,15 @@ class SubgroupDelivery:
                         first += self._end_bytes(hdr)
                     self._opening = group_id
                     try:
-                        sid = await self.session.open_uni_stream(
-                            initial=first, priority=self.stream_priority,
-                            end_stream=end_of_group)
+                        if self.chain is None:
+                            sid = await self.session.open_uni_stream(
+                                initial=first, priority=self.stream_priority,
+                                end_stream=end_of_group)
+                        else:
+                            sid = await self.session.open_uni_stream(
+                                initial=first, priority=self.stream_priority,
+                                end_stream=end_of_group, chain=self.chain,
+                                order=group_id)
                     finally:
                         self._opening = None
                     self.stream_count += 1
