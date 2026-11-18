@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.15.0 (unreleased)
+
+- Logging: once a track is found malformed, its later streams are refused at DEBUG (the first ERROR line stays); the "at or past end of group" reason names what ended the group, an END_OF_GROUP object or a stream header's END_OF_GROUP bit with the header byte; aiomoqt-relay logs a PUBLISH_DONE it cannot send to a closing session at DEBUG instead of a WARNING with a traceback.
+
 ## v0.15.0rc2
 
 - moq_interop_client: a moq-test datagram case that loses some but not all of its datagrams runs again, up to 3 attempts; it passes only on a clean attempt and names each earlier attempt's losses.

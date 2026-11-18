@@ -2465,8 +2465,14 @@ class _RelayedTrack:
         except ConnectionError:
             logger.debug("relay: ending a subscription on a closed session")
         except Exception:
-            logger.warning("relay: ending a subscription failed",
-                           exc_info=True)
+            closing = (not _session_live(session)
+                       or getattr(session, "_close_err", None) is not None)
+            if closing:
+                logger.debug("relay: ending a subscription on a closing "
+                             "session", exc_info=True)
+            else:
+                logger.warning("relay: ending a subscription failed",
+                               exc_info=True)
         # Done: its cancel handler would hold this track until the
         # session closes.
         handlers = getattr(session, "_request_cancel_handlers", None)
