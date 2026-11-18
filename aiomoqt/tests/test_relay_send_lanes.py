@@ -17,7 +17,8 @@ from aiomoqt.delivery import LANE_MIN_BYTES, SendLane
 from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import StreamResetCode, SubscribeDoneCode
+from aiomoqt.types import (MOQTException, SessionCloseCode, StreamResetCode,
+                           SubscribeDoneCode)
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -928,3 +929,27 @@ async def test_replays_and_traced_subscribers_stay_on_the_lane(monkeypatch):
         assert track._lane(d)._nowait is None
     finally:
         track.close()
+
+
+@pytest.mark.parametrize("closing", [True, False], ids=["closing", "live"])
+async def test_ending_a_subscription_on_a_closing_session_is_quiet(closing,
+                                                                   caplog):
+    caplog.set_level(logging.DEBUG, logger="aiomoqt.relay")
+    track = relay._RelayedTrack(((b"ns",), b"t"))
+    fake = _Fake()
+
+    def refuse(**_kw):
+        raise MOQTException(SessionCloseCode.INTERNAL_ERROR,
+                            "control stream not initialized")
+    fake.subscribe_done = refuse
+    if closing:
+        fake._close_err = (SessionCloseCode.PROTOCOL_VIOLATION,
+                           "peer closed its control stream 4")
+    d = track.add_downstream(fake, 1, 1)
+    try:
+        track._end(d, SubscribeDoneCode.TRACK_ENDED, None, "ended")
+    finally:
+        track.close()
+    warned = [r for r in caplog.records if r.levelno >= logging.WARNING
+              and "ending a subscription" in r.getMessage()]
+    assert bool(warned) is not closing

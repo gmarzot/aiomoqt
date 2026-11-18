@@ -12,7 +12,8 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.messages.data import SubgroupHeader
-from aiomoqt.protocol import _MOQTSessionMixin, _DataStreamState, QuicErrorCode
+from aiomoqt.protocol import (MOQTStreamReject, _MOQTSessionMixin,
+                              _DataStreamState, QuicErrorCode)
 from aiomoqt.types import MOQTMessageType, ObjectStatus, StreamResetCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -47,7 +48,9 @@ def test_end_of_group_and_end_of_track_bound_later_objects():
     s._note_object_bound(7, 3, 10, EOG)
     assert s._object_out_of_bounds(7, 3, 9, NORMAL) is None
     assert s._object_out_of_bounds(7, 3, 10, EOG) is None       # same terminal again
-    assert s._object_out_of_bounds(7, 3, 10, NORMAL)
+    assert s._object_out_of_bounds(7, 3, 10, NORMAL) == (
+        "object 3.10 at or past end of group (10, from the END_OF_GROUP "
+        "object 3.10)")
     assert s._object_out_of_bounds(7, 3, 11, NORMAL)
     assert s._object_out_of_bounds(7, 4, 11, NORMAL) is None    # other group
     s._note_object_bound(7, 5, 0, EOT)
@@ -72,7 +75,20 @@ def test_fin_on_end_of_group_bit_stream_bounds_the_group():
     s._data_streams[11] = state
     s._cleanup_stream(11)
     assert s._object_out_of_bounds(7, 3, 4, NORMAL) is None
-    assert s._object_out_of_bounds(7, 3, 5, NORMAL)
+    # The reason names what ended the group: here the header's bit.
+    assert s._object_out_of_bounds(7, 3, 5, NORMAL) == (
+        "object 3.5 at or past end of group (5, from the END_OF_GROUP bit "
+        "of stream 11's header 0x1c)")
+
+
+def test_later_streams_of_a_malformed_track_are_refused_quietly():
+    s = _stub()
+    s._malformed_aliases.add(7)
+    header = SubgroupHeader(track_alias=7, group_id=4, subgroup_id=0)
+    with pytest.raises(MOQTStreamReject) as e:
+        s._admit_subgroup_stream(15, header)
+    assert e.value.error_code == StreamResetCode.MALFORMED_TRACK
+    assert e.value.quiet
 
 
 async def test_cancelling_a_request_stream_frees_the_track_bounds():

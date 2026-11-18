@@ -521,9 +521,10 @@ class _MOQTSessionMixin:
         # property (utils.timing.TIMING_IDS): a track that declared none
         # checks only those.
         self._timing_watch: Dict[int, Callable] = {}
-        # alias -> {group_id: first object id that does not exist}, from
-        # END_OF_GROUP status objects and FIN on END_OF_GROUP-bit streams.
-        self._group_bound: Dict[int, Dict[int, int]] = {}
+        # alias -> {group_id: (first object id that does not exist, what
+        # set it)}, from END_OF_GROUP status objects and FIN on
+        # END_OF_GROUP-bit streams.
+        self._group_bound: Dict[int, Dict[int, Tuple[int, str]]] = {}
         # alias -> (group_id, object_id) location from END_OF_TRACK.
         self._track_bound: Dict[int, Tuple[int, int]] = {}
         # Tombstone map: stream_ids whose state was popped in response
@@ -1825,7 +1826,10 @@ class _MOQTSessionMixin:
             if (error_code == QuicErrorCode.NO_ERROR
                     and state.object_id is not None
                     and getattr(state.parser, 'end_of_group', False)):
-                self._set_group_bound(alias, group_id, state.object_id + 1)
+                self._set_group_bound(
+                    alias, group_id, state.object_id + 1,
+                    f"END_OF_GROUP bit of stream {stream_id}'s header "
+                    f"0x{state.parser._compute_type():x}")
             cb = self._stream_end_handlers.get(alias)
             clean = error_code == QuicErrorCode.NO_ERROR
             if cb:
@@ -2241,12 +2245,12 @@ class _MOQTSessionMixin:
         again."""
         groups = self._group_bound.get(alias)
         if groups is not None:
-            bound = groups.get(group_id)
-            if (bound is not None and object_id >= bound
-                    and not (object_id == bound
+            entry = groups.get(group_id)
+            if (entry is not None and object_id >= entry[0]
+                    and not (object_id == entry[0]
                              and status == ObjectStatus.END_OF_GROUP)):
                 return (f"object {group_id}.{object_id} at or past end "
-                        f"of group ({bound})")
+                        f"of group ({entry[0]}, from the {entry[1]})")
         end = self._track_bound.get(alias)
         if (end is not None and (group_id, object_id) >= end
                 and not ((group_id, object_id) == end
@@ -2259,15 +2263,20 @@ class _MOQTSessionMixin:
                            status, end_of_group_bit: bool = False) -> None:
         """Record the end of group / track an object announces."""
         if status == ObjectStatus.END_OF_GROUP:
-            self._set_group_bound(alias, group_id, object_id)
+            self._set_group_bound(
+                alias, group_id, object_id,
+                f"END_OF_GROUP object {group_id}.{object_id}")
         elif status == ObjectStatus.END_OF_TRACK:
             self._track_bound[alias] = (group_id, object_id)
         elif end_of_group_bit:
-            self._set_group_bound(alias, group_id, object_id + 1)
+            self._set_group_bound(
+                alias, group_id, object_id + 1,
+                f"END_OF_GROUP bit of datagram {group_id}.{object_id}")
 
     GROUP_BOUNDS_PER_TRACK = 256
 
-    def _set_group_bound(self, alias: int, group_id: int, bound: int) -> None:
+    def _set_group_bound(self, alias: int, group_id: int, bound: int,
+                         source: str) -> None:
         groups = self._group_bound.get(alias)
         if groups is None:
             groups = self._group_bound[alias] = {}
@@ -2275,7 +2284,8 @@ class _MOQTSessionMixin:
               and len(groups) >= self.GROUP_BOUNDS_PER_TRACK):
             del groups[next(iter(groups))]
         prev = groups.get(group_id)
-        groups[group_id] = bound if prev is None else min(prev, bound)
+        if prev is None or bound < prev[0]:
+            groups[group_id] = (bound, source)
 
     def _status_object_fault(self, status, extensions) -> Optional[str]:
         """§11.2.1.1/§11.2.1.2: a non-Normal status must be one the
@@ -2376,8 +2386,9 @@ class _MOQTSessionMixin:
           and the uniqueness check is deferred until the first object.
         """
         if header.track_alias in self._malformed_aliases:
+            # Logged when the track was found malformed.
             raise MOQTStreamReject(StreamResetCode.MALFORMED_TRACK,
-                                   "malformed track")
+                                   "malformed track", quiet=True)
         if header.track_alias not in self._track_aliases:
             # Data before the control message that binds the alias is
             # legal (§10.4.2), so this alone is not an error — it is
