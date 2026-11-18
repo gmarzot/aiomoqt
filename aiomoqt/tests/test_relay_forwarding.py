@@ -1097,7 +1097,9 @@ async def test_a_second_publisher_in_a_namespace_keeps_the_firsts_track(
 
 _MP_NS = "relay/multi"
 _MP_TRACKS = ("video", "audio")
-_MP_PERIOD = 0.05
+# Long enough that two publishers' scheduling skew stays within the relay's
+# one-group window for a copy of the track.
+_MP_PERIOD = 0.2
 _MP_OBJECTS = 4
 _MP_DRAFTS = pytest.mark.parametrize("draft", [18, 22])
 
