@@ -1,12 +1,13 @@
-"""moq-peering CityHash, track hashes and node ids.
+"""moq-fabric CityHash, track hashes and node ids.
 
-Vectors from moq-peering d0bfdc9's cityhash.h, name.h and node_info.h, and libstdc++ std::hash<std::string>, compiled with g++ 11.4 -std=c++20.
+Vectors from moq-fabric f10e8bc5's cityhash.h, name.h and node_info.h, and libstdc++ std::hash<std::string>, compiled with g++ 11.4 -std=c++20.
 """
 import pytest
 
 from aiomoqt.peering.hashing import (city64, fresh_node_id, hash_combine,
-                                     libstdcxx_hash, node_id_format,
-                                     node_id_parse, track_hashes)
+                                     libstdcxx_hash, namespace_hash,
+                                     node_id_format, node_id_parse,
+                                     track_hashes)
 
 
 def _digits64():
@@ -46,7 +47,7 @@ CITY = [
 # (namespace tuples, name) -> (namespace, name, fullname)
 TRACKS = [
     ((b"moq-test", b"live"), b"video",
-     (0x2d006bd9160bdc5f, 0x8dfd2b64f2d8463b, 0xf9deacf2c69f506d)),
+     (0x18b469fe11acd643, 0x8dfd2b64f2d8463b, 0x773c11b5d5e8b10e)),
     ((b"aiomoqt",), b"track0",
      (0x1984c282901e2f9c, 0x0255566faeb3872f, 0xe38286231db8048f)),
     ((b"edge-left",), b"live",
@@ -54,7 +55,7 @@ TRACKS = [
     ((b"demo",), b"",
      (0xc75b2d610612d894, 0x9ae16a3b2f90404f, 0xf7260bfde8a2eee9)),
     ((b"aiomoqt", b"probe"), b"",
-     (0x721eaf3d6a1fc21c, 0x9ae16a3b2f90404f, 0xe596d32e33a9cd47)),
+     (0x599fc53333edde89, 0x9ae16a3b2f90404f, 0xb380d272feff0cff)),
     ((), b"",
      (0x9ae16a3b2f90404f, 0x9ae16a3b2f90404f, 0xe99333bb9d359ac0)),
 ]
@@ -83,12 +84,25 @@ def test_track_hashes(namespace, name, want):
     assert track_hashes(namespace, name) == want
 
 
-def test_namespace_hash_has_no_delimiter():
-    """("ab","c") and ("a","bc") hash the same: the tuples are
-    concatenated."""
-    want = (0x24a5b3a074e7f369, 0xc17efdbaecff6802, 0x4869ffff6c885347)
-    assert track_hashes((b"ab", b"c"), b"x") == want
-    assert track_hashes((b"a", b"bc"), b"x") == want
+# Tuple boundaries and order change the namespace hash.
+CHAINED = [
+    ((b"ab", b"c"), (0x9256a7fadf777e8b, 0xc17efdbaecff6802, 0x1a1f6a4d9c2062dd)),
+    ((b"a", b"bc"), (0x7567a6ea518f00e2, 0xc17efdbaecff6802, 0x3083762ed52f4aa8)),
+    ((b"a", b"b"), (0x7b9a7e9bab37fb01, 0xc17efdbaecff6802, 0x08a753b461eee941)),
+    ((b"b", b"a"), (0xf01eaa9a9027bb83, 0xc17efdbaecff6802, 0xd75258df32d6e6a7)),
+    ((b"a", b"b", b"c"), (0x38f801782951d438, 0xc17efdbaecff6802, 0xf86933086c3ab984)),
+]
+
+
+@pytest.mark.parametrize("namespace,want", CHAINED)
+def test_namespace_hash_chains_tuples(namespace, want):
+    assert track_hashes(namespace, b"x") == want
+
+
+def test_namespace_hash_chain_step():
+    ab = namespace_hash((b"a", b"b"))
+    assert namespace_hash((b"a", b"b", b"c")) == city64(ab.to_bytes(8, "big") + b"c")
+    assert namespace_hash((b"a",)) == city64(b"a")
 
 
 def test_hash_combine():

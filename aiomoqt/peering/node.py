@@ -1,4 +1,4 @@
-"""FabricNode: a moq-peering leaf node on aiopquic raw QUIC.
+"""FabricNode: a moq-fabric leaf node on aiopquic raw QUIC.
 
 Dials peers (re-dialing after a close), optionally listens, learns nodes,
 announces, subscribes and SNS sets per session, and originates its own
@@ -359,7 +359,7 @@ class RxTrack:
 
 
 class FabricNode:
-    """A moq-peering leaf: dial `peers`, listen on `port` (0: do not)."""
+    """A moq-fabric leaf: dial `peers`, listen on `port` (0: do not)."""
 
     def __init__(self, *, node_id: Optional[int] = None,
                  label: str = DEFAULT_LABEL, metric: int = LEAF_METRIC,
@@ -475,7 +475,7 @@ class FabricNode:
                                 idle_timeout=self.idle_timeout,
                                 keep_alive_interval=self.keepalive)
         if client:
-            # moq-peering never verifies certificates.
+            # moq-fabric never verifies certificates.
             cfg.verify_mode = ssl.CERT_NONE
             cfg.server_name = _sni(host)
         return cfg

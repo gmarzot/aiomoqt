@@ -1,6 +1,6 @@
-"""moq-peering wire codec, byte-exact both ways, plus malformed input.
+"""moq-fabric wire codec, byte-exact both ways, plus malformed input.
 
-Vectors are the output of moq-peering d0bfdc9's own serializers (its unit-test inputs), compiled with g++ 11.4 -std=c++20.
+Vectors are the output of moq-fabric f10e8bc5's own serializers (its unit-test inputs), compiled with g++ 11.4 -std=c++20.
 """
 import struct
 
@@ -14,7 +14,7 @@ from aiomoqt.peering.wire import (
     SubscribeInfo, WireError, decode_body, decode_varint, encode_message,
     encode_varint, parse_data_header, rewrite_sns)
 
-# value -> moq-peering UintVar bytes
+# value -> moq-fabric UintVar bytes
 VARINTS = [
     (0, "00"), (63, "3f"), (64, "40"), (127, "7f"), (128, "8080"),
     (300, "812c"), (16383, "bfff"), (16384, "c04000"),

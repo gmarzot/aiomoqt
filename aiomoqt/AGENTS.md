@@ -31,7 +31,7 @@ plain ints (`draft=18`, `supported_drafts=[18, 16]`). Clients offer newest-first
 
 Console scripts: `moq-pub-bench`, `moq-sub-bench`, `moq-loopback-bench`, `moq-adaptive-bench`,
 `moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-peer-probe` (a leaf node on a
-moq-peering fabric), `moq-peer-bench` (sends and measures a track through one),
+moq-fabric mesh), `moq-peer-bench` (sends and measures a track through one),
 `moq-interop-client`, `moq-interop-relay`, `aiomoqt-versions`. Others run as
 modules: `python -m aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--ts --msfts` and
 `--ts-out` carry MPEG-TS as MSFTS, `--ts-playout` plays it out on its PCR; `--input` ingest needs
