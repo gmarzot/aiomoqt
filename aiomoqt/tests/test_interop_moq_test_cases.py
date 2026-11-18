@@ -253,6 +253,73 @@ async def test_a_refused_subscribe_leads_a_publish_timeout(monkeypatch,
     assert "never retrieved" not in caplog.text
 
 
+def _lose(monkeypatch, attempts, lost=lambda loc: loc == (1, 5)):
+    """The first `attempts` subscribers never see the objects at the
+    locations `lost` picks. Returns every subscriber, in order."""
+    on_object = client._MoqTestSubscriber.on_object
+    subs = []
+
+    def lossy(self, msg, size, ts, group_id, subgroup_id):
+        if self not in subs:
+            subs.append(self)
+        gid = getattr(msg, "group_id", None)
+        loc = (group_id if gid is None else gid, msg.object_id)
+        if subs.index(self) < attempts and lost(loc):
+            return
+        on_object(self, msg, size, ts, group_id, subgroup_id)
+
+    monkeypatch.setattr(client._MoqTestSubscriber, "on_object", lossy)
+    return subs
+
+
+_EOG_LOST = "missing End of Group at 1.5"
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempts", [1, 2])
+async def test_a_datagram_case_that_lost_some_runs_again(monkeypatch,
+                                                         attempts):
+    subs = _lose(monkeypatch, attempts)
+    r = await _run_case("moq-test-datagram-eog", _BASE_PORT + 55 + attempts,
+                        18, True)
+    assert r.passed, r.message
+    assert len(subs) == attempts + 1
+    earlier = "; ".join(f"attempt {n}: {_EOG_LOST}"
+                        for n in range(1, attempts + 1))
+    assert r.message == (f"objects 15/15, End of Group 3/3, Stream Count "
+                         f"0/0 (attempt {attempts + 1} of 3; datagrams lost "
+                         f"on {earlier})")
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_datagram_case_that_loses_on_every_attempt_fails(
+        monkeypatch):
+    subs = _lose(monkeypatch, 3)
+    r = await _run_case("moq-test-datagram-eog", _BASE_PORT + 58, 18, True)
+    assert not r.passed
+    assert len(subs) == 3
+    assert r.message == (
+        f"{_EOG_LOST} (1 problem(s)); objects 15/15, End of Group 2/3, "
+        f"Stream Count 0/0; datagrams lost on all 3 attempts (attempt 1: "
+        f"{_EOG_LOST}; attempt 2: {_EOG_LOST})")
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name, lost", [
+    ("moq-test-subgroup-per-group-eog", lambda loc: loc == (1, 5)),
+    ("moq-test-datagram-eog", lambda loc: True),
+], ids=["stream", "every-datagram"])
+async def test_only_some_lost_datagrams_run_again(monkeypatch, name, lost):
+    subs = _lose(monkeypatch, 3, lost)
+    r = await _run_case(name, _BASE_PORT + 59, 18, True)
+    assert not r.passed
+    assert len(subs) == 1
+    assert "attempt" not in r.message, r.message
+
+
 def _params(name):
     return client.parse_moq_test(("moq-test-00", *client.MOQ_TEST_CASES[name]))
 

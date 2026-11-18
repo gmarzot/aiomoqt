@@ -1975,6 +1975,9 @@ _MOQ_TEST_FORWARD_WAIT_S = 1.0
 # After PUBLISH_DONE: datagrams can still trail it, and with Forward State 0
 # an object arriving here still fails the case.
 _MOQ_TEST_GRACE_S = 0.25
+# Datagrams are never retransmitted: a datagram case that lost some but not
+# all of them runs again, up to this many attempts in all.
+_MOQ_TEST_DATAGRAM_ATTEMPTS = 3
 
 
 def _moq_test_expected(p):
@@ -2192,10 +2195,40 @@ def _subscribe_refusal(task) -> Optional[str]:
 async def _run_moq_test(name: str, host: str, port: int, path: str,
                         use_quic: bool, tls_disable_verify: bool, debug: bool,
                         supported_drafts=None) -> TestResult:
+    """One attempt, or up to _MOQ_TEST_DATAGRAM_ATTEMPTS while a datagram
+    case only loses datagrams; the message names each earlier loss."""
+    t0 = time.monotonic()
+    losses: list[str] = []
+    for attempt in range(1, _MOQ_TEST_DATAGRAM_ATTEMPTS + 1):
+        r, lost = await _moq_test_attempt(name, host, port, path, use_quic,
+                                          tls_disable_verify, debug,
+                                          supported_drafts)
+        if not lost or attempt == _MOQ_TEST_DATAGRAM_ATTEMPTS:
+            break
+        losses.append(f"attempt {attempt}: {', '.join(lost)}")
+    if not losses:
+        return r
+    earlier = "; ".join(losses)
+    if lost:
+        message = (f"{r.message}; datagrams lost on all {attempt} attempts "
+                   f"({earlier})")
+    else:
+        message = (f"{r.message} (attempt {attempt} of "
+                   f"{_MOQ_TEST_DATAGRAM_ATTEMPTS}; datagrams lost on "
+                   f"{earlier})")
+    return replace(r, message=message,
+                   duration_ms=(time.monotonic() - t0) * 1000)
+
+
+async def _moq_test_attempt(name: str, host: str, port: int, path: str,
+                            use_quic: bool, tls_disable_verify: bool,
+                            debug: bool, supported_drafts
+                            ) -> tuple[TestResult, list]:
     """Subscriber first: SUBSCRIBE with RENDEZVOUS_TIMEOUT to the bare
     tuple namespace, then a second session PUBLISHes the same track and
     sends the tuple's objects; the subscriber checks what the relay
-    delivers."""
+    delivers. Also returns the problems when they are only some lost
+    datagrams, else []."""
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     sessions = {}
@@ -2211,11 +2244,12 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
     pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=supported_drafts)
 
-    def result(passed: bool, message: str, **kw) -> TestResult:
+    def result(passed: bool, message: str, lost=(),
+               **kw) -> tuple[TestResult, list]:
         return _skip_unsupported_publish(TestResult(
             name=name, passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
-            sessions=sessions, message=message, **kw), reply)
+            sessions=sessions, message=message, **kw), reply), list(lost)
 
     step = "subscriber SETUP"
     phase_end = loop.time() + _MOQ_TEST_PHASE_S
@@ -2314,8 +2348,10 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
         summary = (f"objects {received}/{len(data)}, End of Group "
                    f"{eogs}/{len(markers)}, Stream Count {count}/{streams}")
     if problems:
+        lost = problems if params.fp == 3 and sub.objects and all(
+            x.startswith("missing ") for x in problems) else ()
         return result(False, f"{problems[0]} ({len(problems)} problem(s)); "
-                             f"{summary}")
+                             f"{summary}", lost=lost)
     return result(True, summary)
 
 
