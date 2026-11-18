@@ -1899,6 +1899,10 @@ class _PushedFeed(_Feed):
                 is self.handler)
 
 
+def _ignore_object(*_args, **_kw) -> None:
+    """A closed track's upstream on_object."""
+
+
 class _RelayedTrack:
     """Upstream subscriptions to a track, one per publisher, fanned out
     to N downstream subscribers.
@@ -2097,6 +2101,7 @@ class _RelayedTrack:
         try:
             session.unregister_object_handler(self.upstream_alias)
             session.unregister_stream_end_handler(self.upstream_alias)
+            session._timing_watch.pop(self.upstream_alias, None)
         except Exception:
             logger.debug("relay: releasing upstream handlers failed",
                          exc_info=True)
@@ -2241,6 +2246,15 @@ class _RelayedTrack:
             self.task = None
         self._release_downstream()
         self._drop_cache()
+        self._unlink_upstream()
+
+    def _unlink_upstream(self) -> None:
+        """Drop the upstream subscriptions' references back to this
+        track, so a closed track is freed by reference counting."""
+        for sub in (self.upstream, getattr(self.feed, "sub", None)):
+            if isinstance(sub, SubscribedTrack):
+                sub.on_object = _ignore_object
+                sub.on_done = None
 
     def _release_downstream(self) -> None:
         """Forget the subscribers; lanes draining to their PUBLISH_DONE
@@ -2453,6 +2467,11 @@ class _RelayedTrack:
         except Exception:
             logger.warning("relay: ending a subscription failed",
                            exc_info=True)
+        # Done: its cancel handler would hold this track until the
+        # session closes.
+        handlers = getattr(session, "_request_cancel_handlers", None)
+        if handlers:
+            handlers.pop(d.request_id, None)
 
     def _enqueue_terminal(self, status, reason, key) -> None:
         """Terminal behind everything already queued."""
@@ -2755,6 +2774,7 @@ class _RelayedTrack:
                 self._release_publish()
                 self._release_downstream()
                 self._drop_cache()
+                self._unlink_upstream()
                 self.task = None
                 _drop_track(key, self)
                 return

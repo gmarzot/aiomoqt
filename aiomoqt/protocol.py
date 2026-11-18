@@ -3387,7 +3387,8 @@ class _MOQTSessionMixin:
         # session: dropped here, a closed session is freed without a GC pass.
         for name in ("_request_cancel_handlers", "_timing_watch",
                      "_object_handlers", "_stream_end_handlers",
-                     "_fetch_object_handlers", "_pending_object_handlers"):
+                     "_fetch_object_handlers", "_pending_object_handlers",
+                     "_publish_done_handlers"):
             table = getattr(self, name, None)
             if table:
                 table.clear()
