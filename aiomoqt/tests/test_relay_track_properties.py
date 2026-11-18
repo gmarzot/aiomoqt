@@ -177,6 +177,8 @@ async def test_a_publish_offer_carries_each_tracks_properties(draft,
 @_TRANSPORTS
 async def test_a_new_publisher_replaces_the_cached_set(use_quic):
     # §8.4: the newest set replaces the cached one, never merged with it.
+    # The first publisher ends its track; a further PUBLISH of a live
+    # track would join it instead.
     first = {"video": {0x0E: 10, 0x3800: 1, 0x3803: b"first"}}
     second = {"video": {0x3800: 2, 0x3805: b"second"}}
     async with _relay(_port(2, 22, use_quic), use_quic, 22) as connect:
@@ -188,8 +190,10 @@ async def test_a_new_publisher_replaces_the_cached_set(use_quic):
         ok = await rx.subscribe(_NS, "video", forward=1, wait_response=True)
         assert _received(ok) == _sent(track, pub)
 
-        pub2 = await connect()
         old = _relayed("video")
+        track.end()
+        assert await _until(lambda: old.finished)
+        pub2 = await connect()
         track = _tracks(pub2, second)["video"]
         await track.publish()
         assert await _until(lambda: _relayed("video") not in (None, old))

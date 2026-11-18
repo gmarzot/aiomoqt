@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay takes further publishers of a pushed track (d22 §7.3): another session's PUBLISH of a live track feeds it too, Objects are deduplicated by Location, and the relay fails over when the serving publisher ends or disconnects; a further PUBLISH numbered far from the track supersedes it, as before. A second PUBLISH used to retire the track.
 - aiomoqt-relay decides whether a standby takes over a track only once the serving publisher's PUBLISH_DONE Stream Count streams have ended: a PUBLISH_DONE that overtook the stream carrying its End of Track handed the track to the standby, past its end.
 - `abr_ingest --output NS[,packaging=…][,codec=…][,rung=…]`, repeated, publishes several ladders, each under its own namespace and catalog, from one source subscription and one decode; rungs of one size, rate and codec share an encoder. `AbrLadder(codec=)` takes a codec per rung.
 - aiomoqt-relay sends a prefix subscriber NAMESPACE once per namespace until it is withdrawn (d22 §4.2), instead of again on each PUBLISH_NAMESPACE or PUBLISH of it, and NAMESPACE_DONE only after a NAMESPACE. A second publisher of a namespace repeated it, which failed the interop runner's multi-publisher retention case.
