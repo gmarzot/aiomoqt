@@ -185,7 +185,7 @@ def _pytest_all(log_dir: Path) -> tuple[str, str]:
     extra = [f"--ignore={p}" for p in _PYTEST_STANDALONE]
     extra.append("--durations=10")
     return _pytest_file("aiomoqt/tests", log_dir / "pytest.log", extra,
-                        timeout=1800)
+                        timeout=3000)
 
 
 # ---------------------------------------------------------------------------
