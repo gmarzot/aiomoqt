@@ -105,6 +105,17 @@ class FanoutPublisher:
     async def start(self, **kw) -> None:
         await asyncio.gather(*(p.start(**kw) for p in self.publishers))
 
+    async def publish_track(self, track: PublishedTrack) -> None:
+        """Offer a track added after start() on every session."""
+        await asyncio.gather(*(p.publish_track(track)
+                               for p in self.publishers))
+
+    def remove_track(self, name: str) -> None:
+        """Stop routing to track `name` on every session; end it first."""
+        self.tracks.pop(name, None)
+        for p in self.publishers:
+            p.remove_track(name)
+
     async def add_session(self, session, **kw) -> None:
         """Serve one more relay, or one that came back, from the same
         tracks; kw as start(). Its catalog groups follow every group sent

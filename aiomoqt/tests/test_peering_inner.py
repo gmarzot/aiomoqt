@@ -1,4 +1,4 @@
-"""MoQT d18 inner framing of moq-peering data: moqx's bytes both ways,
+"""MoQT d18 inner framing of moq-fabric data: moqx's bytes both ways,
 aiomoqt's own d18 decoder on what we write, moqx's quirks, bad input.
 
 Vectors are moqx 7b67019's PeeringObject encoding (wire-spec §10.1).

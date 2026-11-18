@@ -13,6 +13,7 @@ Reads the catalog track, subscribes every media track it describes
   <out>/<role>.mp4   fMP4 for CMAF and LOCMAF tracks (LOCMAF objects
                      rebuilt to CMAF chunks); <name>.mp4 when several
                      tracks share a role
+  <out>/<name>.ts    the TS packets of an mpeg2ts (MSFTS) track
 
 On exit it prints one line per track: `name: N frames, R rejected`.
 
@@ -25,6 +26,23 @@ goes to stderr; the other track still writes to --out):
       ffplay -fflags nobuffer -flags low_delay -probesize 32 -f h264 -i -
   %(prog)s URL -N demo/live --pipe audio | \\
       ffplay -f s16le -ar 48000 -ch_layout stereo -i -
+
+MPEG-TS out (--ts-out): the packets of one mpeg2ts track, in Group and
+Object order as its objects arrive, to a file, stdout (-) or UDP, seven
+packets to a datagram; with --ts-playout MS, each at its PCR time behind
+an MS buffer. --analyze on that track writes a JSON line per -i interval,
+each followed by the summary so far, and the run's summary at the end
+(SIGTERM too): CC errors, PCR, delay variation, late packets and output
+breaks at the buffer and at 100 to 1000 ms, object loss, and the delay
+from the publisher's wall clock when it gives one (clocks must agree).
+
+  %(prog)s URL -N contrib/feed --ts-out udp://127.0.0.1:6000
+  %(prog)s URL -N contrib/feed --ts-out udp://127.0.0.1:6000 \\
+      --ts-playout 300 --analyze -i 5 --report rx.jsonl
+
+Frame log (--frame-log): a JSON line per LOC frame received, keyed by the
+sha1 of its payload, the bytes aiomoqt's TS demuxer yields for that frame
+of a pub_media --ts source.
 
 Delivery analysis (--analyze writes no media): measures whether the
 network delivered the stream well enough to play, without decoding it.
@@ -40,19 +58,28 @@ skew are built from differences and do not.
 import asyncio
 import csv
 import functools
+import hashlib
+import json
 import math
 import os
+import signal
 import sys
 import time
 import wave
+from typing import Optional
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.media import MediaSubscriber
+from aiomoqt.track import SubscribedTrack
+from aiomoqt.media import MediaSubscriber, MsftsTrackSubscriber
 from aiomoqt.media.catalog import (
-    MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOCMAF,
+    MEDIA_PACKAGINGS, PACKAGING_CMAF, PACKAGING_LOC, PACKAGING_LOCMAF,
+    PACKAGING_MEDIA_TIMELINE, PACKAGING_MPEG2TS,
 )
 from aiomoqt.media.cmaf import init_timescale
+from aiomoqt.media import msfts, tsplayout
 from aiomoqt.media.loc import LOC_PROP_TIMESCALE
+from aiomoqt.media.msfts import MODE_ES_PACKETS, TS_PACKET
+from aiomoqt.media.udp import UdpOutput, is_udp_url, parse_udp_url
 from aiomoqt.types import MOQTRequestError
 from aiomoqt.media.sources import (
     IvfWriter, adts_frame, as_annexb, avcc_param_sets,
@@ -63,7 +90,9 @@ from aiomoqt.utils.media_stats import (
     interval_header, wall_clock_us,
 )
 from aiomoqt.utils.hostinfo import CPU_FIELDS, cpu_fields, cpu_summary
-from aiomoqt.utils.timing import TimestampMalformed, capture_time_us
+from aiomoqt.utils.timing import (
+    SOURCE_FRINDELL, TimestampMalformed, capture_time_us,
+)
 from aiomoqt.utils.url import parse_relay_url
 
 
@@ -90,6 +119,39 @@ def parse_args():
                              'into a player (video: Annex-B h264; audio: '
                              's16le pcm). Status moves to stderr; the '
                              'other track still writes to --out.')
+    parser.add_argument('--ts-out', type=str, default=None, metavar='URL',
+                        help='Write the TS packets of the mpeg2ts (MSFTS) '
+                             'track to udp://HOST:PORT (seven packets a '
+                             'datagram), a file, or - for stdout, in Group '
+                             'and Object order as objects arrive. Subscribes '
+                             'that track only, and the one a catalog '
+                             'replaces it with; -T picks one of several. '
+                             'LOC tracks are refused.')
+    ts_group = parser.add_argument_group('MPEG-TS (mpeg2ts tracks)')
+    ts_group.add_argument(
+        '--ts-playout', type=int, default=None, metavar='MS',
+        help='With --ts-out: release each TS packet at its PCR time behind '
+             'a fixed buffer of MS: first PCR arrival + MS + (PCR - first '
+             'PCR) / 27 MHz, across PCR discontinuities. Default: as '
+             'objects arrive.')
+    ts_group.add_argument(
+        '--ts-late', choices=('drop', 'emit'), default='drop',
+        help='A packet past its release time: drop it (default) or emit it '
+             'at once; counted late either way')
+    ts_group.add_argument(
+        '--break-ms', type=int, default=tsplayout.BREAK_MS, metavar='MS',
+        help='A gap of MS or more in the released media is an output '
+             f'break (default: {tsplayout.BREAK_MS})')
+    ts_group.add_argument(
+        '--arrival-log', type=str, default=None, metavar='FILE',
+        help='Write a JSON line per PCR: pcr (27 MHz), arrival_ns and '
+             'release_ns, wall clock')
+    parser.add_argument('--frame-log', type=str, default=None,
+                        metavar='FILE',
+                        help='Write a JSON line per LOC frame received: '
+                             'track, group, object, key, size, sha1 of the '
+                             'payload (as aiomoqt\'s TS demuxer yields the '
+                             'frame) and arrival_ns, wall clock')
     parser.add_argument('--show-catalog', action='store_true',
                         help='Print the full catalog JSON (and every '
                              'applied update) to stderr')
@@ -107,7 +169,11 @@ def parse_args():
                              'underrun, buffer). ts_skew carries the '
                              'clock offset when publisher and subscriber '
                              'are on different machines; jitter does '
-                             'not. --out is ignored.')
+                             'not. --out is ignored. On an mpeg2ts track: '
+                             'a JSON line per interval and a summary (TS '
+                             'packets, CC errors, PCR, delay variation, '
+                             'late packets and breaks at several buffers), '
+                             'beside --ts-out if given.')
     parser.add_argument('--target-latency', type=float, default=None,
                         metavar='MS',
                         help='Playout cushion for --analyze; overrides '
@@ -115,7 +181,8 @@ def parse_args():
                              'else 500)')
     parser.add_argument('--report', type=str, default=None, metavar='PATH',
                         help='With --analyze: write interval and summary '
-                             'rows as CSV to PATH (- = stdout)')
+                             'rows as CSV to PATH (- = stdout); JSON lines '
+                             'for an mpeg2ts track')
     _cli.add_run(parser)
     _cli.add_interval(parser)
     _cli.add_session(parser)
@@ -130,6 +197,24 @@ def parse_args():
         parser.error('--analyze writes no media; drop --pipe')
     if args.report and not args.analyze:
         parser.error('--report requires --analyze')
+    if args.ts_playout is not None:
+        if args.ts_playout <= 0:
+            parser.error('--ts-playout must be positive')
+        if not (args.ts_out or args.analyze):
+            parser.error('--ts-playout needs --ts-out or --analyze')
+    if args.break_ms <= 0:
+        parser.error('--break-ms must be positive')
+    if args.ts_out:
+        if args.packaging is not None:
+            parser.error('--ts-out subscribes the mpeg2ts track; drop '
+                         '--packaging')
+        if args.ts_out == '-' and args.pipe:
+            parser.error('--ts-out - and --pipe both write stdout')
+        if is_udp_url(args.ts_out):
+            try:
+                parse_udp_url(args.ts_out, listen=False)
+            except ValueError as e:
+                parser.error(f'--ts-out: {e}')
     if args.interval <= 0:
         parser.error('-i/--interval must be > 0')
     return args
@@ -142,8 +227,8 @@ class _Writers:
     """Per-track sinks: LOC video → Annex-B .h264 (video.h264, or
     <name>.h264 when several wanted LOC video tracks), pcm audio → .wav,
     CMAF and LOCMAF → fMP4 (<role>.mp4, or <name>.mp4 when several wanted
-    tracks share the role). One track may stream raw to stdout instead
-    (pipe_role)."""
+    tracks share the role), mpeg2ts → its packets (<name>.ts). One track
+    may stream raw to stdout instead (pipe_role)."""
 
     def __init__(self, out_dir: str, subscriber: MediaSubscriber,
                  pipe_role: str = None, wanted=None):
@@ -151,6 +236,8 @@ class _Writers:
         self.sub = subscriber
         self.pipe_role = pipe_role
         self.wanted = wanted or (lambda entry: True)
+        self.ts = {}
+        self.ts_bytes = {}
         self.h264 = {}
         self.ivf = None
         self.wav = None
@@ -173,6 +260,16 @@ class _Writers:
         self.counts[name] = self.counts.get(name, 0) + 1
         entry = self.sub.catalog.find(name) if self.sub.catalog else None
         role = entry.role if entry else None
+        if entry is not None and entry.packaging == PACKAGING_MPEG2TS:
+            sink = self.ts.get(name)
+            if sink is None:
+                sink = self.ts[name] = open(
+                    os.path.join(self.out, f'{entry.name}.ts'), 'wb',
+                    buffering=0)
+            sink.write(frame.payload)
+            self.ts_bytes[name] = (self.ts_bytes.get(name, 0)
+                                   + len(frame.payload))
+            return
         if entry is not None and entry.packaging in _CHUNKED:
             # CMAF chunks pass through verbatim; init segment (CMAF
             # header) from the catalog prefixes the fMP4 sink.
@@ -279,6 +376,274 @@ class _Writers:
         for fh in self.cmaf.values():
             if fh is not sys.stdout.buffer:
                 fh.close()
+        for sink in self.ts.values():
+            sink.close()
+
+
+class _StdoutSink:
+    """--ts-out -: stdout, until its reader goes away."""
+
+    def __init__(self):
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except (BrokenPipeError, ValueError):
+            self.closed = True
+
+    def close(self) -> None:
+        pass
+
+
+def _ts_sink(dest: str, packet_size: int):
+    """--ts-out: UDP, stdout or a file written unbuffered."""
+    if is_udp_url(dest):
+        return UdpOutput(dest, packet_size)
+    if dest == '-':
+        return _StdoutSink()
+    return open(dest, 'wb', buffering=0)
+
+
+class _TsLane:
+    """The one mpeg2ts track a TS run subscribes: its packets to
+    --ts-out as objects arrive or, with --ts-playout, at their PCR
+    times; with --analyze, --ts-playout or --arrival-log, a TsPlayout
+    model of it. When the catalog replaces the track (msfts-02 §6), the
+    lane goes on in the next one once the old one ends (`switches`)."""
+
+    def __init__(self, args):
+        self.args = args
+        self.name: Optional[str] = None
+        self.track = None
+        self.player: Optional[tsplayout.TsPlayout] = None
+        self.sink = None
+        self.objects = 0
+        self.bytes = 0
+        self.packet_size = TS_PACKET
+        self._log = None
+        self._wake = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        self.switches = 0
+        self.stale = 0
+        self._next = None
+        self._parked: list = []
+        self._park_timer = None
+
+    def start(self, entry, track) -> None:
+        args = self.args
+        self.name, self.track = entry.name, track
+        self.packet_size = entry.extra.get('mpeg2tsPacketSize', TS_PACKET)
+        if args.ts_out:
+            self.sink = _ts_sink(args.ts_out, self.packet_size)
+        if args.analyze or args.ts_playout is not None or args.arrival_log:
+            if args.arrival_log:
+                self._log = open(args.arrival_log, 'w')
+            self.player = tsplayout.TsPlayout(
+                args.ts_playout, late=args.ts_late, break_ms=args.break_ms,
+                pcr_pid=entry.extra.get('mpeg2tsPcrPid'),
+                arrival_log=self._log,
+                release=args.ts_playout is not None and self.sink is not None)
+        if self.player is not None and self.player.release:
+            self._task = asyncio.ensure_future(self._play())
+
+    def follow(self, entry, track) -> None:
+        """Go on in `track` (catalog entry `entry`) once the current
+        track ends, or HOLD_S after its first frame."""
+        self._next = (entry, track)
+        old = self.track
+        if old is None or getattr(old, 'ended', True):
+            self._switch()
+        else:
+            old.on_end = self._switch
+
+    def _switch(self) -> None:
+        if self._next is None:
+            return
+        entry, track = self._next
+        self._next = None
+        if self._park_timer is not None:
+            self._park_timer.cancel()
+            self._park_timer = None
+        old = self.track
+        if old is not None:
+            old.on_end = None
+            old.flush()
+        self.name, self.track = entry.name, track
+        self.switches += 1
+        if self.player is not None:
+            self.player.switch()
+        _status(f"  switched to {entry.name}")
+        parked, self._parked = self._parked, []
+        for frame, group_id, object_id in parked:
+            self.on_frame(entry.name, frame, group_id, object_id)
+
+    def _frindell_us(self, frame, group_id, object_id) -> Optional[int]:
+        """The object's draft-frindell time on the publisher's wall
+        clock, µs; None when the track declares none."""
+        timing = getattr(self.track, 'timing', None)
+        if timing is None or not timing.declared:
+            return None
+        try:
+            us, source = capture_time_us(timing, group_id, object_id,
+                                         frame.extensions)
+        except TimestampMalformed:
+            return None
+        return us if source == SOURCE_FRINDELL else None
+
+    def timeline(self, name, records) -> None:
+        if name == self.name and self.player is not None:
+            self.player.timeline(records)
+
+    def on_frame(self, name, frame, group_id, object_id) -> None:
+        if name != self.name:
+            nxt = self._next
+            if nxt is not None and name == nxt[0].name:
+                self._parked.append((frame, group_id, object_id))
+                if self._park_timer is None:
+                    self._park_timer = asyncio.get_running_loop().call_later(
+                        msfts.HOLD_S, self._switch)
+            else:
+                self.stale += 1
+            return
+        payload = frame.payload
+        self.objects += 1
+        self.bytes += len(payload)
+        p = self.player
+        if p is not None:
+            p.push(payload, time.monotonic_ns(), group_id, object_id,
+                   self._frindell_us(frame, group_id, object_id),
+                   time.time_ns())
+            if p.release:
+                self._wake.set()
+                return
+        if self.sink is not None:
+            self.sink.write(payload)
+
+    async def _play(self) -> None:
+        """Release the queued packets as they fall due."""
+        p, sink = self.player, self.sink
+        if p is None or sink is None:
+            return
+        while True:
+            due = p.due()
+            if due is None:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            wait = (due - time.monotonic_ns()) / 1e9
+            if wait > 0.0005:
+                await asyncio.sleep(wait)
+            data = p.pop(time.monotonic_ns() + 500_000)
+            if data:
+                sink.write(data)
+
+    def report(self, kind: str, t0: float, t1: float,
+               final: bool = True) -> dict:
+        """An interval, or the summary: of the run, or with `final`
+        False, of the intervals reported so far."""
+        p = self.player
+        assert p is not None
+        if self.track is not None:
+            p.dups = self.track.order.late
+        body = (p.interval() if kind == 'interval' else
+                p.summary() if final else p.totals())
+        return {"type": kind, "track": self.name, "t0": round(t0, 3),
+                "t1": round(t1, 3), **body}
+
+    def close(self) -> None:
+        sink, p = self.sink, self.player
+        if self._task is not None:
+            self._task.cancel()
+            if sink is not None and p is not None:
+                rest = p.pop(1 << 62)
+                if rest:
+                    sink.write(rest)
+        if sink is not None:
+            sink.close()
+        if self._log is not None:
+            self._log.close()
+
+
+async def _follow_timeline(session, namespace, catalog, lane,
+                           name: str) -> None:
+    """Feed lane the MSF media timeline of track `name`, if the catalog
+    has one (<name>.timeline, from pub_media or moq2ts): the publisher's
+    wall clock per group."""
+    entry = next((t for t in catalog.tracks
+                  if t.packaging == PACKAGING_MEDIA_TIMELINE
+                  and name in (t.depends or ())), None)
+    if entry is None or lane.player is None:
+        return
+
+    def on_object(msg, size, recv_us, group_id, subgroup_id):
+        if getattr(msg, 'status', None) not in (None, 0):
+            return
+        try:
+            records = json.loads(bytes(msg.payload))
+        except ValueError:
+            return
+        if isinstance(records, list):
+            lane.timeline(name, records)
+    track = SubscribedTrack(session, entry.namespace or namespace,
+                            entry.name, on_object=on_object)
+    try:
+        await track.subscribe()
+    except Exception as e:
+        _status(f"  note: media timeline {entry.name}: {e}")
+
+
+class _FrameLog:
+    """--frame-log: a JSON line per LOC frame received."""
+
+    def __init__(self, path: str, subscriber: MediaSubscriber):
+        self.fh = open(path, 'w', buffering=1)
+        self.sub = subscriber
+        self._loc = {}
+
+    def on_arrival(self, name, msg, recv_us, group_id, subgroup_id, frame):
+        if frame is None:
+            return
+        loc = self._loc.get(name)
+        if loc is None:
+            entry = self.sub.catalog.find(name) if self.sub.catalog else None
+            loc = self._loc[name] = (entry is not None
+                                     and entry.packaging == PACKAGING_LOC)
+        if not loc:
+            return
+        payload = frame.payload
+        self.fh.write(json.dumps({
+            'track': name, 'group': group_id, 'object': msg.object_id,
+            'key': frame.key_frame, 'size': len(payload),
+            'sha1': hashlib.sha1(payload).hexdigest(),
+            'arrival_ns': time.time_ns()}, separators=(',', ':')) + '\n')
+
+    def close(self) -> None:
+        self.fh.close()
+
+
+def _ts_out_track(args, catalog):
+    """The catalog track --ts-out writes, or None with why not."""
+    tracks = [t for t in catalog.tracks if args.trackname is None
+              or t.name == args.trackname]
+    ts = [t for t in tracks if t.packaging == PACKAGING_MPEG2TS]
+    if len(ts) == 1:
+        if ts[0].extra.get('mpeg2tsMode') == MODE_ES_PACKETS:
+            return None, (f"track '{ts[0].name}' is es-packets, one PID; "
+                          f"--ts-out needs a program or a multiplex")
+        return ts[0], None
+    if ts:
+        return None, (f"several mpeg2ts tracks "
+                      f"({', '.join(t.name for t in ts)}); pick one with -T")
+    if args.trackname is not None and tracks:
+        return None, (f"track '{args.trackname}' is {tracks[0].packaging}, "
+                      f"not mpeg2ts")
+    return None, ("no mpeg2ts track"
+                  + (f" named '{args.trackname}'" if args.trackname else "")
+                  + " in the catalog (tracks: "
+                  + ', '.join(f'{t.name} {t.packaging}'
+                              for t in catalog.tracks) + ")")
 
 
 def _timestamp_policy(args) -> str:
@@ -382,13 +747,15 @@ async def _analyze(args, analysis: MediaAnalysis, closed, report) -> None:
             report[0].flush()
 
 
-def _open_report(path):
-    """(file, csv writer) with the header written; `-` is stdout."""
+def _open_report(path, csv_header: bool = True):
+    """(file, csv writer) with the header written; `-` is stdout. An
+    mpeg2ts track's report is JSON lines, no header."""
     if not path:
         return None
     fh = sys.stdout if path == '-' else open(path, 'w', newline='')
     w = csv.writer(fh)
-    w.writerow((*CSV_FIELDS, *CPU_FIELDS))
+    if csv_header:
+        w.writerow((*CSV_FIELDS, *CPU_FIELDS))
     return fh, w
 
 
@@ -415,15 +782,66 @@ def _finish_analysis(analysis: MediaAnalysis, start_us: int, end_us: int,
     return 0
 
 
+def _ts_forced(args) -> bool:
+    """A flag that only an mpeg2ts track serves."""
+    return bool(args.ts_out or args.ts_playout is not None
+                or args.arrival_log)
+
+
+async def _ts_run(args, lane: _TsLane, closed, report) -> None:
+    """--analyze on an mpeg2ts track: a JSON line per -i interval and the
+    summary so far, then the run's summary; else wait for the run to
+    end."""
+    out = report[0] if report else sys.stdout
+    start = time.monotonic()
+    end = start + args.duration if args.duration else math.inf
+    k = 0
+    last = 0.0
+    try:
+        while not closed.done() and time.monotonic() < end:
+            if lane.sink is not None and getattr(lane.sink, 'closed', False):
+                break
+            k += 1
+            due = min(start + k * args.interval, end)
+            await asyncio.wait([closed],
+                               timeout=max(0.0, due - time.monotonic()))
+            now = time.monotonic() - start
+            if lane.player is not None and args.analyze:
+                print(json.dumps(lane.report('interval', last, now)),
+                      file=out)
+                print(json.dumps(lane.report('summary', 0.0, now, False)),
+                      file=out, flush=True)
+            last = now
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+    if lane.player is not None and args.analyze:
+        if lane.track is not None:
+            lane.track.flush()
+        now = time.monotonic() - start
+        if now - last > 0.001:
+            print(json.dumps(lane.report('interval', last, now)),
+                  file=out, flush=True)
+        print(json.dumps(lane.report('summary', 0.0, now)), file=out,
+              flush=True)
+    if report and report[0] is not sys.stdout:
+        report[0].close()
+
+
 async def run(args):
     _cli.apply_logging(args)
     relay = parse_relay_url(args.url)
-    if not args.analyze:
+    # True: the mpeg2ts track only; None: decided by the catalog.
+    ts_mode = True if _ts_forced(args) else None if args.analyze else False
+    if not args.analyze and not ts_mode:
         os.makedirs(args.out, exist_ok=True)
     analysis = (MediaAnalysis(cushion_ms=args.target_latency)
                 if args.analyze else None)
-    report = _open_report(args.report)
+    report = None
     inspector = _Inspector(args.inspect) if args.inspect else None
+    frame_log = None
+    lane = _TsLane(args)
     sub = None
 
     def _timing_of(name):
@@ -447,25 +865,74 @@ async def run(args):
         await session.client_session_init()
 
         def _select(entry):
-            if not _wanted(args, entry):
+            nonlocal ts_mode
+            if not _wanted(args, entry) or sub is None:
                 return False
+            ts_entry = _ts_out_track(args, sub.catalog)[0]
+            if ts_mode is None:
+                ts_mode = ts_entry is not None
+            if ts_mode:
+                return ts_entry is entry
             if analysis is not None:
                 _register(analysis, sub.catalog, entry)
             return True
+
+        def _on_frame(name, frame, group_id, object_id):
+            if ts_mode:
+                lane.on_frame(name, frame, group_id, object_id)
+            elif writers is not None:
+                writers.on_frame(name, frame, group_id, object_id)
+
+        def _analysis_arrival(*a):
+            if analysis is not None and not ts_mode:
+                analysis.on_arrival(*a)
+
+        following = set()
+
+        async def _switch_to(entry):
+            if sub is None:
+                return
+            # A name the stream comes back to: its old track has ended.
+            old = sub.tracks.get(entry.name)
+            if old is not None and getattr(old, 'ended', False):
+                sub.tracks.pop(entry.name)
+            try:
+                track = await sub.subscribe_track(entry)
+            except Exception as e:
+                _status(f"  error: {entry.name}: {e}")
+                return
+            finally:
+                following.discard(entry.name)
+            if track is not None:
+                lane.follow(entry, track)
+                await _follow_timeline(session, args.namespace, sub.catalog,
+                                       lane, entry.name)
+
+        def _on_catalog(catalog):
+            if args.show_catalog:
+                _status(catalog.to_json(indent=2))
+            if not ts_mode or lane.track is None or sub is None:
+                return
+            entry = _ts_out_track(args, catalog)[0]
+            if (entry is not None and entry.name != lane.name
+                    and entry.name not in following):
+                following.add(entry.name)
+                asyncio.ensure_future(_switch_to(entry))
 
         sub = MediaSubscriber(
             session, args.namespace, discover=args.discover,
             track_filter=_select,
             timestamp_errors=_timestamp_policy(args),
-            on_catalog=((lambda c: _status(c.to_json(indent=2)))
-                        if args.show_catalog else None))
-        writers = (None if args.analyze
+            on_catalog=_on_catalog)
+        writers = (None if args.analyze or ts_mode
                    else _Writers(args.out, sub, pipe_role=args.pipe,
                                  wanted=functools.partial(_wanted, args)))
-        if writers is not None:
-            sub.on_frame = writers.on_frame
+        sub.on_frame = _on_frame
+        if args.frame_log:
+            frame_log = _FrameLog(args.frame_log, sub)
         sub.on_arrival = _fan(inspector and inspector.on_arrival,
-                              analysis and analysis.on_arrival)
+                              analysis and _analysis_arrival,
+                              frame_log and frame_log.on_arrival)
         try:
             catalog = await sub.start(timeout=_cli.setup_timeout(args))
         except MOQTRequestError as e:
@@ -478,6 +945,15 @@ async def run(args):
                     f"{_cli.setup_timeout(args)}s")
             sys.exit(2)
         _status(f"  catalog: {[t.name for t in catalog.tracks]}")
+        if ts_mode and not sub.tracks:
+            entry, why = _ts_out_track(args, catalog)
+            flag = '--ts-out' if args.ts_out else (
+                '--ts-playout' if args.ts_playout is not None
+                else '--arrival-log')
+            _status(f"  error: {flag}: " + (
+                why or f"track '{entry.name}' was not subscribed: its "
+                       f"MSFTS fields are invalid"))
+            sys.exit(2)
         if not sub.tracks:
             _status("  error: no media catalog track"
                     + (f" named '{args.trackname}'" if args.trackname
@@ -485,6 +961,12 @@ async def run(args):
                     + (f" of packaging {args.packaging}" if args.packaging
                        else ""))
             sys.exit(2)
+        report = _open_report(args.report, csv_header=not ts_mode)
+        if ts_mode:
+            entry = _ts_out_track(args, catalog)[0]
+            lane.start(entry, sub.tracks[entry.name])
+            await _follow_timeline(session, args.namespace, catalog, lane,
+                                   entry.name)
         if args.pipe == 'audio':
             a = catalog.find('audio')
             if a and (a.codec or '').startswith('mp4a'):
@@ -500,7 +982,9 @@ async def run(args):
                     "-flags low_delay -probesize 32 -f h264 -i -")
         closed = asyncio.ensure_future(session.async_closed())
         try:
-            if analysis is not None:
+            if ts_mode:
+                await _ts_run(args, lane, closed, report)
+            elif analysis is not None:
                 start_us = _now_us()
                 analysis.start(start_us)
                 try:
@@ -524,13 +1008,22 @@ async def run(args):
         finally:
             if not closed.done():
                 closed.cancel()
+            for track in sub.tracks.values():
+                if isinstance(track, MsftsTrackSubscriber):
+                    track.flush()
             if writers is not None:
                 writers.close()
+            lane.close()
+            if frame_log is not None:
+                frame_log.close()
+    if ts_mode:
+        return _ts_status(args, lane)
     if writers is None:
         return rc
     for name in sorted(set(writers.counts) | set(sub.tracks)):
         line = f"  {name}: {writers.counts.get(name, 0)} frames"
-        rejected = getattr(sub.tracks.get(name), 'objects_rejected', None)
+        track = sub.tracks.get(name)
+        rejected = getattr(track, 'objects_rejected', None)
         if rejected is not None:
             line += f", {rejected} rejected"
         _status(line)
@@ -542,14 +1035,52 @@ async def run(args):
         files += [os.path.basename(fh.name)
                   for fh in writers.cmaf.values()
                   if fh is not sys.stdout.buffer]
+        files += [os.path.basename(fh.name) for fh in writers.ts.values()]
         _status(f"  wrote {args.out}/{{{', '.join(files)}}} — "
                 f"play each with ffplay")
+    return rc
+
+
+def _ts_status(args, lane: _TsLane) -> int:
+    """The TS run's last lines; 1 when no object arrived."""
+    track = lane.track
+    line = (f"  {lane.name}: {lane.objects} objects, "
+            f"{lane.bytes // lane.packet_size} packets")
+    if track is not None:
+        line += (f", {track.objects_rejected} rejected, "
+                 f"{track.order.late} late, {track.order.skipped} skipped")
+    if lane.switches:
+        line += f", {lane.switches} track switches"
+    p = lane.player
+    if p is not None and p.model is not None:
+        line += (f"; playout {p.buffer_ms} ms: {p.model.late} late, "
+                 f"{p.model.breaks} breaks")
+    _status(line)
+    if args.ts_out:
+        _status(f"  wrote {args.ts_out}")
+    if not lane.objects:
+        _status(f"  FAIL: no objects delivered on {lane.name or 'any track'}")
+        return 1
+    return 0
+
+
+async def _main(args):
+    """run() as the program: SIGTERM stops it as Ctrl-C does, so the
+    summaries still print."""
+    task = asyncio.current_task()
+    try:
+        if task is not None:
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, task.cancel)
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass
+    return await run(args)
 
 
 def main():
     try:
-        sys.exit(_cli.run(run(parse_args())))
-    except KeyboardInterrupt:
+        sys.exit(_cli.run(_main(parse_args())))
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 
 

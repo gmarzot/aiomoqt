@@ -1,9 +1,10 @@
-"""moq-peering track hashes and node ids.
+"""moq-fabric track hashes and node ids.
 
 city64 is Google CityHash64 v1.1 with every 32- and 64-bit fetch loaded
-big-endian, as moq-peering's cityhash.h does (it matches libquicr), so it
+big-endian, as moq-fabric's cityhash.h does (it matches libquicr), so it
 differs from Google's for inputs longer than 3 bytes. The namespace hash
-covers the tuples concatenated without delimiters.
+chains the tuples: city64 of the first, then city64 of the previous hash
+(8 bytes, big-endian) followed by the next tuple.
 """
 import secrets
 from typing import NamedTuple, Sequence
@@ -105,7 +106,7 @@ def _len33to64(s: bytes) -> int:
 
 
 def city64(data: bytes) -> int:
-    """moq-peering's CityHash64 of data."""
+    """moq-fabric's CityHash64 of data."""
     s = bytes(data)
     n = len(s)
     if n <= 16:
@@ -149,10 +150,19 @@ class TrackHashes(NamedTuple):
     fullname: int
 
 
+def namespace_hash(namespace: Sequence[bytes]) -> int:
+    if not namespace:
+        return city64(b"")
+    h = city64(bytes(namespace[0]))
+    for t in namespace[1:]:
+        h = city64(h.to_bytes(8, "big") + bytes(t))
+    return h
+
+
 def track_hashes(namespace: Sequence[bytes], name: bytes = b"") -> TrackHashes:
-    """The three hashes moq-peering carries for a track; a namespace
+    """The three hashes moq-fabric carries for a track; a namespace
     announce has an empty name."""
-    ns = city64(b"".join(bytes(t) for t in namespace))
+    ns = namespace_hash(namespace)
     nm = city64(name)
     return TrackHashes(ns, nm, hash_combine(hash_combine(0, ns), nm))
 

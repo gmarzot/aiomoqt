@@ -1,4 +1,4 @@
-"""moq-peering wire codec, as Quicr/moq-peering d0bfdc9 sends and accepts it.
+"""moq-fabric wire codec, as Quicr/moq-fabric f10e8bc5 sends and accepts it.
 
 Sans-I/O. Fixed-width integers are big-endian, except NodeInfo path items:
 the library memcpy's those in host order, little-endian on every platform
@@ -11,7 +11,7 @@ from enum import IntEnum
 from typing import (List, Literal, NamedTuple, Optional, Sequence, Tuple,
                     Union, overload)
 
-ALPN = "moq-peering"
+ALPN = "moq-fabric"
 DEFAULT_PORT = 33434
 PROTOCOL_VERSION = 1
 HEADER_SIZE = 7
@@ -64,7 +64,7 @@ class DataType(IntEnum):
 
 
 class WireError(ValueError):
-    """Malformed moq-peering bytes."""
+    """Malformed moq-fabric bytes."""
 
 
 _U64 = (1 << 64) - 1

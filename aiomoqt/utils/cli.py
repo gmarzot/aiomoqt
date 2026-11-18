@@ -28,6 +28,8 @@ addressing
   --bind, -p/--port, --path      listener address. The path is shared by
                      both transports: WT CONNECT path / raw-QUIC PATH
                      setup parameter.
+  udp://[@][HOST]:PORT  MPEG-TS in or out (pub_media --ts, sub_media
+                     --ts-out), not a MoQT address: no grid flag takes it.
 
 identity          -N/--namespace  -T/--trackname
 publisher media   -s/--object-size -g/--group-size -P/--streams
@@ -49,8 +51,8 @@ fetch history     --fetch-history (long only)
 compat            --compat
 payload check     --verify-payload [N] (long only)
 peering           --peer HOST[:PORT] (repeatable) --bind -p/--port
-                  --node-id --node-metric --cert --key: a moq-peering
-                  fabric node. Dials raw QUIC, ALPN moq-peering; no -k,
+                  --node-id --node-metric --cert --key: a moq-fabric
+                  fabric node. Dials raw QUIC, ALPN moq-fabric; no -k,
                   peering never verifies certificates
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 entry point       run(main) in place of asyncio.run: Ctrl-C reaches the
@@ -582,10 +584,10 @@ def peer_address(value):
 
 
 def add_peering(p, port=PEERING_PORT):
-    """moq-peering fabric node: peers to dial, listener, identity."""
+    """moq-fabric mesh node: peers to dial, listener, identity."""
     p.add_argument('--peer', action='append', type=peer_address,
                    default=None, metavar='HOST[:PORT]',
-                   help=f'Peer to dial, raw QUIC (ALPN moq-peering); '
+                   help=f'Peer to dial, raw QUIC (ALPN moq-fabric); '
                         f'repeatable. Re-dialed after a close. Default '
                         f'port {PEERING_PORT}')
     p.add_argument('--bind', type=str, default=None,
