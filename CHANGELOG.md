@@ -2,6 +2,8 @@
 
 ## v0.15.0 (unreleased)
 
+- A `PublishedTrack`'s `object_delivery_timeout` and `subgroup_delivery_timeout` go out as Track Properties (OBJECT_DELIVERY_TIMEOUT, and SUBGROUP_DELIVERY_TIMEOUT on d18+) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and REQUEST_OK; they were enforced but not announced. A PER_OBJECT object past its delivery timeout is dropped alone instead of with the rest of its group.
+- `pub_media --delivery-timeout MS` sets both delivery timeouts on every media track.
 - Logging: once a track is found malformed, its later streams are refused at DEBUG (the first ERROR line stays); the "at or past end of group" reason names what ended the group, an END_OF_GROUP object or a stream header's END_OF_GROUP bit with the header byte; aiomoqt-relay logs a PUBLISH_DONE it cannot send to a closing session at DEBUG instead of a WARNING with a traceback.
 - aiomoqt-relay takes every further publisher of a track as a copy (d22 §7.3): a Location it already holds is dropped wherever the publisher's numbering sits, so a standby several groups behind no longer supersedes the track. A copy of Object 0 differing in size from the one taken is logged once per publisher, not acted on.
 - Release images: `ghcr.io/gmarzot/aiomoqt:interop` is the highest release, pre-releases included, and the interop runner tracks it; `:latest` is the highest stable release, and a patch to an older line no longer moves it.

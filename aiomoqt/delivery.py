@@ -898,8 +898,10 @@ class SubgroupDelivery:
     def expire(self, group_id: int) -> bool:
         """§8: an object past the delivery timeout is dropped; on a
         stream, its subgroup is reset with DELIVERY_TIMEOUT and not
-        reopened. True when the rest of the group is skipped."""
-        if self.mapping is StreamMapping.DATAGRAM:
+        reopened. True when the rest of the group, its one subgroup
+        under PER_GROUP, is skipped; a PER_OBJECT object is its own
+        subgroup, so only it is dropped."""
+        if self.mapping is not StreamMapping.PER_GROUP:
             return False
         if self.open_group == group_id:
             self.reset_group(StreamResetCode.DELIVERY_TIMEOUT)

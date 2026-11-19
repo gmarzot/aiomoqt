@@ -3,7 +3,9 @@ than the subscription's timeout is not sent. On a stream its subgroup is
 reset with DELIVERY_TIMEOUT (0x2) and not reopened; a datagram is
 dropped."""
 import asyncio
+import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +14,8 @@ from aiomoqt.context import profile_for
 from aiomoqt.delivery import (FanoutDelivery, OBJECT_RECORD_BYTES,
                               StreamMapping, SubgroupDelivery)
 from aiomoqt.server import MOQTServer
-from aiomoqt.track import PublishedTrack, _Subscription, _min_nonzero
+from aiomoqt.track import (PublishedTrack, _Subscription, _min_nonzero,
+                           _reply_properties)
 from aiomoqt.types import MOQTMessageType, StreamResetCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -130,6 +133,53 @@ async def test_no_timeout_sends_everything():
     assert delivery.largest == (0, 1)
 
 
+async def test_a_late_per_object_object_drops_only_itself():
+    session, delivery, lane = await _run_lane(
+        StreamMapping.PER_OBJECT,
+        [(0, 0, 0.0), (0, 1, 0.3), (0, 2, 0.0), (0, 3, 0.0)], 0.1)
+    # Each object is its own subgroup: the rest of the group still goes.
+    assert lane.expired == 1 and session.resets == []
+    assert len(session.fins) == 3
+    assert delivery.objects_sent == 3 and delivery.largest == (0, 3)
+
+
+_TIMEOUT_PROPS = (0x02, 0x06)
+
+
+@pytest.mark.parametrize("draft, timeouts, want", [
+    (14, (200, 50), None),
+    (16, (200, 50), {0x02: 200}),
+    (18, (200, 50), {0x02: 200, 0x06: 50}),
+    (20, (200, 50), {0x02: 200, 0x06: 50}),
+    (20, (0, 50), {0x06: 50}),
+    (20, (0, 0), {}),
+])
+def test_track_properties_carry_the_timeouts(draft, timeouts, want):
+    t = PublishedTrack(None, "ns", "t")
+    t.object_delivery_timeout, t.subgroup_delivery_timeout = timeouts
+    props = t._track_properties(SimpleNamespace(_profile=profile_for(draft)))
+    if want is None:
+        assert props is None
+    else:
+        assert {k: v for k, v in (props or {}).items()
+                if k in _TIMEOUT_PROPS} == want
+
+
+@pytest.mark.parametrize("argv, want", [([], 0),
+                                         (["--delivery-timeout", "250"], 250)])
+def test_pub_media_delivery_timeout(monkeypatch, argv, want):
+    from aiomoqt.tools import pub_media
+    monkeypatch.setattr(sys, "argv",
+                        ["pub_media", "moqt://localhost:4433", *argv])
+    args = pub_media.parse_args()
+    assert args.delivery_timeout == want
+    pub = pub_media._Publisher([], "ns", None)
+    pub.delivery_timeout = args.delivery_timeout
+    track = pub.add_track(PublishedTrack(None, "ns", "video"))
+    assert (track.object_delivery_timeout,
+            track.subgroup_delivery_timeout) == (want, want)
+
+
 # -- loopback: two tracks on one session, one with a timeout ----------
 
 _DRAFTS = [16, 18, 20]
@@ -242,3 +292,74 @@ async def test_late_objects_reset_the_subgroup(draft, use_quic):
         assert ids == list(range(len(ids)))
     # Production after the stall reaches the timed subscriber again.
     assert max(g for g, _ in got["timed"]) == _GROUPS - 1
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("draft", [18, 20])
+async def test_track_property_timeouts_reset_the_subgroup(draft, use_quic):
+    """The publisher's own timeouts, announced as Track Properties, time
+    out one track's subgroups; the other track, with longer ones, loses
+    nothing."""
+    port = 16730 + 2 * (draft == 20) + (0 if use_quic else 1)
+    server = MOQTServer(host="localhost", port=port, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=use_quic,
+                        supported_drafts=draft)
+    rx = {}
+
+    async def on_publish_namespace(session, msg):
+        rx["session"] = session
+        session.publish_namespace_ok(msg)
+    server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
+                            on_publish_namespace)
+    quic_server = await server.serve()
+    timeouts = {"timed": (100, 300), "patient": (60_000, 60_000)}
+    got = {name: [] for name in timeouts}
+    resets = {name: [] for name in timeouts}
+    props = {}
+    try:
+        client = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                            verify_tls=False, supported_drafts=draft)
+        async with client.connect() as session:
+            await session.client_session_init()
+            for name, (obj_ms, sg_ms) in timeouts.items():
+                track = _Paced(session, _NS, name, object_size=50)
+                track.object_delivery_timeout = obj_ms
+                track.subgroup_delivery_timeout = sg_ms
+                track.attach()
+            await session.publish_namespace(namespace=_NS,
+                                            wait_response=True)
+            _stall_once(session, after=12, seconds=0.3)
+            sub = rx["session"]
+            for name in timeouts:
+                def on_object(obj, _n, _t, group_id, *_, name=name):
+                    if obj.payload:
+                        got[name].append((group_id, obj.object_id))
+                ok = await sub.subscribe(_NS, name, forward=1,
+                                         on_object=on_object,
+                                         wait_response=True)
+                props[name] = dict(_reply_properties(ok) or {})
+                sub.register_stream_end_handler(
+                    ok.track_alias,
+                    lambda g, s, clean, reset_code, name=name:
+                        resets[name].append((g, clean, reset_code)))
+            total = _GROUPS * _PER_GROUP
+            for _ in range(300):
+                if len(got["patient"]) >= total:
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.1)
+    finally:
+        quic_server.close()
+
+    for name, (obj_ms, sg_ms) in timeouts.items():
+        assert props[name].get(0x02) == obj_ms, props[name]
+        assert props[name].get(0x06) == sg_ms, props[name]
+    assert len(got["patient"]) == _GROUPS * _PER_GROUP
+    assert all(code != StreamResetCode.DELIVERY_TIMEOUT
+               for _, _, code in resets["patient"])
+    timed_out = [g for g, clean, code in resets["timed"]
+                 if not clean and code == StreamResetCode.DELIVERY_TIMEOUT]
+    assert timed_out, resets["timed"]
+    assert len(got["timed"]) < len(got["patient"])

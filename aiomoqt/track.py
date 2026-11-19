@@ -1103,6 +1103,10 @@ class PublishedTrack(Track):
             return None
         props = dict(self.track_properties or ())
         props.update(self._timing_properties(session._profile.vi64))
+        if self.object_delivery_timeout:
+            props[ParamType.DELIVERY_TIMEOUT] = self.object_delivery_timeout
+        if self.subgroup_delivery_timeout and session._profile.vi64:
+            props[SUBGROUP_DELIVERY_TIMEOUT] = self.subgroup_delivery_timeout
         if self.immutable_properties:
             buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
             MOQTMessage._extensions_encode(buf, self.immutable_properties,

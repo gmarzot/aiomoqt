@@ -10,7 +10,7 @@ import pytest
 
 from aiomoqt.context import canonical_stream_reset
 from aiomoqt.tools import moq_interop_relay as relay
-from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.track import PublishedTrack, SubscribedTrack, _reply_properties
 from aiomoqt.types import ParamType, StreamResetCode
 
 from aiomoqt.tests._certs import requires_certs
@@ -285,3 +285,64 @@ async def test_subscribe_and_update_set_the_timeout(
     assert subs["video"].count and subs["audio"].count
     assert StreamResetCode.DELIVERY_TIMEOUT in resets, resets
     assert StreamResetCode.CANCELLED not in resets, resets
+
+
+class _Origin(PublishedTrack):
+    """A publisher recording the SUBSCRIBE parameters it receives."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.params = []
+
+    def _take_timeouts(self, sub, params, prof):
+        self.params.append(dict(params or {}))
+        super()._take_timeouts(sub, params, prof)
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 20])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_subscriber_timeouts_stay_at_the_relay(
+        use_quic, draft, relay_tables, lag):
+    """§10.2.3-10.2.4: each subscriber's timeouts apply to its own lane,
+    the smaller non-zero of its and the publisher's; none go upstream.
+    The publisher's Track Properties reach the subscribers."""
+    lag(0)
+    port = _BASE_PORT + 70 + 4 * (draft == 20) + 2 * (not use_quic)
+    pub_ms = {"video": 3000, "audio": 0}
+    async with _relay(port, use_quic, draft) as connect:
+        pub = await connect()
+        origins = {}
+        for name, ms in pub_ms.items():
+            origins[name] = _Origin(pub, namespace=_NS, trackname=name,
+                                    object_size=500, group_size=_GROUP,
+                                    rate=_RATE)
+            origins[name].object_delivery_timeout = ms
+            origins[name].attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        viewers = [await connect() for _ in range(2)]
+        props = {}
+        for name in pub_ms:
+            for i, viewer in enumerate(viewers):
+                ok = await viewer.subscribe(
+                    namespace=_NS, track_name=name, wait_response=True,
+                    parameters={ParamType.DELIVERY_TIMEOUT: 1000 * (i + 1),
+                                0x06: 500},
+                    on_object=lambda *_: None)
+                props[(i, name)] = dict(_reply_properties(ok) or {})
+        keys = {n: (relay._ns_tuple(_NS), n.encode()) for n in pub_ms}
+        await asyncio.sleep(0.3)
+        # Downstreams in subscription order: viewer 0, then viewer 1.
+        deadlines = {(i, n): d.lane.deadline for n, k in keys.items()
+                     for i, d in enumerate(relay._tracks[k].downstream)}
+
+    assert deadlines == {(0, "video"): 1.0, (1, "video"): 2.0,
+                         (0, "audio"): 1.0, (1, "audio"): 2.0}
+    for (i, name), p in props.items():
+        assert p.get(int(ParamType.DELIVERY_TIMEOUT)) == (pub_ms[name]
+                                                          or None), p
+    for o in origins.values():
+        assert o.params, "no upstream SUBSCRIBE"
+        for params in o.params:
+            assert ParamType.DELIVERY_TIMEOUT not in params, params
+            assert 0x06 not in params, params
