@@ -74,7 +74,8 @@ Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
 
 moq-fabric (--peer, --peer-port): the relay is also a fabric node, on its
-own UDP port. A track the fabric announces is pulled from it when no
+own UDP port, forwarding for other nodes. A track the fabric announces
+is pulled from it when no
 local publisher serves it, its objects deduplicated by Location; local
 PUBLISH_NAMESPACEs and PUBLISHes are announced into the fabric, and a
 fabric subscribe to one is served from local publishers only. The fabric
@@ -7531,11 +7532,23 @@ class _Fabric:
         self.metrics[(host, port)] = metric
         peer_log.info(f"peering: peer {_addr_text(host, port)} session "
                       f"metric {metric}")
+        self._apply_metrics()
         return True
+
+    def _apply_metrics(self) -> None:
+        """Each live session of a peer with a set metric takes it."""
+        node = self.node
+        for s in node.connected():
+            metric = self.metrics.get(_split_addr(s.peer))
+            if (metric is not None
+                    and node._session_metric.get(s.id) != metric):
+                node.set_session_metric(s.id, metric)
 
     async def _sample(self) -> None:
         while True:
             await asyncio.sleep(FABRIC_SAMPLE_S)
+            if self.metrics:
+                self._apply_metrics()
             for sid, proto in list(self.node._protocols.items()):
                 self._pq[sid] = _path_quality(proto)
             for sid in [sid for sid in self._pq
@@ -7626,6 +7639,18 @@ class _Fabric:
         return rows
 
     def _node_rows(self) -> list:
+        node = self.node
+        if node.transit is not None:
+            rows = []
+            for n, sid, info in sorted(node.transit.routes()):
+                s = node.sessions.get(sid)
+                cost = node._session_cost(s) if s is not None else 0
+                rows.append({"node_id": node_id_format(n),
+                             "contact": info.contact,
+                             "best_peer": s.peer if s is not None else None,
+                             "path_metric": info.sum_metric() + cost,
+                             "hops": len(info.path) + 1})
+            return rows
         best: dict = {}
         for s, rec in self.node.learned_nodes():
             if s.state != "connected":
@@ -7638,6 +7663,31 @@ class _Fabric:
                  "best_peer": s.peer, "path_metric": body.sum_metric(),
                  "hops": len(body.path) + 1}
                 for n, (s, body) in sorted(best.items())]
+
+    def _transit_rows(self) -> list:
+        """One row per ingress SNS and track hash it carried (None before
+        its first data)."""
+        node = self.node
+        if node.transit is None:
+            return []
+        rows = []
+        for ing in list(node.transit.ingress.values()):
+            s = node.sessions.get(ing.session_id)
+            egress = []
+            for sid, eg in ing.egress.items():
+                out = node.sessions.get(sid)
+                egress.append({
+                    "peer": out.peer if out is not None else None,
+                    "sns_id": eg.sns.sns_id,
+                    "nodes": [node_id_format(n) for n in eg.sns.nodes]})
+            for h in sorted(ing.hashes) or [None]:
+                rows.append({
+                    "fullname_hash": None if h is None else f"0x{h:016x}",
+                    "ingress": s.peer if s is not None else None,
+                    "sns_id": ing.sns.sns_id, "local": ing.local,
+                    "egress": egress, "streams": ing.streams,
+                    "bytes": ing.bytes})
+        return rows
 
     def report(self) -> dict:
         node = self.node
@@ -7670,7 +7720,7 @@ class _Fabric:
                             "source": node_id_format(s.source),
                             "fullname_hash": f"0x{s.fullname_hash:016x}"}
                            for s in subs],
-            "transit": [],
+            "transit": self._transit_rows(),
             "tracks": tracks,
         }
 
@@ -7685,7 +7735,8 @@ async def _start_fabric(*, peers=(), port=FABRIC_PORT, bind=None,
     node_kw.setdefault("redial_interval", FABRIC_REDIAL_S)
     node = FabricNode(node_id=node_id, label=label, metric=metric,
                       node_type=NodeType.EDGE, peers=peers, bind=bind,
-                      port=port, cert=cert, key=key, **node_kw)
+                      port=port, cert=cert, key=key, transit=True,
+                      **node_kw)
     fabric = _Fabric(node)
     _fabric = fabric
     try:

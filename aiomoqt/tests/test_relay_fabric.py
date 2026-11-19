@@ -3,9 +3,10 @@ subscribers at d18, d20 and d22 over raw QUIC and WebTransport, two
 tracks on one session; local publishers (PUBLISH and namespace-only) to a
 fabric subscriber; the fabric subscribe withdrawn at --pause-after and
 re-advertised; a fabric withdraw ending the track downstream; a dropped
-peer redialed; a stuck fabric hop not stalling local viewers; GET
-/fabric and POST /fabric/peer. Every case counts objects and
-duplicates."""
+peer redialed; a stuck fabric hop not stalling local viewers; transit
+to a far node beside the relay's own viewers, each leaving without loss
+to the other; GET /fabric and POST /fabric/peer. Every case counts
+objects and duplicates."""
 import asyncio
 import contextlib
 import json
@@ -468,7 +469,10 @@ async def test_control_get_fabric_and_post_peer(tmp_path):
                 (sub,) = rep["subscribes"]
                 assert sub["source"] == rep["node_id"]
                 assert sub["fullname_hash"].startswith("0x")
-                assert rep["transit"] == []
+                (tr,) = rep["transit"]
+                assert tr["local"] and tr["egress"] == []
+                assert tr["fullname_hash"] == sub["fullname_hash"]
+                assert tr["streams"] > 0 and tr["bytes"] > 0
                 assert rep["tracks"] == [{
                     "namespace": NS, "name": "video", "local_viewers": 1,
                     "fabric": "subscribed"}]
@@ -489,8 +493,8 @@ async def test_control_get_fabric_and_post_peer(tmp_path):
                 assert dialed()[0]["metric"] == 9
                 assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
                                     + q))[0] == 200
-                await _until(lambda: not b.connected())
-                assert all(r["status"] == "closed" for r in dialed())
+                await _until(lambda: not b.connected() and all(
+                    r["status"] == "closed" for r in dialed()))
                 assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
                                     + q))[0] == 404
                 assert (await _http(sock, "POST", "/fabric/peer?op=metric&"
@@ -503,3 +507,77 @@ async def test_control_get_fabric_and_post_peer(tmp_path):
                 _complete(viewer.got["video"])
     finally:
         server.close()
+
+
+# -- transit beside the relay's own viewers -----------------------------
+
+@contextlib.asynccontextmanager
+async def _via(case):
+    """pub -- relay -- far, the relay forwarding; yields (fabric,
+    connect, pub, far, the publisher's video track, its feeder)."""
+    port, fport = _PORT + case, _FABRIC_PORT + case
+    async with _relay(port, fabric_port=fport) as (fabric, connect):
+        pub = _pub_node(fport)
+        far = FabricNode(label="far", peers=[("127.0.0.1", fport)],
+                         redial_interval=0.2)
+        async with pub, far:
+            await _until(lambda: pub.connected() and far.connected()
+                         and len(fabric.node.connected()) == 2)
+            video = pub.publish(NS, "video")
+            await _until(lambda: fabric.covers(NS_T, b"video") and any(
+                a.name == b"video" for a in far.remote_announces()))
+            feeder = _Feeder({"video": video})
+            try:
+                yield fabric, connect, pub, far, video, feeder
+            finally:
+                await feeder.stop()
+
+
+def _transit_row(fabric):
+    rows = fabric.report()["transit"]
+    return rows[0] if len(rows) == 1 else None
+
+
+@pytest.mark.asyncio
+async def test_a_local_viewer_comes_and_goes_while_the_relay_transits(
+        monkeypatch):
+    monkeypatch.setattr(relay, "_pause_after", 0.3)
+    async with _via(50) as (fabric, connect, pub, far, video, feeder):
+        far_sink = _Sink()
+        far.pull(NS, "video", far_sink)
+        await _until(lambda: len(far_sink.got) > 20)
+        row = _transit_row(fabric)
+        assert row is not None and not row["local"]
+        (eg,) = row["egress"]
+        assert eg["nodes"] == [relay.node_id_format(far.node_id)]
+        viewer = _Viewer(await connect(), names=("video",))
+        sub = await viewer.subscribe("video")
+        await _until(lambda: len(viewer.got["video"]) > 20)
+        assert _transit_row(fabric)["local"]
+        sub.unsubscribe()
+        await _until(lambda: not fabric.node.subscribed(NS_T, b"video"))
+        await _until(lambda: not _transit_row(fabric)["local"])
+        n = len(far_sink.got)
+        await _until(lambda: len(far_sink.got) > n + 20)
+        _complete(viewer.got["video"])
+        _complete(far_sink.got)
+
+
+@pytest.mark.asyncio
+async def test_a_far_subscriber_leaves_while_the_relay_keeps_its_feed():
+    async with _via(52) as (fabric, connect, pub, far, video, feeder):
+        viewer = _Viewer(await connect(), names=("video",))
+        await viewer.subscribe("video")
+        await _until(lambda: len(viewer.got["video"]) > 20)
+        far_sink = _Sink()
+        far.pull(NS, "video", far_sink)
+        await _until(lambda: len(far_sink.got) > 20)
+        row = _transit_row(fabric)
+        assert row["local"] and len(row["egress"]) == 1
+        far.unpull(NS, "video")
+        await _until(lambda: not _transit_row(fabric)["egress"])
+        n = len(viewer.got["video"])
+        await _until(lambda: len(viewer.got["video"]) > n + 20)
+        _complete(viewer.got["video"])
+        _complete(far_sink.got)
+        assert viewer.done["video"] is None
