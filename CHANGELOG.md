@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay: a track closed while its publisher's PUBLISH_DONE was held for streams (its publisher's session closed) cancels the hold, instead of keeping the closed track for TERMINAL_GRACE_S and logging "released on grace"; its subscribers get the publisher's status and reason.
 - `sub_media -Q/-W [-p PORT] [--cert --key]` listens instead of dialing: the first publisher session to dial it (e.g. `pub_media --pub-ns`) is subscribed and fetched over once it announces `-N`, no relay between. `MOQTServer.register_session_handler(fn)` calls `fn(session)` as each session completes setup.
 - aiomoqt-relay opens a viewer's one-object stream (an audio frame, say) from the forward step when the stream's end is already queued, with no lane task wake and, over WebTransport, no wait for the stream id (aiopquic `create_stream_nowait`). New: `open_uni_stream_nowait()`.
 - A `PublishedTrack`'s `object_delivery_timeout` and `subgroup_delivery_timeout` go out as Track Properties (OBJECT_DELIVERY_TIMEOUT, and SUBGROUP_DELIVERY_TIMEOUT on d18+) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and REQUEST_OK; they were enforced but not announced. A PER_OBJECT object past its delivery timeout is dropped alone instead of with the rest of its group.
