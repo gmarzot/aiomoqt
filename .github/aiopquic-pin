@@ -1,2 +1,2 @@
-# Build aiopquic with create_stream_nowait and stream_released() until they are released.
+# Build aiopquic from its 0.8.0 dev branch until it is released.
 gmarzot/aiopquic@gmarzot-0.8.0

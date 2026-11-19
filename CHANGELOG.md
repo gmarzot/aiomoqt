@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- WebTransport sessions no longer leave one queued event per peer-opened stream for the session's life (aiopquic `queue_new_streams`); on aiomoqt-relay a WT publisher's audio added one per frame.
 - aiomoqt-relay: a track closed while its publisher's PUBLISH_DONE was held for streams (its publisher's session closed) cancels the hold, instead of keeping the closed track for TERMINAL_GRACE_S and logging "released on grace"; its subscribers get the publisher's status and reason.
 - `sub_media -Q/-W [-p PORT] [--cert --key]` listens instead of dialing: the first publisher session to dial it (e.g. `pub_media --pub-ns`) is subscribed and fetched over once it announces `-N`, no relay between. `MOQTServer.register_session_handler(fn)` calls `fn(session)` as each session completes setup.
 - aiomoqt-relay opens a viewer's one-object stream (an audio frame, say) from the forward step when the stream's end is already queued, with no lane task wake and, over WebTransport, no wait for the stream id (aiopquic `create_stream_nowait`). New: `open_uni_stream_nowait()`.
