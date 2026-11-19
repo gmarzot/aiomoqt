@@ -55,6 +55,7 @@ class _Out:
             try:
                 self.proto._quic.send_stream_data(self.stream_id, data,
                                                   end_stream=fin, **kw)
+                self.proto.tx_bytes += len(data)
                 return
             except BufferError:
                 pass
@@ -81,6 +82,7 @@ class _Out:
                 self.ended = True
                 return
             self.queue.popleft()
+            self.proto.tx_bytes += len(data)
 
     def reset(self, code: int = 0) -> None:
         self.queue.clear()
@@ -489,6 +491,7 @@ class Transit:
                            proto._quic.get_next_available_stream_id(True))
                 eg.streams[stream_id] = out
                 eg.stream_count += 1
+                proto.tx_streams += 1
                 eg.bytes += len(head)
                 st.outs.append((eg, out))
                 out.write(rewrite_sns(head, eg.sns.sns_id), fin,
@@ -547,6 +550,7 @@ class Transit:
             if proto._quic.send_datagram_frame(rewrite_sns(data,
                                                            eg.sns.sns_id)):
                 self.datagrams += 1
+                proto.tx_datagrams += 1
                 eg.bytes += len(data)
             else:
                 self.datagrams_dropped += 1
@@ -642,6 +646,11 @@ class Transit:
             self._map(ing)
 
     # -- views -----------------------------------------------------------
+
+    def open_streams(self, session_id: int) -> int:
+        """Egress streams open toward a session."""
+        return sum(len(eg.streams) for ing in self.ingress.values()
+                   for sid, eg in ing.egress.items() if sid == session_id)
 
     def routes(self) -> List[Tuple[int, int, NodeInfo]]:
         """(node id, route session id, its advertisement) per known node."""

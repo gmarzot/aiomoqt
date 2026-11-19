@@ -119,18 +119,24 @@ class _Proto:
         self.session = None
         self.dialer = True
         self.terminated = asyncio.Event()
+        self.dial_key = None
+        self.tx_streams = self.tx_bytes = self.tx_datagrams = 0
 
     def write_control(self, data):
         self.wire.control(data)
+
+    def close(self):
+        self.wire.close()
 
 
 class _Wire:
     """A node session dialed to a remote PeerSession, in memory."""
 
-    def __init__(self, node, sid, remote):
+    def __init__(self, node, sid, remote, dial_key=None):
         self.node = node
         self.quic = _Quic()
         self.proto = _Proto(self.quic, self)
+        self.proto.dial_key = dial_key
         self.session = s = PeerSession(node.local, dialer=True,
                                        session_id=sid, peer=f"peer{sid}",
                                        on_event=node._event)

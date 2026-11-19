@@ -5,7 +5,7 @@ a leaf, or with transit=True a node that forwards for others. The edge API
 (FabricHop, FabricSource) presents fabric sessions to a relay as MoQT d18
 downstream and upstream sessions."""
 from aiomoqt.peering.edge import (FabricHop, FabricPull, FabricSource,
-                                  relay_object)
+                                  HopRetiring, relay_object)
 from aiomoqt.peering.hashing import (city64, fresh_node_id, hash_combine,
                                      libstdcxx_hash, node_id_format,
                                      node_id_parse, track_hashes)
@@ -22,7 +22,7 @@ __all__ = [
     "ALPN", "DEFAULT_PORT", "LEAF_METRIC",
     "AnnounceInfo", "Connect", "ConnectResponse", "ControlReader",
     "DataHeader", "FabricHop", "FabricNode", "FabricPull", "FabricSource",
-    "FabricTrack", "MsgType", "NodeInfo", "NodeSet", "NodeType",
+    "FabricTrack", "HopRetiring", "MsgType", "NodeInfo", "NodeSet", "NodeType",
     "PathItem", "PeerSession", "RxTrack", "SessionEvent", "SubscribeInfo",
     "WireError", "build_report", "city64", "fresh_node_id", "hash_combine",
     "libstdcxx_hash", "node_id_format", "node_id_parse", "parse_identity",

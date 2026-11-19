@@ -11,7 +11,7 @@ from aiopquic.quic.events import (DatagramFrameReceived, StreamDataReceived,
                                   StreamReset)
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering import FabricNode, track_hashes
+from aiomoqt.peering import FabricHop, FabricNode, HopRetiring, track_hashes
 from aiomoqt.peering import transit as transit_mod
 from aiomoqt.peering.inner import SubgroupWriter, encode_datagram
 from aiomoqt.peering.node import _PeerProtocol
@@ -549,6 +549,9 @@ async def test_diamond_takes_the_lower_metric_and_fails_over():
         await t1.stop()
         await sender
         await _until(lambda: via(t2))
+        # Peers learn of T1's loss from the close, not from withdraws.
+        assert set(_withdraws_from(a, t1).values()) == {0}
+        assert set(_withdraws_from(b, t1).values()) == {0}
         await _groups(track, 35, 5, gap=0.01)
         await _until(lambda: set(sink.objects) >= _want(35, 5))
         missing = _want(0, 40) - set(sink.objects)
@@ -564,3 +567,267 @@ async def test_diamond_takes_the_lower_metric_and_fails_over():
         assert any(ing.streams for ing in t1.transit.ingress.values())
         await t1.stop()
     assert sink.objects and not sink.dups
+
+
+# -- external egress (FabricHop) make before break --------------------------
+
+class _Hops:
+    """A relay-like egress: one FabricHop per (track, session) from
+    on_sns, closed on its loss."""
+
+    def __init__(self, node):
+        self.node = node
+        self.hops = {}
+        self.calls = []
+        node.on_sns = self.on_sns
+
+    def on_sns(self, track, sid, sns):
+        self.calls.append((sid, None if sns is None else sns.sns_id))
+        key = (track.fullname_hash, sid)
+        if sns is None:
+            hop = self.hops.pop(key, None)
+            if hop is not None:
+                hop.close()
+        elif key not in self.hops:
+            self.hops[key] = FabricHop(self.node, track, sid)
+
+    def live(self, track):
+        """Hops that take new streams."""
+        return [h for (fh, _), h in sorted(self.hops.items())
+                if fh == track.fullname_hash and not h.retiring
+                and not h.closed]
+
+
+def _pub_two_paths():
+    pub = FabricNode(label="pub")
+    w1 = _Wire(pub, 1, _remote(A, "t1"))
+    w2 = _Wire(pub, 2, _remote(C, "t2"))
+    for w, metric in ((w1, 100), (w2, 200)):
+        w.send(MsgType.NODE_INFO_ADV, NodeInfo(
+            B, contact="b", path=(PathItem(w.remote.local.node_id, 1,
+                                           metric),)))
+        w.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(B, NS, b"video"))
+    hops = _Hops(pub)
+    track = pub.publish(NS, b"video")
+    return pub, w1, w2, hops, track
+
+
+def _move_to_t2(w1):
+    w1.send(MsgType.NODE_INFO_ADV, NodeInfo(
+        B, contact="b", path=(PathItem(A, 1, 900),)))
+
+
+async def _hop_open(hop, h, gid):
+    from aiomoqt.tests.test_peering_edge import _relay_header
+    hdr = _relay_header(h, gid)
+    sid = await hop.open_uni_stream(initial=hdr.serialize().data
+                                    + hdr.next_object_bytes(
+                                        payload=b"o0", extensions=None,
+                                        object_id=0))
+    return hdr, sid
+
+
+@pytest.mark.asyncio
+async def test_hop_retires_on_a_move_and_finishes_its_group():
+    pub, w1, w2, hops, track = _pub_two_paths()
+    h = track.fullname_hash
+    (hop1,) = hops.live(track)
+    hdr, s1 = await _hop_open(hop1, h, 0)
+    _move_to_t2(w1)
+    assert hop1.retiring and not hop1.closed
+    assert hops.calls == [(1, 1), (2, 1)]      # loss of 1 not yet
+    with pytest.raises(HopRetiring):
+        await hop1.open_uni_stream(initial=b"x")
+    (hop2,) = hops.live(track)
+    assert hop2.session_id == 2
+    for oid in (1, 2):
+        assert hop1.stream_write_nowait(s1, hdr.next_object_bytes(
+            payload=b"o", extensions=None, object_id=oid))
+    assert _sent(w1, MsgType.SNS_WD) == 0
+    hop1.stream_write(s1, b"", end_stream=True)
+    assert hops.calls[-1] == (1, None) and hop1.closed
+    assert _sent(w1, MsgType.SNS_WD) == 1
+    _, s2 = await _hop_open(hop2, h, 1)
+    assert s1 in w1.quic.fins and s2 in w2.quic.data
+    assert not track._hop_streams.get((1, s1))
+
+
+@pytest.mark.asyncio
+async def test_hop_drain_is_bounded(monkeypatch):
+    from aiomoqt.peering import node as node_mod
+    monkeypatch.setattr(node_mod, "DRAIN_MAX_S", 0.05)
+    pub, w1, w2, hops, track = _pub_two_paths()
+    (hop1,) = hops.live(track)
+    _, s1 = await _hop_open(hop1, track.fullname_hash, 0)
+    _move_to_t2(w1)
+    assert hop1.retiring
+    await asyncio.sleep(0.15)
+    assert track.drain_cut == 1 and s1 in w1.quic.resets
+    assert hops.calls[-1] == (1, None) and hop1.closed
+    assert _sent(w1, MsgType.SNS_WD) == 1
+
+
+@pytest.mark.asyncio
+async def test_hop_session_close_mid_group_is_immediate():
+    pub, w1, w2, hops, track = _pub_two_paths()
+    (hop1,) = hops.live(track)
+    await _hop_open(hop1, track.fullname_hash, 0)
+    w1.close()
+    assert hop1.closed and (1, None) in hops.calls
+    assert not track._hop_streams and not track._draining
+    (hop2,) = hops.live(track)
+    assert hop2.session_id == 2
+
+
+# -- peer API ------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_peer_api_add_remove_metric_and_table():
+    node = FabricNode(label="n", transit=True)
+    node.add_peer("192.0.2.7", 4000, metric=300)
+    node.add_peer("192.0.2.7", 4000)
+    assert node.peers == [("192.0.2.7", 4000)]
+    (row,) = node.peer_table()
+    assert (row["status"], row["metric"], row["session"]) == (
+        "connecting", 300, None)
+    w = _Wire(node, 1, _remote(A, "a"), dial_key=("192.0.2.7", 4000))
+    # Re-applied when the dial comes up.
+    w.control(b"")
+    assert node.advertised_metric(1) == 300
+    assert w.remote.nodes[node.node_id].body.metric == 300
+    (row,) = node.peer_table()
+    assert (row["status"], row["origin"], row["remote_node_id"]) == (
+        "connected", "dialed", f"{A >> 48 & 0xffff}.{A >> 32 & 0xffff}:"
+        f"{A >> 16 & 0xffff}.{A & 0xffff}")
+    assert node.set_peer_metric("192.0.2.7", 4000, 500)
+    assert node.advertised_metric(1) == 500
+    w.close()
+    w2 = _Wire(node, 2, _remote(A, "a"), dial_key=("192.0.2.7", 4000))
+    w2.control(b"")
+    assert node.advertised_metric(2) == 500
+    assert node.remove_peer("192.0.2.7", 4000)
+    assert w2.session.state == "closed"
+    assert not node.peers and not node.remove_peer("192.0.2.7", 4000)
+    assert node.peer_table() == []
+
+
+async def _hop_group(hops, track, gid, per=6, at=None, then=None):
+    """One group through the egress the way a relay writes it: opened on
+    a hop taking new streams, written to its end there. `then` runs
+    before object `at`. False when the group could not be finished."""
+    from aiomoqt.tests.test_peering_edge import _relay_header
+    live = hops.live(track)
+    if not live:
+        return False
+    hop, h = live[0], track.fullname_hash
+    hdr = _relay_header(h, gid)
+    try:
+        sid = await hop.open_uni_stream(
+            initial=hdr.serialize().data + hdr.next_object_bytes(
+                payload=b"x" * 300, extensions=None, object_id=0))
+        for oid in range(1, per):
+            if oid == at and then is not None:
+                await then()
+            data = hdr.next_object_bytes(payload=b"x" * 300, extensions=None,
+                                         object_id=oid)
+            if not hop.stream_write_nowait(sid, data):
+                await hop.stream_write_drain(sid, data)
+            await asyncio.sleep(0.005)
+        hop.stream_write(sid, hdr.next_object(
+            payload=b"", status=ObjectStatus.END_OF_GROUP,
+            object_id=per).data, end_stream=True)
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise
+        return False
+    return True
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_diamond_external_egress_moves_without_loss():
+    p1, p2 = _BASE_PORT + 9, _BASE_PORT + 10
+    t1 = _listen(p1, "T1", transit=True, metric=100)
+    t2 = _listen(p2, "T2", transit=True, metric=200)
+    a, b = _dial([p1, p2], "A"), _dial([p1, p2], "B")
+    sink, per = _Sink(), 6
+    async with t1, t2, a, b:
+        await _until(lambda: len(t1.connected()) == 2
+                     and len(t2.connected()) == 2)
+        hops = _Hops(a)
+        track = a.publish("x/live", "video")
+        b.pull("x/live", "video", sink)
+
+        def via(t):
+            live = hops.live(track)
+            return bool(live) and a.sessions[live[0].session_id] \
+                .remote.node_id == t.node_id
+
+        await _until(lambda: via(t1))
+        for g in range(3):
+            assert await _hop_group(hops, track, g, per)
+
+        async def move():
+            # A leaf advertises 2^32: a session metric counts above it.
+            a.set_peer_metric("127.0.0.1", p1, (1 << 32) + 1000)
+            assert via(t2)
+
+        # Move mid-group: it finishes on T1, the next group takes T2.
+        assert await _hop_group(hops, track, 3, per, at=3, then=move)
+        for g in range(4, 7):
+            assert await _hop_group(hops, track, g, per)
+        await _until(lambda: set(sink.objects) >= _want(0, 7, per))
+        assert set(sink.objects) == _want(0, 7, per) and not sink.dups
+        await _until(lambda: not track._draining)
+        assert track.drain_cut == 0
+        for t, n in ((t1, 4), (t2, 3)):
+            assert sum(f.streams for s in t.sessions.values()
+                       for f in s.flows.values()) == n
+
+        # Session close mid-group: at most that group is lost.
+        async def stop_t2():
+            await t2.stop()
+
+        await _hop_group(hops, track, 7, per, at=2, then=stop_t2)
+        await _until(lambda: via(t1))
+        for g in range(8, 11):
+            assert await _hop_group(hops, track, g, per)
+        await _until(lambda: set(sink.objects) >= _want(8, 3, per))
+        missing = _want(0, 11, per) - set(sink.objects)
+        assert {g for g, _, _ in missing} <= {7}
+    assert sink.objects and not sink.dups
+
+
+def _withdraws_from(node, other):
+    """Withdraws `node` received on its sessions to `other`."""
+    kinds = ("NODE_INFO_WD", "SUBSCRIBE_INFO_WD", "ANNOUNCE_INFO_WD")
+    return {k: sum(s.rx_msgs[k] for s in node.sessions.values()
+                   if s.remote and s.remote.node_id == other.node_id)
+            for k in kinds}
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_graceful_stop_withdraws_nothing_it_only_transits():
+    port = _BASE_PORT + 11
+    t = _listen(port, "T", transit=True)
+    a, b = _dial([port], "A"), _dial([port], "B")
+    async with a, b:
+        await t.start()
+        await _until(lambda: any(rec.body.node_id == a.node_id
+                                 for _, rec in b.learned_nodes()))
+        a.announce("s/live")
+        track = a.publish("s/live", "video")
+        sink = _Sink()
+        b.pull("s/live", "video", sink)
+        await _until(lambda: track.subscribed
+                     and any(True for _ in b.learned_announces()))
+        await _groups(track, 0, 2)
+        await _until(lambda: set(sink.objects) == _want(0, 2))
+        await t.stop()
+        await _until(lambda: not a.connected() and not b.connected())
+        assert _withdraws_from(a, t) == _withdraws_from(b, t) == {
+            "NODE_INFO_WD": 0, "SUBSCRIBE_INFO_WD": 0,
+            "ANNOUNCE_INFO_WD": 0}
+    assert not sink.dups
