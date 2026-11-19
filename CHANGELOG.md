@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- A transit `FabricNode` withdraws its route to a node from each peer that holds it but may not take the new best path, such as the session the new path arrived on: the peer kept the stale path and, after the node stopped, could route to it in a loop.
 - A stopping `FabricNode` withdraws only what it originated and closes every session at once: a transit node no longer floods withdraws for the nodes, announces and subscribes it only forwarded, which made peers drop routes that another node still offered.
 - `FabricNode` gains a peer API: `add_peer()`, `remove_peer()`, `set_peer_metric()` (kept across re-dials) and `peer_table()`, one row per session. A `FabricHop` whose SNS moves to another session retires: `open_uni_stream` raises `HopRetiring` while its open streams finish, at most the subscribers' delivery timeout (5 s cap), then the SNS is withdrawn and `on_sns(..., None)` follows.
 - `FabricNode(transit=True)` forwards for other moq-fabric nodes: learned nodes are re-advertised with the path appended and routed by metric sum, hops, then srtt; accepted announces and subscribes are flooded; each ingress SNS maps to one egress SNS per next hop, and data is forwarded as raw chunks with only the SNS id rewritten, data before its SNS waiting in a bounded stash. When a route moves, new streams take the new hop and open ones finish on the old, also for a node's own published tracks. `set_session_metric()` sets one session's metric.
