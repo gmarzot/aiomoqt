@@ -5298,8 +5298,8 @@ def parse_args(argv=None):
                              "state (and, with --trace-subscribers, what each "
                              "subscription was sent); with the fabric on, "
                              "GET /moq-fabric reports the node and POST "
-                             "/moq-fabric/peer?op=add|remove|metric&host=H&port=P"
-                             "[&metric=M] changes its peers")
+                             "/moq-fabric/peer?op=add|remove|metric|restart"
+                             "&host=H&port=P[&metric=M] changes its peers")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -7598,10 +7598,11 @@ def _fabric_peer_op(fabric, query: str) -> tuple:
         return "400 Bad Request", {"error": "host, port and metric: numbers"}
     if (not host or not 0 < port < 65536
             or (metric is not None and metric < 0)
-            or op not in ("add", "remove", "metric")
+            or op not in ("add", "remove", "metric", "restart")
             or (op == "metric" and metric is None)):
         return "400 Bad Request", {
-            "error": "op=add|remove|metric&host=H&port=P[&metric=M]"}
+            "error": "op=add|remove|metric|restart&host=H&port=P"
+                     "[&metric=M]"}
     node = fabric.node
     if op == "add":
         node.add_peer(host, port, metric)
@@ -7610,6 +7611,10 @@ def _fabric_peer_op(fabric, query: str) -> tuple:
         if not node.remove_peer(host, port):
             return "404 Not Found", {"error": "no such peer"}
         peer_log.info(f"fabric: peer {_addr_text(host, port)} removed")
+    elif op == "restart":
+        if not node.restart_peer(host, port):
+            return "404 Not Found", {"error": "no such peer"}
+        peer_log.info(f"fabric: peer {_addr_text(host, port)} restarted")
     elif not node.set_peer_metric(host, port, metric):
         return "404 Not Found", {"error": "no such peer"}
     return "200 OK", {"ok": True}

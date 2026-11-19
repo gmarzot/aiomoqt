@@ -1117,6 +1117,25 @@ class FabricNode:
                 proto.close()
         return found
 
+    def restart_peer(self, host: str, port: int = DEFAULT_PORT) -> bool:
+        """Close a dialed peer's session and dial it again at once, or
+        close the session accepted from that address for the peer to
+        re-dial. The peer's metric applies again on reconnect. False
+        when neither exists."""
+        key = (host, int(port))
+        if key in self.peers:
+            task = self._dials.pop(key, None)
+            if task is not None:
+                task.cancel()
+            if self._started and not self._stopping:
+                self._start_dial(*key)
+            return True
+        accepted = [self._protocols[s.id] for s in self._sessions_of(*key)
+                    if not self._protocols[s.id].dialer]
+        for proto in accepted:
+            proto.close()
+        return bool(accepted)
+
     def set_peer_metric(self, host: str, port: int, metric: int) -> bool:
         """Set the metric of a peer's sessions, now and after a re-dial.
         False when no session to the peer is up yet."""
