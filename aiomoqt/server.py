@@ -370,7 +370,8 @@ class MOQTServer(MOQTPeer):
         return session
 
     def _setup_done(self, session, fut) -> None:
-        if fut.cancelled() or fut.result() is not True:
+        if (fut.cancelled() or fut.exception() is not None
+                or fut.result() is not True):
             return
         for handler in self._session_handlers:
             try:

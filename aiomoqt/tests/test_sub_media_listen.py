@@ -145,3 +145,36 @@ def test_listener_flags(monkeypatch):
               '--cert', CERT)
     args = _argv(monkeypatch, 'sub_media', '-Q', '-p', '4433', '-k')
     assert (args.url, args.listen, args.port) == (None, True, 4433)
+
+
+class _Session:
+    def __init__(self):
+        self._moqt_session_setup = asyncio.get_running_loop().create_future()
+
+
+@pytest.mark.parametrize('outcome,called', [
+    (True, True), (False, False), (RuntimeError('setup failed'), False),
+    (None, False)], ids=['ok', 'refused', 'raised', 'cancelled'])
+async def test_session_handler_sees_only_completed_setups(outcome, called):
+    loop = asyncio.get_running_loop()
+    errors = []
+    loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx))
+    try:
+        server = MOQTServer(host='localhost', port=0, certificate=CERT,
+                            private_key=KEY)
+        seen = []
+        server.register_session_handler(seen.append)
+        session = server._adopt(_Session())
+        fut = session._moqt_session_setup
+        if outcome is None:
+            fut.cancel()
+        elif isinstance(outcome, Exception):
+            fut.set_exception(outcome)
+        else:
+            fut.set_result(outcome)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert seen == ([session] if called else [])
+        assert errors == []
+    finally:
+        loop.set_exception_handler(None)
