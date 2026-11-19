@@ -73,6 +73,13 @@ Routing model (cross-session, single relay instance):
     restart before their publishers are answered.
   - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
 
+moq-fabric (--peer, --peer-port): the relay is also a fabric node, on its
+own UDP port. A track the fabric announces is pulled from it when no
+local publisher serves it, its objects deduplicated by Location; local
+PUBLISH_NAMESPACEs and PUBLISHes are announced into the fabric, and a
+fabric subscribe to one is served from local publishers only. The fabric
+subscribe is withdrawn at --pause-after like any upstream.
+
 Run on UDP/4443 with the runner's /certs convention:
 
   python -m aiomoqt.tools.moq_interop_relay \\
@@ -160,6 +167,11 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
+from aiomoqt.peering import (FabricHop, FabricNode, FabricSource, NodeType,
+                             node_id_format, parse_identity)
+from aiomoqt.peering.ib import path_rank
+from aiomoqt.peering.wire import DEFAULT_NODE_METRIC
+from aiomoqt.peering.wire import DEFAULT_PORT as FABRIC_PORT
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
@@ -168,8 +180,9 @@ from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
 from aiomoqt.utils.buffer import Buffer, BufferReadError
-from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth, add_help,
-                               add_logging, apply_logging, auth_from_args)
+from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth,
+                               add_fabric_node, add_help, add_logging,
+                               apply_logging, auth_from_args)
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -183,6 +196,7 @@ _RELAY_DRAFT_DEFAULT = (
 
 logger = get_category_logger("relay")
 control_log = get_category_logger("control")
+peer_log = get_category_logger("peering")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -418,9 +432,9 @@ def _announcers(ns: tuple) -> list:
     return out
 
 
-def _publishers_for(ns: tuple) -> list:
+def _publishers_for(ns: tuple, name=None) -> list:
     """Publisher sessions that announced `ns` or a prefix of it, then the
-    origins we dialled."""
+    origins we dialled, then the fabric when it announces the track."""
     out = _announcers(ns)
     seen = {id(s) for s in out}
     # An origin we dialled advertises nothing to us, so ask it last:
@@ -430,6 +444,9 @@ def _publishers_for(ns: tuple) -> list:
         if id(sess) not in seen:
             seen.add(id(sess))
             out.append(sess)
+    fabric = _fabric
+    if fabric is not None and fabric.covers(ns, name):
+        out.append(fabric.source)
     return out
 
 
@@ -441,6 +458,8 @@ def _fetch_sources(ns: tuple, track_name) -> list:
     track = _tracks.get((tuple(ns), name))
     owner = _track_owner(track) if track is not None else None
     pubs = _publishers_for(ns)
+    if isinstance(owner, FabricSource):
+        owner = None
     if not _session_live(owner) or any(p is owner for p in pubs):
         return pubs
     return [owner, *pubs]
@@ -2079,6 +2098,12 @@ class _RelayedTrack:
         session = _upstream_session(self)
         if session is None or self.upstream_alias is None:
             return
+        if isinstance(session, FabricSource):
+            session.unsubscribe(getattr(self.upstream, "request_id", None))
+            session.unregister_object_handler(self.upstream_alias)
+            session.unregister_stream_end_handler(self.upstream_alias)
+            self.upstream_alias = None
+            return
         try:
             session.unregister_object_handler(self.upstream_alias)
             session.unregister_stream_end_handler(self.upstream_alias)
@@ -3408,6 +3433,7 @@ def _forget_session(session) -> None:
                 not _announced[ns]:
             del _announced[ns]
             _retract_namespace(ns)
+    _fabric_changed()
     for lane in [lane for lane in _lanes if lane.d.session is session]:
         lane.track.drop_session(session)
     for key, track in list(_tracks.items()):
@@ -3526,6 +3552,7 @@ async def _on_publish_namespace(session, msg):
         lambda rid, s=session: _withdraw_namespace(s, request_id=rid))
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
     _announce_namespace(ns)
+    _fabric_changed()
     _forward_announcements(ns, session)
     # Reuse the protocol's built-in OK helper. It emits RequestOk on
     # d16+ and PublishNamespaceOk on d14, matching peer expectation.
@@ -3560,6 +3587,7 @@ def _withdraw_namespace(session, request_id=None, ns=None) -> None:
     if not holders:
         del _announced[ns]
         _retract_namespace(ns)
+        _fabric_changed()
     logger.info(f"relay: namespace_done ns={ns} -> "
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
@@ -3614,6 +3642,8 @@ class _Establishing:
         self.filter: dict = {}
         # The SUBSCRIBE's NEW_GROUP_REQUEST, carried upstream (§10.2.13).
         self.params: dict = {}
+        # Local publishers only: the fabric is not asked.
+        self.local = False
         self.task = None
 
     def resolve(self, result) -> None:
@@ -3623,10 +3653,12 @@ class _Establishing:
             self.fut.set_result(result)
 
 
-async def _establish_upstream(ns, track_name, forward=True, sub=None):
+async def _establish_upstream(ns, track_name, forward=True, sub=None,
+                              local=False):
     """Subscribe upstream once per Full Track Name. Returns (fan-out,
     None), or (None, the last upstream refusal or None) when no
-    publisher accepts. Concurrent callers share one upstream SUBSCRIBE.
+    publisher accepts. Concurrent callers share one upstream SUBSCRIBE;
+    with `local` a new one asks no fabric source.
 
     Transport §"Relays": with no Established upstream subscription for
     the Track, the relay subscribes to each publisher that announced the
@@ -3646,6 +3678,7 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
             track.close()
             _drop_track(key, track)
         entry = _Establishing(key)
+        entry.local = local
         entry.filter = _upstream_filter(sub)
         value = (getattr(sub, "parameters", None) or {}).get(
             ParamType.NEW_GROUP_REQUEST)
@@ -3814,6 +3847,9 @@ def _drop_track(key, track) -> None:
     """Remove `track` from the table, only if `key` still maps to it."""
     if _tracks.get(key) is track:
         del _tracks[key]
+        if _fabric is not None:
+            _fabric.track_dropped(key, track)
+            _fabric.changed()
 
 
 def _live_published(key):
@@ -3887,10 +3923,14 @@ async def _subscribe_publishers(entry):
     ns, track_name = key
     refusal = None
     tried = []
-    for pub in _publishers_for(ns):
+    for pub in _publishers_for(ns, track_name):
         tried.append(pub)
         if entry.fut.done():
             break
+        if isinstance(pub, FabricSource):
+            if entry.local:
+                continue
+            return _subscribe_fabric(key, pub), None
         track = _RelayedTrack(key)
         track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
@@ -4252,6 +4292,7 @@ async def _on_publish(session, msg):
     _announce_namespace(ns)
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias}")
+    _fabric_changed()
     offered = _offer_to_track_subs(track)
     if crossing:
         _answer_publish(track, forward=any(entry.forwards))
@@ -4675,7 +4716,7 @@ def _publisher_known(ns: tuple, track_name) -> bool:
     if (track is not None and _track_live(track)
             and (track.pending_publish or track.upstream)):
         return True
-    return bool(_publishers_for(ns) or _upstream_urls)
+    return bool(_publishers_for(ns, track_name) or _upstream_urls)
 
 
 def _rendezvous_s(session, msg) -> float:
@@ -5091,7 +5132,8 @@ async def _relay_subscribe(session, msg):
     if not _announced_match(ns) and not _upstreams and _upstream_urls:
         await _await_upstream()
     why = "not announced"
-    if _announced_match(ns) or _upstreams:
+    if (_announced_match(ns) or _upstreams
+            or _fabric_covers(ns, msg.track_name)):
         forward = msg.forward is None or bool(msg.forward)
         track, refusal = await _establish_upstream(ns, msg.track_name,
                                                    forward=forward, sub=msg)
@@ -5249,7 +5291,10 @@ def parse_args(argv=None):
                              "reports DEBUG logging, POST /debug toggles it, "
                              "GET /sessions reports each session's transport "
                              "state (and, with --trace-subscribers, what each "
-                             "subscription was sent)")
+                             "subscription was sent); with the fabric on, "
+                             "GET /fabric reports the node and POST "
+                             "/fabric/peer?op=add|remove|metric&host=H&port=P"
+                             "[&metric=M] changes its peers")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -5329,6 +5374,12 @@ def parse_args(argv=None):
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
                              "DEBUG, TRACE, INFO")
+    add_fabric_node(parser, metric=DEFAULT_NODE_METRIC)
+    parser.add_argument("--peer-port", type=int, default=None, metavar="N",
+                        help="moq-fabric listen port, on --bind with "
+                             "--cert and --key; 0 = do not listen. The "
+                             "fabric is on with --peer or --peer-port. "
+                             f"Default with the fabric on: {FABRIC_PORT}")
     add_auth(parser)
     add_logging(parser)
     add_help(parser)
@@ -5914,7 +5965,8 @@ def _known_namespaces(prefix) -> list:
     """Namespaces the relay can serve under `prefix`: announced ones
     plus any track it already relays."""
     out, seen = [], set()
-    for ns in list(_announced) + [key[0] for key in _tracks]:
+    fabric = _fabric.namespaces() if _fabric is not None else []
+    for ns in list(_announced) + [key[0] for key in _tracks] + fabric:
         if ns in seen or not _prefix_covers(prefix, ns):
             continue
         seen.add(ns)
@@ -6813,6 +6865,7 @@ class _Status:
             "history": self.history.to_json(),
             "track_history": {tid: {k: list(v) for k, v in series.items()}
                               for tid, series in self.track_history.items()},
+            "fabric": _fabric.report() if _fabric is not None else None,
         }
 
     def _add_track_history(self, tracks) -> None:
@@ -7058,6 +7111,626 @@ def _toggle_debug() -> None:
         logger.info("relay: debug logging on")
 
 
+# -- moq-fabric node (--peer / --peer-port) ---------------------------
+
+# The relay's fabric node; None while the fabric is off.
+_fabric = None
+FABRIC_LABEL = "aiomoqt-relay"
+# A learned announce outlives its last withdraw this long, so a redial or
+# a path change does not end the tracks it covers.
+FABRIC_WITHDRAW_GRACE_S = 3.0
+# Redial delay for a lost fabric peer.
+FABRIC_REDIAL_S = 2.0
+# How often live fabric sessions' transport counters are sampled, so a
+# closed session's row keeps its last values.
+FABRIC_SAMPLE_S = 1.0
+
+
+def _fabric_covers(ns: tuple, name=None) -> bool:
+    """The fabric announces `ns` (with `name`, that track)."""
+    return _fabric is not None and _fabric.covers(ns, name)
+
+
+def _fabric_fed(track) -> bool:
+    return isinstance(_upstream_session(track), FabricSource)
+
+
+def _fabric_changed() -> None:
+    """Local publishers or tracks changed: resync the fabric soon."""
+    if _fabric is not None:
+        _fabric.changed()
+
+
+def _local_published(track) -> bool:
+    """A live track a local session PUBLISHed."""
+    if track.finished or track._closed:
+        return False
+    if track.pending_publish is not None:
+        return _session_live(track.pending_publish[0])
+    return _is_session(track.upstream) and _session_live(track.upstream)
+
+
+def _subscribe_fabric(key, source):
+    """Pull `key` from the fabric: SUBSCRIBE_INFO now, objects into a new
+    fan-out deduplicated by Location; no Largest is known."""
+    ns, name = key
+    track = _RelayedTrack(key)
+    track.attaching = True
+    track._multi = True
+    pull = source.subscribe(ns, name)
+    track.upstream = pull
+    track.upstream_alias = pull.track_alias
+    source.register_object_handler(pull.track_alias, track.on_object)
+    source.register_stream_end_handler(pull.track_alias,
+                                       track.on_stream_end)
+    old = _tracks.get(key)
+    if old is not None and old is not track:
+        old.close()
+    _tracks[key] = track
+    logger.info(f"relay: upstream established ns={ns} track={name} "
+                f"from the fabric, hash=0x{pull.track_alias:016x}")
+    return track
+
+
+def _split_addr(text: str):
+    """'host:port' or '[v6]:port' as (host, port); port None if absent."""
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        port = rest[1:]
+    else:
+        host, _, port = text.rpartition(":")
+        if not host:
+            host, port = text, ""
+    return host, int(port) if port.isdigit() else None
+
+
+def _addr_text(host, port) -> str:
+    return f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
+
+
+class _Egress:
+    """A local track the fabric subscribes to: its FabricTrack, one hop
+    per session holding an SNS for it, and the fan-out the hops are
+    downstreams of (None until established)."""
+
+    __slots__ = ("key", "ftrack", "hops", "track", "timeout_ms")
+
+    def __init__(self, key, ftrack):
+        self.key = key
+        self.ftrack = ftrack
+        self.hops: dict = {}
+        self.track = None
+        self.timeout_ms = 0
+
+
+class _Fabric:
+    """The relay's moq-fabric node and its bridges to the relay tables.
+
+    Learned announces make `source` a publisher of what they cover, last
+    in _publishers_for. Local announces and PUBLISHes become fabric
+    announces; a learned subscribe to one is served from local publishers
+    only, through a FabricHop per session holding its SNS."""
+
+    def __init__(self, node: FabricNode):
+        self.node = node
+        self.source = FabricSource(node)
+        # (fullname hash, source node) -> learned announce, held through
+        # its withdraw grace.
+        self.announced: dict = {}
+        self._expiring: dict = {}
+        # (ns, name) -> _Egress.
+        self.egress: dict = {}
+        self._attaching: set = set()
+        self._sync_due = False
+        # Session metric per peer (host, port).
+        self.metrics: dict = {}
+        # Session id -> Counter of data sent on its closed hops.
+        self._tx_closed: dict = {}
+        # Session id -> last path_quality() sample.
+        self._pq: dict = {}
+        self._sampler = None
+        node.on_announce = self._on_announce
+        node.on_subscribe = self._on_subscribe
+        node.on_sns = self._on_sns
+
+    async def start(self) -> None:
+        await self.node.start()
+        self._sampler = asyncio.create_task(self._sample())
+        self.changed()
+
+    async def stop(self) -> None:
+        """Withdraw everything, then close every fabric session; the
+        relay's fabric-fed tracks end downstream."""
+        if self._sampler is not None:
+            self._sampler.cancel()
+        for e in list(self.egress.values()):
+            self._unserve(e.key)
+        self.source.close()
+        await self.node.stop()
+        _forget_session(self.source)
+
+    # -- learned announces --------------------------------------------
+
+    def covers(self, ns: tuple, name=None) -> bool:
+        if name is not None and not isinstance(name, bytes):
+            name = str(name).encode()
+        for ann in self.announced.values():
+            if ann.is_namespace:
+                if ns[:len(ann.namespace)] == ann.namespace:
+                    return True
+            elif ann.namespace == ns and (name is None or ann.name == name):
+                return True
+        return False
+
+    def namespaces(self) -> list:
+        return list({ann.namespace for ann in self.announced.values()})
+
+    def _on_announce(self, ann, present) -> None:
+        if ann.source == self.node.node_id:
+            return
+        key = (ann.fullname_hash, ann.source)
+        if present:
+            timer = self._expiring.pop(key, None)
+            if timer is not None:
+                timer.cancel()
+            fresh = key not in self.announced
+            self.announced[key] = ann
+            if fresh:
+                logger.info(f"relay: fabric announces "
+                            f"{_ns_str(ann.namespace)}"
+                            + (f" track={_name_str(ann.name)}"
+                               if ann.name else " (namespace)")
+                            + f" from {node_id_format(ann.source)}")
+                if ann.namespace not in _announced:
+                    _announce_namespace(ann.namespace)
+        elif key in self.announced and key not in self._expiring:
+            self._expiring[key] = asyncio.get_running_loop().call_later(
+                FABRIC_WITHDRAW_GRACE_S, self._expire, key)
+
+    def _expire(self, key) -> None:
+        self._expiring.pop(key, None)
+        ann = self.announced.pop(key, None)
+        if ann is None:
+            return
+        logger.info(f"relay: fabric withdrew {_ns_str(ann.namespace)}"
+                    + (f" track={_name_str(ann.name)}" if ann.name else "")
+                    + f" from {node_id_format(ann.source)}")
+        for tkey, track in list(_tracks.items()):
+            if not _fabric_fed(track) or self.covers(*tkey):
+                continue
+            if track.fail_over(tkey):
+                continue
+            logger.info(f"relay: {tkey} no longer announced in the fabric "
+                        f"-> PUBLISH_DONE to {len(track.downstream)} "
+                        f"subscriber(s)")
+            track.finish(reason="fabric announce withdrawn")
+            track.close()
+            _drop_track(tkey, track)
+        ns = ann.namespace
+        if ns not in _announced and ns not in self.namespaces():
+            _retract_namespace(ns)
+
+    # -- local publishers to the fabric -------------------------------
+
+    def changed(self) -> None:
+        if not self._sync_due:
+            self._sync_due = True
+            asyncio.get_running_loop().call_soon(self.sync)
+
+    def sync(self) -> None:
+        self._sync_due = False
+        if self.node._stopping:
+            return
+        self._sync_announces()
+        self._sync_egress()
+
+    def _sync_announces(self) -> None:
+        want = {(ns, b"") for ns, holders in _announced.items()
+                if not _internal_ns(ns)
+                and any(_session_live(s) for s in holders)}
+        want.update(key for key, track in _tracks.items()
+                    if not _internal_ns(key[0]) and _local_published(track))
+        have = {(a.namespace, a.name)
+                for a in self.node.originated_announces()}
+        for ns, name in want - have:
+            self.node.announce(ns, name)
+            logger.info(f"relay: announcing {_ns_str(ns)}"
+                        + (f" track={_name_str(name)}" if name
+                           else " (namespace)") + " into the fabric")
+        for ns, name in have - want:
+            self.node.withdraw_announce(ns, name)
+            logger.info(f"relay: withdrew {_ns_str(ns)}"
+                        + (f" track={_name_str(name)}" if name else "")
+                        + " from the fabric")
+
+    def _on_subscribe(self, sub, present) -> None:
+        self.changed()
+
+    def _wanted(self) -> dict:
+        """(ns, name) -> delivery timeout of each track a remote node
+        subscribes to with Forward 1."""
+        out: dict = {}
+        for sub in self.node.remote_subscribes():
+            if sub.source == self.node.node_id or not sub.forward:
+                continue
+            key = (sub.namespace, sub.name)
+            out[key] = _min_nonzero(out.get(key, 0), sub.delivery_timeout_ms)
+        return out
+
+    def _sync_egress(self) -> None:
+        wanted = self._wanted()
+        for key in [k for k in self.egress if k not in wanted]:
+            self._unserve(key)
+        for key, timeout_ms in wanted.items():
+            e = self.egress.get(key)
+            if e is not None:
+                e.timeout_ms = timeout_ms
+                if e.track is not None and _track_live(e.track):
+                    continue
+                e.track = None
+            if key not in self._attaching:
+                self._attaching.add(key)
+                _spawn(self._serve(key, timeout_ms))
+
+    async def _local_track(self, key):
+        """The live fan-out of `key` local publishers feed, established
+        if needed; None when there is none or the fabric feeds it."""
+        ns, name = key
+        track = _tracks.get(key)
+        if track is not None and _track_live(track):
+            if _fabric_fed(track):
+                return None
+            if track.pending_publish is not None:
+                _answer_publish(track, forward=True)
+            if track.upstream is not None:
+                return track
+        if not (_announcers(ns) or _upstreams):
+            return None
+        track, _refusal = await _establish_upstream(ns, name, local=True)
+        if track is None or _fabric_fed(track):
+            return None
+        return track
+
+    async def _serve(self, key, timeout_ms) -> None:
+        try:
+            track = await self._local_track(key)
+        finally:
+            self._attaching.discard(key)
+        if track is None or key not in self._wanted() or self.node._stopping:
+            return
+        e = self.egress.get(key)
+        if e is None:
+            e = self.egress[key] = _Egress(key, self.node.publish(
+                key[0], key[1], announce=False))
+        e.timeout_ms = timeout_ms
+        e.track = track
+        logger.info(f"relay: serving {key} to the fabric")
+        for hop in list(e.hops.values()):
+            self._add_hop(e, hop)
+        self._sync_hops(e)
+        if track.attaching:
+            track.attaching = False
+            track._ensure_drain()
+        _resume_paused(track)
+
+    def _unserve(self, key) -> None:
+        e = self.egress.pop(key, None)
+        if e is None:
+            return
+        for sid in list(e.hops):
+            self._drop_hop(e, sid)
+        self.node.unpublish(e.ftrack)
+        logger.info(f"relay: {key} no longer subscribed in the fabric")
+
+    def _on_sns(self, ftrack, session_id, sns) -> None:
+        e = self.egress.get((ftrack.origin.namespace, ftrack.origin.name))
+        if e is not None and e.ftrack is ftrack:
+            self._sync_hops(e)
+
+    def _sync_hops(self, e) -> None:
+        """One hop per session holding the track's SNS."""
+        held = e.ftrack.origin.sns
+        for sid in [sid for sid in e.hops if sid not in held]:
+            self._drop_hop(e, sid)
+        for sid in held:
+            if sid in e.hops:
+                continue
+            hop = FabricHop(self.node, e.ftrack, sid)
+            if hop.closed:
+                continue
+            e.hops[sid] = hop
+            if e.track is not None:
+                self._add_hop(e, hop)
+
+    def _add_hop(self, e, hop) -> None:
+        track = e.track
+        if track.find(hop, None) is not None or track.finished:
+            return
+        d = track.add_downstream(hop, e.ftrack.fullname_hash, None)
+        d.timeout = e.timeout_ms
+        logger.info(f"relay: fabric session {hop.session_id} "
+                    f"({self._peer_text(hop.session_id)}) joins {e.key} "
+                    f"-> fanout={len(track.downstream)}")
+        _resume_paused(track)
+
+    def _drop_hop(self, e, sid) -> None:
+        hop = e.hops.pop(sid, None)
+        if hop is None:
+            return
+        tx = self._tx_closed.setdefault(sid, Counter())
+        tx["streams"] += hop.streams
+        tx["datagrams"] += hop.datagrams
+        if e.track is not None:
+            # Its open subgroups end with a FIN, not a reset.
+            e.track._close_streams(hop)
+            e.track.drop_session(hop)
+        hop.close()
+        if e.track is not None:
+            logger.info(f"relay: fabric session {sid} leaves {e.key} "
+                        f"-> fanout={len(e.track.downstream)}")
+
+    def track_dropped(self, key, track) -> None:
+        e = self.egress.get(key)
+        if e is not None and e.track is track:
+            e.track = None
+
+    # -- peers ---------------------------------------------------------
+
+    def _peer_text(self, sid) -> str:
+        s = self.node.sessions.get(sid)
+        return s.peer if s is not None else "?"
+
+    def _dialed(self, host, port):
+        try:
+            return self.node.peers.index((host, port))
+        except ValueError:
+            return None
+
+    def _accepted(self, host, port) -> list:
+        out = []
+        for s in self.node.sessions.values():
+            if s.dialer or s.state == "closed":
+                continue
+            if _split_addr(s.peer) == (host, port):
+                out.append(s)
+        return out
+
+    def add_peer(self, host, port, metric=None) -> None:
+        if metric is not None:
+            self.metrics[(host, port)] = metric
+        if self._dialed(host, port) is not None:
+            return
+        node = self.node
+        node.peers.append((host, port))
+        node._dial_tasks.append(
+            asyncio.ensure_future(node._dial_loop(host, port)))
+        peer_log.info(f"peering: peer {_addr_text(host, port)} added")
+
+    def remove_peer(self, host, port) -> bool:
+        node = self.node
+        i = self._dialed(host, port)
+        found = False
+        if i is not None:
+            node.peers.pop(i)
+            node._dial_tasks.pop(i).cancel()
+            found = True
+        for s in self._accepted(host, port):
+            proto = node._protocols.get(s.id)
+            if proto is not None:
+                proto.close()
+            found = True
+        if found:
+            self.metrics.pop((host, port), None)
+            peer_log.info(f"peering: peer {_addr_text(host, port)} removed")
+        return found
+
+    def set_metric(self, host, port, metric) -> bool:
+        if self._dialed(host, port) is None and not self._accepted(host,
+                                                                   port):
+            return False
+        self.metrics[(host, port)] = metric
+        peer_log.info(f"peering: peer {_addr_text(host, port)} session "
+                      f"metric {metric}")
+        return True
+
+    async def _sample(self) -> None:
+        while True:
+            await asyncio.sleep(FABRIC_SAMPLE_S)
+            for sid, proto in list(self.node._protocols.items()):
+                self._pq[sid] = _path_quality(proto)
+            for sid in [sid for sid in self._pq
+                        if sid not in self.node.sessions]:
+                del self._pq[sid]
+
+    # -- report --------------------------------------------------------
+
+    def _peer_row(self, s) -> dict:
+        node = self.node
+        host, port = _split_addr(s.peer)
+        proto = node._protocols.get(s.id)
+        live = proto is not None and s.state != "closed"
+        if live:
+            node.sample_srtt(s)
+            self._pq[s.id] = _path_quality(proto)
+        pq = self._pq.get(s.id, {})
+        tx = Counter(self._tx_closed.get(s.id, ()))
+        active = len(s._streams)
+        publishes = 0
+        for e in self.egress.values():
+            if s.id in e.ftrack.origin.sns:
+                publishes += 1
+            hop = e.hops.get(s.id)
+            if hop is None:
+                continue
+            tx["streams"] += hop.streams
+            tx["datagrams"] += hop.datagrams
+            if e.track is not None:
+                active += sum(1 for k in e.track._streams if k[0] == id(hop))
+        remote = s.remote
+        flows = list(s.flows.values())
+        return {
+            "host": host, "port": port,
+            "origin": "dialed" if s.dialer else "accepted",
+            "status": {"connected": "connected",
+                       "closed": "closed"}.get(s.state, "connecting"),
+            "identified": remote is not None,
+            "contact": remote.contact if remote else None,
+            "remote_node_id": (node_id_format(remote.node_id)
+                               if remote else None),
+            "srtt_us": s.srtt_us,
+            "metric": self.metrics.get((host, port), 0),
+            "node_metric": remote.metric if remote else None,
+            "connect_time_us": (round(s.connect_ms * 1000)
+                                if s.connect_ms is not None else None),
+            "subscribe_tracks": len(s.subscribes),
+            "publishes": publishes,
+            "active_streams": active,
+            "tx_streams": tx["streams"],
+            "rx_streams": sum(f.streams for f in flows),
+            "tx_bytes": pq.get("bytes_sent") or 0,
+            "rx_bytes": pq.get("bytes_received") or 0,
+            "tx_datagrams": tx["datagrams"],
+            "rx_datagrams": sum(f.datagrams for f in flows),
+        }
+
+    def _peer_rows(self) -> list:
+        """One row per live session, the newest closed one of a peer with
+        none live, and a connecting row for a dialed peer with neither."""
+        live, closed = [], {}
+        for s in self.node.sessions.values():
+            where = ("dialed" if s.dialer else "accepted",
+                     _split_addr(s.peer))
+            if s.state == "closed":
+                closed[where] = s
+            else:
+                live.append((where, s))
+        held = {w for w, _ in live}
+        rows = [self._peer_row(s) for _, s in live]
+        rows += [self._peer_row(s) for w, s in closed.items()
+                 if w not in held]
+        shown = {("dialed", (r["host"], r["port"])) for r in rows
+                 if r["origin"] == "dialed"}
+        for host, port in self.node.peers:
+            if ("dialed", (host, port)) not in shown:
+                rows.append({
+                    "host": host, "port": port, "origin": "dialed",
+                    "status": "connecting", "identified": False,
+                    "contact": None, "remote_node_id": None,
+                    "srtt_us": None,
+                    "metric": self.metrics.get((host, port), 0),
+                    "node_metric": None, "connect_time_us": None,
+                    "subscribe_tracks": 0, "publishes": 0,
+                    "active_streams": 0, "tx_streams": 0, "rx_streams": 0,
+                    "tx_bytes": 0, "rx_bytes": 0, "tx_datagrams": 0,
+                    "rx_datagrams": 0})
+        return rows
+
+    def _node_rows(self) -> list:
+        best: dict = {}
+        for s, rec in self.node.learned_nodes():
+            if s.state != "connected":
+                continue
+            body = rec.body
+            held = best.get(body.node_id)
+            if held is None or path_rank(body) < path_rank(held[1]):
+                best[body.node_id] = (s, body)
+        return [{"node_id": node_id_format(n), "contact": body.contact,
+                 "best_peer": s.peer, "path_metric": body.sum_metric(),
+                 "hops": len(body.path) + 1}
+                for n, (s, body) in sorted(best.items())]
+
+    def report(self) -> dict:
+        node = self.node
+        anns = [*node.originated_announces(), *self.announced.values()]
+        subs = [*node.originated_subscribes(), *node.remote_subscribes()]
+        tracks = []
+        for key, t in list(_tracks.items()):
+            fed = _fabric_fed(t)
+            tracks.append({
+                "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
+                "local_viewers": sum(1 for d in t.downstream
+                                     if d.forward and not isinstance(
+                                         d.session, FabricHop)),
+                "fabric": ("none" if not fed
+                           else "paused" if t.paused else "subscribed")})
+        return {
+            "node_id": node_id_format(node.node_id),
+            "label": node.local.contact,
+            "metric": node.local.metric,
+            "listen": node.listen_text(),
+            "peers": self._peer_rows(),
+            "nodes": self._node_rows(),
+            "announces": [{"namespace": _ns_str(a.namespace),
+                           "name": _name_str(a.name),
+                           "source": node_id_format(a.source),
+                           "kind": "namespace" if a.is_namespace
+                           else "track"} for a in anns],
+            "subscribes": [{"namespace": _ns_str(s.namespace),
+                            "name": _name_str(s.name),
+                            "source": node_id_format(s.source),
+                            "fullname_hash": f"0x{s.fullname_hash:016x}"}
+                           for s in subs],
+            "transit": [],
+            "tracks": tracks,
+        }
+
+
+async def _start_fabric(*, peers=(), port=FABRIC_PORT, bind=None,
+                        cert=None, key=None, node_id=None,
+                        label=FABRIC_LABEL, metric=DEFAULT_NODE_METRIC,
+                        **node_kw) -> _Fabric:
+    """Start the relay's fabric node: dial `peers`, listen on `port`
+    (0: do not)."""
+    global _fabric
+    node_kw.setdefault("redial_interval", FABRIC_REDIAL_S)
+    node = FabricNode(node_id=node_id, label=label, metric=metric,
+                      node_type=NodeType.EDGE, peers=peers, bind=bind,
+                      port=port, cert=cert, key=key, **node_kw)
+    fabric = _Fabric(node)
+    _fabric = fabric
+    try:
+        await fabric.start()
+    except BaseException:
+        _fabric = None
+        await node.stop()
+        raise
+    return fabric
+
+
+async def _stop_fabric() -> None:
+    """Withdraw from the fabric and close its sessions."""
+    global _fabric
+    fabric, _fabric = _fabric, None
+    if fabric is not None:
+        await fabric.stop()
+        logger.info("relay: fabric node stopped")
+
+
+def _fabric_peer_op(fabric, query: str) -> tuple:
+    """POST /fabric/peer: (HTTP status, body)."""
+    q = {k: v[-1] for k, v in urllib.parse.parse_qs(query).items()}
+    op, host = q.get("op"), q.get("host")
+    try:
+        port = int(q["port"])
+        metric = int(q["metric"]) if "metric" in q else None
+    except (KeyError, ValueError):
+        return "400 Bad Request", {"error": "host, port and metric: numbers"}
+    if (not host or not 0 < port < 65536
+            or (metric is not None and metric < 0)
+            or op not in ("add", "remove", "metric")
+            or (op == "metric" and metric is None)):
+        return "400 Bad Request", {
+            "error": "op=add|remove|metric&host=H&port=P[&metric=M]"}
+    if op == "add":
+        fabric.add_peer(host, port, metric)
+    elif op == "remove":
+        if not fabric.remove_peer(host, port):
+            return "404 Not Found", {"error": "no such peer"}
+    elif not fabric.set_metric(host, port, metric):
+        return "404 Not Found", {"error": "no such peer"}
+    return "200 OK", {"ok": True}
+
+
 def _sent_fields(d) -> dict:
     return {"objects_sent": d.objects_sent, "bytes_sent": d.bytes_sent,
             "largest_sent": list(d.largest_sent) if d.largest_sent else None}
@@ -7110,8 +7783,15 @@ async def _on_control(reader, writer) -> None:
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
         target = urllib.parse.urlsplit(path)
+        fabric = _fabric
         if path == "/sessions" and method == "GET":
             status, body = "200 OK", _sessions_report()
+        elif target.path.startswith("/fabric") and fabric is None:
+            status, body = "404 Not Found", {"error": "the fabric is off"}
+        elif target.path == "/fabric" and method == "GET" and fabric:
+            status, body = "200 OK", fabric.report()
+        elif target.path == "/fabric/peer" and method == "POST" and fabric:
+            status, body = _fabric_peer_op(fabric, target.query)
         elif target.path == "/gc" and method == "GET":
             top = urllib.parse.parse_qs(target.query).get("top", ["40"])[0]
             if top.isdigit():
@@ -7328,6 +8008,14 @@ async def main():
     if args.idle_timeout is not None and args.idle_timeout <= 0:
         print("Error: --idle-timeout must be above 0", file=sys.stderr)
         sys.exit(2)
+    if args.peer_port is not None and not 0 <= args.peer_port < 65536:
+        sys.exit("error: --peer-port must be 0 to 65535")
+    if args.node_metric < 0:
+        sys.exit("error: --node-metric must be 0 or above")
+    try:
+        fabric_id, fabric_label = parse_identity(args.node_id, FABRIC_LABEL)
+    except ValueError as e:
+        sys.exit(f"error: --node-id: {e}")
     global MAX_SUBSCRIBERS
     MAX_SUBSCRIBERS = args.max_subscribers
     global MAX_NAMESPACES_PER_SESSION, MAX_SUBSCRIPTIONS_PER_SESSION
@@ -7360,6 +8048,12 @@ async def main():
     handles = [await (server.serve_dual() if args.dual else server.serve())
                for server, _port, _label in listeners]
     _begin_startup_hold(args.startup_hold)
+    if args.peer or args.peer_port is not None:
+        await _start_fabric(
+            peers=args.peer or (),
+            port=FABRIC_PORT if args.peer_port is None else args.peer_port,
+            bind=args.bind, cert=cert, key=key, node_id=fabric_id,
+            label=fabric_label, metric=args.node_metric)
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
@@ -7441,12 +8135,16 @@ async def main():
         await stop.wait()
         if watchdog is not None:
             watchdog.cancel()
+        await _stop_fabric()
         await _refuse_connections(handles)
         await _drain(servers, args.goaway_uri, args.drain_timeout,
                      stopped_by[0])
     except asyncio.CancelledError:
         wait = 0
     finally:
+        if _fabric is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(_stop_fabric(), 1.0)
         reason = _shutdown_reason(args.goaway_uri)
         for server in servers:
             server.refuse_sessions(reason)
