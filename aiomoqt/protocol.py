@@ -7453,6 +7453,10 @@ class _WTSessionMixin:
 
     _is_wt = True
 
+    # Stream events are taken in _on_event; aiopquic's events() queue is
+    # never read, so it gets no per-stream entries.
+    queue_new_streams = False
+
     # The session itself; an attribute holding self would make each
     # session a reference cycle, freed only by a GC pass.
     @property
