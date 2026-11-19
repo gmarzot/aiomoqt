@@ -12,6 +12,8 @@ objects and duplicates."""
 import asyncio
 import contextlib
 import json
+import os
+import tempfile
 
 import pytest
 
@@ -422,9 +424,16 @@ async def _http(path, method, target):
     return int(head.split()[1]), json.loads(body)
 
 
+@pytest.fixture
+def short_dir():
+    # macOS caps AF_UNIX paths near 104 bytes; pytest's tmp_path is longer.
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        yield d
+
+
 @pytest.mark.asyncio
-async def test_control_get_fabric_and_post_peer(tmp_path):
-    sock = str(tmp_path / "relay.sock")
+async def test_control_get_fabric_and_post_peer(short_dir):
+    sock = os.path.join(short_dir, "relay.sock")
     server = await asyncio.start_unix_server(relay._on_control, path=sock)
     port, fport, bport = _PORT + 48, _FABRIC_PORT + 48, _FABRIC_PORT + 49
     try:
