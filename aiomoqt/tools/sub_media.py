@@ -4,6 +4,14 @@ playable files, or pipes one track straight into a player.
 
   %(prog)s moqt://localhost:4433/ -N demo/live -t 30 --out ./media-out
 
+  # no relay: listen, and let the publisher dial in
+  %(prog)s -Q -p 4433 -N demo/live --analyze -i 5
+  pub_media moqt://HOST:4433/ -k -N demo/live --pub-ns --mp4 clip.mp4
+
+With -Q/-W instead of a URL, sub_media listens and takes the first
+publisher session to dial it; once that session announces -N
+(PUBLISH_NAMESPACE, pub_media --pub-ns) it runs as a dialed run does.
+
 Reads the catalog track, subscribes every media track it describes
 (--packaging narrows to one packaging), and writes:
   <out>/video.h264   Annex-B elementary stream (SPS/PPS injected from
@@ -56,6 +64,7 @@ run on different machines. Jitter, the playout model and cross-track
 skew are built from differences and do not.
 """
 import asyncio
+import contextlib
 import csv
 import functools
 import hashlib
@@ -69,6 +78,7 @@ import wave
 from typing import Optional
 
 from aiomoqt.client import MOQTClient
+from aiomoqt.server import MOQTServer
 from aiomoqt.track import SubscribedTrack
 from aiomoqt.media import MediaSubscriber, MsftsTrackSubscriber
 from aiomoqt.media.catalog import (
@@ -80,11 +90,12 @@ from aiomoqt.media import msfts, tsplayout
 from aiomoqt.media.loc import LOC_PROP_TIMESCALE
 from aiomoqt.media.msfts import MODE_ES_PACKETS, TS_PACKET
 from aiomoqt.media.udp import UdpOutput, is_udp_url, parse_udp_url
-from aiomoqt.types import MOQTRequestError
+from aiomoqt.types import MOQTMessageType, MOQTRequestError
 from aiomoqt.media.sources import (
     IvfWriter, adts_frame, as_annexb, avcc_param_sets,
 )
 from aiomoqt.utils import cli as _cli
+from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
 from aiomoqt.utils.media_stats import (
     CSV_FIELDS, MediaAnalysis, csv_row, format_interval, format_summary,
     interval_header, wall_clock_us,
@@ -100,7 +111,11 @@ def parse_args():
     parser = _cli.make_parser(
         'LOC/MSF media subscriber (catalog-driven, writes playable '
         'files)', epilog=__doc__)
-    _cli.add_endpoint(parser)
+    _cli.add_optional_endpoint(parser)
+    listen = parser.add_argument_group(
+        'listen for the publisher (instead of a URL)')
+    _cli.add_listener(listen)
+    _cli.add_tls(listen)
     _cli.add_identity(parser, namespace='demo/live')
     parser.add_argument('--discover', action='store_true',
                         help='Treat -N as a namespace prefix and find the '
@@ -193,6 +208,17 @@ def parse_args():
     _cli.add_logging(parser)
     _cli.add_help(parser)
     args = parser.parse_args()
+    _cli.check_url_vs_listener(parser, args)
+    args.listen = bool(args.quic or args.wt)
+    if not (args.url or args.listen):
+        parser.error('give a URL to dial, or -Q/-W to listen for the '
+                     'publisher')
+    for flag, on in (('--cert', args.cert), ('--key', args.key)):
+        if on and not args.listen:
+            parser.error(f'{flag} applies to -Q/-W only')
+    if args.listen and args.discover:
+        parser.error('--discover asks a relay; with -Q/-W the publisher '
+                     'announces -N')
     if args.analyze and args.pipe:
         parser.error('--analyze writes no media; drop --pipe')
     if args.report and not args.analyze:
@@ -829,9 +855,95 @@ async def _ts_run(args, lane: _TsLane, closed, report) -> None:
         report[0].close()
 
 
+def _listener_cert(args):
+    """(cert, key): --cert/--key, else certs/, else a generated
+    self-signed localhost cert."""
+    cert = args.cert or find_cert()
+    key = args.key or find_key(cert)
+    if cert and key:
+        return cert, key
+    if args.cert:
+        raise SystemExit(f"--cert {args.cert}: no key beside it; use --key")
+    return ensure_self_signed()
+
+
+def _ns(parts) -> str:
+    return '/'.join(p.decode() if isinstance(p, bytes) else p for p in parts)
+
+
+@contextlib.asynccontextmanager
+async def _dial(args):
+    relay = parse_relay_url(args.url)
+    client = MOQTClient(
+        relay.host, relay.port, path=relay.path,
+        use_quic=relay.use_quic, verify_tls=not args.insecure,
+        supported_drafts=args.draft, debug=args.debug,
+        keylog_filename=args.keylogfile,
+        **_cli.transport_kwargs(args),
+    )
+    _status(f"  relay: {relay}  namespace: {args.namespace}")
+    async with client.connect() as session:
+        await session.client_session_init()
+        yield session
+
+
+@contextlib.asynccontextmanager
+async def _listen(args):
+    """The first publisher session to dial in, once it has announced -N;
+    later sessions are refused."""
+    quic, wt = _cli.resolve_listener(args)
+    cert, key = _listener_cert(args)
+    loop = asyncio.get_running_loop()
+    first = loop.create_future()
+    announced = loop.create_future()
+    server = MOQTServer(
+        host=args.bind, port=args.port, certificate=cert,
+        private_key=key, path=args.path, use_quic=quic and not wt,
+        supported_drafts=args.draft, debug=args.debug,
+        **_cli.transport_kwargs(args))
+
+    def on_session(session):
+        if not first.done():
+            first.set_result(session)
+            server.refuse_sessions("one publisher session at a time")
+
+    async def on_namespace(session, msg):
+        session.publish_namespace_ok(msg)
+        ns = _ns(msg.namespace)
+        if ns == args.namespace and not announced.done():
+            announced.set_result(session)
+        elif ns != args.namespace:
+            _status(f"  note: ignoring announced '{ns}'")
+    server.register_session_handler(on_session)
+    server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE, on_namespace)
+    handle = await (server.serve_dual() if quic and wt else server.serve())
+    try:
+        host = args.bind or 'localhost'
+        _status(f"  listening: {'QUIC+WT' if quic and wt else 'QUIC' if quic else 'WT'}"
+                f" {host}:{args.port}{args.path}  namespace: {args.namespace}")
+        session = await first
+        _status(f"  publisher up: draft-{session.negotiated_draft}")
+        closed = asyncio.ensure_future(session.async_closed())
+        try:
+            async with asyncio.timeout(_cli.setup_timeout(args)):
+                await asyncio.wait({announced, closed},
+                                   return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            closed.cancel()
+        if not announced.done():
+            _status(f"  error: the publisher did not announce "
+                    f"'{args.namespace}' within {_cli.setup_timeout(args)}s")
+            sys.exit(2)
+        yield session
+    finally:
+        await server.close_sessions()
+        handle.close()
+
+
 async def run(args):
     _cli.apply_logging(args)
-    relay = parse_relay_url(args.url)
     # True: the mpeg2ts track only; None: decided by the catalog.
     ts_mode = True if _ts_forced(args) else None if args.analyze else False
     if not args.analyze and not ts_mode:
@@ -852,18 +964,10 @@ async def run(args):
     if analysis is not None:
         analysis.timing_of = _timing_of
 
-    client = MOQTClient(
-        relay.host, relay.port, path=relay.path,
-        use_quic=relay.use_quic, verify_tls=not args.insecure,
-        supported_drafts=args.draft, debug=args.debug,
-        keylog_filename=args.keylogfile,
-        **_cli.transport_kwargs(args),
-    )
-    _status(f"  relay: {relay}  namespace: {args.namespace}")
     rc = 0
-    async with client.connect() as session:
-        await session.client_session_init()
-
+    opened = (_listen(args) if getattr(args, 'listen', False)
+              else _dial(args))
+    async with opened as session:
         def _select(entry):
             nonlocal ts_mode
             if not _wanted(args, entry) or sub is None:

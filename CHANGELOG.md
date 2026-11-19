@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `sub_media -Q/-W [-p PORT] [--cert --key]` listens instead of dialing: the first publisher session to dial it (e.g. `pub_media --pub-ns`) is subscribed and fetched over once it announces `-N`, no relay between. `MOQTServer.register_session_handler(fn)` calls `fn(session)` as each session completes setup.
 - Logging: once a track is found malformed, its later streams are refused at DEBUG (the first ERROR line stays); the "at or past end of group" reason names what ended the group, an END_OF_GROUP object or a stream header's END_OF_GROUP bit with the header byte; aiomoqt-relay logs a PUBLISH_DONE it cannot send to a closing session at DEBUG instead of a WARNING with a traceback.
 - aiomoqt-relay takes every further publisher of a track as a copy (d22 §7.3): a Location it already holds is dropped wherever the publisher's numbering sits, so a standby several groups behind no longer supersedes the track. A copy of Object 0 differing in size from the one taken is logged once per publisher, not acted on.
 - Release images: `ghcr.io/gmarzot/aiomoqt:interop` is the highest release, pre-releases included, and the interop runner tracks it; `:latest` is the highest stable release, and a patch to an older line no longer moves it.

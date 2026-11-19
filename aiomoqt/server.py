@@ -3,7 +3,8 @@ import errno
 import socket
 import weakref
 from asyncio.futures import Future
-from typing import Any, Coroutine, Iterable, List, Optional, Tuple, Union
+from typing import (Any, Callable, Coroutine, Iterable, List, Optional,
+                    Tuple, Union)
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.dispatch import serve_dispatch
@@ -173,6 +174,7 @@ class MOQTServer(MOQTPeer):
         self._refusal: Optional[str] = None
         # Sessions this server closed, until their connections end.
         self._closing: weakref.WeakSet = weakref.WeakSet()
+        self._session_handlers: List[Callable[[Any], None]] = []
 
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
@@ -352,11 +354,29 @@ class MOQTServer(MOQTPeer):
         # Omitted at 1, so an aiopquic without workers= still serves.
         return {"workers": self.workers} if self.workers != 1 else {}
 
+    def register_session_handler(self,
+                                 handler: Callable[[Any], None]) -> None:
+        """Call handler(session) as each session arriving from now on
+        completes setup."""
+        self._session_handlers.append(handler)
+
     def _adopt(self, session):
         self._live.add(session)
         if self._refusal is not None:
             self._loop.call_soon(self.refuse, session)
+        if self._session_handlers:
+            session._moqt_session_setup.add_done_callback(
+                lambda fut: self._setup_done(session, fut))
         return session
+
+    def _setup_done(self, session, fut) -> None:
+        if fut.cancelled() or fut.result() is not True:
+            return
+        for handler in self._session_handlers:
+            try:
+                handler(session)
+            except Exception:
+                logger.exception("session handler failed")
 
     def refuse_sessions(self, reason: str = "server shutting down") -> None:
         """Close every session that arrives from now on (NO_ERROR) before
