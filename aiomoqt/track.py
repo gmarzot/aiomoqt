@@ -864,6 +864,7 @@ class PublishedTrack(Track):
                                                           sub.track_alias))
         sub._filter()
         sub.delivery.excludes_end = sub.excludes_end
+        sub.delivery.subgroup_timeout = self._subgroup_deadline(sub)
         self._out.add(sub.delivery,
                       gate=bool(sub.forward and sub.generating),
                       deadline=self._delivery_deadline(sub))
@@ -902,7 +903,9 @@ class PublishedTrack(Track):
             self._sync_deadline(sub)
 
     def _sync_deadline(self, sub) -> None:
-        """Hand the peer's send lane its delivery timeout."""
+        """Hand the peer's delivery and send lane its delivery timeouts."""
+        if sub.delivery is not None:
+            sub.delivery.subgroup_timeout = self._subgroup_deadline(sub)
         lane = getattr(sub.delivery, "lane", None)
         if lane is not None:
             lane.deadline = self._delivery_deadline(sub)
@@ -920,6 +923,16 @@ class PublishedTrack(Track):
         if self.mapping is StreamMapping.DATAGRAM:
             timeout = _min_nonzero(timeout, _min_nonzero(
                 self.subgroup_delivery_timeout, sub.subgroup_timeout))
+        return timeout / 1000 if timeout else None
+
+    def _subgroup_deadline(self, sub) -> Optional[float]:
+        """A peer's SUBGROUP_DELIVERY_TIMEOUT in seconds on streams, None
+        for none: the smaller non-zero of the track's and the
+        subscriber's."""
+        if self.mapping is StreamMapping.DATAGRAM:
+            return None
+        timeout = _min_nonzero(self.subgroup_delivery_timeout,
+                               sub.subgroup_timeout)
         return timeout / 1000 if timeout else None
 
     def _ensure_production(self) -> asyncio.Future:
@@ -1103,6 +1116,10 @@ class PublishedTrack(Track):
             return None
         props = dict(self.track_properties or ())
         props.update(self._timing_properties(session._profile.vi64))
+        if self.object_delivery_timeout:
+            props[ParamType.DELIVERY_TIMEOUT] = self.object_delivery_timeout
+        if self.subgroup_delivery_timeout and session._profile.vi64:
+            props[SUBGROUP_DELIVERY_TIMEOUT] = self.subgroup_delivery_timeout
         if self.immutable_properties:
             buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
             MOQTMessage._extensions_encode(buf, self.immutable_properties,

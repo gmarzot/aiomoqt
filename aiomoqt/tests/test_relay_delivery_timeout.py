@@ -10,7 +10,7 @@ import pytest
 
 from aiomoqt.context import canonical_stream_reset
 from aiomoqt.tools import moq_interop_relay as relay
-from aiomoqt.track import PublishedTrack, SubscribedTrack
+from aiomoqt.track import PublishedTrack, SubscribedTrack, _reply_properties
 from aiomoqt.types import ParamType, StreamResetCode
 
 from aiomoqt.tests._certs import requires_certs
@@ -43,6 +43,63 @@ async def _feed(track, gid, n, start=0):
 
 
 # -- lane mechanics against fake sessions --------------------------------
+
+class _Released:
+    def __init__(self):
+        self.released = set()
+
+    def stream_released(self, sid):
+        return sid in self.released
+
+
+async def test_an_upstream_fin_starts_the_subscribers_subgroup_timer(lag):
+    """§8 at a relay: each subscriber's SUBGROUP_DELIVERY_TIMEOUT starts at
+    the upstream FIN; a stream not released by then is reset."""
+    lag(0)
+    track = relay._RelayedTrack(("ns", "t"))
+    track.properties = {0x06: 40}
+    timed, patient = _Fake(), _Fake()
+    for s in (timed, patient):
+        s._quic = _Released()
+    d1 = track.add_downstream(timed, 1, 1)
+    d2 = track.add_downstream(patient, 2, 2)
+    assert d1.take_timeout({0x06: 20})
+    assert d2.take_timeout({0x06: 5000})
+    try:
+        for gid in range(2):
+            await _feed(track, gid, 2)
+            track.on_stream_end(gid, 0)
+            await _settle(5)
+        await _settle()
+        fins = [e[1] for e in timed.kinds("fin")]
+        assert len(fins) == 2 and not timed.kinds("reset")
+        timed._quic.released.add(fins[0])
+        timers = track._subgroup_timers
+        assert timers[id(timed)].timeout == 0.02
+        assert timers[id(patient)].timeout == 0.04
+        await asyncio.sleep(0.08)
+        assert timed.kinds("reset") == [("reset", fins[1], _DT)]
+        assert patient.kinds("reset") == [
+            ("reset", sid, _DT) for _, sid in patient.kinds("fin")]
+    finally:
+        track.close()
+
+
+async def test_no_subgroup_timeout_arms_no_relay_timer(lag):
+    lag(0)
+    track = relay._RelayedTrack(("ns", "t"))
+    s = _Fake()
+    s._quic = _Released()
+    d = track.add_downstream(s, 1, 1)
+    d.take_timeout({ParamType.DELIVERY_TIMEOUT: 1000})
+    try:
+        await _feed(track, 0, 2)
+        track.on_stream_end(0, 0)
+        await _settle()
+        assert s.kinds("fin") and track._subgroup_timers == {}
+    finally:
+        track.close()
+
 
 async def test_a_lagging_lane_expires_live_objects_its_peer_gets_all(lag):
     lag(0.05)
@@ -285,3 +342,73 @@ async def test_subscribe_and_update_set_the_timeout(
     assert subs["video"].count and subs["audio"].count
     assert StreamResetCode.DELIVERY_TIMEOUT in resets, resets
     assert StreamResetCode.CANCELLED not in resets, resets
+
+
+class _Origin(PublishedTrack):
+    """A publisher recording the SUBSCRIBE parameters it receives."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.params = []
+
+    def _take_timeouts(self, sub, params, prof):
+        self.params.append(dict(params or {}))
+        super()._take_timeouts(sub, params, prof)
+
+
+@requires_certs
+@pytest.mark.parametrize("draft", [18, 20])
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_subscriber_timeouts_stay_at_the_relay(
+        use_quic, draft, relay_tables, lag):
+    """§10.2.3-10.2.4: each subscriber's timeouts apply to its own lane,
+    the smaller non-zero of its and the publisher's; none go upstream.
+    The publisher's Track Properties reach the subscribers."""
+    lag(0)
+    port = _BASE_PORT + 70 + 4 * (draft == 20) + 2 * (not use_quic)
+    pub_ms = {"video": 3000, "audio": 0}
+    pub_sg_ms = {"video": 300, "audio": 0}
+    async with _relay(port, use_quic, draft) as connect:
+        pub = await connect()
+        origins = {}
+        for name, ms in pub_ms.items():
+            origins[name] = _Origin(pub, namespace=_NS, trackname=name,
+                                    object_size=500, group_size=_GROUP,
+                                    rate=_RATE)
+            origins[name].object_delivery_timeout = ms
+            origins[name].subgroup_delivery_timeout = pub_sg_ms[name]
+            origins[name].attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        viewers = [await connect() for _ in range(2)]
+        props = {}
+        for name in pub_ms:
+            for i, viewer in enumerate(viewers):
+                ok = await viewer.subscribe(
+                    namespace=_NS, track_name=name, wait_response=True,
+                    parameters={ParamType.DELIVERY_TIMEOUT: 1000 * (i + 1),
+                                0x06: 500 * (i + 1)},
+                    on_object=lambda *_: None)
+                props[(i, name)] = dict(_reply_properties(ok) or {})
+        keys = {n: (relay._ns_tuple(_NS), n.encode()) for n in pub_ms}
+        await asyncio.sleep(0.3)
+        # Downstreams in subscription order: viewer 0, then viewer 1.
+        deadlines = {(i, n): d.lane.deadline for n, k in keys.items()
+                     for i, d in enumerate(relay._tracks[k].downstream)}
+        subgroups = {(i, n): relay._tracks[k]._subgroup_timers[
+                         id(d.session)].timeout
+                     for n, k in keys.items()
+                     for i, d in enumerate(relay._tracks[k].downstream)}
+
+    assert deadlines == {(0, "video"): 1.0, (1, "video"): 2.0,
+                         (0, "audio"): 1.0, (1, "audio"): 2.0}
+    assert subgroups == {(0, "video"): 0.3, (1, "video"): 0.3,
+                         (0, "audio"): 0.5, (1, "audio"): 1.0}
+    for (i, name), p in props.items():
+        assert p.get(int(ParamType.DELIVERY_TIMEOUT)) == (pub_ms[name]
+                                                          or None), p
+        assert p.get(0x06) == (pub_sg_ms[name] or None), p
+    for o in origins.values():
+        assert o.params, "no upstream SUBSCRIBE"
+        for params in o.params:
+            assert ParamType.DELIVERY_TIMEOUT not in params, params
+            assert 0x06 not in params, params
