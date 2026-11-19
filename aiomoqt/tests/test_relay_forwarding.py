@@ -2195,6 +2195,29 @@ def test_one_publishers_datagram_record_keeps_two_groups():
     track.close()
 
 
+def test_a_standby_datagram_below_the_record_is_a_copy():
+    # One publisher's datagram record holds two groups: a standby's
+    # datagram below it cannot be told apart and is dropped.
+    def dg(gid):
+        return ObjectDatagram(track_alias=1, group_id=gid, object_id=0,
+                              publisher_priority=128, payload=b"x")
+    track = relay._RelayedTrack(((b"relay", b"multi"), b"audio"))
+    track.attaching = True
+    for gid in range(50):
+        track.on_object(dg(gid), 1, 0, gid, 0)
+    feed = relay._Feed()
+    feed.sub = SimpleNamespace(session=SimpleNamespace(), track_alias=2,
+                               largest=None, request_id=None)
+    track.standby.append(feed)
+    track._multi = True
+    for gid in (3, 47, 48, 49):
+        track.on_object(dg(gid), 1, 0, gid, 0, feed=feed)
+    assert track._objects_in == 50 and track._copies == 4
+    track.on_object(dg(50), 1, 0, 50, 0, feed=feed)
+    assert track._objects_in == 51
+    track.close()
+
+
 def test_a_closed_track_takes_no_objects():
     track = relay._RelayedTrack(("ns", "t"))
     track.close()

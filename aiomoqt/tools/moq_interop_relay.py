@@ -2547,6 +2547,10 @@ class _RelayedTrack:
         """§7.3: True for an object already taken from another publisher,
         or one of a subgroup already ended; else it is recorded."""
         if dgram:
+            # Below the record, which one publisher keeps for two groups,
+            # a copy cannot be told apart: dropped.
+            if self._multi and gid < max(self._floor, self._dgram_gid - 1):
+                return True
             if (gid, oid) in self._dgrams:
                 return self._multi
             self._dgrams.add((gid, oid))
