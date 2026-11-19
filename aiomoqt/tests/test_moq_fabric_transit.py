@@ -831,3 +831,71 @@ async def test_graceful_stop_withdraws_nothing_it_only_transits():
             "NODE_INFO_WD": 0, "SUBSCRIBE_INFO_WD": 0,
             "ANNOUNCE_INFO_WD": 0}
     assert not sink.dups
+
+
+def test_best_switch_withdraws_from_the_new_arrival_session():
+    t = _transit()
+    wa = _Wire(t, 1, _remote(A, "a"))
+    wc = _Wire(t, 2, _remote(C, "c"))
+    wb = _Wire(t, 3, _remote(B, "b"))
+    wa.send(MsgType.NODE_INFO_ADV, NodeInfo(X, path=(PathItem(A, 1, 100),)))
+    # C and B hold our route to X, through A.
+    assert [p.node_id for p in wc.remote.nodes[X].body.path] == [
+        A, t.node_id]
+    assert wb.remote.nodes[X].body.path[-1].node_id == t.node_id
+    wc.send(MsgType.NODE_INFO_ADV, NodeInfo(X, path=()))
+    assert t.transit.best[X] == 2
+    # C cannot take a route that arrived from it: it is withdrawn there,
+    # and B gets the new one.
+    assert _sent(wc, MsgType.NODE_INFO_WD) == 1 and X not in wc.remote.nodes
+    assert [p.node_id for p in wb.remote.nodes[X].body.path] == [t.node_id]
+    assert _sent(wb, MsgType.NODE_INFO_WD) == 0
+    # A late peer gets the route in its sync, and later its withdraw.
+    wd = _Wire(t, 4, _remote(0x0f0f0f0f0f0f0f0f, "late"))
+    assert _sent(wd, MsgType.NODE_INFO_WD) == 0 and X in wd.remote.nodes
+    assert X in wa.remote.nodes
+    # Back through A: A, the arrival session, loses our route; C gets it.
+    wc.send(MsgType.NODE_INFO_WD, NodeInfo(X))
+    assert t.transit.best[X] == 1
+    assert X not in wa.remote.nodes and X in wc.remote.nodes
+    wa.send(MsgType.NODE_INFO_WD, NodeInfo(X))
+    assert X not in t.transit.best
+    assert all(X not in w.remote.nodes for w in (wa, wb, wc, wd))
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_ring_drops_a_stopped_node_without_ghost_routes():
+    ports = [_BASE_PORT + 12 + i for i in range(4)]
+    peers = [[], [ports[0]], [ports[1]], [ports[2], ports[0]]]
+    ring = [_listen(p, f"N{i + 1}", transit=True,
+                    peers=[("127.0.0.1", q) for q in peers[i]],
+                    redial_interval=0.2)
+            for i, p in enumerate(ports)]
+    n1, rest = ring[0], ring[1:]
+    gone = n1.node_id
+    try:
+        for n in ring:
+            await n.start()
+        await _until(lambda: all(len(n.connected()) == 2 for n in ring))
+        await _until(lambda: all(len(n.transit.best) == 3 for n in ring))
+        await n1.stop()
+
+        def converged():
+            for n in rest:
+                if gone in n.transit.best:
+                    return False
+                if any(gone in s.nodes for s in n.connected()):
+                    return False
+            return True
+
+        await _until(converged, timeout=3)
+        for n in rest:
+            assert len(n.transit.best) == 2
+            for s in n.connected():
+                for rec in s.nodes.values():
+                    assert all(p.node_id != n.node_id
+                               for p in rec.body.path)
+    finally:
+        for n in ring:
+            await n.stop()

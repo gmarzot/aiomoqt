@@ -158,6 +158,8 @@ class Transit:
         self.best: Dict[int, int] = {}
         # Node id -> (route session id, advertisement) last propagated.
         self.advertised: Dict[int, Tuple[int, NodeInfo]] = {}
+        # Node id -> session id -> the advertisement it holds from us.
+        self._sent: Dict[int, Dict[int, NodeInfo]] = defaultdict(dict)
         # Accepted learned announces and subscribes, by (hash, source).
         self.announces: Dict[Key, AnnounceInfo] = {}
         self.subscribes: Dict[Key, SubscribeInfo] = {}
@@ -231,13 +233,25 @@ class Transit:
         item = PathItem(self.node_id, srtt, self.node.advertised_metric(to.id))
         return dataclasses.replace(info, path=info.path + (item,))
 
-    def _propagate(self, via: int, info: NodeInfo,
-                   withdraw: bool = False) -> None:
-        kind = MsgType.NODE_INFO_WD if withdraw else MsgType.NODE_INFO_ADV
+    def _propagate(self, via: int, info: NodeInfo) -> None:
+        """The new best advertisement where the loop rule allows it; a
+        withdraw to each session holding our previous one that may not
+        take this one (the new arrival session, a node on the path)."""
+        sent = self._sent[info.node_id]
         for s in self.node.connected():
             out = self._forwarded(info, via, s)
             if out is not None:
-                self._send(s, kind, out)
+                sent[s.id] = out
+                self._send(s, MsgType.NODE_INFO_ADV, out)
+            elif s.id in sent:
+                self._send(s, MsgType.NODE_INFO_WD, sent.pop(s.id))
+
+    def _withdraw_all(self, node_id: int) -> None:
+        """A withdraw to every session holding our advertisement."""
+        for sid, out in self._sent.pop(node_id, {}).items():
+            session = self.node.sessions.get(sid)
+            if session is not None:
+                self._send(session, MsgType.NODE_INFO_WD, out)
 
     def _route(self, node_id: int) -> Optional[PeerSession]:
         sid = self.best.get(node_id)
@@ -257,7 +271,7 @@ class Transit:
             if held is not None:
                 log.info(f"fabric transit: node {node_id_format(node_id)} "
                          f"unreachable; withdrawn")
-                self._propagate(held[0], held[1], withdraw=True)
+                self._withdraw_all(node_id)
                 self._source_gone(node_id)
         else:
             self.best[node_id] = s.id
@@ -294,6 +308,7 @@ class Transit:
         for via, info in list(self.advertised.values()):
             out = self._forwarded(info, via, session)
             if out is not None:
+                self._sent[info.node_id][session.id] = out
                 self._send(session, MsgType.NODE_INFO_ADV, out)
 
     def _source_gone(self, node_id: int) -> None:
@@ -621,6 +636,8 @@ class Transit:
         """Forget a closed session's sets and streams, then re-route the
         nodes it reached."""
         sid = session.id
+        for sent in self._sent.values():
+            sent.pop(sid, None)
         for key, ing in list(self.ingress.items()):
             if ing.session_id == sid:
                 for eg in list(ing.egress.values()):
