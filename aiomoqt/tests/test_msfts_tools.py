@@ -470,8 +470,9 @@ async def test_end_to_end_delay(monkeypatch, capsys, tmp_path, pub_argv,
     if source == 'frindell':
         assert timings[0].timescale == 90_000
         assert timings[0].mapping[2:] == (0, 0)
-        # Every object carries one.
-        assert e2e['samples'] == summary['objects']['received']
+        # Every object carries one; a timeline record that lands before
+        # the first object adds one more.
+        assert 0 <= e2e['samples'] - summary['objects']['received'] <= 1
     else:
         assert not timings[0].declared
         # One per group: a group's record may still be on its way.

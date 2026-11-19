@@ -424,6 +424,23 @@ def _count_writes(session):
                 fins.add(sid)
             return sid
         t.create_stream = create_stream
+        create_nowait = getattr(t, "create_stream_nowait", None)
+        if create_nowait is not None:
+            def create_stream_nowait(*a, initial=b"", end_stream=False,
+                                     on_created=None, **kw):
+                def created(sid):
+                    if sid:
+                        opened.add(sid)
+                        if initial or end_stream:
+                            writes[sid] += 1
+                        if end_stream:
+                            fins.add(sid)
+                    if on_created is not None:
+                        on_created(sid)
+                return create_nowait(*a, initial=initial,
+                                     end_stream=end_stream,
+                                     on_created=created, **kw)
+            t.create_stream_nowait = create_stream_nowait
     else:
         next_id = t.get_next_available_stream_id
 

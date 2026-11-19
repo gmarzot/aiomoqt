@@ -142,7 +142,7 @@ from aiomoqt.types import (
 )
 from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
                               SubgroupTimer, properties_charge,
-                              retained_object_bytes)
+                              retained_object_bytes, END_DUE)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -1542,6 +1542,10 @@ class _RelayDelivery:
                 ) and ((id(session), gid, sgid) not in track._streams
                        or (gid, sgid) in track._ends_due):
             # A stream end queued behind leaves with the lane's last write.
+            if ((id(session), gid, sgid) not in track._streams
+                    and (gid, sgid) in track._ends_due and oid is not None
+                    and status not in _STREAM_ENDS):
+                return END_DUE
             return None
         if track._forward_one(session, d.alias, gid, sgid, oid, payload,
                               exts, prio, status, shape, encoded,
@@ -1553,6 +1557,28 @@ class _RelayDelivery:
             track._bytes_out += len(payload or b"")
             if _born is not None:
                 track._tx_born[self.sid] = _born
+        return True
+
+    def send_whole_nowait(self, item, end) -> bool:
+        """Open, write and end a stream holding object `item` and the end
+        `end` queued behind it, when that completes now."""
+        (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
+         shape, encoded) = item
+        if not live:
+            return False
+        track, d, session = self.track, self.d, self.session
+        if track._forward_one(session, d.alias, gid, sgid, oid, payload,
+                              exts, prio, status, shape, encoded,
+                              start=d.start, lost=d.lost,
+                              end=(end[5], end[9]),
+                              nowait=True) is _NOT_SENT:
+            return False
+        track._objects_out += 1
+        track._bytes_out += len(payload or b"")
+        if _born is not None:
+            track._tx_born[self.sid] = _born
+        if end[5] is not None:
+            track._objects_out += 1
         return True
 
     @staticmethod
@@ -3139,6 +3165,10 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         if entry is None:
+            if nowait:
+                return self._open_stream_nowait(
+                    session, alias, gid, sgid, oid, payload, exts, prio,
+                    status, shape, encoded, start, lost, end)
             return self._open_stream(
                 session, skey, alias, gid, sgid, oid, payload, exts, prio,
                 status, shape, encoded, start, lost, lane, end)
@@ -3294,6 +3324,53 @@ class _RelayedTrack:
                                  exts, prio, status, shape, encoded, start,
                                  lost, lane, end)
         return True if rest is None else await rest
+
+    def _open_stream_nowait(self, session, alias, gid, sgid, oid, payload,
+                            exts, prio, status, shape, encoded, start, lost,
+                            end):
+        """_open_stream for a stream written whole, without waiting: None
+        once submitted, else _NOT_SENT."""
+        if (end is None or status in _STREAM_ENDS or gid in lost
+                or self._short(gid, start)):
+            return _NOT_SENT
+        first_obj, eog, _inherited = shape or (False, False, False)
+        prof = session._profile
+        key = (alias, id(prof), end)
+        parts = None if encoded is None else encoded.get(key)
+        if parts is None:
+            header = SubgroupHeader(
+                track_alias=alias, group_id=gid, subgroup_id=sgid,
+                publisher_priority=prio, extensions_present=True,
+                end_of_group=eog, first_object=first_obj, prof=prof)
+            parts = (header.serialize().data,
+                     _object_data(header, payload, exts, oid, encoded),
+                     self._end_data(header, gid, end, start, lost))
+            if encoded is not None:
+                encoded[key] = parts
+        initial = b"".join(parts)
+        sched = getattr(session, 'stream_scheduling', None)
+        band = _band_of(prio if prio is not None and 0 <= prio <= 255 else 128,
+                        sched or STREAM_SCHEDULING)
+        tx = self._tx_streams.setdefault(id(session), {})
+        k = (gid, sgid)
+
+        def created(stream_id):
+            if stream_id:
+                tx[k] = stream_id
+                self._fin(session, stream_id)
+        if sched == "chain":
+            ok = session.open_uni_stream_nowait(
+                initial=initial, priority=band, chain=alias + 1, order=gid,
+                on_created=created)
+        else:
+            ok = session.open_uni_stream_nowait(
+                initial=initial, priority=band, on_created=created)
+        if not ok:
+            return _NOT_SENT
+        self._count_tx(session, len(initial))
+        self._sent_streams[id(session)] = \
+            self._sent_streams.get(id(session), 0) + 1
+        return None
 
     def _end_data(self, header, gid, end, start, lost):
         """The bytes before the FIN that ends a stream for `end`, its

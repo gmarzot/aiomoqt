@@ -1,2 +1,2 @@
-# Build aiopquic with stream_released() until it is on PyPI.
+# Build aiopquic with create_stream_nowait and stream_released() until they are released.
 gmarzot/aiopquic@gmarzot-0.8.0
