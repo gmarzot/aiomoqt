@@ -595,9 +595,10 @@ def add_fabric_node(p, metric=LEAF_METRIC):
                         f'port {PEERING_PORT}')
     p.add_argument('--node-id', type=str, default=None, metavar='ID|LABEL',
                    help='Node id as high:low (each a uint32 or u16.u16, '
-                        'e.g. 9.9:1), or a contact LABEL. Default: the '
-                        "tool's label; without an ID the id is fresh on "
-                        'every start')
+                        'e.g. 9.9:1), or a contact LABEL, whose id is the '
+                        'one moq-fabric derives from it, the same on every '
+                        "start. Default: the tool's label with a fresh id "
+                        'each start')
     p.add_argument('--node-metric', type=int, default=metric,
                    help=f'Metric advertised for this node; peers prefer '
                         f'lower path sums (default: {metric}; '
