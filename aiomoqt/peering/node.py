@@ -635,20 +635,22 @@ class FabricNode:
         if self._stopping:
             return
         await self.withdraw_originated()
+        # From here nothing is recomputed or propagated: every session
+        # closes at once and peers learn the loss from the close.
         self._stopping = True
+        protos = list(self._protocols.values())
+        for proto in protos:
+            proto.close()
+        if protos:
+            waits = [asyncio.ensure_future(p.terminated.wait())
+                     for p in protos]
+            _, pending = await asyncio.wait(waits, timeout=1.0)
+            for w in pending:
+                w.cancel()
         dials = list(self._dials.values())
         for task in dials:
             task.cancel()
         await asyncio.gather(*dials, return_exceptions=True)
-        accepted = [p for p in self._protocols.values() if not p.dialer]
-        for proto in accepted:
-            proto.close()
-        if accepted:
-            waits = [asyncio.ensure_future(p.terminated.wait())
-                     for p in accepted]
-            _, pending = await asyncio.wait(waits, timeout=1.0)
-            for w in pending:
-                w.cancel()
         if self._server is not None:
             self._server.close()
             self._server = None
@@ -824,7 +826,7 @@ class FabricNode:
         elif ev.kind in ("connected", "node", "node_withdrawn"):
             for track in list(self._origins.values()):
                 self._reconcile(track)
-        if self.transit is not None:
+        if self.transit is not None and not self._stopping:
             self.transit.on_event(session, ev)
 
     def _held(self, table: str, key: LearnedKey) -> List[Any]:
@@ -892,10 +894,11 @@ class FabricNode:
         for sub in subs:
             self._learned_subscribe(sub)
         self._session_metric.pop(session.id, None)
-        if self.transit is not None:
-            self.transit.session_closed(session, nodes)
-        for track in list(self._origins.values()):
-            self._reconcile(track)
+        if not self._stopping:
+            if self.transit is not None:
+                self.transit.session_closed(session, nodes)
+            for track in list(self._origins.values()):
+                self._reconcile(track)
         closed = [s for s in self.sessions.values() if s.state == "closed"]
         for old in closed[:-MAX_CLOSED_SESSIONS]:
             del self.sessions[old.id]

@@ -549,6 +549,9 @@ async def test_diamond_takes_the_lower_metric_and_fails_over():
         await t1.stop()
         await sender
         await _until(lambda: via(t2))
+        # Peers learn of T1's loss from the close, not from withdraws.
+        assert set(_withdraws_from(a, t1).values()) == {0}
+        assert set(_withdraws_from(b, t1).values()) == {0}
         await _groups(track, 35, 5, gap=0.01)
         await _until(lambda: set(sink.objects) >= _want(35, 5))
         missing = _want(0, 40) - set(sink.objects)
@@ -794,3 +797,37 @@ async def test_diamond_external_egress_moves_without_loss():
         missing = _want(0, 11, per) - set(sink.objects)
         assert {g for g, _, _ in missing} <= {7}
     assert sink.objects and not sink.dups
+
+
+def _withdraws_from(node, other):
+    """Withdraws `node` received on its sessions to `other`."""
+    kinds = ("NODE_INFO_WD", "SUBSCRIBE_INFO_WD", "ANNOUNCE_INFO_WD")
+    return {k: sum(s.rx_msgs[k] for s in node.sessions.values()
+                   if s.remote and s.remote.node_id == other.node_id)
+            for k in kinds}
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_graceful_stop_withdraws_nothing_it_only_transits():
+    port = _BASE_PORT + 11
+    t = _listen(port, "T", transit=True)
+    a, b = _dial([port], "A"), _dial([port], "B")
+    async with a, b:
+        await t.start()
+        await _until(lambda: any(rec.body.node_id == a.node_id
+                                 for _, rec in b.learned_nodes()))
+        a.announce("s/live")
+        track = a.publish("s/live", "video")
+        sink = _Sink()
+        b.pull("s/live", "video", sink)
+        await _until(lambda: track.subscribed
+                     and any(True for _ in b.learned_announces()))
+        await _groups(track, 0, 2)
+        await _until(lambda: set(sink.objects) == _want(0, 2))
+        await t.stop()
+        await _until(lambda: not a.connected() and not b.connected())
+        assert _withdraws_from(a, t) == _withdraws_from(b, t) == {
+            "NODE_INFO_WD": 0, "SUBSCRIBE_INFO_WD": 0,
+            "ANNOUNCE_INFO_WD": 0}
+    assert not sink.dups
