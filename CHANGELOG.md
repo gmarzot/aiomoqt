@@ -3,6 +3,7 @@
 ## v0.15.0 (unreleased)
 
 - WebTransport sessions no longer leave one queued event per peer-opened stream for the session's life (aiopquic `queue_new_streams`); on aiomoqt-relay a WT publisher's audio added one per frame.
+- aiomoqt-relay opens a viewer's one-object stream (an audio frame, say) from the forward step when the stream's end is already queued, with no lane task wake and, over WebTransport, no wait for the stream id (aiopquic `create_stream_nowait`). New: `open_uni_stream_nowait()`.
 - A `PublishedTrack`'s `object_delivery_timeout` and `subgroup_delivery_timeout` go out as Track Properties (OBJECT_DELIVERY_TIMEOUT, and SUBGROUP_DELIVERY_TIMEOUT on d18+) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and REQUEST_OK; they were enforced but not announced. A PER_OBJECT object past its delivery timeout is dropped alone instead of with the rest of its group.
 - `pub_media --delivery-timeout MS` sets both delivery timeouts on every media track.
 - SUBGROUP_DELIVERY_TIMEOUT is enforced on streams (§8), by publishers and by aiomoqt-relay for each subscriber: a subgroup stream the transport has not released (all data acknowledged) that long after its FIN is reset with DELIVERY_TIMEOUT. It needs aiopquic's `stream_released()`; without it the timeout is logged once as not enforced. aiomoqt-relay reads a subscriber's SUBGROUP_DELIVERY_TIMEOUT and, like OBJECT_DELIVERY_TIMEOUT, does not send it upstream.
