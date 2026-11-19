@@ -943,6 +943,10 @@ class SubgroupDelivery:
                             sid, StreamResetCode.CANCELLED)
 
 
+# send_nowait(): the item's stream end follows; hold the item for it.
+END_DUE = object()
+
+
 class SendLane:
     """One peer's objects behind its own FIFO and writer task.
 
@@ -1034,6 +1038,9 @@ class SendLane:
         self._wake = asyncio.Event()
         self._nowait = (getattr(writer, "send_nowait", None)
                         if self.write_through else None)
+        self._whole = (getattr(writer, "send_whole_nowait", None)
+                       if self.write_through else None)
+        self._held = None
         self.task = asyncio.ensure_future(self._run())
         self.task.add_done_callback(self._ended)
 
@@ -1108,6 +1115,24 @@ class SendLane:
                 self._probe_gid, self._probe_n = gid, 0
                 self._probe(floor)
             self._probe_n += 1
+        held = self._held
+        if held is not None:
+            self._held = None
+            items = self.items
+            if (len(items) == 1 and items[0] is held and not self.busy
+                    and self.gate and not self.late
+                    and self.writer.ends_stream(held, item)):
+                try:
+                    whole = self._whole(held, item)
+                except Exception:
+                    whole = False
+                if whole:
+                    items.popleft()
+                    self._uncount(held)
+                    self.done += 2
+                    if self.on_sent is not None:
+                        self.on_sent(held)
+                    return False
         nowait = self._nowait
         if (nowait is not None and not self.items and not self.busy
                 and self.gate and not self.late
@@ -1118,6 +1143,17 @@ class SendLane:
                 if not self._failed(item, e):
                     self.stop()
                 return False
+            if sent is END_DUE:
+                if cost:
+                    self.objects += 1
+                    if live:
+                        self.bytes += cost
+                    else:
+                        self.replay_bytes += cost
+                self.items.append(item)
+                self._held = item
+                asyncio.get_running_loop().call_soon(self._release_held, item)
+                return True
             if sent is not None:
                 self.done += 1
                 if sent and self.on_sent is not None:
@@ -1134,6 +1170,12 @@ class SendLane:
         if live and self._over(item):
             self._shed(item)
         return True
+
+    def _release_held(self, item) -> None:
+        """A held item whose end did not follow this pass: send it."""
+        if self._held is item:
+            self._held = None
+            self._wake.set()
 
     def _probe(self, floor) -> None:
         """Read what the transport holds of the lane's groups from `floor`."""
