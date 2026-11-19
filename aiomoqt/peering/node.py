@@ -31,7 +31,8 @@ from aiopquic.quic.events import (ConnectionTerminated, DatagramFrameReceived,
                                   StreamReset)
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering.hashing import (fresh_node_id, node_id_format,
+from aiomoqt.peering.hashing import (fresh_node_id, libstdcxx_hash,
+                                     node_id_format,
                                      node_id_parse, track_hashes)
 from aiomoqt.peering.ib import (DEFAULT_TTL_MS, OriginTrack, reconcile,
                                 seq_newer)
@@ -95,16 +96,26 @@ def parse_track(text: str) -> Tuple[Tuple[bytes, ...], bytes]:
     return namespace_tuple(namespace), name.encode()
 
 
+def label_node_id(label: str) -> int:
+    """The node id moq-fabric gives a node named `label`: libstdc++
+    std::hash<std::string> of it, so a restart keeps its id."""
+    node_id = libstdcxx_hash(label.encode())
+    if node_id == 0:
+        raise ValueError(f"label {label!r} hashes to the reserved id 0")
+    return node_id
+
+
 def parse_identity(spec: Optional[str], label: str = DEFAULT_LABEL
                    ) -> Tuple[int, str]:
     """--node-id: (node id, contact label). An 'a.b:c.d' / 'high:low' id is
-    used as given; anything else is a label, and the id is fresh."""
+    used as given; anything else is a label, with the id moq-fabric
+    derives from it (label_node_id). No --node-id: a fresh id."""
     if spec is None:
         return fresh_node_id(label), label
     try:
         node_id = node_id_parse(spec)
     except ValueError:
-        return fresh_node_id(spec), spec
+        return label_node_id(spec), spec
     if node_id == 0:
         raise ValueError("node id 0 is reserved")
     return node_id, label
@@ -560,6 +571,10 @@ class FabricNode:
         self._sinks: Dict[int, Any] = {}
         # Seq of the last withdraw per hash, so a re-subscribe goes on.
         self._withdrawn_seq: Dict[int, int] = {}
+        # First seq of a track's subscribe: the wall clock in seconds, so
+        # after a restart under the same id it is newer than the last one
+        # peers still hold.
+        self._seq_base = (self.start_unix_ns // 1_000_000_000) & 0xFFFF
         # Learned announces and subscribes across sessions: present while
         # any session holds them.
         self._remote_announces: Dict[LearnedKey, AnnounceInfo] = {}
@@ -1329,7 +1344,8 @@ class FabricNode:
                 else self._withdrawn_seq.pop(th.fullname, None))
         sub = SubscribeInfo(
             self.node_id, ns, nm, th.namespace, th.name, th.fullname,
-            epoch=0, seq=(last + 1) & 0xFFFF if last is not None else 1,
+            epoch=0,
+            seq=(last + 1) & 0xFFFF if last is not None else self._seq_base,
             priority=priority, delivery_timeout_ms=delivery_timeout_ms,
             expires_ms=expires_ms, forward=forward)
         self._subscribes[th.fullname] = sub
