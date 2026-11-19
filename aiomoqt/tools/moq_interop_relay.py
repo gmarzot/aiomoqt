@@ -2204,6 +2204,10 @@ class _RelayedTrack:
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
         self._closed = True
+        if self._done_timer is not None:
+            self._done_timer.cancel()
+            self._done_timer = None
+        self._pending_done = None
         self.release_upstream()
         self._release_standby()
         self._release_publish()
@@ -3469,8 +3473,13 @@ def _forget_session(session) -> None:
             if track.fail_over(key):
                 continue
             # Upstream is gone: give each subscriber a clean terminal
-            # before dropping the fan-out.
-            track.finish()
+            # before dropping the fan-out, with the publisher's status if
+            # its PUBLISH_DONE was held for streams.
+            pending = track._pending_done
+            if pending is not None:
+                track.finish(status_code=pending[0], reason=pending[1])
+            else:
+                track.finish()
             track.close()
             _drop_track(key, track)
 

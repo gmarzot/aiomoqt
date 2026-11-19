@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay: a track closed while its publisher's PUBLISH_DONE was held for streams (its publisher's session closed) cancels the hold, instead of keeping the closed track for TERMINAL_GRACE_S and logging "released on grace"; its subscribers get the publisher's status and reason.
 - A `PublishedTrack`'s `object_delivery_timeout` and `subgroup_delivery_timeout` go out as Track Properties (OBJECT_DELIVERY_TIMEOUT, and SUBGROUP_DELIVERY_TIMEOUT on d18+) in PUBLISH, SUBSCRIBE_OK, FETCH_OK and REQUEST_OK; they were enforced but not announced. A PER_OBJECT object past its delivery timeout is dropped alone instead of with the rest of its group.
 - `pub_media --delivery-timeout MS` sets both delivery timeouts on every media track.
 - SUBGROUP_DELIVERY_TIMEOUT is enforced on streams (§8), by publishers and by aiomoqt-relay for each subscriber: a subgroup stream the transport has not released (all data acknowledged) that long after its FIN is reset with DELIVERY_TIMEOUT. It needs aiopquic's `stream_released()`; without it the timeout is logged once as not enforced. aiomoqt-relay reads a subscriber's SUBGROUP_DELIVERY_TIMEOUT and, like OBJECT_DELIVERY_TIMEOUT, does not send it upstream.

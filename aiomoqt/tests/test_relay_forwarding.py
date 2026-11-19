@@ -2387,3 +2387,66 @@ async def test_a_cancelled_subscription_has_its_open_streams_reset(
     finally:
         handle.close()
         _reset_relay_state()
+
+
+@requires_certs
+@pytest.mark.asyncio
+@_TRANSPORTS
+async def test_a_publisher_closing_on_a_held_publish_done_ends_the_track_once(
+        use_quic, monkeypatch, caplog):
+    # PUBLISH_DONE counts a stream the relay never sees, then the
+    # publisher's session closes: the subscriber gets the publisher's
+    # status at the close, and the hold's timer goes with the track.
+    monkeypatch.setattr(relay, "TERMINAL_GRACE_S", 0.3)
+    port = _BASE_PORT + 230 + (not use_quic)
+    ns = "relay/held-close"
+    _reset_relay_state()
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=22)
+    handle = await server.serve()
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            async def connect():
+                s = await stack.enter_async_context(MOQTClient(
+                    "localhost", port, path="/", use_quic=use_quic,
+                    verify_tls=False, supported_drafts=22).connect())
+                await s.client_session_init()
+                return s
+            pub_cm = MOQTClient("localhost", port, path="/",
+                                use_quic=use_quic, verify_tls=False,
+                                supported_drafts=22).connect()
+            pub = await pub_cm.__aenter__()
+            await pub.client_session_init()
+            track = PublishedTrack(pub, namespace=ns, trackname="video",
+                                   object_size=500, group_size=5, rate=50)
+            await track.publish(publish_track=True, forward=1)
+            rx = await connect()
+            done = asyncio.get_running_loop().create_future()
+            await rx.subscribe(ns, "video", wait_response=True,
+                               on_done=lambda m: done.done()
+                               or done.set_result(m))
+            await asyncio.sleep(0.2)
+            held = relay._tracks[(relay._ns_tuple(ns), b"video")]
+            real = PublishedTrack._send_publish_done
+
+            def short(self, session, status_code=0x2, final=True,
+                      reason=None):
+                self._sub_for(session).fill_streams += 1
+                return real(self, session, SubscribeDoneCode.GOING_AWAY,
+                            final, "publisher restarting")
+            monkeypatch.setattr(PublishedTrack, "_send_publish_done", short)
+            track.end()
+            async with asyncio.timeout(2):
+                while held._pending_done is None:
+                    await asyncio.sleep(0.01)
+            caplog.set_level(logging.INFO, logger=relay.logger.name)
+            await pub_cm.__aexit__(None, None, None)
+            msg = await asyncio.wait_for(done, relay.TERMINAL_GRACE_S)
+            assert msg.status_code == SubscribeDoneCode.GOING_AWAY
+            assert msg.reason == "publisher restarting"
+            assert held._done_timer is None and held._pending_done is None
+            await asyncio.sleep(relay.TERMINAL_GRACE_S + 0.2)
+            assert "released on grace" not in caplog.text
+    finally:
+        handle.close()
+        _reset_relay_state()
