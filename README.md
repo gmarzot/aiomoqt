@@ -214,6 +214,10 @@ python -m aiomoqt.tools.sub_media $RELAY -N demo/live --inspect 5 --show-catalog
 ffplay media-out/video.h264      # LOC → elementary stream
 ffplay media-out/video.mp4       # CMAF or LOCMAF → fMP4
 
+# No relay: sub_media listens, the publisher dials it and announces the namespace
+python -m aiomoqt.tools.sub_media -Q -p 4433 -N demo/live --analyze -i 5
+python -m aiomoqt.tools.pub_media moqt://localhost:4433/ -k -N demo/live --pub-ns --mp4 clip.mp4 --loop
+
 # Only the LOCMAF tracks; the summary line per track counts rejected objects
 python -m aiomoqt.tools.sub_media $RELAY -N cmsf/live --packaging locmaf -t 30
 
