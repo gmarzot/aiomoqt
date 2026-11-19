@@ -1,8 +1,9 @@
 """moq-fabric (Quicr/moq-fabric) support: wire codec, hashes, MoQT d18
-inner framing, and a leaf FabricNode that joins a moqx / LAPS fabric,
-originates announces and subscribes, and publishes and receives objects.
-The edge API (FabricHop, FabricSource) presents fabric sessions to a relay
-as MoQT d18 downstream and upstream sessions."""
+inner framing, and a FabricNode that joins a moqx / LAPS fabric,
+originates announces and subscribes, and publishes and receives objects;
+a leaf, or with transit=True a node that forwards for others. The edge API
+(FabricHop, FabricSource) presents fabric sessions to a relay as MoQT d18
+downstream and upstream sessions."""
 from aiomoqt.peering.edge import (FabricHop, FabricPull, FabricSource,
                                   relay_object)
 from aiomoqt.peering.hashing import (city64, fresh_node_id, hash_combine,
