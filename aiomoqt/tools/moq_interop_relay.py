@@ -63,9 +63,9 @@ Routing model (cross-session, single relay instance):
   - SUBSCRIBE: find publishers that announced the namespace or a prefix
     of it (§2.4 Namespace Prefix Matching), subscribe each upstream once
     per Full Track Name, answer SUBSCRIBE_OK on the first to accept and
-    fan the objects out, deduplicated by Location, to every downstream
-    subscriber of that track. When the serving publisher ends, another
-    takes over. With no match, send
+    fan the objects out to every downstream subscriber of that track. A
+    Location's first copy is forwarded and later ones are dropped. When
+    the serving publisher ends, another takes over. With no match, send
     SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
     0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
     rejection. For --startup-hold seconds after start, such a SUBSCRIBE
@@ -1790,14 +1790,12 @@ class _RelayLane(SendLane):
 class _Feed:
     """A further publisher's subscription to a relayed track (§7.6)."""
 
-    __slots__ = ("sub", "ended", "props", "bound", "at")
+    __slots__ = ("sub", "ended", "props", "bound")
 
     def __init__(self):
         self.sub = None
         # Accepted: the handlers under its alias are its own.
         self.bound = False
-        # Largest Location it delivered, copies included.
-        self.at = None
         # Its subgroup streams ended, against its PUBLISH_DONE Stream Count.
         self.ended = 0
         self.props: dict = {}
@@ -1853,7 +1851,7 @@ class _Feed:
 class _PushedFeed(_Feed):
     """A further publisher's PUBLISH of a relayed track (§7.3)."""
 
-    __slots__ = ("track", "msg", "handler", "in_step")
+    __slots__ = ("track", "msg", "handler")
 
     def __init__(self, track, session, msg):
         super().__init__()
@@ -1864,31 +1862,10 @@ class _PushedFeed(_Feed):
         self.sub = SimpleNamespace(session=session, request_id=msg.request_id,
                                    track_alias=msg.track_alias,
                                    largest=largest)
-        # Its numbering matches the track's; until known, its first object
-        # once Largest is current decides.
-        self.in_step = largest is not None and track._near(largest[0])
         self.handler = self._on_object
 
     def _on_object(self, msg, size, ts, group_id, subgroup_id):
-        track = self.track
-        if not self.in_step and self.bound:
-            gid = getattr(msg, "group_id", None)
-            gid = group_id if gid is None else gid
-            current = track.largest_current()
-            if track._behind(gid) or (current and not track._near(gid)):
-                _supersede(track, self, (gid, msg.object_id)).on_object(
-                    msg, size, ts, group_id, subgroup_id)
-                return
-            self.in_step = current
-        track.on_object(msg, size, ts, group_id, subgroup_id, feed=self)
-
-    def settle(self, largest) -> None:
-        """Its resume REQUEST_OK reports `largest`: below the track's, it
-        is a restarted publisher. Otherwise its objects decide, since a
-        paused publisher's reported Largest may not have advanced."""
-        if (not self.in_step and self.bound and largest is not None
-                and self.track._behind(largest[0])):
-            _supersede(self.track, self, largest, sent=False)
+        self.track.on_object(msg, size, ts, group_id, subgroup_id, feed=self)
 
     def _location(self) -> dict:
         return _publish_ok_location(self.msg)
@@ -1943,6 +1920,12 @@ class _RelayedTrack:
         self._floor = 0
         # Copies dropped as already taken from another publisher.
         self._copies = 0
+        # With several publishers, group -> Object 0's payload size.
+        self._head_sizes: dict = {}
+        # Copies of an Object 0 differing in size from the one taken; id()
+        # of each feed already logged for one.
+        self._changed = 0
+        self._changed_from: set = set()
         # Location of the End of Track taken: nothing past it is forwarded
         # and no standby takes over.
         self._end_at = None
@@ -1969,8 +1952,6 @@ class _RelayedTrack:
         self.unwatched_since = None
         # Resumed after a pause: the next object sets complete_from.
         self._resync = False
-        # Monotonic time of the last resume.
-        self.resumed_at = 0.0
         self.downstream: list[_Downstream] = []
         # Send lanes still running, including those of subscribers that
         # have left `downstream` and are draining to their PUBLISH_DONE.
@@ -2126,9 +2107,7 @@ class _RelayedTrack:
             feed.sub.track_alias,
             lambda g, sg, clean=True, reset_code=0, f=feed:
             self.on_stream_end(g, sg, clean, reset_code, feed=f))
-        largest = feed.sub.largest
-        if largest is not None and self._near(largest[0]):
-            self.note_largest(largest)
+        self.note_largest(feed.sub.largest)
 
     def _carried(self, feed) -> bool:
         """`feed` (None: the first upstream) still feeds the track."""
@@ -2161,33 +2140,9 @@ class _RelayedTrack:
         self._uncarry(feed)
         return True
 
-    def _near(self, gid) -> bool:
-        """Group `gid` is within one of Largest's, once Largest is known."""
-        return self.largest is not None and abs(gid - self.largest[0]) <= 1
-
-    def _behind(self, gid) -> bool:
-        """Group `gid` is more than one below Largest. Decisive even while
-        Largest is stale: a live track's groups only rise."""
-        return self.largest is not None and gid < self.largest[0] - 1
-
-    def largest_current(self) -> bool:
-        """Largest tracks the serving publisher's numbering: known, not
-        paused, and objects taken since the last resume or RESUME_REPLY_S
-        past it."""
-        return (self.largest is not None and not self.paused
-                and not self._closed
-                and (not self._resync or time.monotonic()
-                     - self.resumed_at >= RESUME_REPLY_S))
-
-    def _in_step(self, feed) -> bool:
-        """`feed` is near Largest: a copy of the track, not a publisher
-        that restarted its numbering."""
-        at = feed.at or feed.sub.largest
-        return self.largest is None or (at is not None and self._near(at[0]))
-
     def fail_over(self, key) -> bool:
-        """The serving publisher ended: a live standby in step, subscribed
-        or PUBLISHed, takes its place. False when there is none."""
+        """The serving publisher ended: a live standby, subscribed or
+        PUBLISHed, takes its place. False when there is none."""
         if self._closed or self.pending_publish is not None:
             return False
         live = [f for f in self.standby if _session_live(f.session)]
@@ -2197,19 +2152,14 @@ class _RelayedTrack:
                             f"Track {self._end_at}; {len(live)} standby "
                             f"not taken over, ending the track")
             return False
-        nxt = next((f for f in live if self._in_step(f)), None)
-        if nxt is None:
-            if live:
-                logger.info(f"relay: upstream {key} ended; {len(live)} "
-                            f"standby not at Largest {self.largest}, "
-                            f"ending the track")
+        if not live:
             return False
+        nxt = live[0]
         self.standby.remove(nxt)
         old = self.feed
         self.release_upstream()
         self._release_publish()
         if isinstance(nxt, _PushedFeed):
-            nxt.in_step = True
             self.upstream = nxt.session
             self.upstream_alias = None
             self.upstream_request_id = nxt.msg.request_id
@@ -2232,7 +2182,7 @@ class _RelayedTrack:
         logger.info(f"relay: upstream {key} failed over to another "
                     f"publisher, alias={alias}, "
                     f"{len(self.standby)} standby, {self._copies} copies "
-                    f"dropped")
+                    f"dropped, {self._changed} differing")
         return True
 
     def close(self) -> None:
@@ -2596,13 +2546,10 @@ class _RelayedTrack:
     def _copy(self, feed, gid, sgid, oid, dgram) -> bool:
         """§7.3: True for an object already taken from another publisher,
         or one of a subgroup already ended; else it is recorded."""
-        if feed is not None and (feed.at is None or (gid, oid) > feed.at):
-            feed.at = (gid, oid)
-        # A standby opens nothing far from Largest: it is numbering
-        # another track.
-        far = feed is not self.feed and not self._near(gid)
         if dgram:
-            if self._multi and far:
+            # Below the record, which one publisher keeps for two groups,
+            # a copy cannot be told apart: dropped.
+            if self._multi and gid < max(self._floor, self._dgram_gid - 1):
                 return True
             if (gid, oid) in self._dgrams:
                 return self._multi
@@ -2617,8 +2564,6 @@ class _RelayedTrack:
             return True
         st = self._subgroups.get(k)
         if st is None:
-            if self._multi and far:
-                return True
             self._subgroups[k] = [oid, {feed}]
             return False
         st[1].add(feed)
@@ -2626,6 +2571,20 @@ class _RelayedTrack:
             return True
         st[0] = oid
         return False
+
+    def _check_copy(self, feed, gid, msg) -> None:
+        """§2.1: a copy of Object 0 differing in size from the one taken is
+        counted and logged once per feed. The first copy stays."""
+        size = self._head_sizes.get(gid)
+        if size is None or size == len(msg.payload):
+            return
+        self._changed += 1
+        if id(feed) not in self._changed_from:
+            self._changed_from.add(id(feed))
+            logger.warning(f"relay: {self.key}: a publisher's copy of object "
+                           f"{gid}.0 differs from the one taken "
+                           f"({len(msg.payload)} vs {size} bytes); keeping "
+                           f"the first")
 
     def on_object(self, msg, size, ts, group_id, subgroup_id, feed=None):
         """Upstream delivery callback (sync) — hand off to the drain."""
@@ -2638,6 +2597,8 @@ class _RelayedTrack:
             return
         if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
             self._copies += 1
+            if msg.object_id == 0:
+                self._check_copy(feed, gid, msg)
             return
         if getattr(msg, "status", None) == ObjectStatus.END_OF_TRACK:
             self._end_at = (gid, msg.object_id)
@@ -2649,6 +2610,8 @@ class _RelayedTrack:
             self._last_gid = gid
         if msg.object_id == 0:
             self._heads.add((gid, 0))
+            if self._multi:
+                self._head_sizes[gid] = len(payload)
         if self._gaps and self._gaps[-1][1] is None and not self.paused:
             self._gaps[-1][1] = (gid, msg.object_id)
         if self._resync:
@@ -2964,6 +2927,8 @@ class _RelayedTrack:
                                if k[0] >= low}
             self._reset = {k for k in self._reset if k[0] >= low}
             self._dgrams = {k for k in self._dgrams if k[0] >= low}
+            self._head_sizes = {g: n for g, n in self._head_sizes.items()
+                                if g >= low}
             self._opened = {k for k in self._opened if k[0] >= low}
             self._backfilled = {k for k in self._backfilled if k[0] >= low}
             self._stopped = {k for k in self._stopped if k[1] >= low}
@@ -4120,6 +4085,13 @@ async def _await_joined(session, request_id):
     return None
 
 
+def _copies_note(track) -> str:
+    """Copy counts for a PUBLISH_DONE line, with several publishers."""
+    if not track._multi:
+        return ""
+    return f", copies dropped={track._copies} differing={track._changed}"
+
+
 def _upstream_done(track, key, done, feed=None) -> None:
     """Upstream ended the track: a standby takes over, else FIN
     downstream streams, PUBLISH_DONE each subscriber, and drop the
@@ -4136,7 +4108,8 @@ def _upstream_done(track, key, done, feed=None) -> None:
     logger.info(f"relay: upstream PUBLISH_DONE {key} status={status} "
                 f"streams={getattr(done, 'stream_count', 0)} "
                 f"-> {len(track.downstream)} subscriber(s), objects "
-                f"in={track._objects_in} out={track._objects_out}, "
+                f"in={track._objects_in} out={track._objects_out}"
+                f"{_copies_note(track)}, "
                 f"upstream streams ended={track._upstream_ended}")
     need = int(getattr(done, "stream_count", 0) or 0)
     if track.standby and track._upstream_ended < need:
@@ -4193,7 +4166,8 @@ async def _on_publish_done(session, msg):
         logger.info(f"relay: publisher PUBLISH_DONE {key} status={status} "
                     f"streams={getattr(msg, 'stream_count', 0)} -> "
                     f"{len(track.downstream)} subscriber(s), objects "
-                    f"in={track._objects_in} out={track._objects_out}")
+                    f"in={track._objects_in} out={track._objects_out}"
+                    f"{_copies_note(track)}")
         need = int(getattr(msg, "stream_count", 0) or 0)
         if track.standby and track._upstream_ended < need:
             # As in _upstream_done: decide once its streams have ended.
@@ -4249,15 +4223,11 @@ async def _on_publish(session, msg):
         if owner is not session and not crossing and _takes_publisher(track):
             # A held first PUBLISH is answered: feeds join an answered track.
             _answer_publish(track)
-            if not _numbers_far(track, msg):
-                _add_publisher(track, session, msg, props)
-                return
-            logger.info(f"relay: publish {key} Largest "
-                        f"({msg.largest_group_id}, {msg.largest_object_id}) "
-                        f"is far from {track.largest}: a restarted publisher")
+            _add_publisher(track, session, msg, props)
+            return
         if track.finished or owner is not session:
-            # Finished, taking no further feed, or superseded by a restarted
-            # publisher: reusing it would drop everything this one sends.
+            # Finished or taking no further feed: reusing it would drop
+            # everything this one sends.
             logger.info(f"relay: retiring the track registered for {key}")
             track.finish(reason="superseded by a new publisher")
             track.close()
@@ -4319,60 +4289,6 @@ def _takes_publisher(track) -> bool:
     return (not track._closed and _track_live(track)
             and (track.upstream is not None
                  or track.pending_publish is not None))
-
-
-def _numbers_far(track, msg) -> bool:
-    """The PUBLISH's Largest is far from the track's: its publisher
-    restarted the numbering."""
-    if not getattr(msg, "content_exists", 0):
-        return False
-    gid = msg.largest_group_id
-    return track._behind(gid) or (track.largest_current()
-                                  and not track._near(gid))
-
-
-def _supersede(track, feed, location, sent=True):
-    """`feed`'s first object at `location`, or with `sent` False its
-    reported Largest, is far from `track`'s Largest: its publisher
-    restarted the numbering, and its PUBLISH replaces the track as a new
-    one would. Returns the new track."""
-    key = track.key
-    session, msg = feed.session, feed.msg
-    logger.info(f"relay: publish {key} alias={msg.track_alias} "
-                f"{'sent' if sent else 'reports Largest'} {location}, far "
-                f"from Largest {track.largest}: a restarted publisher; "
-                f"retiring the track registered for {key}")
-    track.standby.remove(feed)
-    feed.bound = False
-    # A subscriber held on the resume is answered from the new track.
-    resume = _resuming.pop(key, None)
-    if resume is not None:
-        resume.cancel()
-    track.finish(reason="superseded by a new publisher")
-    track.close()
-    _drop_track(key, track)
-    new = _RelayedTrack(key)
-    _tracks[key] = new
-    if key[1] == CATALOG_TRACK:
-        _catalogs.pop(key[0], None)
-    new.upstream = session
-    new.upstream_request_id = msg.request_id
-    new.publish_msg = msg
-    new.publish_alias = msg.track_alias
-    new.properties = feed.props
-    if sent:
-        new.complete_from = location
-    else:
-        new.note_largest(location)
-        # Complete from its first object.
-        new._resync = True
-    session.register_object_handler(msg.track_alias, new.on_object)
-    session.register_stream_end_handler(msg.track_alias, new.on_stream_end)
-    _ensure_pause_sweep()
-    _offer_to_track_subs(new)
-    if _probing(new):
-        _spawn(_probe_catalog_head(new))
-    return new
 
 
 def _add_publisher(track, session, msg, props) -> None:
@@ -4520,9 +4436,7 @@ def _upstream_request(track):
 def _resume_paused(track, wanted=False):
     """Raise a paused upstream's Forward State once a subscriber
     forwards, or is about to (`wanted`). With `wanted`, returns the
-    awaitable reply when the upstream draft has one (d16+) and the
-    (feed, reply task) of each further publisher whose numbering is
-    unsettled, else None."""
+    awaitable reply when the upstream draft has one (d16+), else None."""
     if not track.paused or not (wanted or _forwarding(track)):
         return None
     req = _upstream_request(track)
@@ -4538,7 +4452,6 @@ def _resume_paused(track, wanted=False):
     track.pause_reply = None
     track.paused = track.lowered = False
     track.unwatched_since = None
-    track.resumed_at = time.monotonic()
     if track._objects_in:
         track.complete_from = None
         track._resync = True
@@ -4549,18 +4462,13 @@ def _resume_paused(track, wanted=False):
                                        **location)
         logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
                     f"forward=1 request {rid}")
-        settling = []
         for f in track.standby:
-            ask = (wait and isinstance(f, _PushedFeed) and not f.in_step
-                   and not f.session._profile.update_has_location)
-            sent = f.update(1, reply=ask)
-            if sent is not None:
-                settling.append((f, sent))
+            f.update(1)
     except Exception:
         logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
         return None
-    return (reply, settling) if wait else None
+    return reply if wait else None
 
 
 # Track key -> task taking the Largest from a resume's REQUEST_OK.
@@ -4578,12 +4486,11 @@ async def _resume_for(track, msg) -> None:
     if task is None:
         paused_at = track.pause_largest
         pause_reply = track.pause_reply if paused_at is None else None
-        replies = _resume_paused(track, wanted=True)
-        if replies is None:
+        reply = _resume_paused(track, wanted=True)
+        if reply is None:
             return
-        reply, settling = replies
         task = asyncio.create_task(_take_live_largest(
-            track, reply, paused_at, pause_reply, settling))
+            track, reply, paused_at, pause_reply))
         _resuming[track.key] = task
         task.add_done_callback(
             lambda t, k=track.key: _resuming.pop(k, None)
@@ -4593,64 +4500,45 @@ async def _resume_for(track, msg) -> None:
     track.attaching = True
     try:
         await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Cancelled by _supersede; the caller re-reads the track.
-        if not task.cancelled():
-            raise
     finally:
         track.attaching = False
         track._ensure_drain()
 
 
 async def _take_live_largest(track, reply, paused_at=None,
-                             pause_reply=None, settling=()) -> None:
+                             pause_reply=None) -> None:
     """Note the Largest a resume's REQUEST_OK reports, waiting at most
     RESUME_REPLY_S. Past the publisher's Largest at the pause
     (`paused_at`, else what `pause_reply` resolves to), its group is live
-    and the fence stops before it. Then settle each further publisher in
-    `settling` by its own reply."""
+    and the fence stops before it."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + RESUME_REPLY_S
     try:
+        ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
+    except TimeoutError:
+        logger.warning(f"relay: resume {track.key}: no REQUEST_OK "
+                       f"within {RESUME_REPLY_S:g}s; answering with the "
+                       f"cached Largest {track.largest}")
+        return
+    except MOQTRequestError as e:
+        logger.info(f"relay: resume {track.key}: upstream refused the "
+                    f"update: {e}")
+        return
+    live = _update_largest(ok)
+    track.note_largest(live)
+    if paused_at is None and pause_reply is not None:
+        # The pause's REQUEST_OK precedes this one on the same request.
         try:
-            ok = await asyncio.wait_for(reply, RESUME_REPLY_S)
+            paused_at = await asyncio.wait_for(
+                asyncio.shield(pause_reply),
+                max(deadline - loop.time(), 0))
         except TimeoutError:
-            logger.warning(f"relay: resume {track.key}: no REQUEST_OK "
-                           f"within {RESUME_REPLY_S:g}s; answering with the "
-                           f"cached Largest {track.largest}")
-            return
-        except MOQTRequestError as e:
-            logger.info(f"relay: resume {track.key}: upstream refused the "
-                        f"update: {e}")
-            return
-        live = _update_largest(ok)
-        track.note_largest(live)
-        if paused_at is None and pause_reply is not None:
-            # The pause's REQUEST_OK precedes this one on the same request.
-            try:
-                paused_at = await asyncio.wait_for(
-                    asyncio.shield(pause_reply),
-                    max(deadline - loop.time(), 0))
-            except TimeoutError:
-                paused_at = None
-            if paused_at is not None and track.fence is not None:
-                track.fence = max(track.fence, paused_at[0])
-        if (track.fence is not None and paused_at is not None
-                and live is not None and live > tuple(paused_at)):
-            track.fence = min(track.fence, live[0] - 1)
-        for feed, sent in settling:
-            try:
-                ok = await asyncio.wait_for(
-                    sent, max(deadline - loop.time(), 0))
-            except (TimeoutError, MOQTRequestError):
-                continue
-            feed.settle(_update_largest(ok))
-            if track._closed:
-                return
-    finally:
-        for _feed, sent in settling:
-            sent.cancel()
-
+            paused_at = None
+        if paused_at is not None and track.fence is not None:
+            track.fence = max(track.fence, paused_at[0])
+    if (track.fence is not None and paused_at is not None
+            and live is not None and live > tuple(paused_at)):
+        track.fence = min(track.fence, live[0] - 1)
 
 def _update_largest(reply):
     """The LARGEST_OBJECT a REQUEST_OK carries: a Location from d18, a
@@ -5180,7 +5068,7 @@ async def _relay_subscribe(session, msg):
         track = None
     if track is not None and track.paused and track.upstream is not None:
         await _resume_for(track, msg)
-        # A restarted publisher may have superseded it meanwhile.
+        # It may have been replaced meanwhile.
         track = _tracks.get((ns, msg.track_name))
     # The relay's Largest as it takes the SUBSCRIBE (§3.1.4).
     seen = None if track is None else track.largest
