@@ -23,6 +23,12 @@ from aiomoqt.peering.wire import (DATAGRAM_HEADER_LEN, DataHeader, DataType,
                                   WireError)
 from aiomoqt.types import MOQTStreamStopped, StreamResetCode
 
+class HopRetiring(MOQTStreamStopped):
+    """FabricHop.open_uni_stream on a hop whose SNS moved to another
+    session: open no new stream here; the hop's open streams still
+    write until they end, then on_sns(track, session, None) fires."""
+
+
 # Fraction of the TX event ring past which a nowait write refuses.
 TX_RING_WAIT_AT = 0.9
 # How long a stream FIN or reset refused on a full ring is retried.
@@ -49,8 +55,10 @@ class FabricHop:
     """A published track's data on one fabric session, as a d18 MoQT
     downstream session. The track alias is the fullname hash. Each
     stream opens with NEW_STREAM carrying the session's current SNS id;
-    datagrams get the DATAGRAM header. close() it when the SNS is lost
-    (FabricNode.on_sns with None)."""
+    datagrams get the DATAGRAM header. When a route move takes the SNS,
+    the hop is retiring: open_uni_stream raises HopRetiring while its
+    open streams finish, within the subscribers' delivery timeout. close()
+    it on FabricNode.on_sns with None, which follows."""
 
     _profile = P18
     stream_scheduling = "fifo"
@@ -93,9 +101,25 @@ class FabricHop:
     def closed(self) -> bool:
         return not self._writable()
 
+    @property
+    def retiring(self) -> bool:
+        return self.track.retiring(self.session_id)
+
     def close(self) -> None:
         if not self._moqt_session_closed.done():
             self._moqt_session_closed.set_result(None)
+        for key in [k for k, (hop, _) in self.track._hop_streams.items()
+                    if hop is self]:
+            self.track._hop_ended(*key)
+
+    def _ended(self, stream_id: int) -> None:
+        self.track._hop_ended(self.session_id, stream_id)
+
+    def _count(self, n: int, datagram: bool = False) -> None:
+        proto = self._proto
+        if proto is not None:
+            proto.tx_bytes += n
+            proto.tx_datagrams += datagram
 
     def _writable(self) -> bool:
         proto = self._proto
@@ -116,8 +140,12 @@ class FabricHop:
                               chain: Optional[int] = None,
                               order: int = 0) -> int:
         """Open a data stream: NEW_STREAM, then `initial` (a d18
-        subgroup header and its first objects). Returns the stream id."""
+        subgroup header and its first objects). Returns the stream id.
+        HopRetiring while the hop is retiring; CancelledError once
+        closed or without an SNS."""
         sns_id = self.sns_id
+        if sns_id is None and self._writable() and self.retiring:
+            raise HopRetiring()
         if not self._writable() or sns_id is None:
             self.close()
             raise asyncio.CancelledError()
@@ -126,6 +154,10 @@ class FabricHop:
                           origin.priority, origin.ttl_ms).encode()
         sid = self._quic.get_next_available_stream_id(True)
         self.streams += 1
+        assert self._proto is not None
+        self._proto.tx_streams += 1
+        if not end_stream:
+            self.track._hop_opened(self, sid, sns_id)
         try:
             await self.stream_write_drain(sid, head + bytes(initial),
                                           end_stream=end_stream,
@@ -140,14 +172,20 @@ class FabricHop:
                      end_stream: bool = False) -> None:
         """Write now, or once the transport takes it."""
         if not self._writable():
+            if end_stream:
+                self._ended(stream_id)
             return
         try:
             self._quic.send_stream_data(stream_id, data,
                                         end_stream=end_stream)
+            self._count(len(data))
         except BufferError:
             self.node._spawn(self._write_later(stream_id, data, end_stream))
+            return
         except (AssertionError, AttributeError, ConnectionError) as e:
             log.debug(f"peering: {self!r} stream {stream_id} write: {e!r}")
+        if end_stream:
+            self._ended(stream_id)
 
     async def _write_later(self, stream_id: int, data: bytes,
                            end_stream: bool) -> None:
@@ -155,7 +193,8 @@ class FabricHop:
             await self.stream_write_drain(stream_id, data,
                                           end_stream=end_stream)
         except asyncio.CancelledError:
-            pass
+            if end_stream:
+                self._ended(stream_id)
 
     def stream_write_nowait(self, stream_id: int, data: bytes,
                             end_stream: bool = False,
@@ -176,11 +215,15 @@ class FabricHop:
         except BufferError:
             return False
         except (AssertionError, AttributeError, ConnectionError) as e:
+            self._ended(stream_id)
             if self._writable():
                 log.debug(f"peering: {self!r} stream {stream_id} write: "
                           f"{e!r}")
                 raise MOQTStreamStopped() from e
             return False
+        self._count(len(data))
+        if end_stream:
+            self._ended(stream_id)
         return True
 
     async def stream_write_drain(self, stream_id: int, data: bytes,
@@ -191,6 +234,7 @@ class FabricHop:
         """Write, waiting out backpressure. CancelledError once closed;
         MOQTStreamStopped when the stream is gone on a live session."""
         if not self._writable():
+            self._ended(stream_id)
             raise asyncio.CancelledError()
         cap = self._stream_ring_cap()
         if cap and len(data) > cap:
@@ -213,15 +257,20 @@ class FabricHop:
             await self._quic.send_stream_data_drained(
                 stream_id, data, end_stream=end_stream, **kw)
         except (AssertionError, AttributeError, ConnectionError) as e:
+            self._ended(stream_id)
             if self._writable():
                 raise MOQTStreamStopped() from e
             raise asyncio.CancelledError() from e
+        self._count(len(data))
+        if end_stream:
+            self._ended(stream_id)
 
     def stream_reset(self, stream_id: int,
                      error_code: int = StreamResetCode.CANCELLED, *,
                      reliable_size: int = 0) -> None:
         """RESET_STREAM with the d18 code; retried while the ring is
         full."""
+        self._ended(stream_id)
         if not self._writable():
             return
         code = stream_reset_code(error_code, P18)
@@ -273,6 +322,7 @@ class FabricHop:
                           self.track.fullname_hash).encode()
         if self._quic.send_datagram_frame(head + data):
             self.datagrams += 1
+            self._count(0, datagram=True)
             return len(data)
         self.datagrams_dropped += 1
         return 0

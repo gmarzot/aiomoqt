@@ -43,7 +43,8 @@ from aiomoqt.peering.session import (DataFlow, Inbound, Learned, PeerSession,
                                      SessionEvent, Stamp, log, now_stamp)
 from aiomoqt.peering.transit import Transit
 from aiomoqt.peering.wire import (ALPN, ANNOUNCE_NAMESPACE,
-                                  DEFAULT_NODE_METRIC, AnnounceInfo,
+                                  DEFAULT_NODE_METRIC, DEFAULT_PORT,
+                                  AnnounceInfo,
                                   DataHeader, DataType, MsgType, NodeInfo,
                                   NodeSet, NodeType, SubscribeInfo)
 from aiomoqt.utils.payload import PayloadCheck
@@ -61,6 +62,9 @@ MAX_CLOSED_SESSIONS = 100
 HEADER_GAP_SAMPLES = 10_000
 # Longest a stop waits for its withdraws to be sent and acked.
 WITHDRAW_GRACE = 0.25
+# Longest a moved SNS keeps its open streams, when no subscriber's
+# delivery timeout is shorter.
+DRAIN_MAX_S = 5.0
 
 Name = Union[str, bytes, Sequence[Union[str, bytes]]]
 # A learned announce or subscribe: (fullname hash, source node).
@@ -124,11 +128,18 @@ class _PeerProtocol(QuicConnectionProtocol):
 
     def __init__(self, quic, stream_handler=None, *, node: "FabricNode",
                  dialer: bool, peer: Optional[str] = None,
-                 dial_start: Optional[Stamp] = None):
+                 dial_start: Optional[Stamp] = None,
+                 dial_key: Optional[Tuple[str, int]] = None):
         super().__init__(quic, stream_handler=stream_handler)
         self.node = node
         self.dialer = dialer
         self.peer = peer
+        # (host, port) as given to add_peer, for a dialed connection.
+        self.dial_key = dial_key
+        # Data sent: streams opened, stream bytes, datagrams.
+        self.tx_streams = 0
+        self.tx_bytes = 0
+        self.tx_datagrams = 0
         self.dial_start = dial_start
         self.session: Optional[PeerSession] = None
         self.terminated = asyncio.Event()
@@ -191,6 +202,7 @@ class _PeerProtocol(QuicConnectionProtocol):
                            fin: bool = False) -> None:
         await self._quic.send_stream_data_drained(stream_id, data,
                                                   end_stream=fin)
+        self.tx_bytes += len(data)
 
     def send_nowait(self, stream_id: int, data: bytes,
                     fin: bool = False) -> bool:
@@ -200,6 +212,7 @@ class _PeerProtocol(QuicConnectionProtocol):
             self._quic.send_stream_data(stream_id, data, end_stream=fin)
         except BufferError:
             return False
+        self.tx_bytes += len(data)
         return True
 
     def control_flushed(self) -> bool:
@@ -237,8 +250,13 @@ class FabricTrack:
         self.announced = announced
         self._subgroups: Dict[Tuple[int, int], _Egress] = {}
         # Session id -> withdrawn SNS still carrying open subgroups; each
-        # SNS_WD waits for its streams to end.
+        # SNS_WD waits for its streams to end, at most the drain bound.
         self._draining: Dict[int, List[NodeSet]] = {}
+        self._drain_timers: Dict[Tuple[int, int], asyncio.TimerHandle] = {}
+        # (session id, stream id) -> (FabricHop, SNS id) of open hop streams.
+        self._hop_streams: Dict[Tuple[int, int], Tuple[Any, int]] = {}
+        # Streams the drain bound cut.
+        self.drain_cut = 0
         self.objects = 0
         self.bytes = 0
         self.streams = 0
@@ -286,6 +304,7 @@ class FabricTrack:
                 eg.streams[sid] = stream
                 eg.sns_of[sid] = sns_id
                 self.streams += 1
+                proto.tx_streams += 1
                 wire = head + eg.writer.header + data
                 if not proto.send_nowait(stream, wire):
                     waits.append(proto.send_drained(stream, wire))
@@ -325,30 +344,82 @@ class FabricTrack:
         if waits:
             await _gather(waits)
 
-    def _open_on(self, session_id: int) -> Set[int]:
-        """SNS ids of the open subgroup streams on a session."""
-        return {eg.sns_of[session_id] for eg in self._subgroups.values()
-                if session_id in eg.streams}
+    def retiring(self, session_id: int) -> bool:
+        """The session lost the track's SNS to a route move and only
+        finishes the streams it has open."""
+        return (session_id in self._draining
+                and session_id not in self.origin.sns)
 
-    def _drain(self, session_id: int, sns: NodeSet) -> bool:
-        """Hold a withdrawn SNS while its streams are open; False when
-        none is."""
+    def _open_on(self, session_id: int) -> Set[int]:
+        """SNS ids of the open streams on a session, ours and hops'."""
+        ids = {eg.sns_of[session_id] for eg in self._subgroups.values()
+               if session_id in eg.streams}
+        ids.update(sns_id for (sid, _), (_, sns_id)
+                   in self._hop_streams.items() if sid == session_id)
+        return ids
+
+    def _hop_opened(self, hop, stream_id: int, sns_id: int) -> None:
+        self._hop_streams[(hop.session_id, stream_id)] = (hop, sns_id)
+
+    def _hop_ended(self, session_id: int, stream_id: int) -> None:
+        if self._hop_streams.pop((session_id, stream_id), None) is not None \
+                and self._draining:
+            self._release_drained()
+
+    def _drain(self, session_id: int, sns: NodeSet, bound: float) -> bool:
+        """Hold a withdrawn SNS while its streams are open, at most
+        `bound` seconds; False when none is."""
         if sns.sns_id not in self._open_on(session_id):
             return False
         self._draining.setdefault(session_id, []).append(sns)
+        self._drain_timers[(session_id, sns.sns_id)] = \
+            asyncio.get_running_loop().call_later(
+                bound, self._drain_expired, session_id, sns.sns_id, bound)
         return True
+
+    def _drain_expired(self, session_id: int, sns_id: int,
+                       bound: float) -> None:
+        """Cut the streams a moved SNS still holds past its bound."""
+        self._drain_timers.pop((session_id, sns_id), None)
+        if not any(sns.sns_id == sns_id
+                   for sns in self._draining.get(session_id, ())):
+            return
+        proto = self.node._protocols.get(session_id)
+        cut = 0
+        for eg in self._subgroups.values():
+            if eg.sns_of.get(session_id) != sns_id:
+                continue
+            stream = eg.streams.pop(session_id, None)
+            eg.sns_of.pop(session_id, None)
+            if stream is not None:
+                cut += 1
+                if proto is not None and not proto.terminated.is_set():
+                    proto._quic.reset_stream(stream, 0)
+        for (sid, stream), (hop, held) in list(self._hop_streams.items()):
+            if sid == session_id and held == sns_id:
+                cut += 1
+                self._hop_streams.pop((sid, stream), None)
+                hop.stream_reset(stream)
+        self.drain_cut += cut
+        log.warning(f"peering: track 0x{self.fullname_hash:016x} session "
+                    f"{session_id}: {cut} stream(s) still open {bound:g}s "
+                    f"after its subscribers moved; reset")
+        self._release_drained()
 
     def _release_drained(self) -> None:
         for sid, held in list(self._draining.items()):
             open_ids = self._open_on(sid)
             keep = [sns for sns in held if sns.sns_id in open_ids]
-            for sns in held:
-                if sns.sns_id not in open_ids:
-                    self.node._withdraw_sns(self, sid, sns)
             if keep:
                 self._draining[sid] = keep
             else:
                 del self._draining[sid]
+            for sns in held:
+                if sns.sns_id not in open_ids:
+                    timer = self._drain_timers.pop((sid, sns.sns_id), None)
+                    if timer is not None:
+                        timer.cancel()
+                    self.node._withdraw_sns(self, sid, sns)
 
     def datagram(self, group_id: int, object_id: int, payload: bytes,
                  extensions=None, end_of_group: bool = False) -> int:
@@ -366,6 +437,7 @@ class FabricTrack:
             if proto._quic.send_datagram_frame(head + inner):
                 sent += 1
                 self.datagrams += 1
+                proto.tx_datagrams += 1
             else:
                 self.datagrams_dropped += 1
         return sent
@@ -374,6 +446,10 @@ class FabricTrack:
         """FIN this track's streams on a session that lost its SNS."""
         proto = self.node._protocols.get(session_id)
         self._draining.pop(session_id, None)
+        for key in [k for k in self._drain_timers if k[0] == session_id]:
+            self._drain_timers.pop(key).cancel()
+        for key in [k for k in self._hop_streams if k[0] == session_id]:
+            del self._hop_streams[key]
         for eg in self._subgroups.values():
             eg.sns_of.pop(session_id, None)
             stream = eg.streams.pop(session_id, None)
@@ -513,7 +589,11 @@ class FabricNode:
         self._tasks: Set[asyncio.Task] = set()
         self._protocols: Dict[int, _PeerProtocol] = {}
         self._next_session = 1
-        self._dial_tasks: List[asyncio.Task] = []
+        # (host, port) -> its dial loop.
+        self._dials: Dict[Tuple[str, int], asyncio.Task] = {}
+        # (host, port) -> metric set by add_peer / set_peer_metric.
+        self._peer_metric: Dict[Tuple[str, int], int] = {}
+        self._started = False
         self._server = None
         self._stopping = False
         self._changed = asyncio.Event()
@@ -547,18 +627,19 @@ class FabricNode:
                 self.port, configuration=cfg,
                 create_protocol=functools.partial(self._new_protocol,
                                                   dialer=False))
+        self._started = True
         for host, port in self.peers:
-            self._dial_tasks.append(
-                asyncio.ensure_future(self._dial_loop(host, port)))
+            self._start_dial(host, port)
 
     async def stop(self) -> None:
         if self._stopping:
             return
         await self.withdraw_originated()
         self._stopping = True
-        for task in self._dial_tasks:
+        dials = list(self._dials.values())
+        for task in dials:
             task.cancel()
-        await asyncio.gather(*self._dial_tasks, return_exceptions=True)
+        await asyncio.gather(*dials, return_exceptions=True)
         accepted = [p for p in self._protocols.values() if not p.dialer]
         for proto in accepted:
             proto.close()
@@ -625,7 +706,8 @@ class FabricNode:
 
     async def _dial_once(self, host: str, port: int, peer: str) -> None:
         factory = functools.partial(self._new_protocol, dialer=True,
-                                    peer=peer, dial_start=self.clock())
+                                    peer=peer, dial_start=self.clock(),
+                                    dial_key=(host, port))
         async with asyncio.timeout(self.connect_timeout) as limit:
             if self._engine is None:
                 self._engine = QuicClientEngine()
@@ -727,6 +809,10 @@ class FabricNode:
             log.warning(f"peering: {session.tag} CONNECT refused, "
                         f"code {ev.body.code}")
         self._record(ev.kind, session, ev.stamp, **event_fields(ev))
+        if ev.kind == "connected":
+            metric = self._configured_metric(session)
+            if metric is not None:
+                self.set_session_metric(session.id, metric)
         if ev.kind in ("announce", "announce_withdrawn"):
             self._learned_announce(ev.body)
         elif ev.kind in ("subscribe", "subscribe_withdrawn"):
@@ -861,10 +947,10 @@ class FabricNode:
             session = self.sessions.get(ch.session_id)
             live = session is not None and session.state == "connected"
             if (ch.withdraw and live and held.intersection(ch.sns.nodes)
-                    and track._drain(ch.session_id, ch.sns)):
-                # Its subscribers moved: open subgroups finish here first.
-                if self.on_sns is not None:
-                    self.on_sns(track, ch.session_id, None)
+                    and track._drain(ch.session_id, ch.sns,
+                                     self._drain_bound(track, ch.sns))):
+                # Its subscribers moved: open streams finish here first,
+                # then _withdraw_sns() and on_sns(None).
                 continue
             if ch.withdraw:
                 track._drop_session(ch.session_id)
@@ -884,7 +970,8 @@ class FabricNode:
 
     def _withdraw_sns(self, track: FabricTrack, session_id: int,
                       sns: NodeSet) -> None:
-        """SNS_WD for a drained SNS of a track."""
+        """SNS_WD for a drained SNS of a track; on_sns(None) unless the
+        session holds the track's SNS again."""
         session = self.sessions.get(session_id)
         self._record("sns_withdrawn_originated", session,
                      hash=f"0x{track.fullname_hash:016x}", sns=sns.sns_id,
@@ -892,6 +979,19 @@ class FabricNode:
         if session is not None and session.state == "connected":
             session.send(MsgType.SNS_WD, sns)
             self._flush(self._protocols[session_id])
+        if self.on_sns is not None and session_id not in track.origin.sns:
+            self.on_sns(track, session_id, None)
+
+    def _drain_bound(self, track: FabricTrack, sns: NodeSet) -> float:
+        """The longest delivery timeout among the moved subscribers'
+        subscribes, at most DRAIN_MAX_S."""
+        timeouts = [rec.body.delivery_timeout_ms for s in self.connected()
+                    for n in sns.nodes
+                    for rec in (s.subscribes.get((track.fullname_hash, n)),)
+                    if rec is not None and rec.body.delivery_timeout_ms]
+        if not timeouts:
+            return DRAIN_MAX_S
+        return min(max(timeouts) / 1000, DRAIN_MAX_S)
 
     # -- session metrics ---------------------------------------------
 
@@ -927,6 +1027,157 @@ class FabricNode:
         self._flush(self._protocols[session_id])
         if self.transit is not None:
             self.transit.sync_nodes(session)
+
+    # -- peers -------------------------------------------------------
+
+    def _start_dial(self, host: str, port: int) -> None:
+        task = self._dials.get((host, port))
+        if task is None or task.done():
+            self._dials[(host, port)] = asyncio.ensure_future(
+                self._dial_loop(host, port))
+
+    def _sessions_of(self, host: str, port: int) -> List[PeerSession]:
+        """Live sessions to a peer: the dial of (host, port), or accepted
+        from that address; from the host on any port when none matches
+        exactly (an accepted peer dials from an ephemeral port)."""
+        exact, same_host = [], []
+        for sid, proto in self._protocols.items():
+            session = self.sessions.get(sid)
+            if session is None or session.state == "closed":
+                continue
+            if proto.dialer:
+                if proto.dial_key == (host, port):
+                    exact.append(session)
+                continue
+            addr = proto._quic.peer_address()
+            if addr and addr[0] == host:
+                (exact if addr[1] == port else same_host).append(session)
+        return exact or same_host
+
+    def _configured_metric(self, session: PeerSession) -> Optional[int]:
+        proto = self._protocols.get(session.id)
+        if proto is None:
+            return None
+        if proto.dialer and proto.dial_key is not None:
+            return self._peer_metric.get(proto.dial_key)
+        addr = proto._quic.peer_address()
+        if not addr:
+            return None
+        if (addr[0], addr[1]) in self._peer_metric:
+            return self._peer_metric[(addr[0], addr[1])]
+        hits = [m for (h, _), m in self._peer_metric.items() if h == addr[0]]
+        return hits[0] if len(hits) == 1 else None
+
+    def add_peer(self, host: str, port: int = DEFAULT_PORT,
+                 metric: Optional[int] = None) -> None:
+        """Dial a peer, re-dialing after a close; a second call for the
+        same (host, port) only updates the metric. A metric given here
+        or by set_peer_metric() applies to every session to the peer."""
+        key = (host, int(port))
+        if metric is not None:
+            self.set_peer_metric(host, port, metric)
+        if key not in self.peers:
+            self.peers.append(key)
+        if self._started and not self._stopping:
+            self._start_dial(*key)
+
+    def remove_peer(self, host: str, port: int = DEFAULT_PORT) -> bool:
+        """Stop dialing a peer and close its session, or close the
+        session accepted from that address. False when neither exists."""
+        key = (host, int(port))
+        found = key in self.peers or key in self._dials
+        if key in self.peers:
+            self.peers.remove(key)
+        self._peer_metric.pop(key, None)
+        task = self._dials.pop(key, None)
+        if task is not None:
+            task.cancel()
+        for session in self._sessions_of(*key):
+            proto = self._protocols.get(session.id)
+            if proto is not None:
+                found = True
+                proto.close()
+        return found
+
+    def set_peer_metric(self, host: str, port: int, metric: int) -> bool:
+        """Set the metric of a peer's sessions, now and after a re-dial.
+        False when no session to the peer is up yet."""
+        key = (host, int(port))
+        self._peer_metric[key] = metric
+        sessions = self._sessions_of(*key)
+        for session in sessions:
+            self.set_session_metric(session.id, metric)
+        return bool(sessions)
+
+    def peer_table(self) -> List[Dict[str, Any]]:
+        """One row per live session, plus each dialed peer not up yet."""
+        rows: List[Dict[str, Any]] = []
+        up = set()
+        for sid, proto in list(self._protocols.items()):
+            session = self.sessions.get(sid)
+            if session is None or session.state == "closed":
+                continue
+            if proto.dialer and proto.dial_key is not None:
+                host, port = proto.dial_key
+                up.add(proto.dial_key)
+            else:
+                addr = proto._quic.peer_address() or ("?", 0)
+                host, port = addr[0], addr[1]
+            remote = session.remote
+            flows = session.flows.values()
+            rows.append({
+                "host": host, "port": port, "session": sid,
+                "origin": "dialed" if proto.dialer else "accepted",
+                "status": ("connected" if session.state == "connected"
+                           else "connecting"),
+                "identified": remote is not None,
+                "contact": remote.contact if remote else None,
+                "remote_node_id": (node_id_format(remote.node_id)
+                                   if remote else None),
+                "srtt_us": session.srtt_us,
+                "metric": self.advertised_metric(sid),
+                "node_metric": remote.metric if remote else None,
+                "connect_time_us": (int(session.connect_ms * 1000)
+                                    if session.connect_ms is not None
+                                    else None),
+                "subscribe_tracks": len(session.subscribes),
+                "publishes": len(session.announces),
+                "active_streams": len(session._streams)
+                + self._tx_open(sid),
+                "tx_streams": proto.tx_streams,
+                "rx_streams": sum(f.streams for f in flows),
+                "tx_bytes": proto.tx_bytes,
+                "rx_bytes": sum(f.bytes for f in flows),
+                "tx_datagrams": proto.tx_datagrams,
+                "rx_datagrams": sum(f.datagrams for f in flows),
+            })
+        for host, port in self.peers:
+            if (host, port) in up:
+                continue
+            rows.append({
+                "host": host, "port": port, "session": None,
+                "origin": "dialed",
+                "status": "closed" if self._stopping else "connecting",
+                "identified": False, "contact": None, "remote_node_id": None,
+                "srtt_us": None,
+                "metric": self._peer_metric.get((host, port),
+                                                self.local.metric),
+                "node_metric": None, "connect_time_us": None,
+                "subscribe_tracks": 0, "publishes": 0, "active_streams": 0,
+                "tx_streams": 0, "rx_streams": 0, "tx_bytes": 0,
+                "rx_bytes": 0, "tx_datagrams": 0, "rx_datagrams": 0})
+        return rows
+
+    def _tx_open(self, session_id: int) -> int:
+        """Data streams this node has open toward a session."""
+        n = 0
+        for track in self._origins.values():
+            n += sum(1 for eg in track._subgroups.values()
+                     if session_id in eg.streams)
+            n += sum(1 for sid, _ in track._hop_streams if sid == session_id)
+        if self.transit is not None:
+            n += self.transit.open_streams(session_id)
+        return n
 
     def sample_srtt(self, session: PeerSession) -> None:
         proto = self._protocols.get(session.id)
