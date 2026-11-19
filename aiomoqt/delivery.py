@@ -485,6 +485,84 @@ def _peer(session) -> str:
     return f"{addr[0]}:{addr[1]}" if addr else "peer"
 
 
+_unenforced_logged = False
+
+
+def _stream_released(session) -> Optional[Callable[[int], bool]]:
+    """The transport's stream_released(stream_id) query, None where it has
+    none; logged once."""
+    global _unenforced_logged
+    fn = getattr(getattr(session, "_quic", None), "stream_released", None)
+    if fn is None and not _unenforced_logged:
+        _unenforced_logged = True
+        logger.info("transport has no stream_released(): "
+                    "SUBGROUP_DELIVERY_TIMEOUT is not enforced")
+    return fn
+
+
+class SubgroupTimer:
+    """§8 SUBGROUP_DELIVERY_TIMEOUT for one session's subgroup streams: a
+    stream not released by the transport (all data acknowledged) within
+    `timeout` seconds of its FIN is reset with DELIVERY_TIMEOUT. FINed
+    streams queue in order; one timer sweeps those due."""
+
+    __slots__ = ("session", "timeout", "_released", "_due", "_handle",
+                 "expired")
+
+    def __init__(self, session, timeout: Optional[float] = None):
+        self.session = session
+        self.timeout = timeout or None
+        self._released = None
+        self._due: deque = deque()
+        self._handle = None
+        self.expired = 0         # streams reset by the timeout
+
+    def complete(self, stream_id: int) -> None:
+        """Stream `stream_id` holds its whole subgroup and is FINed."""
+        timeout = self.timeout
+        if timeout is None:
+            return
+        released = self._released
+        if released is None:
+            released = self._released = (
+                _stream_released(self.session) or False)
+        if released is False:
+            return
+        loop = asyncio.get_running_loop()
+        due = loop.time() + timeout
+        self._due.append((stream_id, due))
+        if self._handle is None:
+            self._handle = loop.call_at(due, self._sweep)
+
+    def _sweep(self) -> None:
+        self._handle = None
+        due = self._due
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        released = self._released
+        while due and due[0][1] <= now:
+            sid = due.popleft()[0]
+            try:
+                done = released(sid)
+            except Exception:
+                done = True
+            if not done:
+                self.expired += 1
+                data_log.debug(f"stream {sid}: subgroup delivery timeout, "
+                               f"reset")
+                self.session.stream_reset(sid,
+                                          StreamResetCode.DELIVERY_TIMEOUT)
+        if due:
+            self._handle = loop.call_at(due[0][1], self._sweep)
+
+    def cancel(self) -> None:
+        """Stop sweeping; queued streams are left alone."""
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._due.clear()
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -537,6 +615,22 @@ class SubgroupDelivery:
         self._tx_streams: dict = {}
         # Told of each PER_GROUP stream opened at a group start.
         self.head_trace: Optional[HeadTrace] = None
+        # SUBGROUP_DELIVERY_TIMEOUT (§8), set through subgroup_timeout.
+        self._subgroups: Optional[SubgroupTimer] = None
+
+    @property
+    def subgroup_timeout(self) -> Optional[float]:
+        """SUBGROUP_DELIVERY_TIMEOUT in seconds, None for none."""
+        t = self._subgroups
+        return None if t is None else t.timeout
+
+    @subgroup_timeout.setter
+    def subgroup_timeout(self, value: Optional[float]) -> None:
+        if self._subgroups is None:
+            if not value:
+                return
+            self._subgroups = SubgroupTimer(self.session)
+        self._subgroups.timeout = value or None
 
     @property
     def _prof(self):
@@ -571,6 +665,8 @@ class SubgroupDelivery:
         """Stream `sid` of `group_id` is FINed."""
         if self.lane is not None:
             self._tx_streams[sid] = group_id
+        if self._subgroups is not None:
+            self._subgroups.complete(sid)
         if sid == self._stream_id:
             self._stream_id = None
             self._header = None
@@ -592,10 +688,7 @@ class SubgroupDelivery:
                                   status=ObjectStatus.END_OF_TRACK)
             self.session.stream_write(self._stream_id, buf.data,
                                       end_stream=True)
-            if self.lane is not None:
-                self._tx_streams[self._stream_id] = hdr.group_id
-            self._stream_id = None
-            self._header = None
+            self._ended(self._stream_id, hdr.group_id)
             return
         group_id = 0 if largest is None else largest[0] + 1
         if self.passes is not None and not self.passes(group_id, 0):
@@ -626,8 +719,7 @@ class SubgroupDelivery:
         data = hdr.serialize().data + hdr.next_object(
             payload=b"", object_id=0, status=ObjectStatus.END_OF_TRACK).data
         self.session.stream_write(sid, data, end_stream=True)
-        if self.lane is not None:
-            self._tx_streams[sid] = group_id
+        self._ended(sid, group_id)
 
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
