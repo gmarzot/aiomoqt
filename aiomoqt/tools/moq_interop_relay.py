@@ -168,9 +168,8 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
-from aiomoqt.peering import (FabricHop, FabricNode, FabricSource, NodeType,
-                             node_id_format, parse_identity)
-from aiomoqt.peering.ib import path_rank
+from aiomoqt.peering import (FabricHop, FabricNode, FabricSource,
+                             HopRetiring, node_id_format, parse_identity)
 from aiomoqt.peering.wire import DEFAULT_NODE_METRIC
 from aiomoqt.peering.wire import DEFAULT_PORT as FABRIC_PORT
 from aiomoqt import __version__ as AIOMOQT_VERSION
@@ -3244,6 +3243,11 @@ class _RelayedTrack:
             else:
                 stream_id = await session.open_uni_stream(
                     initial=initial, priority=band, end_stream=whole)
+        except HopRetiring:
+            # The SNS moved: this subgroup goes to the new hop only.
+            self._count_tx(session, -len(initial))
+            self._stopped.add(skey)
+            return True
         except MOQTStreamStopped:
             self._stopped.add(skey)
             return True
@@ -7122,9 +7126,6 @@ FABRIC_LABEL = "aiomoqt-relay"
 FABRIC_WITHDRAW_GRACE_S = 3.0
 # Redial delay for a lost fabric peer.
 FABRIC_REDIAL_S = 2.0
-# How often live fabric sessions' transport counters are sampled, so a
-# closed session's row keeps its last values.
-FABRIC_SAMPLE_S = 1.0
 
 
 def _fabric_covers(ns: tuple, name=None) -> bool:
@@ -7173,18 +7174,6 @@ def _subscribe_fabric(key, source):
     return track
 
 
-def _split_addr(text: str):
-    """'host:port' or '[v6]:port' as (host, port); port None if absent."""
-    if text.startswith("["):
-        host, _, rest = text[1:].partition("]")
-        port = rest[1:]
-    else:
-        host, _, port = text.rpartition(":")
-        if not host:
-            host, port = text, ""
-    return host, int(port) if port.isdigit() else None
-
-
 def _addr_text(host, port) -> str:
     return f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
 
@@ -7223,31 +7212,24 @@ class _Fabric:
         self.egress: dict = {}
         self._attaching: set = set()
         self._sync_due = False
-        # Session metric per peer (host, port).
-        self.metrics: dict = {}
-        # Session id -> Counter of data sent on its closed hops.
-        self._tx_closed: dict = {}
-        # Session id -> last path_quality() sample.
-        self._pq: dict = {}
-        self._sampler = None
         node.on_announce = self._on_announce
         node.on_subscribe = self._on_subscribe
         node.on_sns = self._on_sns
 
     async def start(self) -> None:
         await self.node.start()
-        self._sampler = asyncio.create_task(self._sample())
         self.changed()
 
     async def stop(self) -> None:
-        """Withdraw everything, then close every fabric session; the
-        relay's fabric-fed tracks end downstream."""
-        if self._sampler is not None:
-            self._sampler.cancel()
-        for e in list(self.egress.values()):
-            self._unserve(e.key)
-        self.source.close()
+        """node.stop() withdraws what this node originated and closes
+        every session at once; then the hops close and the relay's
+        fabric-fed tracks end downstream."""
         await self.node.stop()
+        for e in list(self.egress.values()):
+            for sid in list(e.hops):
+                self._drop_hop(e, sid)
+        self.egress.clear()
+        self.source.close()
         _forget_session(self.source)
 
     # -- learned announces --------------------------------------------
@@ -7431,7 +7413,8 @@ class _Fabric:
     def _sync_hops(self, e) -> None:
         """One hop per session holding the track's SNS."""
         held = e.ftrack.origin.sns
-        for sid in [sid for sid in e.hops if sid not in held]:
+        for sid in [sid for sid in e.hops if sid not in held
+                    and not e.ftrack.retiring(sid)]:
             self._drop_hop(e, sid)
         for sid in held:
             if sid in e.hops:
@@ -7447,7 +7430,14 @@ class _Fabric:
         track = e.track
         if track.find(hop, None) is not None or track.finished:
             return
-        d = track.add_downstream(hop, e.ftrack.fullname_hash, None)
+        window = _UNFILTERED
+        if track.largest is not None and any(
+                e.ftrack.retiring(sid) for sid in e.hops
+                if sid != hop.session_id):
+            # A route move: the old hop finishes the group in flight.
+            window = ((track.largest[0] + 1, 0), None)
+        d = track.add_downstream(hop, e.ftrack.fullname_hash, None,
+                                 window=window)
         d.timeout = e.timeout_ms
         logger.info(f"relay: fabric session {hop.session_id} "
                     f"({self._peer_text(hop.session_id)}) joins {e.key} "
@@ -7458,14 +7448,9 @@ class _Fabric:
         hop = e.hops.pop(sid, None)
         if hop is None:
             return
-        tx = self._tx_closed.setdefault(sid, Counter())
-        tx["streams"] += hop.streams
-        tx["datagrams"] += hop.datagrams
-        if e.track is not None:
-            # Its open subgroups end with a FIN, not a reset.
-            e.track._close_streams(hop)
-            e.track.drop_session(hop)
         hop.close()
+        if e.track is not None:
+            e.track.drop_session(hop)
         if e.track is not None:
             logger.info(f"relay: fabric session {sid} leaves {e.key} "
                         f"-> fanout={len(e.track.downstream)}")
@@ -7481,162 +7466,17 @@ class _Fabric:
         s = self.node.sessions.get(sid)
         return s.peer if s is not None else "?"
 
-    def _dialed(self, host, port):
-        try:
-            return self.node.peers.index((host, port))
-        except ValueError:
-            return None
-
-    def _accepted(self, host, port) -> list:
-        out = []
-        for s in self.node.sessions.values():
-            if s.dialer or s.state == "closed":
-                continue
-            if _split_addr(s.peer) == (host, port):
-                out.append(s)
-        return out
-
-    def add_peer(self, host, port, metric=None) -> None:
-        if metric is not None:
-            self.metrics[(host, port)] = metric
-        if self._dialed(host, port) is not None:
-            return
-        node = self.node
-        node.peers.append((host, port))
-        node._dial_tasks.append(
-            asyncio.ensure_future(node._dial_loop(host, port)))
-        peer_log.info(f"peering: peer {_addr_text(host, port)} added")
-
-    def remove_peer(self, host, port) -> bool:
-        node = self.node
-        i = self._dialed(host, port)
-        found = False
-        if i is not None:
-            node.peers.pop(i)
-            node._dial_tasks.pop(i).cancel()
-            found = True
-        for s in self._accepted(host, port):
-            proto = node._protocols.get(s.id)
-            if proto is not None:
-                proto.close()
-            found = True
-        if found:
-            self.metrics.pop((host, port), None)
-            peer_log.info(f"peering: peer {_addr_text(host, port)} removed")
-        return found
-
-    def set_metric(self, host, port, metric) -> bool:
-        if self._dialed(host, port) is None and not self._accepted(host,
-                                                                   port):
-            return False
-        self.metrics[(host, port)] = metric
-        peer_log.info(f"peering: peer {_addr_text(host, port)} session "
-                      f"metric {metric}")
-        self._apply_metrics()
-        return True
-
-    def _apply_metrics(self) -> None:
-        """Each live session of a peer with a set metric takes it."""
-        node = self.node
-        for s in node.connected():
-            metric = self.metrics.get(_split_addr(s.peer))
-            if (metric is not None
-                    and node._session_metric.get(s.id) != metric):
-                node.set_session_metric(s.id, metric)
-
-    async def _sample(self) -> None:
-        while True:
-            await asyncio.sleep(FABRIC_SAMPLE_S)
-            if self.metrics:
-                self._apply_metrics()
-            for sid, proto in list(self.node._protocols.items()):
-                self._pq[sid] = _path_quality(proto)
-            for sid in [sid for sid in self._pq
-                        if sid not in self.node.sessions]:
-                del self._pq[sid]
-
     # -- report --------------------------------------------------------
 
-    def _peer_row(self, s) -> dict:
-        node = self.node
-        host, port = _split_addr(s.peer)
-        proto = node._protocols.get(s.id)
-        live = proto is not None and s.state != "closed"
-        if live:
-            node.sample_srtt(s)
-            self._pq[s.id] = _path_quality(proto)
-        pq = self._pq.get(s.id, {})
-        tx = Counter(self._tx_closed.get(s.id, ()))
-        active = len(s._streams)
-        publishes = 0
-        for e in self.egress.values():
-            if s.id in e.ftrack.origin.sns:
-                publishes += 1
-            hop = e.hops.get(s.id)
-            if hop is None:
-                continue
-            tx["streams"] += hop.streams
-            tx["datagrams"] += hop.datagrams
-            if e.track is not None:
-                active += sum(1 for k in e.track._streams if k[0] == id(hop))
-        remote = s.remote
-        flows = list(s.flows.values())
-        return {
-            "host": host, "port": port,
-            "origin": "dialed" if s.dialer else "accepted",
-            "status": {"connected": "connected",
-                       "closed": "closed"}.get(s.state, "connecting"),
-            "identified": remote is not None,
-            "contact": remote.contact if remote else None,
-            "remote_node_id": (node_id_format(remote.node_id)
-                               if remote else None),
-            "srtt_us": s.srtt_us,
-            "metric": self.metrics.get((host, port), 0),
-            "node_metric": remote.metric if remote else None,
-            "connect_time_us": (round(s.connect_ms * 1000)
-                                if s.connect_ms is not None else None),
-            "subscribe_tracks": len(s.subscribes),
-            "publishes": publishes,
-            "active_streams": active,
-            "tx_streams": tx["streams"],
-            "rx_streams": sum(f.streams for f in flows),
-            "tx_bytes": pq.get("bytes_sent") or 0,
-            "rx_bytes": pq.get("bytes_received") or 0,
-            "tx_datagrams": tx["datagrams"],
-            "rx_datagrams": sum(f.datagrams for f in flows),
-        }
-
     def _peer_rows(self) -> list:
-        """One row per live session, the newest closed one of a peer with
-        none live, and a connecting row for a dialed peer with neither."""
-        live, closed = [], {}
-        for s in self.node.sessions.values():
-            where = ("dialed" if s.dialer else "accepted",
-                     _split_addr(s.peer))
-            if s.state == "closed":
-                closed[where] = s
-            else:
-                live.append((where, s))
-        held = {w for w, _ in live}
-        rows = [self._peer_row(s) for _, s in live]
-        rows += [self._peer_row(s) for w, s in closed.items()
-                 if w not in held]
-        shown = {("dialed", (r["host"], r["port"])) for r in rows
-                 if r["origin"] == "dialed"}
-        for host, port in self.node.peers:
-            if ("dialed", (host, port)) not in shown:
-                rows.append({
-                    "host": host, "port": port, "origin": "dialed",
-                    "status": "connecting", "identified": False,
-                    "contact": None, "remote_node_id": None,
-                    "srtt_us": None,
-                    "metric": self.metrics.get((host, port), 0),
-                    "node_metric": None, "connect_time_us": None,
-                    "subscribe_tracks": 0, "publishes": 0,
-                    "active_streams": 0, "tx_streams": 0, "rx_streams": 0,
-                    "tx_bytes": 0, "rx_bytes": 0, "tx_datagrams": 0,
-                    "rx_datagrams": 0})
-        return rows
+        keys = ("host", "port", "origin", "status", "identified", "contact",
+                "remote_node_id", "srtt_us", "metric", "node_metric",
+                "connect_time_us", "subscribe_tracks", "publishes",
+                "active_streams", "tx_streams", "rx_streams", "tx_bytes",
+                "rx_bytes", "tx_datagrams", "rx_datagrams")
+        for s in self.node.connected():
+            self.node.sample_srtt(s)
+        return [{k: row[k] for k in keys} for row in self.node.peer_table()]
 
     def _node_rows(self) -> list:
         node = self.node
@@ -7644,25 +7484,14 @@ class _Fabric:
             rows = []
             for n, sid, info in sorted(node.transit.routes()):
                 s = node.sessions.get(sid)
-                cost = node._session_cost(s) if s is not None else 0
+                cost = node.advertised_metric(sid) - node.local.metric
                 rows.append({"node_id": node_id_format(n),
                              "contact": info.contact,
                              "best_peer": s.peer if s is not None else None,
                              "path_metric": info.sum_metric() + cost,
                              "hops": len(info.path) + 1})
             return rows
-        best: dict = {}
-        for s, rec in self.node.learned_nodes():
-            if s.state != "connected":
-                continue
-            body = rec.body
-            held = best.get(body.node_id)
-            if held is None or path_rank(body) < path_rank(held[1]):
-                best[body.node_id] = (s, body)
-        return [{"node_id": node_id_format(n), "contact": body.contact,
-                 "best_peer": s.peer, "path_metric": body.sum_metric(),
-                 "hops": len(body.path) + 1}
-                for n, (s, body) in sorted(best.items())]
+        return []
 
     def _transit_rows(self) -> list:
         """One row per ingress SNS and track hash it carried (None before
@@ -7734,9 +7563,10 @@ async def _start_fabric(*, peers=(), port=FABRIC_PORT, bind=None,
     global _fabric
     node_kw.setdefault("redial_interval", FABRIC_REDIAL_S)
     node = FabricNode(node_id=node_id, label=label, metric=metric,
-                      node_type=NodeType.EDGE, peers=peers, bind=bind,
-                      port=port, cert=cert, key=key, transit=True,
-                      **node_kw)
+                      bind=bind, port=port, cert=cert, key=key,
+                      transit=True, **node_kw)
+    for host, peer_port in peers:
+        node.add_peer(host, peer_port)
     fabric = _Fabric(node)
     _fabric = fabric
     try:
@@ -7772,12 +7602,15 @@ def _fabric_peer_op(fabric, query: str) -> tuple:
             or (op == "metric" and metric is None)):
         return "400 Bad Request", {
             "error": "op=add|remove|metric&host=H&port=P[&metric=M]"}
+    node = fabric.node
     if op == "add":
-        fabric.add_peer(host, port, metric)
+        node.add_peer(host, port, metric)
+        peer_log.info(f"peering: peer {_addr_text(host, port)} added")
     elif op == "remove":
-        if not fabric.remove_peer(host, port):
+        if not node.remove_peer(host, port):
             return "404 Not Found", {"error": "no such peer"}
-    elif not fabric.set_metric(host, port, metric):
+        peer_log.info(f"peering: peer {_addr_text(host, port)} removed")
+    elif not node.set_peer_metric(host, port, metric):
         return "404 Not Found", {"error": "no such peer"}
     return "200 OK", {"ok": True}
 

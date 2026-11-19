@@ -5,7 +5,9 @@ fabric subscriber; the fabric subscribe withdrawn at --pause-after and
 re-advertised; a fabric withdraw ending the track downstream; a dropped
 peer redialed; a stuck fabric hop not stalling local viewers; transit
 to a far node beside the relay's own viewers, each leaving without loss
-to the other; GET /fabric and POST /fabric/peer. Every case counts
+to the other; a relay track moving between two next hops mid-group
+without loss; a stop that sends no transit withdraws; GET /fabric and
+POST /fabric/peer. Every case counts
 objects and duplicates."""
 import asyncio
 import contextlib
@@ -479,7 +481,7 @@ async def test_control_get_fabric_and_post_peer(tmp_path):
 
                 q = f"host=127.0.0.1&port={bport}"
                 assert (await _http(sock, "POST", "/fabric/peer?op=add&"
-                                    + q + "&metric=7"))[0] == 200
+                                    + q + "&metric=170"))[0] == 200
                 await _until(lambda: len(b.connected()) == 1)
 
                 def dialed():
@@ -487,18 +489,20 @@ async def test_control_get_fabric_and_post_peer(tmp_path):
                             if r["origin"] == "dialed"]
                 await _until(lambda: dialed()
                              and dialed()[0]["status"] == "connected")
-                assert dialed()[0]["metric"] == 7
+                # The metric advertised on the session: at least the node's.
+                await _until(lambda: dialed()[0]["metric"] == 170)
                 assert (await _http(sock, "POST", "/fabric/peer?op=metric&"
-                                    + q + "&metric=9"))[0] == 200
-                assert dialed()[0]["metric"] == 9
+                                    + q + "&metric=250"))[0] == 200
+                assert dialed()[0]["metric"] == 250
                 assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
                                     + q))[0] == 200
-                await _until(lambda: not b.connected() and all(
-                    r["status"] == "closed" for r in dialed()))
+                await _until(lambda: not b.connected() and not dialed())
+                # Another port of a host with a session falls back to it.
+                nobody = f"host=192.0.2.1&port={bport}"
                 assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
-                                    + q))[0] == 404
+                                    + nobody))[0] == 404
                 assert (await _http(sock, "POST", "/fabric/peer?op=metric&"
-                                    + q + "&metric=1"))[0] == 404
+                                    + nobody + "&metric=1"))[0] == 404
                 for bad in ("op=restart&" + q, "op=add&host=x",
                             "op=metric&" + q, "op=add&host=x&port=0"):
                     assert (await _http(sock, "POST",
@@ -581,3 +585,87 @@ async def test_a_far_subscriber_leaves_while_the_relay_keeps_its_feed():
         _complete(viewer.got["video"])
         _complete(far_sink.got)
         assert viewer.done["video"] is None
+
+
+# -- make-before-break between two next hops ----------------------------
+
+def _transit_node(label, port):
+    return FabricNode(label=label, bind="127.0.0.1", port=port, cert=CERT,
+                      key=KEY, transit=True)
+
+
+@pytest.mark.asyncio
+async def test_a_relay_track_moves_between_next_hops_without_loss():
+    port, pa, pb = _PORT + 54, _FABRIC_PORT + 54, _FABRIC_PORT + 55
+    a, b = _transit_node("a", pa), _transit_node("b", pb)
+    far = FabricNode(label="far", peers=[("127.0.0.1", pa),
+                                         ("127.0.0.1", pb)],
+                     redial_interval=0.2)
+    async with a, b, far:
+        async with _relay(port, peers=[("127.0.0.1", pa),
+                                       ("127.0.0.1", pb)]) as (
+                fabric, connect):
+            node = fabric.node
+            await _until(lambda: len(node.connected()) == 2
+                         and len(far.connected()) == 2)
+            assert node.set_peer_metric("127.0.0.1", pb, 500)
+            pub = await connect()
+            # 40-object groups, 200 ms each: a move lands mid-group.
+            t = PublishedTrack(pub, namespace=NS, trackname="video",
+                               object_size=300, group_size=40, rate=200)
+            await t.publish(announce_namespace=False, publish_track=True)
+            await until_published(NS, ["video"])
+            sink = _Sink()
+            far.pull(NS, "video", sink)
+            await _until(lambda: len(sink.got) > 60)
+
+            def carried(n):
+                """Bytes the far node received through `n`."""
+                return sum(f.bytes for s in far.sessions.values()
+                           if s.remote and s.remote.node_id == n.node_id
+                           for f in s.flows.values())
+            assert carried(a) > 0 and carried(b) == 0
+            gid = max(sink.got)[0]
+            on_a = carried(a)
+            assert node.set_peer_metric("127.0.0.1", pa, 500)
+            assert node.set_peer_metric("127.0.0.1", pb, 0)
+            await _until(lambda: carried(b) > 0)
+            # The group in flight finished on the old hop.
+            await _until(lambda: carried(a) > on_a)
+            await _until(lambda: max(sink.got)[0] >= gid + 3)
+            e = fabric.egress[(NS_T, b"video")]
+            await _until(lambda: len(e.hops) == 1)
+            assert e.ftrack.drain_cut == 0
+            # The new hop joined at the group after the one in flight.
+            (hop,) = e.hops.values()
+            assert e.track.find(hop, None).window[0] > (gid, 0)
+            _complete(sink.got, per=40)
+
+
+# -- a stop sends no transit withdraws ------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_relay_stop_sends_no_transit_withdraws():
+    port, fport = _PORT + 56, _FABRIC_PORT + 56
+    pub = _pub_node(fport)
+    far = FabricNode(label="far", peers=[("127.0.0.1", fport)],
+                     redial_interval=0.2)
+    async with pub, far:
+        async with _relay(port, fabric_port=fport) as (fabric, connect):
+            await _until(lambda: pub.connected() and far.connected()
+                         and len(fabric.node.connected()) == 2)
+            video = pub.publish(NS, "video")
+            await _until(lambda: any(a.name == b"video"
+                                     for a in far.remote_announces()))
+            sink = _Sink()
+            far.pull(NS, "video", sink)
+            feeder = _Feeder({"video": video})
+            await _until(lambda: len(sink.got) > 20)
+            (session,) = far.connected()
+            await relay._stop_fabric()
+            await feeder.stop()
+            await _until(lambda: session.state == "closed")
+            _no_dups(sink.got)
+            withdraws = {k: n for k, n in session.rx_msgs.items()
+                         if k.endswith("_WD")}
+            assert not withdraws, withdraws
