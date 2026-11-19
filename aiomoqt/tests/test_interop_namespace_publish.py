@@ -124,8 +124,8 @@ async def test_publish_track_only_fails_when_publish_goes_unanswered(
 @requires_certs
 async def test_publish_track_subscribe_fails_when_objects_are_dropped(
         monkeypatch):
-    async def drop(self, *args, **kw):
-        pass
+    def drop(self, *args, **kw):
+        return None
 
     monkeypatch.setattr(client, "_DATA_DELIVERY_S", 1.0)
     monkeypatch.setattr(relay._RelayedTrack, "_forward_one", drop)
