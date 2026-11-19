@@ -3353,6 +3353,7 @@ class _RelayedTrack:
         def created(stream_id):
             if stream_id:
                 tx[k] = stream_id
+                self._fin(session, stream_id)
         if sched == "chain":
             ok = session.open_uni_stream_nowait(
                 initial=initial, priority=band, chain=alias + 1, order=gid,

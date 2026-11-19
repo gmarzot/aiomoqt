@@ -912,6 +912,30 @@ async def test_a_new_stream_still_opens_with_its_object_and_end(lane_sends,
         track.close()
 
 
+async def test_a_stream_opened_from_offer_starts_its_subgroup_timer(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    fins = []
+
+    class _Timer:
+        session = sub
+
+        def complete(self, sid):
+            fins.append(sid)
+    track._subgroup_timers[id(sub)] = _Timer()
+    try:
+        for gid in range(2):
+            track.on_object(_obj(gid, 0), 0, 0, gid, 0)
+            track.on_stream_end(gid, 0)
+            await _settle(5)
+        await _settle()
+        assert fins == [3, 7] and lane_sends == []
+    finally:
+        track.close()
+
+
 async def test_a_stream_opened_from_offer_carries_the_lane_path_bytes():
     wires = []
     for open_now in (True, False):
