@@ -1,2 +1,2 @@
-# Build aiopquic with queue_new_streams until it is released.
-gmarzot/aiopquic@gmarzot-wt-new-stream-queue
+# Build aiopquic from its 0.8.0 dev branch until it is released.
+gmarzot/aiopquic@gmarzot-0.8.0
