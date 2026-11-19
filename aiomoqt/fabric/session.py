@@ -10,18 +10,18 @@ from dataclasses import dataclass
 from typing import (Any, Callable, Container, Dict, List, NamedTuple,
                     Optional, Tuple)
 
-from aiomoqt.peering.hashing import node_id_format, track_hashes
-from aiomoqt.peering.ib import subscribe_outcome
-from aiomoqt.peering.inner import SubgroupReader, decode_datagram
-from aiomoqt.peering.report import describe, hash_text
-from aiomoqt.peering.wire import (AnnounceInfo, Connect, ConnectCode,
+from aiomoqt.fabric.hashing import node_id_format, track_hashes
+from aiomoqt.fabric.ib import subscribe_outcome
+from aiomoqt.fabric.inner import SubgroupReader, decode_datagram
+from aiomoqt.fabric.report import describe, hash_text
+from aiomoqt.fabric.wire import (AnnounceInfo, Connect, ConnectCode,
                                   ConnectResponse, ControlReader, DataHeader,
                                   Message, MsgType, NodeInfo, NodeSet,
                                   SubscribeInfo, WireError, encode_message,
                                   parse_data_header)
 from aiomoqt.utils.logger import TRACE, get_category_logger
 
-log = get_category_logger("peering")
+log = get_category_logger("fabric")
 
 Stamp = Tuple[int, int]
 
@@ -52,7 +52,7 @@ class SessionEvent:
 
 @dataclass
 class DataFlow:
-    """Peering data received for one track hash; the inner bytes are not
+    """Fabric data received for one track hash; the inner bytes are not
     decoded."""
     first_mono_ns: int
     first_unix_ns: int
@@ -153,7 +153,7 @@ class PeerSession:
     def send(self, msg_type: MsgType, body: Any) -> None:
         self._out.append(encode_message(msg_type, body))
         self.tx_msgs[msg_type.name] += 1
-        log.info(f"peering send: {msg_type.name} {self.tag} {describe(body)}")
+        log.info(f"fabric send: {msg_type.name} {self.tag} {describe(body)}")
 
     def take_output(self) -> List[bytes]:
         out, self._out = self._out, []
@@ -177,19 +177,19 @@ class PeerSession:
             self.control_stream = stream_id
         stamp = self._clock()
         if log.isEnabledFor(TRACE):
-            log.log(TRACE, f"peering control chunk: {self.tag} "
+            log.log(TRACE, f"fabric control chunk: {self.tag} "
                     f"stream={stream_id} len={len(data)} {bytes(data).hex()}")
         msgs = self.reader.feed(data)
         if self.reader.rejected != self._rejected_seen:
             self._rejected_seen = self.reader.rejected
-            log.warning(f"peering: {self.tag} control deviation: "
+            log.warning(f"fabric: {self.tag} control deviation: "
                         f"{self.reader.last_error}")
         events: List[SessionEvent] = []
         for msg in msgs:
             self.rx_msgs[msg.type.name] += 1
             found: List[SessionEvent] = []
             outcome = self._handle(msg, stamp, found)
-            log.info(f"peering message parsed: {msg.type.name} {self.tag} "
+            log.info(f"fabric message parsed: {msg.type.name} {self.tag} "
                      f"{describe(msg.body)} -> {outcome}")
             if msg.type == MsgType.CONNECT:
                 self.send(MsgType.CONNECT_RESPONSE,
@@ -344,7 +344,7 @@ class PeerSession:
         if st is None:
             st = self._streams[stream_id] = _InStream()
         if log.isEnabledFor(TRACE):
-            log.log(TRACE, f"peering data chunk: {self.tag} "
+            log.log(TRACE, f"fabric data chunk: {self.tag} "
                     f"stream={stream_id} len={len(data)} fin={fin}")
         stamp = self._clock()
         inner = data
@@ -358,7 +358,7 @@ class PeerSession:
             except WireError as e:
                 st.bad, st.buf = True, bytearray()
                 self.bad_data += 1
-                log.warning(f"peering: {self.tag} data stream {stream_id} "
+                log.warning(f"fabric: {self.tag} data stream {stream_id} "
                             f"ignored: {e}")
                 parsed = None
             if parsed is not None:
@@ -403,7 +403,7 @@ class PeerSession:
 
     def _bad_inner(self, st: _InStream, stream_id: int, error) -> None:
         self.bad_data += 1
-        log.warning(f"peering: {self.tag} data stream {stream_id}: {error}")
+        log.warning(f"fabric: {self.tag} data stream {stream_id}: {error}")
         self._stream_end(st, stream_id, "bad")
         st.bad, st.reader = True, None
 
@@ -422,7 +422,7 @@ class PeerSession:
             hdr, offset = parse_data_header(data, datagram=True)
         except WireError as e:
             self.bad_data += 1
-            log.debug(f"peering: {self.tag} datagram ignored: {e}")
+            log.debug(f"fabric: {self.tag} datagram ignored: {e}")
             return events
         stamp = self._clock()
         flow = self._flow(hdr, stamp, events)
@@ -433,7 +433,7 @@ class PeerSession:
                 obj = decode_datagram(data[offset:])
             except WireError as e:
                 self.bad_data += 1
-                log.debug(f"peering: {self.tag} datagram ignored: {e}")
+                log.debug(f"fabric: {self.tag} datagram ignored: {e}")
                 return events
             self.on_object(Inbound(self, None, hdr.sns_id, hdr.fullname_hash,
                                    stamp, None), obj)

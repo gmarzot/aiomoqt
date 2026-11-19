@@ -10,8 +10,8 @@ import os
 import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from aiomoqt.peering.hashing import libstdcxx_hash, node_id_format
-from aiomoqt.peering.wire import (AnnounceInfo, Connect, ConnectResponse,
+from aiomoqt.fabric.hashing import libstdcxx_hash, node_id_format
+from aiomoqt.fabric.wire import (AnnounceInfo, Connect, ConnectResponse,
                                   DataHeader, NodeInfo, NodeSet, NodeType,
                                   SubscribeInfo)
 

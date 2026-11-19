@@ -1,5 +1,5 @@
 """FabricNode: a moq-fabric node on aiopquic raw QUIC, a leaf unless
-transit=True (aiomoqt.peering.transit).
+transit=True (aiomoqt.fabric.transit).
 
 Dials peers on one shared QuicClientEngine (re-dialing after a close),
 optionally listens, learns nodes, announces, subscribes and SNS sets per
@@ -31,18 +31,18 @@ from aiopquic.quic.events import (ConnectionTerminated, DatagramFrameReceived,
                                   StreamReset)
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering.hashing import (fresh_node_id, node_id_format,
+from aiomoqt.fabric.hashing import (fresh_node_id, node_id_format,
                                      node_id_parse, track_hashes)
-from aiomoqt.peering.ib import (DEFAULT_TTL_MS, OriginTrack, reconcile,
+from aiomoqt.fabric.ib import (DEFAULT_TTL_MS, OriginTrack, reconcile,
                                 seq_newer)
-from aiomoqt.peering.inner import (DEFAULT_PRIORITY, DatagramObject,
+from aiomoqt.fabric.inner import (DEFAULT_PRIORITY, DatagramObject,
                                    StreamObject, SubgroupWriter,
                                    encode_datagram)
-from aiomoqt.peering.report import describe, event_fields, track_text
-from aiomoqt.peering.session import (DataFlow, Inbound, Learned, PeerSession,
+from aiomoqt.fabric.report import describe, event_fields, track_text
+from aiomoqt.fabric.session import (DataFlow, Inbound, Learned, PeerSession,
                                      SessionEvent, Stamp, log, now_stamp)
-from aiomoqt.peering.transit import Transit
-from aiomoqt.peering.wire import (ALPN, ANNOUNCE_NAMESPACE,
+from aiomoqt.fabric.transit import Transit
+from aiomoqt.fabric.wire import (ALPN, ANNOUNCE_NAMESPACE,
                                   DEFAULT_NODE_METRIC, DEFAULT_PORT,
                                   AnnounceInfo,
                                   DataHeader, DataType, MsgType, NodeInfo,
@@ -401,7 +401,7 @@ class FabricTrack:
                 self._hop_streams.pop((sid, stream), None)
                 hop.stream_reset(stream)
         self.drain_cut += cut
-        log.warning(f"peering: track 0x{self.fullname_hash:016x} session "
+        log.warning(f"fabric: track 0x{self.fullname_hash:016x} session "
                     f"{session_id}: {cut} stream(s) still open {bound:g}s "
                     f"after its subscribers moved; reset")
         self._release_drained()
@@ -610,7 +610,7 @@ class FabricNode:
     # -- lifecycle ---------------------------------------------------
 
     async def start(self) -> None:
-        log.info(f"peering: node {node_id_format(self.node_id)} "
+        log.info(f"fabric: node {node_id_format(self.node_id)} "
                  f"contact={self.local.contact!r} metric={self.local.metric} "
                  f"listen={self.listen_text() or 'off'} "
                  f"peers={','.join(_addr_text(h, p) for h, p in self.peers) or '-'}")
@@ -694,13 +694,13 @@ class FabricNode:
             except Exception as e:
                 self.dial_failures[peer] += 1
                 if not failing:
-                    log.info(f"peering: dial {peer} failed: "
+                    log.info(f"fabric: dial {peer} failed: "
                              f"{type(e).__name__}: {e}; retrying every "
                              f"{self.redial_interval:g}s")
                     self._record("dial_failed", peer=peer,
                                  error=f"{type(e).__name__}: {e}")
                 else:
-                    log.debug(f"peering: dial {peer} failed again: {e}")
+                    log.debug(f"fabric: dial {peer} failed again: {e}")
                 failing = True
             if self._stopping:
                 break
@@ -738,7 +738,7 @@ class FabricNode:
         proto.session = session
         self.sessions[sid] = session
         self._protocols[sid] = proto
-        log.debug(f"peering: QUIC up {session.tag} "
+        log.debug(f"fabric: QUIC up {session.tag} "
                   f"origin={'dialed' if proto.dialer else 'accepted'}")
         self._record("quic_up", session,
                      origin="dialed" if proto.dialer else "accepted")
@@ -803,12 +803,12 @@ class FabricNode:
     def _event(self, session: PeerSession, ev: SessionEvent) -> None:
         if ev.kind == "connected":
             self.sample_srtt(session)
-            log.info(f"peering: connected {session.tag} "
+            log.info(f"fabric: connected {session.tag} "
                      f"origin={'dialed' if session.dialer else 'accepted'} "
                      f"{describe(ev.body)} connect_ms={session.connect_ms}")
             self._sync(session)
         elif ev.kind == "connect_error":
-            log.warning(f"peering: {session.tag} CONNECT refused, "
+            log.warning(f"fabric: {session.tag} CONNECT refused, "
                         f"code {ev.body.code}")
         self._record(ev.kind, session, ev.stamp, **event_fields(ev))
         if ev.kind == "connected":
@@ -884,7 +884,7 @@ class FabricNode:
         subs = [rec.body for rec in session.subscribes.values()]
         nodes = list(session.nodes)
         ev = session.close(reason)
-        log.info(f"peering: closed {session.tag} "
+        log.info(f"fabric: closed {session.tag} "
                  f"node={node_id_format(session.remote.node_id) if session.remote else '-'} "
                  f"{ev.note}")
         self._record("closed", session, ev.stamp, note=ev.note)
@@ -1023,7 +1023,7 @@ class FabricNode:
         session = self.sessions.get(session_id)
         if session is None or session.state != "connected":
             return
-        log.info(f"peering: {session.tag} metric "
+        log.info(f"fabric: {session.tag} metric "
                  f"{self.advertised_metric(session_id)} (was {before})")
         session.send(MsgType.NODE_INFO_ADV, dataclasses.replace(
             self.local, metric=self.advertised_metric(session_id)))

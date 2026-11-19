@@ -10,8 +10,8 @@ from collections import defaultdict
 from typing import (Any, Callable, Dict, Iterable, List, NamedTuple,
                     Optional, Sequence, Tuple)
 
-from aiomoqt.peering.hashing import track_hashes
-from aiomoqt.peering.wire import NodeInfo, NodeSet, SubscribeInfo
+from aiomoqt.fabric.hashing import track_hashes
+from aiomoqt.fabric.wire import NodeInfo, NodeSet, SubscribeInfo
 
 DEFAULT_TTL_MS = 5000
 

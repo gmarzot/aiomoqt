@@ -17,15 +17,15 @@ import dataclasses
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Set, Tuple
 
-from aiomoqt.peering.hashing import node_id_format
-from aiomoqt.peering.ib import best_route, seq_newer
-from aiomoqt.peering.session import PeerSession, SessionEvent, log
-from aiomoqt.peering.wire import (AnnounceInfo, DataHeader, MsgType, NodeInfo,
+from aiomoqt.fabric.hashing import node_id_format
+from aiomoqt.fabric.ib import best_route, seq_newer
+from aiomoqt.fabric.session import PeerSession, SessionEvent, log
+from aiomoqt.fabric.wire import (AnnounceInfo, DataHeader, MsgType, NodeInfo,
                                   NodeSet, PathItem, SubscribeInfo,
                                   WireError, parse_data_header, rewrite_sns)
 
 if TYPE_CHECKING:
-    from aiomoqt.peering.node import FabricNode, _PeerProtocol
+    from aiomoqt.fabric.node import FabricNode, _PeerProtocol
 
 # Data held per session for SNS ids not yet advertised.
 STASH_MAX_BYTES = 1 << 20
@@ -60,7 +60,7 @@ class _Out:
             except BufferError:
                 pass
             except (AssertionError, AttributeError, ConnectionError) as e:
-                log.debug(f"peering transit: stream {self.stream_id} "
+                log.debug(f"fabric transit: stream {self.stream_id} "
                           f"write: {e!r}")
                 self.ended = True
                 return
@@ -94,7 +94,7 @@ class _Out:
             self.proto._quic.reset_stream(self.stream_id, code)
         except (AssertionError, AttributeError, BufferError,
                 ConnectionError) as e:
-            log.debug(f"peering transit: stream {self.stream_id} reset: "
+            log.debug(f"fabric transit: stream {self.stream_id} reset: "
                       f"{e!r}")
         self.ended = True
 
@@ -255,7 +255,7 @@ class Transit:
             self.best.pop(node_id, None)
             held = self.advertised.pop(node_id, None)
             if held is not None:
-                log.info(f"peering transit: node {node_id_format(node_id)} "
+                log.info(f"fabric transit: node {node_id_format(node_id)} "
                          f"unreachable; withdrawn")
                 self._propagate(held[0], held[1], withdraw=True)
                 self._source_gone(node_id)
@@ -264,7 +264,7 @@ class Transit:
             info = s.nodes[node_id].body
             if self.advertised.get(node_id) != (s.id, info):
                 if current != s.id:
-                    log.info(f"peering transit: node "
+                    log.info(f"fabric transit: node "
                              f"{node_id_format(node_id)} via {s.tag}")
                 self.advertised[node_id] = (s.id, info)
                 self._propagate(s.id, info)
@@ -375,7 +375,7 @@ class Transit:
                 s = self._route(node_id)
                 if s is None or s.state != "connected":
                     self.unrouted += 1
-                    log.debug(f"peering transit: no route to "
+                    log.debug(f"fabric transit: no route to "
                               f"{node_id_format(node_id)} for sns "
                               f"{ing.sns.sns_id} of session "
                               f"{ing.session_id}; dropped")
@@ -566,7 +566,7 @@ class Transit:
         if full:
             self.stash_dropped += 1
             (log.warning if self.stash_dropped == 1 else log.debug)(
-                f"peering transit: {session.tag} data before its SNS over "
+                f"fabric transit: {session.tag} data before its SNS over "
                 f"the stash bound ({STASH_MAX_BYTES} bytes, "
                 f"{STASH_MAX_ITEMS} items); dropped "
                 f"{self.stash_dropped} so far")

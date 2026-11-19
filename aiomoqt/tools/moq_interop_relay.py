@@ -168,10 +168,10 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
-from aiomoqt.peering import (FabricHop, FabricNode, FabricSource,
+from aiomoqt.fabric import (FabricHop, FabricNode, FabricSource,
                              HopRetiring, node_id_format, parse_identity)
-from aiomoqt.peering.wire import DEFAULT_NODE_METRIC
-from aiomoqt.peering.wire import DEFAULT_PORT as FABRIC_PORT
+from aiomoqt.fabric.wire import DEFAULT_NODE_METRIC
+from aiomoqt.fabric.wire import DEFAULT_PORT as FABRIC_PORT
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
@@ -196,7 +196,7 @@ _RELAY_DRAFT_DEFAULT = (
 
 logger = get_category_logger("relay")
 control_log = get_category_logger("control")
-peer_log = get_category_logger("peering")
+peer_log = get_category_logger("fabric")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -7605,11 +7605,11 @@ def _fabric_peer_op(fabric, query: str) -> tuple:
     node = fabric.node
     if op == "add":
         node.add_peer(host, port, metric)
-        peer_log.info(f"peering: peer {_addr_text(host, port)} added")
+        peer_log.info(f"fabric: peer {_addr_text(host, port)} added")
     elif op == "remove":
         if not node.remove_peer(host, port):
             return "404 Not Found", {"error": "no such peer"}
-        peer_log.info(f"peering: peer {_addr_text(host, port)} removed")
+        peer_log.info(f"fabric: peer {_addr_text(host, port)} removed")
     elif not node.set_peer_metric(host, port, metric):
         return "404 Not Found", {"error": "no such peer"}
     return "200 OK", {"ok": True}

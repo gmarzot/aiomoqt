@@ -1,4 +1,4 @@
-"""The relay edge API of aiomoqt.peering: FabricHop bytes against
+"""The relay edge API of aiomoqt.fabric: FabricHop bytes against
 FabricTrack's and the moqx vectors, the datagram cap, nowait refusal and
 drain, FabricTrack's nowait-then-gather writes, the learned-state and SNS
 callbacks, FabricSource pulls, and two tracks on one node. Sans-I/O
@@ -12,14 +12,14 @@ from aiopquic.asyncio.client import QuicClientEngine
 from aiomoqt.messages import (SUBGROUP_ID_EXPLICIT, SUBGROUP_ID_ZERO,
                               ObjectStatus)
 from aiomoqt.messages.data import ObjectDatagram, ObjectHeader, SubgroupHeader
-from aiomoqt.peering import (FabricHop, FabricNode, FabricSource,
+from aiomoqt.fabric import (FabricHop, FabricNode, FabricSource,
                              relay_object, track_hashes)
-from aiomoqt.peering.inner import (DATAGRAM_MAX_INNER, P18, DatagramObject,
+from aiomoqt.fabric.inner import (DATAGRAM_MAX_INNER, P18, DatagramObject,
                                    StreamObject, SubgroupWriter,
                                    encode_datagram)
-from aiomoqt.peering.node import _PeerProtocol
-from aiomoqt.peering.session import PeerSession
-from aiomoqt.peering.wire import (ANNOUNCE_NAMESPACE, AnnounceInfo,
+from aiomoqt.fabric.node import _PeerProtocol
+from aiomoqt.fabric.session import PeerSession
+from aiomoqt.fabric.wire import (ANNOUNCE_NAMESPACE, AnnounceInfo,
                                   DataHeader, DataType, MsgType, NodeInfo,
                                   PathItem, SubscribeInfo, WireError)
 

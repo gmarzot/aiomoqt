@@ -7,11 +7,11 @@ import pytest
 
 from aiomoqt.messages import ObjectStatus
 from aiomoqt.messages.data import ObjectDatagram, ObjectHeader, SubgroupHeader
-from aiomoqt.peering.inner import (DATAGRAM_MAX_INNER, MAX_OBJECT, P18,
+from aiomoqt.fabric.inner import (DATAGRAM_MAX_INNER, MAX_OBJECT, P18,
                                    DatagramObject, StreamObject,
                                    SubgroupReader, SubgroupWriter,
                                    decode_datagram, encode_datagram)
-from aiomoqt.peering.wire import (DataHeader, DataType, WireError,
+from aiomoqt.fabric.wire import (DataHeader, DataType, WireError,
                                   parse_data_header, rewrite_sns)
 from aiomoqt.types import LOC_TIMESTAMP
 from aiomoqt.utils.buffer import Buffer

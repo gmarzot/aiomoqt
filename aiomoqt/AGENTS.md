@@ -30,8 +30,8 @@ plain ints (`draft=18`, `supported_drafts=[18, 16]`). Clients offer newest-first
 ## CLI tools
 
 Console scripts: `moq-pub-bench`, `moq-sub-bench`, `moq-loopback-bench`, `moq-adaptive-bench`,
-`moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-peer-probe` (a leaf node on a
-moq-fabric mesh), `moq-peer-bench` (sends and measures a track through one),
+`moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-fabric-probe` (a leaf node on a
+moq-fabric mesh), `moq-fabric-bench` (sends and measures a track through one),
 `moq-interop-client`, `moq-interop-relay`, `aiomoqt-versions`. Others run as
 modules: `python -m aiomoqt.tools.pub_media` / `sub_media` (MSF media; `--ts --msfts` and
 `--ts-out` carry MPEG-TS as MSFTS, `--ts-playout` plays it out on its PCR; `--input` ingest needs
@@ -52,7 +52,7 @@ Levels: ERROR, WARNING, INFO (one line per session event and control message), D
 views, transport plumbing, per-stream lifecycle; bounded however many objects flow) and TRACE
 (`aiomoqt.utils.logger.TRACE`, 5: per object, per chunk, per datagram, wire hex). Category
 loggers, stable names: `aiomoqt.control`, `aiomoqt.data`, `aiomoqt.fetch`, `aiomoqt.transport`,
-`aiomoqt.relay`, `aiomoqt.peering`; other lines use module loggers (`aiomoqt.protocol`, ...).
+`aiomoqt.relay`, `aiomoqt.fabric`; other lines use module loggers (`aiomoqt.protocol`, ...).
 aiomoqt loggers do not propagate to the root logger: attach a handler with
 `aiomoqt.utils.logger.set_log_handler()`.
 

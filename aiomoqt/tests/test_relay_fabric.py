@@ -17,7 +17,7 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering import FabricNode
+from aiomoqt.fabric import FabricNode
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 

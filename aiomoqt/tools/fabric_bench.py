@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moq-peer-bench: send and measure a track through a moq-fabric mesh.
+"""moq-fabric-bench: send and measure a track through a moq-fabric mesh.
 
 --role pub announces -N/-T into the fabric and, once a node subscribes,
 sends -s byte bench objects, -g per group, striped over -P subgroup
@@ -10,7 +10,7 @@ must share the clock (one host, or --role both). --role both runs both
 ends in this process, the publisher on the first --peer and the
 subscriber on the last.
 
-Objects are MoQT draft-18 framed inside the peering streams, as moqx
+Objects are MoQT draft-18 framed inside the fabric streams, as moqx
 frames them. -o writes the report JSON (both ends under "pub" / "sub") on
 exit; --trace-objects writes one JSON line per received object. Exit
 status: 1 when the subscriber got no objects or a bad payload
@@ -18,14 +18,14 @@ status: 1 when the subscriber got no objects or a bad payload
 
 Examples:
   # publish into moqx-a; a MoQT subscriber elsewhere reads aiomoqt/t0
-  moq-peer-bench --peer 10.0.0.11 --role pub -s 1024 -g 30 -r 30 -t 60
+  moq-fabric-bench --peer 10.0.0.11 --role pub -s 1024 -g 30 -r 30 -t 60
 
   # subscribe through a relay, trace every object
-  moq-peer-bench --peer 10.0.0.12 --role sub -N moq-test/live -T video \\
+  moq-fabric-bench --peer 10.0.0.12 --role sub -N moq-test/live -T video \\
       -t 60 --trace-objects objects.jsonl
 
   # one clock through the fabric: pub on relay A, sub on relay C
-  moq-peer-bench --peer 10.0.0.11 --peer 10.0.0.13 --role both \\
+  moq-fabric-bench --peer 10.0.0.11 --peer 10.0.0.13 --role both \\
       -s 1024 -g 30 -r 30 -t 60 -o bench.json
 """
 import asyncio
@@ -36,10 +36,10 @@ import sys
 import time
 from typing import IO, Optional, Tuple
 
-from aiomoqt.peering import FabricNode, build_report, parse_identity
-from aiomoqt.peering.inner import DATAGRAM_MAX_INNER, encode_datagram
-from aiomoqt.peering.node import FabricTrack, RxTrack
-from aiomoqt.peering.report import write_report
+from aiomoqt.fabric import FabricNode, build_report, parse_identity
+from aiomoqt.fabric.inner import DATAGRAM_MAX_INNER, encode_datagram
+from aiomoqt.fabric.node import FabricTrack, RxTrack
+from aiomoqt.fabric.report import write_report
 from aiomoqt.types import LOC_TIMESTAMP
 from aiomoqt.utils import cli as grid
 from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
@@ -69,7 +69,7 @@ def parse_args(argv=None):
     p = grid.make_parser(
         description="Send and measure a track through a moq-fabric mesh",
         epilog=__doc__)
-    grid.add_peering(p, port=0)
+    grid.add_fabric(p, port=0)
     grid.add_identity(p, trackname="t0")
     grid.add_publisher_media(p)
     grid.add_split_role(p)
@@ -91,16 +91,16 @@ def parse_args(argv=None):
         p.error('--role both dials: give --peer (pub on the first, sub on '
                 'the last)')
     if args.mp:
-        p.error('--mp is not supported by moq-peer-bench')
+        p.error('--mp is not supported by moq-fabric-bench')
     if args.video:
-        p.error('--video is not supported by moq-peer-bench')
+        p.error('--video is not supported by moq-fabric-bench')
     if args.streams < 1 or args.group_size < 1:
         p.error('-P and -g must be at least 1')
     grid.check_datagram(p, args)
     if args.datagram:
         limit = datagram_payload_limit(args.group_size)
         if args.object_size > limit:
-            p.error(f'-D: -s {args.object_size} does not fit a peering '
+            p.error(f'-D: -s {args.object_size} does not fit a fabric '
                     f'datagram (max {limit} B with its headers)')
     return args
 
@@ -182,7 +182,7 @@ def _tracer(out: IO[str]):
 def print_summary(rx: RxTrack, sent: Optional[SenderStats]) -> None:
     print()
     print("═" * 56)
-    print("  moq-peer-bench results")
+    print("  moq-fabric-bench results")
     print("═" * 56)
     if sent is not None:
         print(f"  Sent:        {sent.total_objects:,} objects, "
@@ -226,7 +226,7 @@ async def run(args) -> int:
                          metric=args.node_metric, keepalive=1.5)
     nodes = [n for n in (pub, sub) if n is not None]
     for n in nodes:
-        print(f"moq-peer-bench: {'pub' if n is pub else 'sub'} node "
+        print(f"moq-fabric-bench: {'pub' if n is pub else 'sub'} node "
               f"{n.local.contact!r} peers="
               f"{','.join(f'{h}:{p}' for h, p in n.peers) or '-'} "
               f"track {args.namespace}/{args.trackname}", flush=True)
@@ -335,7 +335,7 @@ def main(argv=None) -> int:
 
 
 def cli():
-    """Console entry point (moq-peer-bench)."""
+    """Console entry point (moq-fabric-bench)."""
     sys.exit(main())
 
 

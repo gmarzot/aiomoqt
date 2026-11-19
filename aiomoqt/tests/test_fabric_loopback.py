@@ -1,7 +1,7 @@
 """Two in-process FabricNodes over localhost raw QUIC (moq-fabric has no
 WebTransport mapping): CONNECT, node learning, announces and subscribes
 both ways on two tracks each, withdraws, re-dial after a close, and the
-moq-peer-probe tool end to end."""
+moq-fabric-probe tool end to end."""
 import asyncio
 import json
 import os
@@ -9,10 +9,10 @@ import signal
 
 import pytest
 
-from aiomoqt.peering import (FabricNode, build_report, track_hashes,
+from aiomoqt.fabric import (FabricNode, build_report, track_hashes,
                              write_report)
-from aiomoqt.peering.wire import MsgType
-from aiomoqt.tools import peer_probe
+from aiomoqt.fabric.wire import MsgType
+from aiomoqt.tools import fabric_probe
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -194,19 +194,19 @@ async def test_report_json(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_peer_probe_tool(tmp_path, capsys):
+async def test_fabric_probe_tool(tmp_path, capsys):
     port = _BASE_PORT + 4
     out = tmp_path / "probe.json"
-    listener = peer_probe.parse_args([
+    listener = fabric_probe.parse_args([
         "-p", str(port), "--bind", "127.0.0.1", "--cert", CERT, "--key", KEY,
         "--node-id", "9.9:1", "--announce", "t/a", "--announce", "t/b",
         "--exit", "idle:1", "-t", str(TIMEOUT), "-i", "0"])
-    dialer = peer_probe.parse_args([
+    dialer = fabric_probe.parse_args([
         "--peer", f"127.0.0.1:{port}", "-p", "0", "--subscribe", "t/a",
         "--exit", "announce:t/b", "-t", str(TIMEOUT), "-o", str(out),
         "-i", "0.2"])
-    rc = await asyncio.gather(peer_probe.run(listener),
-                              peer_probe.run(dialer))
+    rc = await asyncio.gather(fabric_probe.run(listener),
+                              fabric_probe.run(dialer))
     assert rc == [0, 0]
     report = json.loads(out.read_text())
     names = {(tuple(a["ns"]), a["name"]) for a in report["announces"]}
@@ -218,12 +218,12 @@ async def test_peer_probe_tool(tmp_path, capsys):
 
 
 @pytest.mark.asyncio
-async def test_peer_probe_exit_not_met():
+async def test_fabric_probe_exit_not_met():
     port = _BASE_PORT + 5
-    args = peer_probe.parse_args([
+    args = fabric_probe.parse_args([
         "--peer", f"127.0.0.1:{port}", "-p", "0", "--exit", "peers-up",
         "-t", "1", "-i", "0", "--no-stats"])
-    assert await peer_probe.run(args) == 1
+    assert await fabric_probe.run(args) == 1
 
 
 def _withdrawn_before_close(node, session_id):
@@ -261,15 +261,15 @@ async def test_stop_withdraws_originated():
 
 
 @pytest.mark.asyncio
-async def test_peer_probe_withdraws_on_signal(tmp_path):
+async def test_fabric_probe_withdraws_on_signal(tmp_path):
     port = _BASE_PORT + 7
     out = tmp_path / "signal.json"
     async with _listener(port, label="L") as lst:
-        args = peer_probe.parse_args([
+        args = fabric_probe.parse_args([
             "--peer", f"127.0.0.1:{port}", "-p", "0", "--announce", "s/a",
             "--announce", "s/b", "--subscribe", "s/x", "--subscribe", "s/y",
             "-o", str(out), "-i", "0", "--no-stats"])
-        probe = asyncio.ensure_future(peer_probe.run(args))
+        probe = asyncio.ensure_future(fabric_probe.run(args))
         await lst.wait_until(lambda: len(_tracks(lst)) == 2
                              and len(_subs(lst)) == 2, TIMEOUT)
         session = lst.connected()[0].id
@@ -296,6 +296,6 @@ async def test_peer_probe_withdraws_on_signal(tmp_path):
     ["--peer", "h", "--subscribe", "nameless"],
     ["--peer", "h:99999"],
 ])
-def test_peer_probe_rejects(argv):
+def test_fabric_probe_rejects(argv):
     with pytest.raises(SystemExit):
-        peer_probe.parse_args(argv)
+        fabric_probe.parse_args(argv)

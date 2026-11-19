@@ -11,13 +11,13 @@ from aiopquic.quic.events import (DatagramFrameReceived, StreamDataReceived,
                                   StreamReset)
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering import FabricHop, FabricNode, HopRetiring, track_hashes
-from aiomoqt.peering import transit as transit_mod
-from aiomoqt.peering.inner import SubgroupWriter, encode_datagram
-from aiomoqt.peering.node import _PeerProtocol
-from aiomoqt.peering.wire import (DataHeader, DataType, MsgType, NodeInfo,
+from aiomoqt.fabric import FabricHop, FabricNode, HopRetiring, track_hashes
+from aiomoqt.fabric import transit as transit_mod
+from aiomoqt.fabric.inner import SubgroupWriter, encode_datagram
+from aiomoqt.fabric.node import _PeerProtocol
+from aiomoqt.fabric.wire import (DataHeader, DataType, MsgType, NodeInfo,
                                   NodeSet, PathItem, rewrite_sns)
-from aiomoqt.tests.test_peering_edge import _ann, _remote, _sub, _Wire
+from aiomoqt.tests.test_fabric_edge import _ann, _remote, _sub, _Wire
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -618,7 +618,7 @@ def _move_to_t2(w1):
 
 
 async def _hop_open(hop, h, gid):
-    from aiomoqt.tests.test_peering_edge import _relay_header
+    from aiomoqt.tests.test_fabric_edge import _relay_header
     hdr = _relay_header(h, gid)
     sid = await hop.open_uni_stream(initial=hdr.serialize().data
                                     + hdr.next_object_bytes(
@@ -654,7 +654,7 @@ async def test_hop_retires_on_a_move_and_finishes_its_group():
 
 @pytest.mark.asyncio
 async def test_hop_drain_is_bounded(monkeypatch):
-    from aiomoqt.peering import node as node_mod
+    from aiomoqt.fabric import node as node_mod
     monkeypatch.setattr(node_mod, "DRAIN_MAX_S", 0.05)
     pub, w1, w2, hops, track = _pub_two_paths()
     (hop1,) = hops.live(track)
@@ -715,7 +715,7 @@ async def _hop_group(hops, track, gid, per=6, at=None, then=None):
     """One group through the egress the way a relay writes it: opened on
     a hop taking new streams, written to its end there. `then` runs
     before object `at`. False when the group could not be finished."""
-    from aiomoqt.tests.test_peering_edge import _relay_header
+    from aiomoqt.tests.test_fabric_edge import _relay_header
     live = hops.live(track)
     if not live:
         return False

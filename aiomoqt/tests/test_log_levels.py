@@ -170,7 +170,7 @@ def test_trace_is_below_debug_and_named():
     assert TRACE < logging.DEBUG
     assert logging.getLevelName(TRACE) == "TRACE"
     assert set(CATEGORIES) == {"control", "data", "fetch", "transport",
-                               "relay", "peering"}
+                               "relay", "fabric"}
 
 
 def test_log_spec_parses():
