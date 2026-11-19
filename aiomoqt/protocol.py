@@ -3268,6 +3268,15 @@ class _MOQTSessionMixin:
             return
         elif isinstance(event, StreamReset):
             transport_log.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
+            sid = event.stream_id
+            if (stream_is_unidirectional(sid)
+                    and sid != self._d18_control_read_sid
+                    and getattr(self._data_streams.get(sid), 'parser', None)
+                    is None):
+                # §9.9: no track can count it in a PUBLISH_DONE.
+                data_log.debug(f"stream({sid}): reset "
+                               f"(code {int(event.error_code or 0)}) before "
+                               f"its subgroup header")
             self._on_request_stream_terminated(event.stream_id)
             self._cleanup_stream(
                 event.stream_id, QuicErrorCode.APPLICATION_ERROR,

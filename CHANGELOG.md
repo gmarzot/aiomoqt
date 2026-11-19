@@ -2,6 +2,8 @@
 
 ## v0.15.0 (unreleased)
 
+- `sub_media --analyze` on a track declaring per-object wall-clock timestamps takes its end-to-end delay from them alone; a media timeline record that arrives first no longer adds a sample.
+- A peer's stream reset before its subgroup header is logged at DEBUG (`aiomoqt.data`): no track can count it in a PUBLISH_DONE Stream Count (§9.9).
 - WebTransport sessions no longer leave one queued event per peer-opened stream for the session's life (aiopquic `queue_new_streams`); on aiomoqt-relay a WT publisher's audio added one per frame.
 - aiomoqt-relay: a track closed while its publisher's PUBLISH_DONE was held for streams (its publisher's session closed) cancels the hold, instead of keeping the closed track for TERMINAL_GRACE_S and logging "released on grace"; its subscribers get the publisher's status and reason.
 - `sub_media -Q/-W [-p PORT] [--cert --key]` listens instead of dialing: the first publisher session to dial it (e.g. `pub_media --pub-ns`) is subscribed and fetched over once it announces `-N`, no relay between. `MOQTServer.register_session_handler(fn)` calls `fn(session)` as each session completes setup.
