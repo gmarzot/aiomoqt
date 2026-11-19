@@ -16,7 +16,7 @@ from aiomoqt.messages import (MOQTMalformedKVP, MOQTUnderflow, ObjectStatus,
                               SUBGROUP_ID_ZERO)
 from aiomoqt.messages.data import (MOQTObjectTooLarge, ObjectDatagram,
                                    ObjectHeader, SubgroupHeader)
-from aiomoqt.fabric.wire import DATAGRAM_HEADER_LEN, WireError
+from aiomoqt.moq_fabric.wire import DATAGRAM_HEADER_LEN, WireError
 from aiomoqt.types import MOQTProtocolViolation
 from aiomoqt.utils.buffer import Buffer, BufferReadError
 

@@ -10,18 +10,18 @@ from dataclasses import dataclass
 from typing import (Any, Callable, Container, Dict, List, NamedTuple,
                     Optional, Tuple)
 
-from aiomoqt.fabric.hashing import node_id_format, track_hashes
-from aiomoqt.fabric.ib import subscribe_outcome
-from aiomoqt.fabric.inner import SubgroupReader, decode_datagram
-from aiomoqt.fabric.report import describe, hash_text
-from aiomoqt.fabric.wire import (AnnounceInfo, Connect, ConnectCode,
+from aiomoqt.moq_fabric.hashing import node_id_format, track_hashes
+from aiomoqt.moq_fabric.ib import subscribe_outcome
+from aiomoqt.moq_fabric.inner import SubgroupReader, decode_datagram
+from aiomoqt.moq_fabric.report import describe, hash_text
+from aiomoqt.moq_fabric.wire import (AnnounceInfo, Connect, ConnectCode,
                                   ConnectResponse, ControlReader, DataHeader,
                                   Message, MsgType, NodeInfo, NodeSet,
                                   SubscribeInfo, WireError, encode_message,
                                   parse_data_header)
 from aiomoqt.utils.logger import TRACE, get_category_logger
 
-log = get_category_logger("fabric")
+log = get_category_logger("moq_fabric")
 
 Stamp = Tuple[int, int]
 

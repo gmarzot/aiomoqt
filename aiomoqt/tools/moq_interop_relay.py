@@ -168,10 +168,10 @@ from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
                              is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
-from aiomoqt.fabric import (FabricHop, FabricNode, FabricSource,
+from aiomoqt.moq_fabric import (FabricHop, FabricNode, FabricSource,
                              HopRetiring, node_id_format, parse_identity)
-from aiomoqt.fabric.wire import DEFAULT_NODE_METRIC
-from aiomoqt.fabric.wire import DEFAULT_PORT as FABRIC_PORT
+from aiomoqt.moq_fabric.wire import DEFAULT_NODE_METRIC
+from aiomoqt.moq_fabric.wire import DEFAULT_PORT as MOQ_FABRIC_PORT
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
@@ -196,7 +196,7 @@ _RELAY_DRAFT_DEFAULT = (
 
 logger = get_category_logger("relay")
 control_log = get_category_logger("control")
-peer_log = get_category_logger("fabric")
+peer_log = get_category_logger("moq_fabric")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -5297,8 +5297,8 @@ def parse_args(argv=None):
                              "GET /sessions reports each session's transport "
                              "state (and, with --trace-subscribers, what each "
                              "subscription was sent); with the fabric on, "
-                             "GET /fabric reports the node and POST "
-                             "/fabric/peer?op=add|remove|metric&host=H&port=P"
+                             "GET /moq-fabric reports the node and POST "
+                             "/moq-fabric/peer?op=add|remove|metric&host=H&port=P"
                              "[&metric=M] changes its peers")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
@@ -5384,7 +5384,7 @@ def parse_args(argv=None):
                         help="moq-fabric listen port, on --bind with "
                              "--cert and --key; 0 = do not listen. The "
                              "fabric is on with --peer or --peer-port. "
-                             f"Default with the fabric on: {FABRIC_PORT}")
+                             f"Default with the fabric on: {MOQ_FABRIC_PORT}")
     add_auth(parser)
     add_logging(parser)
     add_help(parser)
@@ -6870,7 +6870,7 @@ class _Status:
             "history": self.history.to_json(),
             "track_history": {tid: {k: list(v) for k, v in series.items()}
                               for tid, series in self.track_history.items()},
-            "fabric": _fabric.report() if _fabric is not None else None,
+            "moq_fabric": _fabric.report() if _fabric is not None else None,
         }
 
     def _add_track_history(self, tracks) -> None:
@@ -7554,7 +7554,7 @@ class _Fabric:
         }
 
 
-async def _start_fabric(*, peers=(), port=FABRIC_PORT, bind=None,
+async def _start_fabric(*, peers=(), port=MOQ_FABRIC_PORT, bind=None,
                         cert=None, key=None, node_id=None,
                         label=FABRIC_LABEL, metric=DEFAULT_NODE_METRIC,
                         **node_kw) -> _Fabric:
@@ -7588,7 +7588,7 @@ async def _stop_fabric() -> None:
 
 
 def _fabric_peer_op(fabric, query: str) -> tuple:
-    """POST /fabric/peer: (HTTP status, body)."""
+    """POST /moq-fabric/peer: (HTTP status, body)."""
     q = {k: v[-1] for k, v in urllib.parse.parse_qs(query).items()}
     op, host = q.get("op"), q.get("host")
     try:
@@ -7670,11 +7670,11 @@ async def _on_control(reader, writer) -> None:
         fabric = _fabric
         if path == "/sessions" and method == "GET":
             status, body = "200 OK", _sessions_report()
-        elif target.path.startswith("/fabric") and fabric is None:
+        elif target.path.startswith("/moq-fabric") and fabric is None:
             status, body = "404 Not Found", {"error": "the fabric is off"}
-        elif target.path == "/fabric" and method == "GET" and fabric:
+        elif target.path == "/moq-fabric" and method == "GET" and fabric:
             status, body = "200 OK", fabric.report()
-        elif target.path == "/fabric/peer" and method == "POST" and fabric:
+        elif target.path == "/moq-fabric/peer" and method == "POST" and fabric:
             status, body = _fabric_peer_op(fabric, target.query)
         elif target.path == "/gc" and method == "GET":
             top = urllib.parse.parse_qs(target.query).get("top", ["40"])[0]
@@ -7935,7 +7935,7 @@ async def main():
     if args.peer or args.peer_port is not None:
         await _start_fabric(
             peers=args.peer or (),
-            port=FABRIC_PORT if args.peer_port is None else args.peer_port,
+            port=MOQ_FABRIC_PORT if args.peer_port is None else args.peer_port,
             bind=args.bind, cert=cert, key=key, node_id=fabric_id,
             label=fabric_label, metric=args.node_metric)
 

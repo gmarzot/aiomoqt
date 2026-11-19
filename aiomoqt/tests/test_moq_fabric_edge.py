@@ -1,4 +1,4 @@
-"""The relay edge API of aiomoqt.fabric: FabricHop bytes against
+"""The relay edge API of aiomoqt.moq_fabric: FabricHop bytes against
 FabricTrack's and the moqx vectors, the datagram cap, nowait refusal and
 drain, FabricTrack's nowait-then-gather writes, the learned-state and SNS
 callbacks, FabricSource pulls, and two tracks on one node. Sans-I/O
@@ -12,14 +12,14 @@ from aiopquic.asyncio.client import QuicClientEngine
 from aiomoqt.messages import (SUBGROUP_ID_EXPLICIT, SUBGROUP_ID_ZERO,
                               ObjectStatus)
 from aiomoqt.messages.data import ObjectDatagram, ObjectHeader, SubgroupHeader
-from aiomoqt.fabric import (FabricHop, FabricNode, FabricSource,
+from aiomoqt.moq_fabric import (FabricHop, FabricNode, FabricSource,
                              relay_object, track_hashes)
-from aiomoqt.fabric.inner import (DATAGRAM_MAX_INNER, P18, DatagramObject,
+from aiomoqt.moq_fabric.inner import (DATAGRAM_MAX_INNER, P18, DatagramObject,
                                    StreamObject, SubgroupWriter,
                                    encode_datagram)
-from aiomoqt.fabric.node import _PeerProtocol
-from aiomoqt.fabric.session import PeerSession
-from aiomoqt.fabric.wire import (ANNOUNCE_NAMESPACE, AnnounceInfo,
+from aiomoqt.moq_fabric.node import _PeerProtocol
+from aiomoqt.moq_fabric.session import PeerSession
+from aiomoqt.moq_fabric.wire import (ANNOUNCE_NAMESPACE, AnnounceInfo,
                                   DataHeader, DataType, MsgType, NodeInfo,
                                   PathItem, SubscribeInfo, WireError)
 
@@ -328,7 +328,7 @@ async def test_hop_closes_with_its_sns_and_session():
 
 
 @pytest.mark.asyncio
-async def test_fabric_track_write_is_nowait_then_gathered():
+async def test_moq_fabric_track_write_is_nowait_then_gathered():
     node = _node()
     far1, far2 = 0x0101010101010101, 0x0202020202020202
     w1 = _Wire(node, 1, _remote(far1, "far1"))
@@ -462,7 +462,7 @@ def _stream_bytes(sns_id, alias, gid, payloads, sgid=0, eog=True):
 
 
 @pytest.mark.asyncio
-async def test_fabric_source_pulls_two_tracks_on_one_node():
+async def test_moq_fabric_source_pulls_two_tracks_on_one_node():
     node = _node()
     wire = _Wire(node, 1, _remote(0x0a0a0a0a0b0b0b0b))
     source = FabricSource(node)

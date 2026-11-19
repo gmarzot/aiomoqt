@@ -11,13 +11,13 @@ import time
 import pytest
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.fabric import FabricNode
-from aiomoqt.fabric.ib import (OriginTrack, best_session, reconcile,
+from aiomoqt.moq_fabric import FabricNode
+from aiomoqt.moq_fabric.ib import (OriginTrack, best_session, reconcile,
                                 subscribe_outcome)
-from aiomoqt.fabric.session import Learned, PeerSession
-from aiomoqt.fabric.wire import (MsgType, NodeInfo, PathItem, SubscribeInfo,
+from aiomoqt.moq_fabric.session import Learned, PeerSession
+from aiomoqt.moq_fabric.wire import (MsgType, NodeInfo, PathItem, SubscribeInfo,
                                   WireError, parse_data_header, rewrite_sns)
-from aiomoqt.tools import fabric_bench
+from aiomoqt.tools import moq_fabric_bench
 from aiomoqt.types import LOC_TIMESTAMP
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -325,7 +325,7 @@ async def test_a_peer_connecting_late_learns_what_was_flooded(
 
 
 @pytest.mark.asyncio
-async def test_fabric_bench_role_both_through_via(tmp_path, monkeypatch):
+async def test_moq_fabric_bench_role_both_through_via(tmp_path, monkeypatch):
     await _bench_through_via(tmp_path, monkeypatch, FabricNode)
 
 
@@ -339,19 +339,19 @@ async def _bench_through_via(tmp_path, monkeypatch, node_cls):
         def __init__(self, **kw):
             super().__init__(**kw)
             nodes.append(self)
-    monkeypatch.setattr(fabric_bench, "FabricNode", _Kept)
+    monkeypatch.setattr(moq_fabric_bench, "FabricNode", _Kept)
     # DEBUG reaches the captured stderr a failure prints.
-    flog = logging.getLogger("aiomoqt.fabric")
+    flog = logging.getLogger("aiomoqt.moq_fabric")
     level = flog.level
     flog.setLevel(logging.DEBUG)
     try:
         async with _listener(_Via, port, "via") as via:
-            args = fabric_bench.parse_args([
+            args = moq_fabric_bench.parse_args([
                 "--peer", f"127.0.0.1:{port}", "--role", "both", "-s", "512",
                 "-g", "10", "-P", "2", "-r", "200", "-t", "2", "-i", "0",
                 "--verify-payload", "-o", str(out),
                 "--trace-objects", str(trace)])
-            rc = await fabric_bench.run(args)
+            rc = await moq_fabric_bench.run(args)
     finally:
         flog.setLevel(level)
     assert rc == 0, _story([via, *nodes])
@@ -369,13 +369,13 @@ async def _bench_through_via(tmp_path, monkeypatch, node_cls):
 
 
 @pytest.mark.asyncio
-async def test_fabric_bench_zero_objects_fails():
+async def test_moq_fabric_bench_zero_objects_fails():
     port = _BASE_PORT + 6
     async with _listener(FabricNode, port, "empty"):
-        args = fabric_bench.parse_args([
+        args = moq_fabric_bench.parse_args([
             "--peer", f"127.0.0.1:{port}", "--role", "sub", "-t", "1",
             "-i", "0"])
-        assert await fabric_bench.run(args) == 1
+        assert await moq_fabric_bench.run(args) == 1
 
 
 @pytest.mark.parametrize("argv", [
@@ -384,9 +384,9 @@ async def test_fabric_bench_zero_objects_fails():
     ["--peer", "h", "--video", "720p"],
     ["--peer", "h", "-D", "-s", "1153"],
 ])
-def test_fabric_bench_rejects(argv):
+def test_moq_fabric_bench_rejects(argv):
     with pytest.raises(SystemExit):
-        fabric_bench.parse_args(argv)
+        moq_fabric_bench.parse_args(argv)
 
 
 # -- information base (sans-I/O) --------------------------------------
@@ -395,7 +395,7 @@ LOCAL = NodeInfo(1, metric=1 << 32)
 
 
 def _sub(source, seq=1, epoch=0, forward=1, ns=(b"t",), name=b"x"):
-    from aiomoqt.fabric.hashing import track_hashes
+    from aiomoqt.moq_fabric.hashing import track_hashes
     return SubscribeInfo(source, ns, name, *track_hashes(ns, name),
                          epoch=epoch, seq=seq, forward=forward)
 
@@ -471,9 +471,9 @@ def test_sns_ids_count_from_one_and_skip_zero():
 
 
 def test_received_objects_keep_status_out_of_stats():
-    from aiomoqt.fabric.inner import StreamObject
-    from aiomoqt.fabric.node import RxTrack
-    from aiomoqt.fabric.session import Inbound
+    from aiomoqt.moq_fabric.inner import StreamObject
+    from aiomoqt.moq_fabric.node import RxTrack
+    from aiomoqt.moq_fabric.session import Inbound
     rx = RxTrack((b"t",), b"x", verify_every=1)
     where = Inbound(_session(1), 3, 1, rx.fullname_hash, (10, 20), (5, 15))
     rx.on_object(where, StreamObject(0, 0, 0, ObjectStatus.NORMAL, None,

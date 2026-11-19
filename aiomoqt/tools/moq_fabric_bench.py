@@ -36,10 +36,10 @@ import sys
 import time
 from typing import IO, Optional, Tuple
 
-from aiomoqt.fabric import FabricNode, build_report, parse_identity
-from aiomoqt.fabric.inner import DATAGRAM_MAX_INNER, encode_datagram
-from aiomoqt.fabric.node import FabricTrack, RxTrack
-from aiomoqt.fabric.report import write_report
+from aiomoqt.moq_fabric import FabricNode, build_report, parse_identity
+from aiomoqt.moq_fabric.inner import DATAGRAM_MAX_INNER, encode_datagram
+from aiomoqt.moq_fabric.node import FabricTrack, RxTrack
+from aiomoqt.moq_fabric.report import write_report
 from aiomoqt.types import LOC_TIMESTAMP
 from aiomoqt.utils import cli as grid
 from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
@@ -69,7 +69,7 @@ def parse_args(argv=None):
     p = grid.make_parser(
         description="Send and measure a track through a moq-fabric mesh",
         epilog=__doc__)
-    grid.add_fabric(p, port=0)
+    grid.add_moq_fabric(p, port=0)
     grid.add_identity(p, trackname="t0")
     grid.add_publisher_media(p)
     grid.add_split_role(p)

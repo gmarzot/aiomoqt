@@ -17,15 +17,15 @@ import dataclasses
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Set, Tuple
 
-from aiomoqt.fabric.hashing import node_id_format
-from aiomoqt.fabric.ib import best_route, seq_newer
-from aiomoqt.fabric.session import PeerSession, SessionEvent, log
-from aiomoqt.fabric.wire import (AnnounceInfo, DataHeader, MsgType, NodeInfo,
+from aiomoqt.moq_fabric.hashing import node_id_format
+from aiomoqt.moq_fabric.ib import best_route, seq_newer
+from aiomoqt.moq_fabric.session import PeerSession, SessionEvent, log
+from aiomoqt.moq_fabric.wire import (AnnounceInfo, DataHeader, MsgType, NodeInfo,
                                   NodeSet, PathItem, SubscribeInfo,
                                   WireError, parse_data_header, rewrite_sns)
 
 if TYPE_CHECKING:
-    from aiomoqt.fabric.node import FabricNode, _PeerProtocol
+    from aiomoqt.moq_fabric.node import FabricNode, _PeerProtocol
 
 # Data held per session for SNS ids not yet advertised.
 STASH_MAX_BYTES = 1 << 20

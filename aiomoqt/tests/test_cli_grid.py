@@ -23,7 +23,7 @@ TOOLS = [
     "pub_bench", "sub_bench", "loopback_bench", "adaptive_bench",
     "pub_server", "load_sim", "relay_probe",
     "moq_interop_client", "moq_interop_relay", "moqtest_origin",
-    "pub_media", "sub_media", "abr_ingest", "fabric_probe", "fabric_bench",
+    "pub_media", "sub_media", "abr_ingest", "moq_fabric_probe", "moq_fabric_bench",
 ]
 
 EXAMPLES = ["pub_example", "sub_example", "join_example", "server_example"]
@@ -371,18 +371,18 @@ def test_transport_kwargs(argv, expected):
 
 
 FABRIC_NODE_FLAGS = {"--peer", "--node-id", "--node-metric"}
-FABRIC_LISTENER_FLAGS = {"--bind", "-p", "--port", "--cert", "--key"}
+MOQ_FABRIC_LISTENER_FLAGS = {"--bind", "-p", "--port", "--cert", "--key"}
 
 
-@pytest.mark.parametrize("tool", ["fabric_probe", "fabric_bench",
+@pytest.mark.parametrize("tool", ["moq_fabric_probe", "moq_fabric_bench",
                                   "moq_interop_relay"])
-def test_fabric_node_flags_are_the_grid_group(tool):
+def test_moq_fabric_node_flags_are_the_grid_group(tool):
     acts = {o: a for a in _parser_actions(tool) for o in a.option_strings}
     assert FABRIC_NODE_FLAGS <= set(acts)
     assert acts["--peer"].type is cli.peer_address
     assert acts["--peer"].default is None
-    from aiomoqt.fabric import LEAF_METRIC
-    from aiomoqt.fabric.wire import DEFAULT_NODE_METRIC
+    from aiomoqt.moq_fabric import LEAF_METRIC
+    from aiomoqt.moq_fabric.wire import DEFAULT_NODE_METRIC
     want = (DEFAULT_NODE_METRIC if tool == "moq_interop_relay"
             else LEAF_METRIC)
     assert acts["--node-metric"].default == want
@@ -393,11 +393,11 @@ def test_fabric_node_flags_are_the_grid_group(tool):
         assert "-p" not in acts
         assert acts["--port"].default == 4443
     else:
-        assert FABRIC_LISTENER_FLAGS <= set(acts)
+        assert MOQ_FABRIC_LISTENER_FLAGS <= set(acts)
         assert "--peer-port" not in acts
 
 
-def test_relay_fabric_flags_parse():
+def test_relay_moq_fabric_flags_parse():
     from aiomoqt.tools import moq_interop_relay as relay
     a = relay.parse_args([])
     assert a.peer is None and a.peer_port is None

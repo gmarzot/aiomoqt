@@ -1,5 +1,5 @@
 """FabricNode: a moq-fabric node on aiopquic raw QUIC, a leaf unless
-transit=True (aiomoqt.fabric.transit).
+transit=True (aiomoqt.moq_fabric.transit).
 
 Dials peers on one shared QuicClientEngine (re-dialing after a close),
 optionally listens, learns nodes, announces, subscribes and SNS sets per
@@ -31,18 +31,18 @@ from aiopquic.quic.events import (ConnectionTerminated, DatagramFrameReceived,
                                   StreamReset)
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.fabric.hashing import (fresh_node_id, node_id_format,
+from aiomoqt.moq_fabric.hashing import (fresh_node_id, node_id_format,
                                      node_id_parse, track_hashes)
-from aiomoqt.fabric.ib import (DEFAULT_TTL_MS, OriginTrack, reconcile,
+from aiomoqt.moq_fabric.ib import (DEFAULT_TTL_MS, OriginTrack, reconcile,
                                 seq_newer)
-from aiomoqt.fabric.inner import (DEFAULT_PRIORITY, DatagramObject,
+from aiomoqt.moq_fabric.inner import (DEFAULT_PRIORITY, DatagramObject,
                                    StreamObject, SubgroupWriter,
                                    encode_datagram)
-from aiomoqt.fabric.report import describe, event_fields, track_text
-from aiomoqt.fabric.session import (DataFlow, Inbound, Learned, PeerSession,
+from aiomoqt.moq_fabric.report import describe, event_fields, track_text
+from aiomoqt.moq_fabric.session import (DataFlow, Inbound, Learned, PeerSession,
                                      SessionEvent, Stamp, log, now_stamp)
-from aiomoqt.fabric.transit import Transit
-from aiomoqt.fabric.wire import (ALPN, ANNOUNCE_NAMESPACE,
+from aiomoqt.moq_fabric.transit import Transit
+from aiomoqt.moq_fabric.wire import (ALPN, ANNOUNCE_NAMESPACE,
                                   DEFAULT_NODE_METRIC, DEFAULT_PORT,
                                   AnnounceInfo,
                                   DataHeader, DataType, MsgType, NodeInfo,

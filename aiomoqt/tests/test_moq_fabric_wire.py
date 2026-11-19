@@ -7,8 +7,8 @@ import struct
 import pytest
 from aiopquic.buffer import Buffer
 
-from aiomoqt.fabric.session import PeerSession
-from aiomoqt.fabric.wire import (
+from aiomoqt.moq_fabric.session import PeerSession
+from aiomoqt.moq_fabric.wire import (
     AnnounceInfo, Connect, ConnectCode, ConnectResponse, ControlReader,
     DataHeader, DataType, MsgType, NodeInfo, NodeSet, NodeType, PathItem,
     SubscribeInfo, WireError, decode_body, decode_varint, encode_message,
@@ -402,7 +402,7 @@ def test_session_checks_hashes():
 
 
 def test_subscribe_seq_rules():
-    from aiomoqt.fabric.hashing import track_hashes
+    from aiomoqt.moq_fabric.hashing import track_hashes
     th = track_hashes((b"ns",), b"t")
 
     def sub(seq, epoch=0, forward=1):

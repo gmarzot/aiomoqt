@@ -13,13 +13,13 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from aiomoqt.context import stream_reset_code
 from aiomoqt.messages.data import ObjectDatagram, ObjectHeader
-from aiomoqt.fabric.hashing import track_hashes
-from aiomoqt.fabric.inner import (DATAGRAM_MAX_FRAME, P18, DatagramObject,
+from aiomoqt.moq_fabric.hashing import track_hashes
+from aiomoqt.moq_fabric.inner import (DATAGRAM_MAX_FRAME, P18, DatagramObject,
                                    StreamObject)
-from aiomoqt.fabric.node import (FabricNode, FabricTrack, Name, _bytes,
+from aiomoqt.moq_fabric.node import (FabricNode, FabricTrack, Name, _bytes,
                                   namespace_tuple)
-from aiomoqt.fabric.session import Inbound, log
-from aiomoqt.fabric.wire import (DATAGRAM_HEADER_LEN, DataHeader, DataType,
+from aiomoqt.moq_fabric.session import Inbound, log
+from aiomoqt.moq_fabric.wire import (DATAGRAM_HEADER_LEN, DataHeader, DataType,
                                   WireError)
 from aiomoqt.types import MOQTStreamStopped, StreamResetCode
 

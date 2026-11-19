@@ -52,7 +52,7 @@ Levels: ERROR, WARNING, INFO (one line per session event and control message), D
 views, transport plumbing, per-stream lifecycle; bounded however many objects flow) and TRACE
 (`aiomoqt.utils.logger.TRACE`, 5: per object, per chunk, per datagram, wire hex). Category
 loggers, stable names: `aiomoqt.control`, `aiomoqt.data`, `aiomoqt.fetch`, `aiomoqt.transport`,
-`aiomoqt.relay`, `aiomoqt.fabric`; other lines use module loggers (`aiomoqt.protocol`, ...).
+`aiomoqt.relay`, `aiomoqt.moq_fabric`; other lines use module loggers (`aiomoqt.protocol`, ...).
 aiomoqt loggers do not propagate to the root logger: attach a handler with
 `aiomoqt.utils.logger.set_log_handler()`.
 

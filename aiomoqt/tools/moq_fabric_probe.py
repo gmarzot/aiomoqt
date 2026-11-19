@@ -32,9 +32,9 @@ import sys
 import time
 from typing import Optional, Tuple
 
-from aiomoqt.fabric import (FabricNode, build_report, node_id_format,
+from aiomoqt.moq_fabric import (FabricNode, build_report, node_id_format,
                              parse_identity, parse_track, write_report)
-from aiomoqt.fabric.report import summary_line
+from aiomoqt.moq_fabric.report import summary_line
 from aiomoqt.utils import cli as grid
 from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
 
@@ -126,7 +126,7 @@ def parse_args(argv=None):
         description="Join a moq-fabric mesh as a leaf node: observe it "
                     "and originate announces and subscribes",
         epilog=__doc__)
-    grid.add_fabric(p)
+    grid.add_moq_fabric(p)
     grid.add_run(p)
     grid.add_logging(p)
     grid.add_interval(p)

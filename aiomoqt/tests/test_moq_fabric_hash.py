@@ -4,7 +4,7 @@ Vectors from moq-fabric f10e8bc5's cityhash.h, name.h and node_info.h, and libst
 """
 import pytest
 
-from aiomoqt.fabric.hashing import (city64, fresh_node_id, hash_combine,
+from aiomoqt.moq_fabric.hashing import (city64, fresh_node_id, hash_combine,
                                      libstdcxx_hash, namespace_hash,
                                      node_id_format, node_id_parse,
                                      track_hashes)
