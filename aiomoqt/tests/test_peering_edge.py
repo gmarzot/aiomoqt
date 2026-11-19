@@ -615,13 +615,18 @@ async def test_hops_to_fabric_source_two_tracks_over_quic():
                      and len(got[audio]) == want + 3)
         await _until(lambda: all(len(e) == groups for e in ends.values()))
         for h, objs in got.items():
-            assert objs[:want] == [
+            # Streams are independent: order holds within a group only.
+            streamed = [o for o in objs if o[0] < groups]
+            assert sorted(streamed) == [
                 (g, o, ObjectStatus.NORMAL if o < per
                  else ObjectStatus.END_OF_GROUP)
                 for g in range(groups) for o in range(per + 1)]
-            assert ends[h] == [(g, True) for g in range(groups)]
-        assert [o[:2] for o in got[audio][want:]] == [(groups, o)
-                                                      for o in range(3)]
+            for g in range(groups):
+                assert [o[1] for o in streamed if o[0] == g] == list(
+                    range(per + 1))
+            assert sorted(ends[h]) == [(g, True) for g in range(groups)]
+        assert sorted(o[:2] for o in got[audio] if o[0] == groups) == [
+            (groups, o) for o in range(3)]
         # Forward 0 withdraws: the publisher loses the SNS and the hop.
         source.request_update(pulls["video"].request_id, forward=0)
         video = tracks["video"].fullname_hash

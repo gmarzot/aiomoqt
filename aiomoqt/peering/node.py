@@ -1,10 +1,11 @@
-"""FabricNode: a moq-fabric leaf node on aiopquic raw QUIC.
+"""FabricNode: a moq-fabric node on aiopquic raw QUIC, a leaf unless
+transit=True (aiomoqt.peering.transit).
 
 Dials peers on one shared QuicClientEngine (re-dialing after a close),
 optionally listens, learns nodes, announces, subscribes and SNS sets per
-session, and originates its own announces and subscribes. It advertises
-only itself, with a high metric, and never forwards what it learns, so no
-relay routes through it.
+session, and originates its own announces and subscribes. A leaf
+advertises only itself, with a high metric, and never forwards what it
+learns, so no relay routes through it.
 
 publish() makes a FabricTrack that sends d18 objects to every subscriber
 node, one SNS per session; pull() binds a track's received objects to a
@@ -40,7 +41,9 @@ from aiomoqt.peering.inner import (DEFAULT_PRIORITY, DatagramObject,
 from aiomoqt.peering.report import describe, event_fields, track_text
 from aiomoqt.peering.session import (DataFlow, Inbound, Learned, PeerSession,
                                      SessionEvent, Stamp, log, now_stamp)
-from aiomoqt.peering.wire import (ALPN, ANNOUNCE_NAMESPACE, AnnounceInfo,
+from aiomoqt.peering.transit import Transit
+from aiomoqt.peering.wire import (ALPN, ANNOUNCE_NAMESPACE,
+                                  DEFAULT_NODE_METRIC, AnnounceInfo,
                                   DataHeader, DataType, MsgType, NodeInfo,
                                   NodeSet, NodeType, SubscribeInfo)
 from aiomoqt.utils.payload import PayloadCheck
@@ -211,12 +214,14 @@ class _PeerProtocol(QuicConnectionProtocol):
 
 
 class _Egress:
-    """One subgroup in flight: its encoder and its stream per session."""
-    __slots__ = ("writer", "streams")
+    """One subgroup in flight: its encoder and its stream per session,
+    with the SNS id the stream opened under."""
+    __slots__ = ("writer", "streams", "sns_of")
 
     def __init__(self, writer: SubgroupWriter):
         self.writer = writer
         self.streams: Dict[int, int] = {}
+        self.sns_of: Dict[int, int] = {}
 
 
 class FabricTrack:
@@ -231,6 +236,9 @@ class FabricTrack:
         # publish() sent the track's announce; unpublish() withdraws it.
         self.announced = announced
         self._subgroups: Dict[Tuple[int, int], _Egress] = {}
+        # Session id -> withdrawn SNS still carrying open subgroups; each
+        # SNS_WD waits for its streams to end.
+        self._draining: Dict[int, List[NodeSet]] = {}
         self.objects = 0
         self.bytes = 0
         self.streams = 0
@@ -276,6 +284,7 @@ class FabricTrack:
                                   self.fullname_hash, self.origin.priority,
                                   self.origin.ttl_ms).encode()
                 eg.streams[sid] = stream
+                eg.sns_of[sid] = sns_id
                 self.streams += 1
                 wire = head + eg.writer.header + data
                 if not proto.send_nowait(stream, wire):
@@ -311,8 +320,35 @@ class FabricTrack:
                 proto._quic.reset_stream(stream, 0)
             elif not proto.send_nowait(stream, tail, fin=True):
                 waits.append(proto.send_drained(stream, tail, fin=True))
+        if self._draining:
+            self._release_drained()
         if waits:
             await _gather(waits)
+
+    def _open_on(self, session_id: int) -> Set[int]:
+        """SNS ids of the open subgroup streams on a session."""
+        return {eg.sns_of[session_id] for eg in self._subgroups.values()
+                if session_id in eg.streams}
+
+    def _drain(self, session_id: int, sns: NodeSet) -> bool:
+        """Hold a withdrawn SNS while its streams are open; False when
+        none is."""
+        if sns.sns_id not in self._open_on(session_id):
+            return False
+        self._draining.setdefault(session_id, []).append(sns)
+        return True
+
+    def _release_drained(self) -> None:
+        for sid, held in list(self._draining.items()):
+            open_ids = self._open_on(sid)
+            keep = [sns for sns in held if sns.sns_id in open_ids]
+            for sns in held:
+                if sns.sns_id not in open_ids:
+                    self.node._withdraw_sns(self, sid, sns)
+            if keep:
+                self._draining[sid] = keep
+            else:
+                del self._draining[sid]
 
     def datagram(self, group_id: int, object_id: int, payload: bytes,
                  extensions=None, end_of_group: bool = False) -> int:
@@ -337,7 +373,9 @@ class FabricTrack:
     def _drop_session(self, session_id: int) -> None:
         """FIN this track's streams on a session that lost its SNS."""
         proto = self.node._protocols.get(session_id)
+        self._draining.pop(session_id, None)
         for eg in self._subgroups.values():
+            eg.sns_of.pop(session_id, None)
             stream = eg.streams.pop(session_id, None)
             if stream is not None and proto is not None \
                     and not proto.terminated.is_set():
@@ -399,11 +437,13 @@ class RxTrack:
 
 
 class FabricNode:
-    """A moq-fabric leaf: dial `peers`, listen on `port` (0: do not)."""
+    """A moq-fabric node: dial `peers`, listen on `port` (0: do not). A
+    leaf (metric 2^32, type STUB) unless `transit`, which forwards for
+    other nodes (metric 100, type EDGE, by default)."""
 
     def __init__(self, *, node_id: Optional[int] = None,
-                 label: str = DEFAULT_LABEL, metric: int = LEAF_METRIC,
-                 node_type: int = NodeType.STUB,
+                 label: str = DEFAULT_LABEL, metric: Optional[int] = None,
+                 node_type: Optional[int] = None,
                  peers: Sequence[Tuple[str, int]] = (),
                  bind: Optional[str] = None, port: int = 0,
                  cert: Optional[str] = None, key: Optional[str] = None,
@@ -412,7 +452,12 @@ class FabricNode:
                  redial_interval: float = REDIAL_INTERVAL,
                  connect_timeout: float = CONNECT_TIMEOUT,
                  engine: Optional[QuicClientEngine] = None,
+                 transit: bool = False,
                  clock: Callable[[], Stamp] = now_stamp):
+        if metric is None:
+            metric = DEFAULT_NODE_METRIC if transit else LEAF_METRIC
+        if node_type is None:
+            node_type = NodeType.EDGE if transit else NodeType.STUB
         self.local = NodeInfo(node_id or fresh_node_id(label), node_type,
                               label, 0.0, 0.0, metric)
         self.peers = [(h, int(p)) for h, p in peers]
@@ -462,6 +507,9 @@ class FabricNode:
         # Dials share one client transport thread.
         self._engine = engine
         self._own_engine = engine is None
+        # Session id -> configured metric (set_session_metric).
+        self._session_metric: Dict[int, int] = {}
+        self.transit: Optional[Transit] = Transit(self) if transit else None
         self._tasks: Set[asyncio.Task] = set()
         self._protocols: Dict[int, _PeerProtocol] = {}
         self._next_session = 1
@@ -620,6 +668,9 @@ class FabricNode:
         if session is None or session.state == "closed":
             return
         if event.stream_id & 2:
+            if self.transit is not None:
+                self.transit.stream_data(session, event.stream_id,
+                                         bytes(event.data), event.end_stream)
             events = session.stream_data(event.stream_id, event.data,
                                          event.end_stream)
         else:
@@ -631,11 +682,16 @@ class FabricNode:
     def _on_stream_reset(self, proto: _PeerProtocol,
                          event: StreamReset) -> None:
         if proto.session is not None:
+            if self.transit is not None:
+                self.transit.stream_reset(proto.session, event.stream_id,
+                                          event.error_code)
             proto.session.stream_reset(event.stream_id)
 
     def _on_datagram(self, proto: _PeerProtocol,
                      event: DatagramFrameReceived) -> None:
         if proto.session is not None:
+            if self.transit is not None:
+                self.transit.datagram(proto.session, bytes(event.data))
             self._apply(proto.session, proto.session.datagram(event.data))
 
     def _on_terminated(self, proto: _PeerProtocol,
@@ -682,6 +738,8 @@ class FabricNode:
         elif ev.kind in ("connected", "node", "node_withdrawn"):
             for track in list(self._origins.values()):
                 self._reconcile(track)
+        if self.transit is not None:
+            self.transit.on_event(session, ev)
 
     def _held(self, table: str, key: LearnedKey) -> List[Any]:
         """The bodies of `key` the sessions hold."""
@@ -736,6 +794,7 @@ class FabricNode:
     def _close_session(self, session: PeerSession, reason: str) -> None:
         anns = [rec.body for rec in session.announces.values()]
         subs = [rec.body for rec in session.subscribes.values()]
+        nodes = list(session.nodes)
         ev = session.close(reason)
         log.info(f"peering: closed {session.tag} "
                  f"node={node_id_format(session.remote.node_id) if session.remote else '-'} "
@@ -746,6 +805,9 @@ class FabricNode:
             self._learned_announce(ann)
         for sub in subs:
             self._learned_subscribe(sub)
+        self._session_metric.pop(session.id, None)
+        if self.transit is not None:
+            self.transit.session_closed(session, nodes)
         for track in list(self._origins.values()):
             self._reconcile(track)
         closed = [s for s in self.sessions.values() if s.state == "closed"]
@@ -791,10 +853,19 @@ class FabricNode:
 
     def _reconcile(self, track: FabricTrack) -> None:
         """Send the SNS changes the track's subscribers call for."""
-        for ch in reconcile(track.origin, self.connected(), self.node_id,
-                            lambda s: s.next_sns_id()):
+        changes = reconcile(track.origin, self.connected(), self.node_id,
+                            lambda s: s.next_sns_id(),
+                            cost=self._session_cost)
+        held = {n for sns in track.origin.sns.values() for n in sns.nodes}
+        for ch in changes:
             session = self.sessions.get(ch.session_id)
             live = session is not None and session.state == "connected"
+            if (ch.withdraw and live and held.intersection(ch.sns.nodes)
+                    and track._drain(ch.session_id, ch.sns)):
+                # Its subscribers moved: open subgroups finish here first.
+                if self.on_sns is not None:
+                    self.on_sns(track, ch.session_id, None)
+                continue
             if ch.withdraw:
                 track._drop_session(ch.session_id)
                 kind = "sns_withdrawn_originated"
@@ -810,6 +881,52 @@ class FabricNode:
             if self.on_sns is not None:
                 self.on_sns(track, ch.session_id,
                             None if ch.withdraw else ch.sns)
+
+    def _withdraw_sns(self, track: FabricTrack, session_id: int,
+                      sns: NodeSet) -> None:
+        """SNS_WD for a drained SNS of a track."""
+        session = self.sessions.get(session_id)
+        self._record("sns_withdrawn_originated", session,
+                     hash=f"0x{track.fullname_hash:016x}", sns=sns.sns_id,
+                     nodes=[node_id_format(n) for n in sns.nodes])
+        if session is not None and session.state == "connected":
+            session.send(MsgType.SNS_WD, sns)
+            self._flush(self._protocols[session_id])
+
+    # -- session metrics ---------------------------------------------
+
+    def advertised_metric(self, session_id: int) -> int:
+        """The metric this node advertises on a session: the node metric,
+        or a higher one set for the session."""
+        return max(self.local.metric,
+                   self._session_metric.get(session_id, 0))
+
+    def _session_cost(self, session: PeerSession) -> int:
+        """Extra cost of egress on a session, as moq-fabric ranks it."""
+        return self.advertised_metric(session.id) - self.local.metric
+
+    def set_session_metric(self, session_id: int, metric: int) -> None:
+        """Set one session's metric (moq-fabric set-peer-metric): routes
+        are re-ranked, and the session's peer gets this node, and with
+        transit the nodes it reaches, at the advertised metric."""
+        before = self.advertised_metric(session_id)
+        self._session_metric[session_id] = metric
+        if self.advertised_metric(session_id) == before:
+            return
+        if self.transit is not None:
+            self.transit.reselect()
+        for track in list(self._origins.values()):
+            self._reconcile(track)
+        session = self.sessions.get(session_id)
+        if session is None or session.state != "connected":
+            return
+        log.info(f"peering: {session.tag} metric "
+                 f"{self.advertised_metric(session_id)} (was {before})")
+        session.send(MsgType.NODE_INFO_ADV, dataclasses.replace(
+            self.local, metric=self.advertised_metric(session_id)))
+        self._flush(self._protocols[session_id])
+        if self.transit is not None:
+            self.transit.sync_nodes(session)
 
     def sample_srtt(self, session: PeerSession) -> None:
         proto = self._protocols.get(session.id)
@@ -878,15 +995,17 @@ class FabricNode:
         announce."""
         if self._origins.pop(track.fullname_hash, None) is None:
             return
-        held = list(track.origin.sns.items())
+        held = [(sid, sns, True) for sid, sns in track.origin.sns.items()]
+        held += [(sid, sns, False) for sid, sets in track._draining.items()
+                 for sns in sets]
         track.origin.sns.clear()
-        for sid, sns in held:
+        for sid, sns, live_sns in held:
             track._drop_session(sid)
             session = self.sessions.get(sid)
             if session is not None and session.state == "connected":
                 session.send(MsgType.SNS_WD, sns)
                 self._flush(self._protocols[sid])
-            if self.on_sns is not None:
+            if live_sns and self.on_sns is not None:
                 self.on_sns(track, sid, None)
         if track.announced and track.fullname_hash in self._announces:
             self.withdraw_announce(track.origin.namespace, track.origin.name)
