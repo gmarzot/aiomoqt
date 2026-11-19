@@ -14,6 +14,7 @@ Tracks this node receives are decoded by the session as on a leaf.
 """
 import asyncio
 import dataclasses
+import time
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Set, Tuple
 
@@ -27,6 +28,8 @@ from aiomoqt.moq_fabric.wire import (AnnounceInfo, DataHeader, MsgType, NodeInfo
 if TYPE_CHECKING:
     from aiomoqt.moq_fabric.node import FabricNode, _PeerProtocol
 
+# How long a withdrawn subscribe's seq still turns away older ones.
+SUB_MARK_RETAIN_S = 30.0
 # Data held per session for SNS ids not yet advertised.
 STASH_MAX_BYTES = 1 << 20
 STASH_MAX_ITEMS = 1024
@@ -163,8 +166,9 @@ class Transit:
         # Accepted learned announces and subscribes, by (hash, source).
         self.announces: Dict[Key, AnnounceInfo] = {}
         self.subscribes: Dict[Key, SubscribeInfo] = {}
-        # (hash, source) -> (epoch, seq, withdrawn) last accepted.
-        self._sub_marks: Dict[Key, Tuple[int, int, bool]] = {}
+        # (hash, source) -> (epoch, seq, withdrawn at, or None) last
+        # accepted.
+        self._sub_marks: Dict[Key, Tuple[int, int, Optional[float]]] = {}
         self.ingress: Dict[Key, Ingress] = {}
         self._in: Dict[Key, _In] = {}
         # Session id -> sns id -> stashed ("s", stream id) / ("d", bytes).
@@ -341,16 +345,19 @@ class Transit:
             return
         key = (sub.fullname_hash, sub.source)
         mark = self._sub_marks.get(key)
+        if mark is not None and mark[2] is not None and \
+                time.monotonic() - mark[2] > SUB_MARK_RETAIN_S:
+            mark = None
         if mark is not None:
             epoch, seq, withdrawn = mark
             if sub.epoch != epoch:
                 return
-            resume = (sub.seq == seq and not withdrawn
+            resume = (sub.seq == seq and withdrawn is None
                       and key not in self.subscribes)
             if not seq_newer(sub.seq, seq) and not resume:
                 return
         self.subscribes[key] = sub
-        self._sub_marks[key] = (sub.epoch, sub.seq, False)
+        self._sub_marks[key] = (sub.epoch, sub.seq, None)
         self._flood(session, MsgType.SUBSCRIBE_INFO_ADV, sub)
 
     def _subscribe_withdrawn(self, session: PeerSession,
@@ -361,7 +368,7 @@ class Transit:
                 sub.seq == held.seq or seq_newer(sub.seq, held.seq)):
             return
         del self.subscribes[key]
-        self._sub_marks[key] = (sub.epoch, sub.seq, True)
+        self._sub_marks[key] = (sub.epoch, sub.seq, time.monotonic())
         self._flood(session, MsgType.SUBSCRIBE_INFO_WD, sub)
 
     # -- subscribe node sets ---------------------------------------------

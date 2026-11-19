@@ -10,7 +10,8 @@ from aiomoqt.moq_fabric.hashing import (city64, fresh_node_id, hash_combine,
                                      libstdcxx_hash, node_id_format,
                                      node_id_parse, track_hashes)
 from aiomoqt.moq_fabric.node import (LEAF_METRIC, FabricNode, FabricTrack,
-                                  RxTrack, parse_identity, parse_track)
+                                  RxTrack, label_node_id, parse_identity,
+                                  parse_track)
 from aiomoqt.moq_fabric.report import build_report, write_report
 from aiomoqt.moq_fabric.session import PeerSession, SessionEvent
 from aiomoqt.moq_fabric.wire import (ALPN, DEFAULT_PORT, AnnounceInfo, Connect,
@@ -25,6 +26,6 @@ __all__ = [
     "FabricTrack", "HopRetiring", "MsgType", "NodeInfo", "NodeSet", "NodeType",
     "PathItem", "PeerSession", "RxTrack", "SessionEvent", "SubscribeInfo",
     "WireError", "build_report", "city64", "fresh_node_id", "hash_combine",
-    "libstdcxx_hash", "node_id_format", "node_id_parse", "parse_identity",
+    "label_node_id", "libstdcxx_hash", "node_id_format", "node_id_parse", "parse_identity",
     "parse_track", "relay_object", "track_hashes", "write_report",
 ]

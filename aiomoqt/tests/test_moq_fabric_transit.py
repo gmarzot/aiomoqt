@@ -899,3 +899,47 @@ async def test_ring_drops_a_stopped_node_without_ghost_routes():
     finally:
         for n in ring:
             await n.stop()
+
+
+# -- identity ------------------------------------------------------------
+
+def test_label_gives_the_id_moq_fabric_derives_on_every_start():
+    from aiomoqt.moq_fabric import (label_node_id, libstdcxx_hash,
+                                    parse_identity)
+    a, b = parse_identity("via-1"), parse_identity("via-1")
+    assert a == b == (libstdcxx_hash(b"via-1"), "via-1")
+    assert label_node_id("via-1") == a[0]
+    assert parse_identity("via-2")[0] != a[0]
+    # No --node-id: a fresh id each time, the default label.
+    f1, f2 = parse_identity(None), parse_identity(None)
+    assert f1[0] != f2[0] and f1[1] == f2[1] == "aiomoqt-peer"
+    assert parse_identity("9.9:1") == (9 << 48 | 9 << 32 | 1,
+                                       "aiomoqt-peer")
+    assert parse_identity("7:5", "x") == (7 << 32 | 5, "x")
+    with pytest.raises(ValueError):
+        parse_identity("0:0")
+
+
+def test_restart_under_the_same_id_resubscribes_past_held_marks(
+        monkeypatch):
+    # A peer holding a withdrawn seq takes the restarted node's first
+    # subscribe: its seq starts from the clock.
+    t = _transit()
+    wa = _Wire(t, 1, _remote(A, "a"))
+    wb = _Wire(t, 2, _remote(B, "b"))
+    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=40))
+    wa.send(MsgType.SUBSCRIBE_INFO_WD, _sub(A, NS, b"video", seq=41))
+    wa.close()
+    wa = _Wire(t, 3, _remote(A, "a"))
+    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=1))
+    assert not t.transit.subscribes          # older than the held mark
+    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=900))
+    assert t.transit.subscribes
+    # A withdrawn mark stops turning seqs away after the retention.
+    wa.send(MsgType.SUBSCRIBE_INFO_WD, _sub(A, NS, b"video", seq=901))
+    monkeypatch.setattr(transit_mod, "SUB_MARK_RETAIN_S", 0.0)
+    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=2))
+    assert t.transit.subscribes and wb
+    n1, n2 = FabricNode(label="r"), FabricNode(label="r")
+    assert n1._seq_base == n2._seq_base or abs(
+        n1._seq_base - n2._seq_base) <= 1
