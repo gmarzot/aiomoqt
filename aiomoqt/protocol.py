@@ -26,7 +26,7 @@ from .messages import *
 from .messages.d18 import Setup
 from .messages.d20 import PublishStateNotify, Setup as D20Setup
 from .messages.fetch import _is_joining
-from .types import SCHEDULING, to_stream_priority
+from .types import SCHEDULING, stream_band_table, to_stream_priority
 from .cat import (ACTION_FETCH, ACTION_PUBLISH, ACTION_PUBLISH_NAMESPACE,
                   ACTION_SUBSCRIBE, ACTION_SUBSCRIBE_NAMESPACE,
                   ACTION_TRACK_STATUS, CatRefused, Grants)
@@ -4455,10 +4455,81 @@ class _MOQTSessionMixin:
                 sched = "fifo"
         return sched
 
-    def data_stream_band(self, publisher_priority: int) -> int:
-        """Transport band for a data stream of this publisher priority."""
-        return to_stream_priority(publisher_priority,
-                                  discipline=self.stream_scheduling)
+    # Subscriber priorities of this session's requests (§5.1.1): holder ->
+    # (priority, on_change). Their distinct values rank the data bands.
+    _prio_holders: Optional[dict] = None
+    _prio_ranks: Optional[dict] = None
+    # (subscriber priority, discipline) -> band_table() result.
+    _band_tables: Optional[dict] = None
+
+    def data_stream_band(self, publisher_priority: int,
+                         subscriber_priority: int = 128) -> int:
+        """Transport band for a data stream of this publisher priority under
+        a request of this subscriber priority."""
+        if not 0 <= publisher_priority <= 255:
+            raise ValueError(
+                f"MoQT priority must be 0-255, got {publisher_priority}")
+        return self.band_table(subscriber_priority)[publisher_priority]
+
+    def band_table(self, subscriber_priority: int = 128,
+                   discipline: Optional[str] = None) -> bytes:
+        """Bands by publisher priority for a request of this subscriber
+        priority: the session's distinct subscriber priorities each take a
+        slice of the data bands (§5.1.2); one keeps to_stream_priority's."""
+        disc = discipline or self.stream_scheduling
+        key = (subscriber_priority, disc)
+        tables = self._band_tables
+        if tables is not None:
+            table = tables.get(key)
+            if table is not None:
+                return table
+        ranks = self._prio_ranks or {}
+        rank = ranks.get(subscriber_priority)
+        if rank is None:
+            # A priority no request holds yet: ranked as if held, not kept.
+            values = sorted({*ranks, subscriber_priority})
+            return stream_band_table(values.index(subscriber_priority),
+                                     len(values), discipline=disc)
+        table = stream_band_table(rank, len(ranks), discipline=disc)
+        if tables is None:
+            tables = self._band_tables = {}
+        tables[key] = table
+        return table
+
+    def hold_subscriber_priority(self, holder, priority: Optional[int],
+                                 on_change: Optional[Callable] = None) -> None:
+        """Record the subscriber priority `holder` (a subscription or FETCH
+        served on this session) sends under; None releases it. When the
+        bands move, on_change() runs for each holder they move for."""
+        holders = self._prio_holders
+        if holders is None:
+            holders = self._prio_holders = {}
+        old = holders.get(holder)
+        if priority is None:
+            if old is None:
+                return
+            del holders[holder]
+        else:
+            if old is not None and old[0] == priority:
+                holders[holder] = (priority, on_change)
+                return
+            holders[holder] = (priority, on_change)
+        values = sorted({p for p, _ in holders.values()})
+        ranks = {p: i for i, p in enumerate(values)}
+        prev = self._prio_ranks or {}
+        self._prio_ranks = ranks
+        if len(ranks) <= 1 and len(prev) <= 1:
+            # One rank or none: every table is to_stream_priority's.
+            return
+        if ranks != prev:
+            self._band_tables = None
+            moved = [cb for _p, cb in holders.values() if cb is not None]
+        elif priority is not None and on_change is not None:
+            moved = [on_change]
+        else:
+            return
+        for cb in moved:
+            cb()
 
     def _on_setup_complete(self) -> None:
         logger.info(f"MOQT session: setup complete: "

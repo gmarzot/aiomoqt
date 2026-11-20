@@ -656,3 +656,32 @@ def to_stream_priority(moqt_priority: int, *,
             f"MoQT priority must be 0-255, got {moqt_priority}")
     band = max(STREAM_BAND_DATA_FLOOR, moqt_priority & 0xFE)
     return band | (1 if discipline == "fifo" else 0)
+
+
+_DATA_LEVELS = (STREAM_BAND_PADDING - 1 - STREAM_BAND_DATA_FLOOR) // 2 + 1
+
+
+def stream_band_table(rank: int = 0, ranks: int = 1, *,
+                      discipline: str = "round_robin") -> bytes:
+    """Bands for publisher priorities 0-255 under the `rank`-th most urgent
+    of `ranks` distinct subscriber priorities on a session (§5.1.2: the
+    subscriber priority orders first, then the publisher priority).
+
+    One rank is to_stream_priority's mapping. More split the data bands into
+    one slice per rank, in rank order, each scaling the publisher priority
+    into its slice; past 123 ranks adjacent ones share bands.
+    """
+    if not 0 <= rank < ranks:
+        raise ValueError(f"rank {rank} outside {ranks} ranks")
+    if ranks == 1:
+        return bytes(to_stream_priority(p, discipline=discipline)
+                     for p in range(256))
+    if discipline not in SCHEDULING:
+        raise ValueError(
+            f"discipline must be one of {', '.join(SCHEDULING)}, "
+            f"got {discipline!r}")
+    start = rank * _DATA_LEVELS // ranks
+    width = max(1, (rank + 1) * _DATA_LEVELS // ranks - start)
+    low = 1 if discipline == "fifo" else 0
+    return bytes(STREAM_BAND_DATA_FLOOR + 2 * (start + p * width // 256) | low
+                 for p in range(256))
