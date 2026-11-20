@@ -1529,10 +1529,11 @@ class _RelayDelivery:
                                   end=None if end is None else (end[5], end[9]))
         return True if rest is None else rest
 
-    def send_nowait(self, item) -> bool | None:
+    def send_nowait(self, item) -> object:
         """send(item) when it completes now: a live datagram, or an object
         or stream end on an open stream that the transport takes. True
-        once written; None, nothing written, when it has to wait."""
+        once written; None, nothing written, when it has to wait; END_DUE,
+        nothing written, for a new stream whose end is queued behind."""
         (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
          shape, encoded) = item
         if not live:

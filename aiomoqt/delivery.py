@@ -1213,11 +1213,13 @@ class SendLane:
         if held is not None:
             self._held = None
             items = self.items
-            if (len(items) == 1 and items[0] is held and not self.busy
+            send_whole = self._whole
+            if (send_whole is not None and len(items) == 1
+                    and items[0] is held and not self.busy
                     and self.gate and not self.late
                     and self.writer.ends_stream(held, item)):
                 try:
-                    whole = self._whole(held, item)
+                    whole = send_whole(held, item)
                 except Exception:
                     whole = False
                 if whole:
