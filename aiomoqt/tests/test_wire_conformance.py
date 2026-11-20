@@ -2025,6 +2025,7 @@ def test_fetch_object_over_the_limit_is_refused_at_its_length(draft):
 # ValueError, OverflowError, RuntimeError) rather than a protocol error.
 
 from aiomoqt.messages.data import ObjectDatagram  # noqa: E402
+from aiomoqt.messages.data import LengthFieldError  # noqa: E402
 from aiomoqt.messages.session_setup import GoAway  # noqa: E402
 
 
@@ -2093,6 +2094,39 @@ def test_object_properties_that_do_not_parse_agree_across_codecs(
     raw = v(0) + props + v(1) + b"p"
     with pytest.raises(MOQTMalformedKVP):
         _parse_subgroup(draft, raw, fused)
+
+
+_HAS_LENGTH_FIELD_ERROR = isinstance(LengthFieldError, type)
+
+
+@pytest.mark.skipif(not _HAS_LENGTH_FIELD_ERROR,
+                    reason="aiopquic without LengthFieldError")
+@pytest.mark.parametrize("draft", [18, 20, 22])
+@pytest.mark.parametrize("length", [1 << 63, (1 << 64) - 1])
+@pytest.mark.parametrize("field, offset, err", [
+    ("ext_block_len", 1, MOQTMalformedKVP),
+    ("kvp_value_len", 3, MOQTMalformedKVP),
+    ("payload_len", 2, MOQTProtocolViolation),
+])
+def test_object_length_no_stream_can_carry_is_named(
+        draft, length, field, offset, err):
+    """A vi64 length past what a stream carries (e.g. a second subgroup
+    header read as an object) is refused with the field, value and
+    offset, not a raw conversion OverflowError."""
+    v = ref_vi64
+    if field == "ext_block_len":
+        raw = v(0) + v(length)
+    elif field == "kvp_value_len":
+        raw = v(0) + v(10) + v(1) + v(length)
+    else:
+        raw = v(0) + v(0) + v(length)
+    with pytest.raises(err) as e:
+        _parse_subgroup(draft, raw, True)
+    assert type(e.value) is err
+    assert isinstance(e.value.__cause__, LengthFieldError)
+    assert e.value.reason_phrase.startswith(
+        f"object {field} {length} exceeds limit ")
+    assert e.value.reason_phrase.endswith(f"at offset {offset}")
 
 
 def test_kvp_value_over_2_16_is_a_protocol_violation():
