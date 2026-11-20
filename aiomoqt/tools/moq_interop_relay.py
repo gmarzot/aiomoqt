@@ -7740,15 +7740,19 @@ def _fabric_peer_op(fabric, query: str) -> tuple:
         return "400 Bad Request", {
             "error": "op=add|remove|metric&host=H&port=P[&metric=M]"}
     node = fabric.node
-    if op == "add":
-        node.add_peer(host, port, metric)
-        peer_log.info(f"peering: peer {_addr_text(host, port)} added")
-    elif op == "remove":
-        if not node.remove_peer(host, port):
+    try:
+        if op == "add":
+            node.add_peer(host, port, metric)
+            peer_log.info(f"peering: peer {_addr_text(host, port)} added")
+        elif op == "remove":
+            if not node.remove_peer(host, port):
+                return "404 Not Found", {"error": "no such peer"}
+            peer_log.info(f"peering: peer {_addr_text(host, port)} removed")
+        elif not node.set_peer_metric(host, port, metric):
             return "404 Not Found", {"error": "no such peer"}
-        peer_log.info(f"peering: peer {_addr_text(host, port)} removed")
-    elif not node.set_peer_metric(host, port, metric):
-        return "404 Not Found", {"error": "no such peer"}
+    except ValueError as e:
+        # The host has several peers and none at this port.
+        return "409 Conflict", {"error": str(e)}
     return "200 OK", {"ok": True}
 
 

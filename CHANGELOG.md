@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay's `POST /fabric/peer?op=remove|metric` answers 409 naming the candidates when the host has several peers and none at the given port.
 - aiomoqt-relay joins a moq-fabric mesh with `--peer HOST[:PORT]` (repeatable) or `--peer-port N` (default 33434; 0 = do not listen), `--node-id` and `--node-metric` (default 100); off by default. It forwards for other fabric nodes (transit), and its MoQT subscribers get tracks the fabric announces when no local publisher serves them, at any draft it serves; local PUBLISH_NAMESPACEs and PUBLISHes are announced into the fabric and served to fabric subscribers. The `--control` socket answers `GET /fabric` and `POST /fabric/peer?op=add|remove|metric`, and `status.json` carries a `fabric` section. In the grid, `add_peering` splits into `add_fabric_node` and `add_peering_listener`.
 - A transit `FabricNode` forwards a live subscribe that a peer replays at its current seq, as after a session restart, one hop toward each publisher of the track, as moq-fabric does; it dropped it as a duplicate, so the publisher's side kept a stale path until the subscriber re-advertised.
 - `FabricNode.remove_peer` and `set_peer_metric` match a peer's host and port exactly; a host alone matches only when the host has one session or dialed peer, and otherwise they raise `ValueError` naming the candidates.
