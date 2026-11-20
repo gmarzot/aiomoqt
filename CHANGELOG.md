@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- aiomoqt-relay writes a subgroup's objects to the subscribers in step on it with one aiopquic `fanout()` per draft profile per worker, where aiopquic has `DestSet`; the others, and `--trace-subscribers`, take their send lanes as before, and every subscriber gets the same bytes either way.
 - aiomoqt-relay's `POST /moq-fabric/peer?op=remove|restart|metric` answers 409 naming the candidates when the host has several peers and none at the given port.
 - aiomoqt-relay joins a moq-fabric mesh with `--peer HOST[:PORT]` (repeatable) or `--peer-port N` (default 33434; 0 = do not listen), `--node-id` and `--node-metric` (default 100); off by default. It forwards for other fabric nodes (transit), and its MoQT subscribers get tracks the fabric announces when no local publisher serves them, at any draft it serves; local PUBLISH_NAMESPACEs and PUBLISHes are announced into the fabric and served to fabric subscribers. The `--control` socket answers `GET /moq-fabric` and `POST /moq-fabric/peer?op=add|remove|metric|restart`, and `status.json` carries a `moq_fabric` section. In the grid, `add_moq_fabric` splits into `add_fabric_node` and `add_moq_fabric_listener`.
 - A transit `FabricNode` forwards a live subscribe that a peer replays at its current seq, as after a session restart, one hop toward each publisher of the track, as moq-fabric does; it dropped it as a duplicate, so the publisher's side kept a stale path until the subscriber re-advertised.
