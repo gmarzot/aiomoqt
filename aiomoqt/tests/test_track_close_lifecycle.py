@@ -13,7 +13,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 
 _BASE_PORT = 28400
-_DRAFTS = (14, 16, 18, 20, 22)
+_DRAFTS = (16, 18, 20, 22)
 _CASES = pytest.mark.parametrize(
     "draft, use_quic",
     [(draft, raw) for draft in _DRAFTS for raw in (True, False)],

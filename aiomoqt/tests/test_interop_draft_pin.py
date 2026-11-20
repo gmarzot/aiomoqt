@@ -22,7 +22,7 @@ def test_client_reports_an_unsupported_pin_as_not_supported(draft):
     assert r.stdout.splitlines()[:2] == [
         "TAP version 14",
         f"1..0 # SKIP draft {draft} not supported; aiomoqt speaks "
-        "[14, 16, 18, 20, 22]"]
+        "[16, 18, 20, 22]"]
 
 
 def test_relay_refuses_an_unsupported_pin():

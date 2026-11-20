@@ -27,8 +27,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.context import (canonical_request_error, is_draft16_or_later,
-                             profile_for)
+from aiomoqt.context import canonical_request_error, profile_for
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
@@ -39,8 +38,8 @@ from aiomoqt.tools.moqtest_origin import (
 )
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType, MOQTStreamStopped,
-    SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
-    FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
+    RequestErrorCode, SubscribeDoneCode,
+    GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
 from aiomoqt.utils.cli import add_help, add_logging, apply_logging, run
@@ -50,23 +49,16 @@ try:
 except Exception:
     AIOMOQT_VERSION = "unknown"
 
-# Spec-compliant "track not found" codes across drafts:
-# d14 SubscribeErrorCode.TRACK_DOES_NOT_EXIST = 0x04
-# d16 RequestErrorCode.DOES_NOT_EXIST         = 0x10
+# "track not found" codes: RequestErrorCode.DOES_NOT_EXIST, and the 0x04
+# peers still send for it.
 TRACK_NOT_FOUND_CODES = frozenset({
-    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+    0x04,
     int(RequestErrorCode.DOES_NOT_EXIST),
 })
 
 # INTERNAL_ERROR (0x0) is not an acceptable answer to a well-formed
 # request that names a non-existent track — the relay must be specific.
 SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
-    int(SubscribeErrorCode.UNAUTHORIZED),
-    int(SubscribeErrorCode.TIMEOUT),
-    int(SubscribeErrorCode.NOT_SUPPORTED),
-    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
-    int(SubscribeErrorCode.MALFORMED_AUTH_TOKEN),
-    int(SubscribeErrorCode.EXPIRED_AUTH_TOKEN),
     int(RequestErrorCode.MALFORMED_AUTH_TOKEN),
     int(RequestErrorCode.EXPIRED_AUTH_TOKEN),
     int(RequestErrorCode.DOES_NOT_EXIST),
@@ -105,11 +97,11 @@ def _is_refusal(code: int, compat: frozenset) -> bool:
 # refused, decode error, transport reset) are never compat-passed.
 KNOWN_COMPAT_IMPLS = frozenset({
     "moq-dev",            # cdn.moq.dev /anon — returns 404 for not-found
-    "moq-rs",             # cloudflare moq-rs d14 — returns code=0 for not-found
+    "moq-rs",             # cloudflare moq-rs — returns code=0 for not-found
     "moq-rs-d16",         # itzmanish/moq-rs draft-16 fork (CF endpoint)
     "libquicr",           # Cisco libquicr — accepts SUBSCRIBE to unknown tracks
     "lenient-extensions",  # tolerate truncated trailing extensions block
-    "missing-request-credit",  # d14/d16 peer SETUP without MAX_REQUEST_ID
+    "missing-request-credit",  # d16 peer SETUP without MAX_REQUEST_ID
     "all",                # enable every known compat tolerance
 })
 
@@ -151,6 +143,28 @@ def _format_exc(e: BaseException) -> str:
     if not msg:
         return cls
     return f"{cls}: {msg}" if cls not in msg else msg
+
+
+class _NoReply(Exception):
+    """A request ended by our session closing, not by the peer's answer."""
+
+
+def _check_reply(e: MOQTRequestError) -> MOQTRequestError:
+    """`e` if the peer sent it; _NoReply if the request failed because the
+    session closed (INTERNAL_ERROR with a "session closed" reason)."""
+    if (int(e.error_code) == int(RequestErrorCode.INTERNAL_ERROR)
+            and str(e.reason or "").startswith("session closed")):
+        raise _NoReply(f"no reply before the {e.reason}") from e
+    return e
+
+
+def _refused(step: str, e: MOQTRequestError) -> str:
+    """A failed request for a report: the peer's refusal, or our close."""
+    try:
+        _check_reply(e)
+    except _NoReply as closed:
+        return f"{step}: {closed}"
+    return f"{step} refused: code={e.error_code} {e.reason}"
 
 
 async def _probe_setup_ok(host, port, path, use_quic, tls_disable_verify,
@@ -423,7 +437,7 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
 def _publish_reply(session, request_id: Optional[int],
                    track=None) -> asyncio.Future:
     """The future the relay's reply to our PUBLISH resolves. Take it before
-    the next await. A d14/d16 PUBLISH_OK goes to the track, not the
+    the next await. A d16 PUBLISH_OK goes to the track, not the
     session, so it resolves the future only through `track`."""
     assert request_id is not None, "PUBLISH not sent"
     fut = session._pending_requests.get(request_id)
@@ -549,7 +563,7 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                     parameters=_PUB_NS_PARAMS,
                     wait_response=True,
                 )
-                # d14/d16 send PUBLISH_NAMESPACE_DONE; d18 has no such
+                # d16 sends PUBLISH_NAMESPACE_DONE; d18 has no such
                 # message and withdraws by resetting the announce's
                 # request stream (§3.3.2).
                 withdrew = session.publish_namespace_done(
@@ -588,7 +602,7 @@ async def test_subscribe_error(host, port, path, use_quic,
     REQUEST_ERROR, any code) is accepted as a valid "track not found"
     rejection — the assertion is that the relay refused; the exact code
     is noted, not required (relays use non-spec codes, e.g. 404 for
-    moq-dev, 0 for moq-rs d14). A timeout or transport error still fails.
+    moq-dev, 0 for moq-rs). A timeout or transport error still fails.
     """
     moq_dev_compat = _compat_active(compat, "moq-dev")
     moq_rs_compat = _compat_active(compat, "moq-rs")
@@ -642,7 +656,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                     )
                 except MOQTRequestError as e:
                     session.close()
-                    code = int(e.error_code)
+                    code = int(_check_reply(e).error_code)
                     spec_ok = code in TRACK_NOT_FOUND_CODES
                     if spec_ok:
                         return TestResult(
@@ -662,13 +676,13 @@ async def test_subscribe_error(host, port, path, use_quic,
                                 f"Non-spec error code={e.error_code} accepted "
                                 f"as 'track not found'"
                             ),
-                            expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST (0x04/0x10)",
+                            expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST (0x10)",
                             received=f"SUBSCRIBE_ERROR code={e.error_code}",
                             compat=True,
                             compat_note=(
                                 f"{impl} returns non-spec error code "
                                 f"{e.error_code} for not-found; spec expects "
-                                f"0x04 (d14) or 0x10 (d16)"
+                                f"0x10"
                             ),
                         )
                     return TestResult(
@@ -677,7 +691,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                         sessions=sessions,
                         message=(
                             f"Non-conformant: expected TRACK_DOES_NOT_EXIST "
-                            f"(d14=0x04 / d16=0x10), got code={e.error_code}"
+                            f"(0x10), got code={e.error_code}"
                         ),
                         expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
                         received=f"SUBSCRIBE_ERROR code={e.error_code}",
@@ -731,7 +745,7 @@ async def test_rendezvous_timeout(host, port, path, use_quic,
                             wait_response=True)
                     code = None
                 except MOQTRequestError as e:
-                    code = int(e.error_code)
+                    code = int(_check_reply(e).error_code)
                 session.close()
     except Exception as e:
         return TestResult(
@@ -832,7 +846,11 @@ async def test_announce_subscribe(host, port, path, use_quic,
                         passed = True
                         pending_hold = True
                     except MOQTRequestError as e:
-                        msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        try:
+                            _check_reply(e)
+                            msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        except _NoReply as closed:
+                            msg = f"upstream subscribe: {closed}"
                         passed = False
 
                     sub_session.close()
@@ -866,7 +884,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
                                    timeout=15.0) -> TestResult:
     """Test 7: A subscriber knowing only the namespace learns the trackname.
 
-    d14/d16 answer SUBSCRIBE_NAMESPACE with a PUBLISH per track. d18
+    d16 answers SUBSCRIBE_NAMESPACE with a PUBLISH per track. d18
     reports namespaces first (NAMESPACE) and answers a second request,
     SUBSCRIBE_TRACKS, with the PUBLISH — and moved SUBSCRIBE_NAMESPACE
     from 0x11 to 0x50. SubscribedTrack walks whichever shape the
@@ -901,7 +919,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
                 # Announce the namespace as well as the track: d18
                 # enumerates namespaces, and a relay learns a namespace
                 # exists from PUBLISH_NAMESPACE, not from PUBLISH.
-                # d14/d16 need the PUBLISH for the fused response.
+                # d16 needs the PUBLISH for the fused response.
                 await track.publish(announce_namespace=True,
                                     publish_track=True)
                 reply = _publish_reply(pub_session, track.request_id)
@@ -998,7 +1016,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                         async with asyncio.timeout(2.0):
                             sub_response = await sub_task
                     except MOQTRequestError as e:
-                        sub_response = e  # error is a valid outcome
+                        sub_response = _check_reply(e)  # a valid outcome
                     except asyncio.TimeoutError:
                         sub_response = None
 
@@ -1320,17 +1338,16 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
                     sessions["subscriber"] = _session_meta(sub_session)
 
                     # FORWARD, SUBSCRIBER_PRIORITY and SUBSCRIPTION_FILTER
-                    # are omitted; d14 carries them as fixed fields.
+                    # are omitted.
                     step = "SUBSCRIBE"
                     phase.reschedule(loop.time() + _DATA_PHASE_S)
-                    d16 = is_draft16_or_later(sub_session.negotiated_draft)
                     track = SubscribedTrack(
                         sub_session,
                         "/".join((namespace, *DATA_SUBGROUP_BASIC_CASE)),
                         "track", on_object=sub.on_object, on_done=sub.on_done)
                     await track.subscribe(
                         forward=None, group_order=GroupOrder.ASCENDING,
-                        filter_type=None if d16 else FilterType.LATEST_OBJECT)
+                        filter_type=None)
                     sub_session.register_stream_end_handler(
                         track.track_alias, sub.on_stream_end)
 
@@ -1350,7 +1367,7 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
     except TimeoutError:
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except MOQTStreamStopped:
         return result(False, f"relay stopped the subgroup stream for group "
                              f"{pub.group}")
@@ -1610,7 +1627,7 @@ async def test_fetch_error_recovery(host, port, path, use_quic,
                 refusal.append(None)
             except MOQTRequestError as e:
                 refusal.append(canonical_request_error(
-                    int(e.error_code), session._profile, fetch=True))
+                    int(_check_reply(e).error_code), session._profile))
             if refusal[0] == RequestErrorCode.INVALID_RANGE:
                 await _fetch_groups(session, namespace, group, group, fetched)
 
@@ -1694,7 +1711,7 @@ async def test_subscribe_namespace_lifecycle(host, port, path, use_quic,
     """subscribe-namespace-lifecycle: a namespace subscriber hears
     NAMESPACE when a separate publisher publishes that namespace, then
     NAMESPACE_DONE when it is withdrawn. Draft-16 asks for NAMESPACE with
-    Subscribe Options; draft-14 has no NAMESPACE message."""
+    Subscribe Options."""
     name = "subscribe-namespace-lifecycle"
     t0 = time.monotonic()
     sessions = {}
@@ -1740,12 +1757,6 @@ async def test_subscribe_namespace_lifecycle(host, port, path, use_quic,
                 await sub_session.client_session_init()
                 sessions["subscriber"] = _session_meta(sub_session)
                 draft = sub_session.negotiated_draft
-                if draft < 16:
-                    sub_session.close()
-                    return _result(
-                        True, "", skipped=True,
-                        skip_reason=f"NAMESPACE is draft-16; "
-                                    f"negotiated draft-{draft}")
                 sub_session.register_handler(
                     D16MessageType.NAMESPACE, _record("NAMESPACE"))
                 sub_session.register_handler(
@@ -2321,7 +2332,7 @@ async def _moq_test_attempt(name: str, host: str, port: int, path: str,
         return result(False, f"{refusal}; {timed_out}" if refusal
                       else timed_out)
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
     finally:
@@ -2446,11 +2457,6 @@ async def test_publish_namespace_done_track(host, port, path, use_quic,
                 await obs.client_session_init()
                 sessions["observer"] = _session_meta(obs)
                 draft = obs.negotiated_draft
-                if draft < 16:
-                    obs.close()
-                    return result(True, "", skipped=True,
-                                  skip_reason=f"NAMESPACE is draft-16; "
-                                              f"negotiated draft-{draft}")
                 obs.register_handler(D16MessageType.NAMESPACE,
                                      _record("NAMESPACE"))
                 obs.register_handler(D16MessageType.NAMESPACE_DONE,
@@ -2506,7 +2512,7 @@ async def test_publish_namespace_done_track(host, port, path, use_quic,
     except TimeoutError:
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
     finally:
@@ -2624,7 +2630,7 @@ async def test_subscribe_cancel_live(host, port, path, use_quic,
                       expected=f"{_CANCEL_AFTER} objects, then none",
                       received=f"{len(before)} objects")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
 
@@ -2749,12 +2755,9 @@ async def test_publish_namespace_multi_publisher_retention(
                 return session
 
             async def watch(role, withdrawn=()):
-                """A SUBSCRIBE_NAMESPACE for the run prefix; None below
-                draft-16, which has no NAMESPACE."""
+                """A SUBSCRIBE_NAMESPACE for the run prefix."""
                 session = await connect(role)
                 draft = session.negotiated_draft
-                if draft < 16:
-                    return None
                 log = logs[role] = _NamespaceLog(role, withdrawn)
                 session.register_handler(D16MessageType.NAMESPACE,
                                          log.handler(True))
@@ -2766,12 +2769,6 @@ async def test_publish_namespace_multi_publisher_retention(
                 return log
 
             watched = await watch("observer")
-            if watched is None:
-                draft = opened["observer"].negotiated_draft
-                opened["observer"].close()
-                return result(True, "", skipped=True,
-                              skip_reason=f"NAMESPACE is draft-16; "
-                                          f"negotiated draft-{draft}")
 
             step = "publisher_1 PUBLISH_NAMESPACE"
             first = await connect("publisher_1")
@@ -2829,7 +2826,7 @@ async def test_publish_namespace_multi_publisher_retention(
     except TimeoutError:
         return failed(f"timed out at {step} (limit {_RETENTION_S:g}s)")
     except MOQTRequestError as e:
-        return failed(f"{step} refused: code={e.error_code} {e.reason}")
+        return failed(_refused(step, e))
     except Exception as e:
         return failed(f"{step} failed: {_format_exc(e)}")
 
@@ -2932,7 +2929,7 @@ def parse_args():
         "--draft", type=parse_draft_spec,
         default=parse_draft_spec(draft_env) if draft_env else None,
         help="MoQT draft, e.g. 18 or draft-18 (single = strict pin) or a "
-             "comma list 18,16,14 (preference-ordered probe: pin the first "
+             "comma list 20,18,16 (preference-ordered probe: pin the first "
              "whose SETUP completes) (env: DRAFT, MOQT_DRAFT). Default: "
              f"probe {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
     parser.add_argument(
@@ -2987,7 +2984,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # single-ALPN SETUP completes. An int pins strictly.
     effective_draft = supported_drafts
     if isinstance(supported_drafts, (list, tuple)):
-        # Preference-ordered probe (e.g. --draft 18,16,14 / DRAFT=18,16,14):
+        # Preference-ordered probe (e.g. --draft 20,18,16 / DRAFT=20,18,16):
         # pin the FIRST draft whose single-ALPN SETUP completes. Each attempt
         # is a deterministic single-ALPN offer, with no multi-offer
         # server-choice vagary.
@@ -3128,7 +3125,7 @@ def main():
             ParamType.AUTH_TOKEN: args.auth_token.encode(),
         }
 
-    # Public API takes the draft NUMBER (14, 16, ...). MOQTClient
+    # Public API takes the draft NUMBER (16, 18, ...). MOQTClient
     # normalizes to the wire form internally; pass args.draft through.
     # No explicit draft (the moq-interop-runner invokes us with RELAY_URL
     # but no DRAFT): probe newest first and pin the first draft whose SETUP

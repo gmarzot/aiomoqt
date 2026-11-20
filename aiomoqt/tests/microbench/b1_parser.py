@@ -68,7 +68,7 @@ def _parse_subgroup_stream(chain: StreamChain, prof=None) -> int:
     return n_objects
 
 
-_COMPARE_DRAFTS = (14, 16, 18)
+_COMPARE_DRAFTS = (16, 18)
 
 
 def _run_draft(draft, n_objects, payload_size, chunk_size,
@@ -141,7 +141,7 @@ def main():
     ap.add_argument('--warmup', type=float, default=0.5)
     ap.add_argument('--draft', default='16', type=parse_draft_spec,
                     help='draft number, or a comma-separated list '
-                         '(e.g. 14,16,18) for the cross-draft '
+                         '(e.g. 16,18,20) for the cross-draft '
                          'RX-parse comparison')
     args = ap.parse_args()
 

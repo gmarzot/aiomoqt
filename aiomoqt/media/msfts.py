@@ -976,12 +976,8 @@ class MsftsTrackPublisher(LocTrackPublisher):
 
     def _object_extensions(self, frame: LocFrame, group_start: bool,
                            session=None) -> Dict[int, Any]:
-        """The object's own properties, shared by every peer; none on
-        d14, which has no TIMESCALE to give OBJECT_TIMESTAMP."""
-        exts = frame.extensions
-        if not exts or not (session or self.session)._profile.track_properties:
-            return {}
-        return exts
+        """The object's own properties, shared by every peer."""
+        return frame.extensions or {}
 
 
 class MsftsTrackSubscriber(LocTrackSubscriber):

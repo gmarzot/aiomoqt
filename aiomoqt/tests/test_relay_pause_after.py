@@ -23,7 +23,7 @@ _SIZES = {"video": 300, "audio": 100, "catalog": 50}
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
 _FLOWS = pytest.mark.parametrize("flow", ["publish", "announce"])
-_DRAFTS = [14, 18, 22]
+_DRAFTS = [18, 22]
 
 
 def _port(case, draft, flow, use_quic):

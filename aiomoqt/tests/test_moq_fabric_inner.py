@@ -7,11 +7,11 @@ import pytest
 
 from aiomoqt.messages import ObjectStatus
 from aiomoqt.messages.data import ObjectDatagram, ObjectHeader, SubgroupHeader
-from aiomoqt.peering.inner import (DATAGRAM_MAX_INNER, MAX_OBJECT, P18,
+from aiomoqt.moq_fabric.inner import (DATAGRAM_MAX_INNER, MAX_OBJECT, P18,
                                    DatagramObject, StreamObject,
                                    SubgroupReader, SubgroupWriter,
                                    decode_datagram, encode_datagram)
-from aiomoqt.peering.wire import (DataHeader, DataType, WireError,
+from aiomoqt.moq_fabric.wire import (DataHeader, DataType, WireError,
                                   parse_data_header, rewrite_sns)
 from aiomoqt.types import LOC_TIMESTAMP
 from aiomoqt.utils.buffer import Buffer
@@ -102,8 +102,7 @@ def test_aiomoqt_d18_decoder_reads_our_stream():
     seen = []
     while buf.tell() < len(wire):
         o = ObjectHeader(object_id=0)
-        o.deserialize_into(buf, len(wire), True, prev, True,
-                           P18.params_delta_coded)
+        o.deserialize_into(buf, len(wire), True, prev, True)
         prev = o.object_id
         seen.append((o.object_id, o.payload, o.extensions, o.status))
     assert seen == [(1, b"a" * 10, {LOC_TIMESTAMP: 1794777763064534},

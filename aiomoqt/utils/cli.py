@@ -51,10 +51,13 @@ keepalive         --keepalive
 fetch history     --fetch-history (long only)
 compat            --compat
 payload check     --verify-payload [N] (long only)
-peering           --peer HOST[:PORT] (repeatable) --bind -p/--port
-                  --node-id --node-metric --cert --key: a moq-fabric
-                  fabric node. Dials raw QUIC, ALPN moq-fabric; no -k,
-                  peering never verifies certificates
+fabric node       --peer HOST[:PORT] (repeatable) --node-id
+                  --node-metric: a moq-fabric node. Dials raw QUIC, ALPN
+                  moq-fabric; no -k, moq-fabric never verifies certificates.
+                  aiomoqt-relay adds --peer-port and reuses its own --bind
+                  --cert --key
+fabric listener   --bind -p/--port --cert --key, on the fabric tools
+fabric            fabric node + fabric listener
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 entry point       run(main) in place of asyncio.run: Ctrl-C reaches the
                   main task through the event loop, between callbacks;
@@ -72,8 +75,8 @@ import signal
 import threading
 
 from aiomoqt.cat import DEFAULT_TOKEN_TYPE, CatAuth
-from aiomoqt.peering.node import LEAF_METRIC
-from aiomoqt.peering.wire import DEFAULT_PORT as PEERING_PORT
+from aiomoqt.moq_fabric.node import LEAF_METRIC
+from aiomoqt.moq_fabric.wire import DEFAULT_PORT as MOQ_FABRIC_PORT
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
 from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
                                   parse_log_spec)
@@ -535,7 +538,7 @@ def add_compat(p):
                    help='Comma-separated relay compat tolerances: '
                         'lenient-extensions (truncated trailing-'
                         'extensions block on control messages), '
-                        'missing-request-credit (a d14/d16 peer SETUP '
+                        'missing-request-credit (a d16 peer SETUP '
                         'without MAX_REQUEST_ID), libquicr, all')
 
 
@@ -575,12 +578,12 @@ def add_timestamp_checking(p, default='cancel', default_help=None):
                         f'receiving (default: {default_help or default})')
 
 
-# -- peering ---------------------------------------------------------
+# -- fabric ----------------------------------------------------------
 
 def peer_address(value):
     """argparse type for --peer HOST[:PORT], [V6]:PORT for IPv6:
     (host, port)."""
-    host, port = value, str(PEERING_PORT)
+    host, port = value, str(MOQ_FABRIC_PORT)
     if value.startswith('['):
         host, sep, rest = value[1:].partition(']')
         if not sep or (rest and not rest.startswith(':')):
@@ -594,26 +597,31 @@ def peer_address(value):
     return host, int(port)
 
 
-def add_peering(p, port=PEERING_PORT):
-    """moq-fabric mesh node: peers to dial, listener, identity."""
+def add_fabric_node(p, metric=LEAF_METRIC):
+    """moq-fabric node: peers to dial and identity."""
     p.add_argument('--peer', action='append', type=peer_address,
                    default=None, metavar='HOST[:PORT]',
                    help=f'Peer to dial, raw QUIC (ALPN moq-fabric); '
                         f'repeatable. Re-dialed after a close. Default '
-                        f'port {PEERING_PORT}')
+                        f'port {MOQ_FABRIC_PORT}')
+    p.add_argument('--node-id', type=str, default=None, metavar='ID|LABEL',
+                   help='Node id as high:low (each a uint32 or u16.u16, '
+                        'e.g. 9.9:1), or a contact LABEL, whose id is the '
+                        'one moq-fabric derives from it, the same on every '
+                        "start. Default: the tool's label with a fresh id "
+                        'each start')
+    p.add_argument('--node-metric', type=int, default=metric,
+                   help=f'Metric advertised for this node; peers prefer '
+                        f'lower path sums (default: {metric}; '
+                        f'{LEAF_METRIC} routes no path through it)')
+
+
+def add_moq_fabric_listener(p, port=MOQ_FABRIC_PORT):
+    """moq-fabric listener: address and TLS identity."""
     p.add_argument('--bind', type=str, default=None,
                    help='Bind address (default: all interfaces, IPv4 and IPv6)')
     p.add_argument('-p', '--port', type=int, default=port,
                    help=f'Listen port; 0: do not listen (default: {port})')
-    p.add_argument('--node-id', type=str, default=None, metavar='ID|LABEL',
-                   help='Node id as high:low (each a uint32 or u16.u16, '
-                        'e.g. 9.9:1), or a contact LABEL. Default: label '
-                        'aiomoqt-peer; without an ID the id is fresh on '
-                        'every start')
-    p.add_argument('--node-metric', type=int, default=LEAF_METRIC,
-                   help=f'Metric advertised for this node; peers prefer '
-                        f'lower path sums (default: {LEAF_METRIC}, so no '
-                        f'path runs through it)')
     add_tls(p)
 
 
@@ -625,6 +633,12 @@ def add_tls(p):
                         'one)')
     p.add_argument('--key', type=str, default=None,
                    help='Listener TLS key (default: beside --cert)')
+
+
+def add_moq_fabric(p, port=MOQ_FABRIC_PORT):
+    """A standalone moq-fabric leaf: node flags and its own listener."""
+    add_fabric_node(p)
+    add_moq_fabric_listener(p, port=port)
 
 
 # -- validation ------------------------------------------------------

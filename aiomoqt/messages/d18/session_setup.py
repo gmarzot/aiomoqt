@@ -42,7 +42,7 @@ class Setup(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
                     buf_end: Optional[int] = None) -> 'Setup':
         """Parse SETUP. The control dispatch loop consumes the Type and
-        Length first (as for d14/d16 classes), so buf is positioned at
+        Length first (as for d16 classes), so buf is positioned at
         the Setup Options and buf_end bounds them."""
         if buf_end is None:
             buf_end = buf.capacity

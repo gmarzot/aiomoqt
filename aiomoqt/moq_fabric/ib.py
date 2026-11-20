@@ -1,4 +1,5 @@
-"""Information base for the tracks this node originates.
+"""Information base for the tracks this node originates, and the path
+selection transit shares.
 
 Who subscribes to each track, which session reaches each subscriber node
 best, and the one SUBSCRIBE_NODE_SET per egress session that follows from
@@ -9,8 +10,8 @@ from collections import defaultdict
 from typing import (Any, Callable, Dict, Iterable, List, NamedTuple,
                     Optional, Sequence, Tuple)
 
-from aiomoqt.peering.hashing import track_hashes
-from aiomoqt.peering.wire import NodeInfo, NodeSet, SubscribeInfo
+from aiomoqt.moq_fabric.hashing import track_hashes
+from aiomoqt.moq_fabric.wire import NodeInfo, NodeSet, SubscribeInfo
 
 DEFAULT_TTL_MS = 5000
 
@@ -58,24 +59,47 @@ class SnsChange(NamedTuple):
     withdraw: bool
 
 
-def path_rank(info: NodeInfo) -> Tuple[int, int, int]:
+# Extra cost of egressing on a session (its metric above the node's).
+SessionCost = Callable[[Any], int]
+
+
+def path_rank(info: NodeInfo, extra: int = 0) -> Tuple[int, int, int]:
     """§6.1 order: lowest metric sum, then fewest hops, then lowest srtt
     sum."""
-    return info.sum_metric(), len(info.path), info.sum_srtt()
+    return info.sum_metric() + extra, len(info.path), info.sum_srtt()
 
 
-def best_session(node_id: int, carriers: Sequence, sessions: Iterable,
-                 current: Optional[int] = None):
-    """The session reaching node_id best among those that advertised it;
-    a tie keeps `current`, then the lowest session id. A node no session
-    advertised goes to the first session its subscribe came on."""
+def loops_through(info: NodeInfo, node_id: int) -> bool:
+    return any(p.node_id == node_id for p in info.path)
+
+
+def best_route(node_id: int, sessions: Iterable,
+               current: Optional[int] = None, *,
+               cost: Optional[SessionCost] = None,
+               local_id: Optional[int] = None):
+    """The session advertising node_id with the best path rank, or None;
+    a full tie keeps `current`, then the lowest session id. A path
+    through `local_id` is a loop and never chosen."""
     ranked = []
     for s in sessions:
         rec = s.nodes.get(node_id)
-        if rec is not None:
-            ranked.append((path_rank(rec.body), s.id != current, s.id, s))
-    if ranked:
-        return min(ranked, key=lambda r: r[:3])[3]
+        if rec is None or (local_id is not None
+                           and loops_through(rec.body, local_id)):
+            continue
+        rank = path_rank(rec.body, cost(s) if cost is not None else 0)
+        ranked.append((rank, s.id != current, s.id, s))
+    return min(ranked, key=lambda r: r[:3])[3] if ranked else None
+
+
+def best_session(node_id: int, carriers: Sequence, sessions: Iterable,
+                 current: Optional[int] = None, *,
+                 cost: Optional[SessionCost] = None,
+                 local_id: Optional[int] = None):
+    """best_route(); a node no session advertised goes to the first
+    session its subscribe came on."""
+    s = best_route(node_id, sessions, current, cost=cost, local_id=local_id)
+    if s is not None:
+        return s
     return min(carriers, key=lambda s: s.id) if carriers else None
 
 
@@ -97,7 +121,8 @@ def subscribers(fullname_hash: int, sessions: Iterable, local_id: int
 
 
 def reconcile(track: OriginTrack, sessions: Sequence, local_id: int,
-              next_sns_id: Callable[[Any], int]) -> List[SnsChange]:
+              next_sns_id: Callable[[Any], int], *,
+              cost: Optional[SessionCost] = None) -> List[SnsChange]:
     """Bring track.sns in line with the subscribers seen on `sessions`
     (the connected ones): an SNS_ADV for each new or changed set, an
     SNS_WD for each session left with none. A set keeps its id while it
@@ -109,7 +134,8 @@ def reconcile(track: OriginTrack, sessions: Sequence, local_id: int,
     by_id = {s.id: s for s in sessions}
     for node_id, (carriers, prio) in subscribers(
             track.fullname_hash, sessions, local_id).items():
-        s = best_session(node_id, carriers, sessions, current.get(node_id))
+        s = best_session(node_id, carriers, sessions, current.get(node_id),
+                         cost=cost, local_id=local_id)
         if s is not None:
             want[s.id].add(node_id)
             priority.setdefault(s.id, prio)

@@ -1,6 +1,6 @@
 """MoQT Track abstractions — protocol state machine for published and subscribed tracks.
 
-Tracks own the d14/d16 protocol flow and provide a clean interface
+Tracks own the protocol flow and provide a clean interface
 for applications to publish and subscribe without knowing wire details.
 
 Usage:
@@ -49,7 +49,6 @@ from .messages.data import FETCH_FLAGS_END_TIMED_OUT, FETCH_FLAGS_END_UNKNOWN
 from .messages.params import (
     U64_MAX, D20ParamType, LocationFilterType, fill_range,
 )
-from .context import is_draft16_or_later
 from .messages.fetch import _is_joining
 from .utils.buffer import Buffer, BufferReadError
 from .utils.format import fmt_bps, fmt_rate
@@ -130,7 +129,7 @@ def merge_track_properties(props: Optional[Dict[int, Any]], vi64: bool
     try:
         inner = MOQTMessage._extensions_decode(
             Buffer(data=raw, vi64=vi64), with_length=False,
-            buf_end=len(raw), delta=True, lenient=False) or {}
+            buf_end=len(raw), lenient=False) or {}
     except (BufferReadError, RuntimeError, ValueError):
         # Unreachable for a reply the codec accepted (§12.7 check).
         return merged, None, frozenset(dups)
@@ -539,7 +538,7 @@ class _Subscription:
         self.location_filter = None
         self.group_order = None
         # Subscriber's OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT in ms (§8);
-        # 0 sets none. d14/d16 DELIVERY_TIMEOUT is the object timeout.
+        # 0 sets none. d16 DELIVERY_TIMEOUT is the object timeout.
         self.object_timeout = 0
         self.subgroup_timeout = 0
         # Request whose Forward State a REQUEST_UPDATE has set.
@@ -631,8 +630,6 @@ class _Subscription:
 class PublishedTrack(Track):
     """Publisher-side track — announces namespace/track and generates data.
 
-    Handles both d14 (SUBSCRIBE) and d16 (REQUEST_UPDATE) flows.
-
     Two ways to make content. Override produce() to number objects once
     into a delivery the track spreads across every peer: fan-out is then
     `add_session()` plus `publish(session=…)`, with nothing in produce()
@@ -646,8 +643,8 @@ class PublishedTrack(Track):
     `track_properties` and `immutable_properties` ({type: int for even
     types, bytes for odd}) travel as the Track's Properties, the latter
     inside Immutable Properties (0x0B), in PUBLISH, SUBSCRIBE_OK and
-    FETCH_OK from d16, and in the TRACK_STATUS reply from d18; d14
-    carries no Track Properties. A type may appear in only one of them.
+    FETCH_OK, and in the TRACK_STATUS reply from d18. A type may appear
+    in only one of them.
 
     `timestamps` sets the generated objects' timing properties: 'loc'
     (LOC TIMESTAMP 0x10, the default), 'frindell'
@@ -661,7 +658,7 @@ class PublishedTrack(Track):
     def _withdraw_namespace(self, session) -> None:
         """Release the namespace at teardown so the relay cleans up.
 
-        d14/d16 send PUBLISH_NAMESPACE_DONE; d18 resets the announce's
+        d16 sends PUBLISH_NAMESPACE_DONE; d18 resets the announce's
         request stream instead. publish_namespace_done() picks the right
         one for the negotiated draft.
         """
@@ -1112,8 +1109,6 @@ class PublishedTrack(Track):
 
     def _track_properties(self, session) -> Optional[Dict[int, bytes]]:
         """The Track Properties this track's replies carry on `session`."""
-        if not session._profile.track_properties:
-            return None
         props = dict(self.track_properties or ())
         props.update(self._timing_properties(session._profile.vi64))
         if self.object_delivery_timeout:
@@ -1123,7 +1118,7 @@ class PublishedTrack(Track):
         if self.immutable_properties:
             buf = Buffer(capacity=BUF_SIZE, vi64=session._profile.vi64)
             MOQTMessage._extensions_encode(buf, self.immutable_properties,
-                                           with_length=False, delta=True)
+                                           with_length=False)
             props[MOQTMessage.IMMUTABLE_PROPERTIES] = buf.data_slice(
                 0, buf.tell())
         return props or None
@@ -1145,9 +1140,8 @@ class PublishedTrack(Track):
 
     def _stamper(self, session) -> Optional[Callable]:
         """Per-object properties for generated objects; None stamps LOC
-        TIMESTAMP inline, as on d14, which carries no Track Properties."""
-        if (self.timestamps == 'loc'
-                or not session._profile.track_properties):
+        TIMESTAMP inline."""
+        if self.timestamps == 'loc':
             return None
         return self._timestamp_writer().stamp
 
@@ -1185,7 +1179,7 @@ class PublishedTrack(Track):
             namespace; relay routes unknown SUBSCRIBEs to this publisher.
 
           announce_namespace=True, publish_track=True  (hybrid):
-            Rare; some relays want both. Breaks on CF d14 moq-rs.
+            Rare; some relays want both.
 
         Args:
           forward: initial Forward State in PUBLISH (§9.13). 0 (default):
@@ -1272,7 +1266,7 @@ class PublishedTrack(Track):
                     self._await_publish_reply(pub_msg.request_id, sub))
             # Optimistic mode: don't wait for PUBLISH_OK before generating.
             # The relay may RESET our streams or downshift to forward=0;
-            # both are handled by existing reset / SUBSCRIBE_UPDATE paths.
+            # both are handled by existing reset / REQUEST_UPDATE paths.
             if forward:
                 asyncio.create_task(
                     self._start_generating(sess, "OPTIMISTIC"))
@@ -1462,17 +1456,6 @@ class PublishedTrack(Track):
             if resumed:
                 self._resume_lane(sub)
 
-    async def _on_subscribe_update(self, session, msg):
-        """SUBSCRIBE_UPDATE — subscriber changed forward state."""
-        sub = self._sub_for(session)
-        logger.info(f"Track: SUBSCRIBE_UPDATE: forward={msg.forward}")
-        resumed = bool(msg.forward) and not sub.forward
-        self._set_forward(sub, msg.forward)
-        if sub.forward:
-            await self._start_generating(session, "SUBSCRIBE_UPDATE")
-            if resumed:
-                self._resume_lane(sub)
-
     async def _on_subscribe(self, session, msg):
         """Relay forwarded a subscriber's SUBSCRIBE."""
         sub = self._sub_for(session)
@@ -1591,10 +1574,7 @@ class PublishedTrack(Track):
 
     async def _on_track_status(self, session, msg) -> None:
         """TRACK_STATUS (§10.14): the SUBSCRIBE_OK this track would send,
-        as a REQUEST_OK that ends the request; TRACK_STATUS_OK at d14."""
-        if not is_draft16_or_later(session.negotiated_draft):
-            session._d14_track_status_ok(msg.request_id, self._largest)
-            return
+        as a REQUEST_OK that ends the request."""
         params = ({} if self._largest is None
                   else _largest_object_param(session, self._largest))
         session._send_reply(msg.request_id,
@@ -1683,8 +1663,6 @@ class PublishedTrack(Track):
             descending=order == GroupOrder.DESCENDING,
             lost_marker=(FETCH_FLAGS_END_TIMED_OUT if timed_out
                          else FETCH_FLAGS_END_UNKNOWN))
-        if not is_draft16_or_later(session.negotiated_draft):
-            objects = [o for o in objects if o.end_of_range is None]
         ended = self._done and last == self._largest
         session.fetch_ok(request_id=rid, end_of_track=int(ended),
                          largest_group_id=end[0], largest_object_id=end[1],
@@ -1802,9 +1780,9 @@ class PublishedTrack(Track):
         """
         from .messages import SubscribeDone
         sub = self._sub_for(session)
-        # d14 carries the relay's SUBSCRIBE request_id; d16's REQUEST_
-        # UPDATE flow has none, so fall back to our own PUBLISH
-        # request_id. None means no request was assigned; 0 is valid.
+        # A REQUEST_UPDATE flow has no SUBSCRIBE request_id, so fall back
+        # to our own PUBLISH request_id. None means no request was
+        # assigned; 0 is valid.
         req_id = sub.subscribe_request_id
         if req_id is None:
             req_id = sub.request_id
@@ -2383,7 +2361,7 @@ class SubscribedTrack(Track):
             timeout: seconds to wait for PUBLISH announcement
             forward: forwarding preference (1=send objects, 0=hold)
             subscribe_options: d16 only — 0=PUBLISH, 1=NAMESPACE, 2=both
-            filter_type: d14/d16 §9.7 — LATEST_OBJECT (live forward),
+            filter_type: d16 §9.7 — LATEST_OBJECT (live forward),
                 NEXT_GROUP_START (skip current group), ABSOLUTE_START,
                 ABSOLUTE_RANGE.
             start_group, start_object: Start Location for ABSOLUTE_START
@@ -2438,7 +2416,7 @@ class SubscribedTrack(Track):
 
         # Namespace-based discovery. Two shapes:
         #
-        #   d14/d16 — SUBSCRIBE_NAMESPACE alone; the relay pushes a
+        #   d16     — SUBSCRIBE_NAMESPACE alone; the relay pushes a
         #     PUBLISH for every track under the prefix.
         #   d18     — SUBSCRIBE_NAMESPACE reports NAMESPACEs under the
         #     prefix, then SUBSCRIBE_TRACKS asks one namespace for its

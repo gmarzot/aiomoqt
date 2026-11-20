@@ -366,9 +366,9 @@ async def test_a_whole_group_fetch_of_an_evicted_group_completes(use_quic,
 
 @requires_certs
 @_TRANSPORTS
-@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+@pytest.mark.parametrize("draft", [16, 18, 22])
 async def test_a_track_without_history_refuses_fetch(use_quic, draft):
-    port = _port(10 + [14, 16, 18, 22].index(draft), use_quic)
+    port = _port(10 + [16, 18, 22].index(draft), use_quic)
     async with _loopback(port, use_quic, prefill=0, draft=draft,
                          history=False) as (tracks, rx, _):
         assert tracks["video"]._history is None
@@ -479,12 +479,12 @@ def _fetch_stub(draft):
     return _Stub()
 
 
-@pytest.mark.parametrize("draft,served", [(14, 3), (16, 2), (18, 2),
+@pytest.mark.parametrize("draft,served", [(16, 2), (18, 2),
                                            (20, 2), (22, 2)])
 async def test_serve_fetch_drops_object_status_where_fetch_has_none(draft,
                                                                     served):
-    # d16+: Objects delivered by FETCH carry no Object Status, so a
-    # cached END_OF_GROUP is not one of them; d14 sends it.
+    # Objects delivered by FETCH carry no Object Status, so a cached
+    # END_OF_GROUP is not one of them.
     from aiomoqt.messages.data import FetchObject
     from aiomoqt.protocol import _MOQTSessionMixin
     from aiomoqt.types import ObjectStatus

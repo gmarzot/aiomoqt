@@ -513,6 +513,7 @@
   "": [
    "object"
   ],
+  ".moq_fabric": [],
   ".generated": [
    "float"
   ],

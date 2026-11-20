@@ -61,7 +61,7 @@ def test_defers_while_write_stream_pending():
     assert len(s._pending_control_msgs) == 1     # deferred
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_pre_d18_send_without_stream_raises(draft):
     # Pre-d18 the control stream latches before any handler runs, so a
     # missing stream is a programming error — fail loudly at the call

@@ -101,7 +101,7 @@ def test_a_missing_or_malformed_file_is_an_error(tmp_path, capsys):
 @pytest.mark.skipif(not _DEPLOY_TOML.exists(), reason="no deploy tree")
 def test_the_deploy_config_loads():
     args = relay.parse_args(["--config", str(_DEPLOY_TOML)])
-    assert args.draft == [22, 20, 18, 16, 14]
+    assert args.draft == [22, 20, 18, 16]
     assert args.watchdog == 30.0
     assert args.status_dir == "/status" and args.log_dir == "/logs"
     assert args.control == "/status/control.sock"

@@ -27,7 +27,6 @@ def _reset():
     relay._tracks.clear()
     relay._track_subs.clear()
     relay._ns_subs.clear()
-    relay._announce_subs.clear()
 
 
 def _client(port, use_quic, draft):

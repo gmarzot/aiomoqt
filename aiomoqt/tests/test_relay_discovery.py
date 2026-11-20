@@ -3,9 +3,7 @@
 d18 splits discovery in two: SUBSCRIBE_NAMESPACE reports the NAMESPACEs
 under a prefix, then SUBSCRIBE_TRACKS asks one of them for its tracks.
 d16 answers with NAMESPACE, a PUBLISH per matching track, or both, as its
-Subscribe Options ask. d14 forwards PUBLISH_NAMESPACE and a PUBLISH per
-matching track. The relay answered neither
-before — it acked and went silent, and a subscriber waited forever.
+Subscribe Options ask.
 """
 import asyncio
 import contextlib
@@ -19,7 +17,7 @@ from aiomoqt.messages.namespace import SubscribeNamespace
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
-from aiomoqt.types import D16MessageType, MOQTMessageType, MOQTRequestError
+from aiomoqt.types import D16MessageType, MOQTRequestError
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -57,7 +55,6 @@ def _clean_tables():
     relay._ns_subs.clear()
     relay._ns_offered.clear()
     relay._track_subs.clear()
-    relay._announce_subs.clear()
     yield
     relay._tracks.clear()
     relay._tracks.update(tracks)
@@ -67,7 +64,6 @@ def _clean_tables():
     relay._ns_subs.clear()
     relay._ns_offered.clear()
     relay._track_subs.clear()
-    relay._announce_subs.clear()
     relay._watch_session = watch
 
 
@@ -101,10 +97,10 @@ def test_d18_ignores_namespaces_outside_the_prefix():
     assert s._namespaces == []
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_pre_d18_registers_for_publish_fanout(draft):
-    # d14, and d16 with Subscribe Options PUBLISH (0): served by a PUBLISH
-    # per track, with no NAMESPACE.
+    # d16 with Subscribe Options PUBLISH (0): served by a PUBLISH per
+    # track, with no NAMESPACE.
     s = _session(draft)
     asyncio.run(relay._on_subscribe_namespace(s, _sub_ns((b"live",))))
     assert s._namespaces == []
@@ -224,12 +220,11 @@ async def test_d18_cancelled_announcement_retracts_its_namespace(use_quic):
 
 
 @requires_certs
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 @_TRANSPORTS
 async def test_namespace_done_withdraws_only_its_namespace(draft, use_quic):
-    # PUBLISH_NAMESPACE_DONE names the namespace at d14, only the request
-    # at d16.
-    port = _BASE_PORT + 10 + 2 * (draft - 14) + (not use_quic)
+    # PUBLISH_NAMESPACE_DONE names only the request.
+    port = _BASE_PORT + 10 + 2 * (draft - 16) + (not use_quic)
     async with _relay(port, use_quic, draft) as (pub, sub):
         for ns in ("wd/a", "wd/b"):
             _Pub(pub, ns, "video").attach()
@@ -289,42 +284,6 @@ async def test_d16_namespace_option_reports_and_retracts(use_quic):
             "NAMESPACE", (b"b",))
         pub.publish_namespace_done(namespace="wd/a")
         assert await asyncio.wait_for(seen.get(), 5.0) == ("DONE", (b"a",))
-        await asyncio.sleep(0.1)
-        assert seen.empty()
-
-
-@requires_certs
-@_TRANSPORTS
-async def test_d14_forwards_publish_namespace_and_its_withdrawal(
-        use_quic, monkeypatch):
-    monkeypatch.setattr(relay, "_watch_session", _WATCH_SESSION)
-    seen: asyncio.Queue = asyncio.Queue()
-
-    async def _announce(session, msg):
-        session.publish_namespace_ok(msg)
-        await seen.put(("ANNOUNCE", tuple(msg.namespace)))
-
-    async def _done(session, msg):
-        await seen.put(("DONE", tuple(msg.namespace)))
-
-    async with _relay(_BASE_PORT + 40 + (not use_quic), use_quic, 14) as (
-            pub, sub):
-        sub.register_handler(MOQTMessageType.PUBLISH_NAMESPACE, _announce)
-        sub.register_handler(MOQTMessageType.PUBLISH_NAMESPACE_DONE, _done)
-        await pub.publish_namespace(namespace="wd/a", wait_response=True)
-        await sub.subscribe_namespace("wd", wait_response=True)
-        assert await asyncio.wait_for(seen.get(), 5.0) == (
-            "ANNOUNCE", (b"wd", b"a"))
-        await pub.publish_namespace(namespace="wd/b", wait_response=True)
-        assert await asyncio.wait_for(seen.get(), 5.0) == (
-            "ANNOUNCE", (b"wd", b"b"))
-        pub.publish_namespace_done(namespace="wd/a")
-        assert await asyncio.wait_for(seen.get(), 5.0) == (
-            "DONE", (b"wd", b"a"))
-        # The publisher's session ending withdraws what it still holds.
-        pub.close()
-        assert await asyncio.wait_for(seen.get(), 5.0) == (
-            "DONE", (b"wd", b"b"))
         await asyncio.sleep(0.1)
         assert seen.empty()
 

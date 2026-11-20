@@ -22,16 +22,15 @@ Do not reach into `_MOQTSessionMixin` or the other `_`-prefixed classes in `prot
 
 ## Drafts
 
-MoQT drafts 14, 16, 18, 20 and 22 are supported; odd-numbered drafts are not. Draft 14 is
-deprecated and will be removed in 0.15.0. Draft numbers are
+MoQT drafts 16, 18, 20 and 22 are supported; odd-numbered drafts are not. Draft numbers are
 plain ints (`draft=18`, `supported_drafts=[18, 16]`). Clients offer newest-first
-`MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)` unless told otherwise; tools take `--draft`.
+`MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16)` unless told otherwise; tools take `--draft`.
 
 ## CLI tools
 
 Console scripts: `moq-pub-bench`, `moq-sub-bench`, `moq-loopback-bench`, `moq-adaptive-bench`,
-`moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-peer-probe` (a leaf node on a
-moq-fabric mesh), `moq-peer-bench` (sends and measures a track through one),
+`moq-pub-server`, `moq-load-sim`, `moq-relay-probe`, `moq-fabric-probe` (a leaf node on a
+moq-fabric mesh), `moq-fabric-bench` (sends and measures a track through one),
 `moq-interop-client`, `moq-interop-relay`, `aiomoqt-versions`. Others run as
 modules: `python -m aiomoqt.tools.pub_media` / `sub_media` (MSF media; `sub_media -Q/-W` listens
 for a publisher that dials it with `--pub-ns`; `--ts --msfts` and
@@ -53,7 +52,7 @@ Levels: ERROR, WARNING, INFO (one line per session event and control message), D
 views, transport plumbing, per-stream lifecycle; bounded however many objects flow) and TRACE
 (`aiomoqt.utils.logger.TRACE`, 5: per object, per chunk, per datagram, wire hex). Category
 loggers, stable names: `aiomoqt.control`, `aiomoqt.data`, `aiomoqt.fetch`, `aiomoqt.transport`,
-`aiomoqt.relay`, `aiomoqt.peering`; other lines use module loggers (`aiomoqt.protocol`, ...).
+`aiomoqt.relay`, `aiomoqt.moq_fabric`; other lines use module loggers (`aiomoqt.protocol`, ...).
 aiomoqt loggers do not propagate to the root logger: attach a handler with
 `aiomoqt.utils.logger.set_log_handler()`.
 

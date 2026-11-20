@@ -3,17 +3,8 @@ import re
 from enum import IntEnum
 from typing import Dict, Tuple
 
-MOQT_VERSION_DRAFT14 = 0xff00000e
 MOQT_VERSION_DRAFT16 = 0xff000010
 MOQT_VERSION_DRAFT18 = 0xff000012
-
-# Legacy d14 in-band offer list (CLIENT_SETUP versions[]). d16+ negotiate
-# out-of-band via ALPN / WT-Protocol, so d18 is intentionally NOT added
-# here — the set of drafts we can speak is MOQTDraft, below.
-MOQT_VERSIONS = [
-    MOQT_VERSION_DRAFT14,
-    MOQT_VERSION_DRAFT16,
-]
 
 
 class MOQTDraft(IntEnum):
@@ -22,7 +13,6 @@ class MOQTDraft(IntEnum):
     kwarg). The IETF wire code is MOQT_VERSION_DRAFT*; the ALPN is
     moqt_alpn_for_version().
     """
-    DRAFT_14 = 14
     DRAFT_16 = 16
     DRAFT_18 = 18
     DRAFT_20 = 20
@@ -31,27 +21,20 @@ class MOQTDraft(IntEnum):
 
 # What a client offers and a server accepts when supported_drafts is None,
 # newest first.
-MOQT_DEFAULT_DRAFTS: Tuple[int, ...] = (22, 20, 18, 16, 14)
+MOQT_DEFAULT_DRAFTS: Tuple[int, ...] = (22, 20, 18, 16)
 
 
-# ALPN: draft-14 uses legacy "moq-00"; draft-16+ uses "moqt-NN"
-MOQT_ALPN_LEGACY = "moq-00"
-MOQT_ALPN_DRAFT14 = "moq-00"
+# ALPN: "moqt-NN"
 MOQT_ALPN_DRAFT16 = "moqt-16"
-MOQT_ALPN = MOQT_ALPN_LEGACY  # default for backward compat
 
 def moqt_alpn_for_version(version: int) -> str:
     """Return the ALPN string for a given MoQT draft version."""
     from .context import get_major_version
     major = get_major_version(version)
-    if major <= 14:
-        return MOQT_ALPN_LEGACY
     return f"moqt-{major}"
 
 def moqt_version_from_alpn(alpn: str) -> int:
     """Return the MoQT version code from an ALPN string."""
-    if alpn == MOQT_ALPN_LEGACY:
-        return MOQT_VERSION_DRAFT14
     if alpn.startswith("moqt-"):
         draft_num = int(alpn[5:])
         return 0xff000000 + draft_num
@@ -62,7 +45,7 @@ def moqt_version_from_draft(draft: int) -> int:
     """Map a human draft number (e.g. 16) to its IETF version code
     (e.g. 0xff000010 = MOQT_VERSION_DRAFT16).
 
-    The public aiomoqt API takes draft numbers (14, 16, 18...). This
+    The public aiomoqt API takes draft numbers (16, 18, ...). This
     helper performs the normalization to the wire-level IETF code at
     the API boundary so internal modules (ALPN encoding, CLIENT_SETUP,
     context tracking) can speak a single form.
@@ -71,8 +54,6 @@ def moqt_version_from_draft(draft: int) -> int:
     callers passing the full hex form like 0xff000010 hit this) or
     if the draft number is not one aiomoqt knows how to speak.
     """
-    # The set of drafts we can speak is MOQTDraft (not MOQT_VERSIONS,
-    # which is only the legacy d14 in-band offer list).
     supported = sorted(int(d) for d in MOQTDraft)
     if not isinstance(draft, int) or draft < 0 or draft > 0xff:
         raise ValueError(
@@ -99,7 +80,7 @@ def parse_draft_spec(s: str):
 
         '16'        -> 16            (pin: offer only that ALPN)
         'draft-16'  -> 16            (the interop registry spelling)
-        '18,16,14'  -> [18, 16, 14]  (offer the set, in preference order)
+        '20,18,16'  -> [20, 18, 16]  (offer the set, in preference order)
 
     The result is passed straight to ``MOQTClient`` / ``MOQTServer``'s
     ``supported_drafts`` (which accepts an int or an ordered list). Order
@@ -131,18 +112,18 @@ def normalize_supported_drafts(supported_drafts) -> list:
       - None        → MOQT_DEFAULT_DRAFTS, newest first (the "auto"
                        offer)
       - int         → a single draft number, e.g. 16 → [16]
-      - list[int]   → several draft numbers, e.g. [16, 14]; the caller's
+      - list[int]   → several draft numbers, e.g. [18, 16]; the caller's
                       order is preserved (deduped), so a caller can put a
                       relay's preferred draft first — some relays select
                       the first offered ALPN rather than the highest mutual.
 
     Drafts stay as representation-independent ints throughout the
-    codebase; the wire forms (the moq-00 / moqt-16 ALPN and the
+    codebase; the wire forms (the moqt-NN ALPN and the
     0xff0000NN IETF version code) are only translated when building or
-    parsing wire SETUP / ALPN. Each entry is validated via
+    parsing ALPN. Each entry is validated via
     moqt_version_from_draft (so the full hex form or an unknown draft
     raises ValueError at the API boundary). The resulting order is the
-    order ALPN / CLIENT_SETUP / WT-Available-Protocols offer versions in.
+    order ALPN / WT-Available-Protocols offer versions in.
     """
     if supported_drafts is None:
         return list(MOQT_DEFAULT_DRAFTS)
@@ -173,15 +154,13 @@ class MOQTMessageType(IntEnum):
     """MOQT message type constants.
 
     Code points shared across drafts are listed once.
-    Draft-14-only and draft-16-only types are annotated.
-    Some code points are reused between drafts (e.g. 0x05, 0x07, 0x08, 0x0E).
-    The correct interpretation depends on the negotiated version.
+    Some names predate their draft-16 meaning (see D16MessageType): the
+    per-draft CONTROL_REGISTRY maps a code point to its message.
     """
-    # -- Common (same semantics in both drafts) --
     CLIENT_SETUP = 0x20
     SERVER_SETUP = 0x21
     SETUP = 0x2F00  # d18: symmetric SETUP; also the control uni-stream type
-    SUBSCRIBE_UPDATE = 0x02  # d14: SUBSCRIBE_UPDATE; d16: REQUEST_UPDATE (same code point)
+    SUBSCRIBE_UPDATE = 0x02         # REQUEST_UPDATE
     SUBSCRIBE = 0x03
     SUBSCRIBE_OK = 0x04
     PUBLISH_NAMESPACE = 0x06
@@ -200,41 +179,35 @@ class MOQTMessageType(IntEnum):
     PUBLISH = 0x1D
     PUBLISH_OK = 0x1E
 
-    # -- Draft-14 only (removed or repurposed in draft-16) --
-    SUBSCRIBE_ERROR = 0x05          # d16: repurposed as REQUEST_ERROR
-    PUBLISH_NAMESPACE_OK = 0x07     # d16: repurposed as REQUEST_OK
-    PUBLISH_NAMESPACE_ERROR = 0x08  # d16: repurposed as NAMESPACE
-    TRACK_STATUS_OK = 0x0E          # d16: repurposed as NAMESPACE_DONE
-    TRACK_STATUS_ERROR = 0x0F       # d16: removed
-    SUBSCRIBE_NAMESPACE_OK = 0x12   # d16: removed
-    SUBSCRIBE_NAMESPACE_ERROR = 0x13  # d16: removed
-    UNSUBSCRIBE_NAMESPACE = 0x14    # d16: removed
-    FETCH_ERROR = 0x19              # d16: removed
-    PUBLISH_ERROR = 0x1F            # d16: removed (use REQUEST_ERROR)
+    SUBSCRIBE_ERROR = 0x05          # REQUEST_ERROR
+    PUBLISH_NAMESPACE_OK = 0x07     # REQUEST_OK
+    PUBLISH_NAMESPACE_ERROR = 0x08  # NAMESPACE
+    TRACK_STATUS_OK = 0x0E          # NAMESPACE_DONE
+    # Undefined from d16; CONTROL_REGISTRY refuses them by draft.
+    TRACK_STATUS_ERROR = 0x0F
+    SUBSCRIBE_NAMESPACE_OK = 0x12
+    SUBSCRIBE_NAMESPACE_ERROR = 0x13
+    UNSUBSCRIBE_NAMESPACE = 0x14
+    FETCH_ERROR = 0x19
+    PUBLISH_ERROR = 0x1F
 
-    # -- Draft-16 aliases (same code points, different semantics) --
-    # These are aliases for the code points above, for clarity in d16 code paths.
-    # Python IntEnum doesn't allow duplicate values, so we use class-level constants.
 
-# Draft-16 message type aliases (same numeric values, different semantics)
-# Use these in d16 code paths for clarity.
 class D16MessageType:
-    """Draft-16 message type aliases for repurposed code points."""
-    REQUEST_UPDATE = 0x02       # was SUBSCRIBE_UPDATE
-    REQUEST_ERROR = 0x05        # was SUBSCRIBE_ERROR
-    REQUEST_OK = 0x07           # was PUBLISH_NAMESPACE_OK
-    NAMESPACE = 0x08            # was PUBLISH_NAMESPACE_ERROR
-    NAMESPACE_DONE = 0x0E       # was TRACK_STATUS_OK
+    """Draft-16 names for the code points of MOQTMessageType they share."""
+    REQUEST_UPDATE = 0x02
+    REQUEST_ERROR = 0x05
+    REQUEST_OK = 0x07
+    NAMESPACE = 0x08
+    NAMESPACE_DONE = 0x0E
 
 
 class D18MessageType:
     """Draft-18 message type code points that are new or renumbered.
-    Kept separate from MOQTMessageType because PUBLISH_BLOCKED reuses the
-    d14 TRACK_STATUS_ERROR point (0x0F); per-draft CONTROL_REGISTRY tables
+    Kept separate from MOQTMessageType; per-draft CONTROL_REGISTRY tables
     disambiguate by the negotiated draft."""
-    SUBSCRIBE_NAMESPACE = 0x50  # was 0x11 in d14/d16
+    SUBSCRIBE_NAMESPACE = 0x50  # 0x11 at d16
     SUBSCRIBE_TRACKS = 0x51     # new in d18
-    PUBLISH_BLOCKED = 0x0F      # new in d18 (d14 TRACK_STATUS_ERROR point)
+    PUBLISH_BLOCKED = 0x0F      # new in d18
 
 
 class D20MessageType:
@@ -255,7 +228,7 @@ HANDLER_ALIASES: Dict[int, Tuple[int, ...]] = {
 
 
 # Control message types each draft defines, transcribed from the message
-# type registry table in each specification (d14 §9.2, d16 §9.2, d18
+# type registry table in each specification (d16 §9.2, d18
 # §10.2, d20 §10.2, d22 §9 Table 5). Sending a type absent from the
 # negotiated draft's table is a wire violation: the peer sees an unknown
 # control message and closes the session with PROTOCOL_VIOLATION.
@@ -275,11 +248,6 @@ _D20_CONTROL_TYPES = frozenset({
     0x06, 0x50, 0x51, 0x08, 0x0E, 0x0F, 0x02, 0x07, 0x05,
 })
 CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
-    14: frozenset({
-        0x20, 0x21, 0x10, 0x15, 0x1A, 0x03, 0x04, 0x05, 0x02, 0x0A,
-        0x0B, 0x1D, 0x1E, 0x1F, 0x16, 0x18, 0x19, 0x17, 0x0D, 0x0E,
-        0x0F, 0x06, 0x07, 0x08, 0x09, 0x0C, 0x11, 0x12, 0x13, 0x14,
-    }),
     16: frozenset({
         0x20, 0x21, 0x10, 0x15, 0x1A, 0x07, 0x05, 0x03, 0x04, 0x02,
         0x0A, 0x1D, 0x1E, 0x0B, 0x16, 0x18, 0x17, 0x0D, 0x06, 0x08,
@@ -298,7 +266,6 @@ CONTROL_MESSAGE_TYPES: Dict[int, frozenset] = {
 # PUBLISH_OK 0x1E -> REQUEST_OK 0x07. Every draft has a row.
 _D18_RENUMBERED = {0x11: 0x50, 0x1E: 0x07}
 WIRE_TYPE_BY_DRAFT: Dict[int, Dict[int, int]] = {
-    14: {},
     16: {},
     18: _D18_RENUMBERED,
     20: _D18_RENUMBERED,
@@ -344,12 +311,12 @@ class ParamType(IntEnum):
 class SetupParamType(IntEnum):
     """Setup Parameter type constants"""
     PATH = 0x01  # only relevant to raw QUIC connection
-    MAX_REQUEST_ID = 0x02       # d14/d16 only
+    MAX_REQUEST_ID = 0x02       # d16 only
     AUTH_TOKEN = 0x03
     MAX_AUTH_TOKEN_CACHE_SIZE = 0x04
     AUTHORITY = 0x05
     MAX_FILTER_RANGES = 0x06    # d20+
-    IMPLEMENTATION = 0x07  # Wrong in draft 14, draft-15 fixed it to this value
+    IMPLEMENTATION = 0x07
     MAX_REQUEST_UPDATES = 0x08  # d20+
     GREASE_1_PARAM = 0x77
     GREASE_2_PARAM = 0x92
@@ -400,33 +367,21 @@ class AuthTokenType(IntEnum):
     OUT_OF_BAND = 0x0
 
 
-class SubscribeErrorCode(IntEnum):
-    """SUBSCRIBE_ERROR error codes (draft-14)."""
-    INTERNAL_ERROR = 0x0
-    UNAUTHORIZED = 0x01
-    TIMEOUT = 0x02
-    NOT_SUPPORTED = 0x03
-    TRACK_DOES_NOT_EXIST = 0x04
-    INVALID_RANGE = 0x05
-    MALFORMED_AUTH_TOKEN = 0x10
-    EXPIRED_AUTH_TOKEN = 0x12
-
-
 class RequestErrorCode(IntEnum):
     """REQUEST_ERROR error codes (draft-16 unified)."""
     INTERNAL_ERROR = 0x0
     UNAUTHORIZED = 0x01
     TIMEOUT = 0x02
     NOT_SUPPORTED = 0x03
-    MALFORMED_AUTH_TOKEN = 0x04   # was 0x10 in d14
-    EXPIRED_AUTH_TOKEN = 0x05     # was 0x12 in d14
+    MALFORMED_AUTH_TOKEN = 0x04
+    EXPIRED_AUTH_TOKEN = 0x05
     GOING_AWAY = 0x06             # d18
     EXCESSIVE_LOAD = 0x09         # d18
-    DOES_NOT_EXIST = 0x10         # was 0x04 (TRACK_DOES_NOT_EXIST) in d14
-    INVALID_RANGE = 0x11          # was 0x05 in d14
+    DOES_NOT_EXIST = 0x10
+    INVALID_RANGE = 0x11
     MALFORMED_TRACK = 0x12
     DUPLICATE_SUBSCRIPTION = 0x19
-    UNINTERESTED = 0x20           # was 0x04 in PublishErrorCode d14
+    UNINTERESTED = 0x20
     PREFIX_OVERLAP = 0x30
     NAMESPACE_TOO_LARGE = 0x31    # d18
     INVALID_JOINING_REQUEST_ID = 0x32
@@ -448,7 +403,7 @@ class SubscribeDoneCode(IntEnum):
     GOING_AWAY = 0x04
     EXPIRED = 0x05
     TOO_FAR_BEHIND = 0x06
-    MALFORMED_TRACK = 0x12        # 0x07 at d14
+    MALFORMED_TRACK = 0x12
     UPDATE_FAILED = 0x08          # d16+
     EXCESSIVE_LOAD = 0x09         # d18
 
@@ -533,7 +488,7 @@ class GroupOrder(IntEnum):
 class ObjectStatus(IntEnum):
     """Object status codes."""
     NORMAL = 0x0
-    DOES_NOT_EXIST = 0x01  # draft-14 only; removed in draft-16
+    DOES_NOT_EXIST = 0x01  # undefined at every supported draft; refused on receive
     END_OF_GROUP = 0x03
     END_OF_TRACK = 0x04
 
@@ -560,15 +515,6 @@ class FetchType(IntEnum):
     JOINING_FETCH = 0x02
 
 
-class PublishErrorCode(IntEnum):
-    """PUBLISH_ERROR error codes."""
-    INTERNAL_ERROR = 0x0
-    UNAUTHORIZED = 0x01
-    TIMEOUT = 0x02
-    NOT_SUPPORTED = 0x03
-    UNINTERESTED = 0x04
-
-
 class DataStreamType(IntEnum):
     """Stream type identifiers."""
     FETCH_HEADER = 0x05
@@ -580,18 +526,15 @@ PADDING_STREAM_TYPE = 0x132B3E28
 PADDING_DATAGRAM_TYPE = 0x132B3E29
 
 
-# Draft-14 SubgroupHeader type range: 0x10-0x1D (12 valid types, 0x16-0x17 reserved)
+# SubgroupHeader type base: 0x10-0x1D (12 valid types, 0x16-0x17 reserved)
 # Bits: 0=extensions_present, 1-2=subgroup_id_mode, 3=end_of_group
 SUBGROUP_HEADER_BASE = 0x10
 SUBGROUP_ID_ZERO = 0        # subgroup_id = 0 (no field on wire)
 SUBGROUP_ID_FIRST_OBJ = 1   # subgroup_id = first object's ID (no field on wire)
 SUBGROUP_ID_EXPLICIT = 2    # subgroup_id present on wire
 
-# Draft-14 ObjectDatagram type range: 0x00-0x07 (payload), 0x20-0x21 (status)
-# Payload types bits: 0=extensions, 1=end_of_group, 2=no_object_id
-# Status types bits: 0=extensions
+# ObjectDatagram type base. Bits: 0=extensions, 1=end_of_group, 2=no_object_id
 OBJECT_DATAGRAM_BASE = 0x00
-OBJECT_DATAGRAM_STATUS_BASE = 0x20
 
 # Draft-16 adds DEFAULT_PRIORITY bit (0x20) to subgroup and datagram types.
 # When set, Publisher Priority field is omitted (inherited from Track Extension).
@@ -634,9 +577,7 @@ class MOQTStreamStopped(asyncio.CancelledError):
 class MOQTRequestError(Exception):
     """Raised when a MoQT request receives an error response.
 
-    Works for both draft-14 (SubscribeError, PublishError, etc.) and
-    draft-16 (RequestError). User code catches this without needing
-    to know the draft version.
+    User code catches this without needing to know the draft version.
     """
     def __init__(self, error_code: int, reason: str = "",
                  retry_interval: int = 0, response=None):

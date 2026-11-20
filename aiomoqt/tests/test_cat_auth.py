@@ -136,7 +136,7 @@ def test_secret_stays_out_of_repr():
 
 
 @pytest.mark.parametrize("draft, message", [
-    (16, ClientSetup(versions=[], parameters={
+    (16, ClientSetup(parameters={
         SetupParamType.AUTH_TOKEN: AUTH.mint()})),
     (18, Setup(options={SetupParamType.AUTH_TOKEN: AUTH.mint()})),
 ], ids=["client-setup", "setup"])
@@ -200,7 +200,7 @@ def test_cli_bad_key_exits(monkeypatch):
 
 
 _BASE_PORT = 20700
-_DRAFTS = [14, 16, 18, 20, 22]
+_DRAFTS = [16, 18, 20, 22]
 
 
 def _client(port, draft, use_quic, auth=None):
