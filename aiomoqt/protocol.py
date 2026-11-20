@@ -146,6 +146,10 @@ PEER_REQUEST_SEEN_CAP = 4096
 # base class for client and server session objects
 class MOQTPeer:
     """MOQT client and server base-class."""
+    # From d20, admit several SUBSCRIBEs to one track per session (§3.1);
+    # False refuses a second with NOT_SUPPORTED.
+    _concurrent_subscribes = True
+
     def __init__(self, libquicr_compat: bool = False,
                  tx_max_inflight_bytes: Optional[int] =
                      DEFAULT_TX_MAX_INFLIGHT_BYTES,
@@ -4749,11 +4753,16 @@ class _MOQTSessionMixin:
             key = (ns, bytes(msg.track_name or b""))
             # From d20 a session may hold several subscriptions to a track
             # (§3.1); before, a second is DUPLICATE_SUBSCRIPTION (§5.1).
-            if not d20 and (kind, key) in self._peer_requests.values():
-                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+            single = not d20 or not getattr(
+                getattr(self, '_session', None), '_concurrent_subscribes',
+                True)
+            duplicate = (RequestErrorCode.NOT_SUPPORTED if d20
+                         else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
+            if single and (kind, key) in self._peer_requests.values():
+                code = duplicate
                 reason = "track already subscribed in this session"
-            elif not d20 and self._publishing(key):
-                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
+            elif single and self._publishing(key):
+                code = duplicate
                 reason = "our PUBLISH of the track holds its subscription"
         elif kind in (SubscribeNamespace, SubscribeTracks):
             key = ns

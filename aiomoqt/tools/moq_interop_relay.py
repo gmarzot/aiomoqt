@@ -6303,6 +6303,8 @@ def _build_server(bind, port, cert, key, use_quic, draft, **transport):
         **transport,
     )
     server.stream_scheduling = STREAM_SCHEDULING
+    # Downstream tables are per session: one subscription to a track each.
+    server._concurrent_subscribes = False
     server.register_handler(
         MOQTMessageType.PUBLISH_NAMESPACE, _answered(_on_publish_namespace))
     server.register_handler(

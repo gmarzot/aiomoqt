@@ -353,3 +353,46 @@ async def test_second_subscribe_refused_before_d20(draft, use_quic):
         for rx in (video, audio):
             assert await _grows(rx)
             rx.check()
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+@_D20
+async def test_relay_refuses_a_second_downstream_subscribe(draft, use_quic):
+    """aiomoqt-relay keeps one downstream subscription per track and
+    session: a second is NOT_SUPPORTED, and the first keeps flowing."""
+    from aiomoqt.tools import moq_interop_relay as relay
+    tables = (relay._announced, relay._tracks, relay._announce_requests,
+              relay._ns_subs, relay._track_subs)
+    for t in tables:
+        t.clear()
+    port = _port(6, draft, "generate", use_quic)
+    server = relay._build_server("localhost", port, CERT, KEY,
+                                 use_quic=use_quic, draft=draft)
+    handle = await server.serve()
+    pub = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                     verify_tls=False, supported_drafts=draft)
+    sub = MOQTClient("localhost", port, path="/", use_quic=use_quic,
+                     verify_tls=False, supported_drafts=draft)
+    try:
+        async with pub.connect() as ps, sub.connect() as ss:
+            await ps.client_session_init()
+            await ss.client_session_init()
+            for n in ("audio", "video"):
+                await _track(ps, n, "generate").publish(forward=1)
+            peer = _Peer()
+            peer.session = ss
+            _, audio = await peer.subscribe("audio")
+            _, video = await peer.subscribe("video")
+            assert await _until(lambda: len(video.objects) >= _MIN_OBJECTS)
+            with pytest.raises(MOQTRequestError) as err:
+                await peer.subscribe("video")
+            assert err.value.response is not None, "timed out, no reply"
+            assert err.value.error_code == RequestErrorCode.NOT_SUPPORTED
+            for rx in (video, audio):
+                assert await _grows(rx)
+                rx.check(whole=False)
+    finally:
+        handle.close()
+        for t in tables:
+            t.clear()
