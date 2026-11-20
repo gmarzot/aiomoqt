@@ -509,7 +509,7 @@ async def test_fabric_source_pulls_two_tracks_on_one_node():
     assert (await reply) is None
     seqs = [rec.body.seq for _, rec in wire.remote.subscribes.items()
             if rec.body.name == b"video"]
-    assert seqs == [(node._seq_base + 2) & 0xFFFF]   # ADV, WD, ADV
+    assert seqs == [3]                  # ADV 1, WD 2, ADV 3
     source.unsubscribe(video.request_id)
     assert not node.subscribed(NS, b"video")
     assert hv not in node._sinks and ha in node._sinks
@@ -535,8 +535,7 @@ def test_pull_binds_one_sink_per_track():
     node.unpull(NS, b"video")
     assert not node.subscribed(NS, b"video") and not node._sinks
     node.subscribe(NS, b"video")
-    assert node.originated_subscribes()[0].seq == (
-        node._seq_base + 2) & 0xFFFF
+    assert node.originated_subscribes()[0].seq == 3
 
 
 def test_relay_object_fields():

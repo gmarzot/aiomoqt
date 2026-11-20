@@ -3268,6 +3268,15 @@ class _MOQTSessionMixin:
             return
         elif isinstance(event, StreamReset):
             transport_log.debug(f"MOQT event: StreamReset: stream {event.stream_id}")
+            sid = event.stream_id
+            if (stream_is_unidirectional(sid)
+                    and sid != self._d18_control_read_sid
+                    and getattr(self._data_streams.get(sid), 'parser', None)
+                    is None):
+                # §9.9: no track can count it in a PUBLISH_DONE.
+                data_log.debug(f"stream({sid}): reset "
+                               f"(code {int(event.error_code or 0)}) before "
+                               f"its subgroup header")
             self._on_request_stream_terminated(event.stream_id)
             self._cleanup_stream(
                 event.stream_id, QuicErrorCode.APPLICATION_ERROR,
@@ -3726,6 +3735,59 @@ class _MOQTSessionMixin:
                 self.stream_reset(sid, StreamResetCode.CANCELLED)
                 raise
         return sid
+
+    def open_uni_stream_nowait(self, initial: bytes,
+                               priority: Optional[int] = None,
+                               chain: Optional[int] = None, order: int = 0,
+                               on_created=None) -> bool:
+        """Open a uni stream holding all of `initial` and end it, without
+        waiting: True once the transport has it, False, with nothing
+        sent, when it would have to wait. on_created(stream_id) gets the
+        id, 0 if the transport refused the stream; over WebTransport it
+        runs when the create's reply arrives."""
+        if not self._session_writable():
+            return False
+        if chain is not None and not _STREAM_CHAINS:
+            chain = None
+        if self._is_wt:
+            create = getattr(self, "create_stream_nowait", None)
+            if create is None or not _WT_CREATE_WITH_DATA:
+                return False
+            try:
+                if chain is not None:
+                    return create(bidir=False, initial=initial,
+                                  priority=priority, end_stream=True,
+                                  chain=chain, order=order,
+                                  on_created=on_created)
+                return create(bidir=False, initial=initial,
+                              priority=priority, end_stream=True,
+                              on_created=on_created)
+            except WebTransportError:
+                return False
+        quic = self._quic
+        if getattr(quic, 'closed', False):
+            return False
+        if priority is not None and not _RAW_WRITE_PRIORITY:
+            return False
+        cap = self._stream_ring_cap()
+        if ((cap and len(initial) > cap)
+                or quic.tx_event_ring_fill() > self.TX_RING_WAIT_AT):
+            return False
+        sid = quic.get_next_available_stream_id(is_unidirectional=True)
+        kw = {}
+        if priority is not None:
+            kw["priority"] = priority
+        if chain is not None:
+            kw["chain"], kw["order"] = chain, order
+        try:
+            quic.send_stream_data(sid, initial, True, **kw)
+        except (BufferError, AssertionError, AttributeError, ConnectionError):
+            # The id is spent: reset it so the peer does not hold it open.
+            self.stream_reset(sid, StreamResetCode.CANCELLED)
+            return False
+        if on_created is not None:
+            on_created(sid)
+        return True
 
     async def open_bidi_stream(self) -> int:
         """Open a bidirectional stream. Returns the stream ID."""
@@ -7452,6 +7514,10 @@ class _WTSessionMixin:
     """
 
     _is_wt = True
+
+    # Stream events are taken in _on_event; aiopquic's events() queue is
+    # never read, so it gets no per-stream entries.
+    queue_new_streams = False
 
     # The session itself; an attribute holding self would make each
     # session a reference cycle, freed only by a GC pass.

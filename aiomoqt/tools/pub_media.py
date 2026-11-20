@@ -230,6 +230,11 @@ def parse_args():
                         metavar='MS',
                         help='Catalog targetLatency (msf-01 §5.2.8) — '
                              'players size their playout buffer from it')
+    parser.add_argument('--delivery-timeout', type=int, default=0,
+                        metavar='MS',
+                        help='OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT of every '
+                             'media track, as Track Properties (MOQT §8); '
+                             '0 sets none. Default: 0')
     parser.add_argument('--loc01-compat', action='store_true',
                         help='Also emit timestamps under loc-01\'s '
                              'property id 0x02 for players not yet on '
@@ -381,6 +386,8 @@ def parse_args():
         parser.error('-t/--duration: seconds, or 0 for no limit')
     if args.duration == 0:
         args.duration = math.inf
+    if args.delivery_timeout < 0:
+        parser.error('--delivery-timeout: milliseconds, or 0 for none')
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
     if is_udp_url(args.ts):
@@ -994,6 +1001,18 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
             units, eof = dmx.close(), True
     for track in tracks.values():
         await track.finish()
+
+
+class _Publisher(FanoutPublisher):
+    """FanoutPublisher giving each media track the --delivery-timeout."""
+
+    delivery_timeout = 0
+
+    def add_track(self, track):
+        if self.delivery_timeout:
+            track.object_delivery_timeout = self.delivery_timeout
+            track.subgroup_delivery_timeout = self.delivery_timeout
+        return super().add_track(track)
 
 
 # --msfts: refuse a stream with no PAT and PMT in this many packets.
@@ -2146,8 +2165,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             if args.timestamp_mapping:
                 track.frindell = frindell
             return track
-        pub = FanoutPublisher(sessions, args.namespace,
-                              None if args.no_catalog else catalog)
+        pub = _Publisher(sessions, args.namespace,
+                         None if args.no_catalog else catalog)
+        pub.delivery_timeout = args.delivery_timeout
         stats = {}
         feeders = []
         if ingest is not None:

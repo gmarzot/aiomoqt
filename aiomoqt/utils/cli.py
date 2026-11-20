@@ -28,6 +28,7 @@ addressing
   --bind, -p/--port, --path      listener address. The path is shared by
                      both transports: WT CONNECT path / raw-QUIC PATH
                      setup parameter.
+  --cert --key       listener TLS (add_tls; also in peering)
   udp://[@][HOST]:PORT  MPEG-TS in or out (pub_media --ts, sub_media
                      --ts-out), not a MoQT address: no grid flag takes it.
 
@@ -216,13 +217,23 @@ def endpoint_url(value):
     return value
 
 
-def add_endpoint(p):
-    """Positional URL for tools that dial. Scheme picks the transport."""
-    p.add_argument('url', metavar='URL', type=endpoint_url,
+def _endpoint(p, nargs):
+    p.add_argument('url', metavar='URL', nargs=nargs, type=endpoint_url,
                    help='Endpoint. moqt://host[:port][/path] = raw QUIC; '
                         'https://host[:port][/path] = WebTransport; '
                         'host[:port] = WebTransport. The scheme selects '
                         'the transport.')
+
+
+def add_endpoint(p):
+    """Positional URL for tools that dial. Scheme picks the transport."""
+    _endpoint(p, None)
+
+
+def add_optional_endpoint(p):
+    """add_endpoint for tools that dial or listen: args.url may be None
+    (see check_url_vs_listener)."""
+    _endpoint(p, '?')
 
 
 def add_endpoints(p):
@@ -611,6 +622,11 @@ def add_peering_listener(p, port=PEERING_PORT):
                    help='Bind address (default: all interfaces, IPv4 and IPv6)')
     p.add_argument('-p', '--port', type=int, default=port,
                    help=f'Listen port; 0: do not listen (default: {port})')
+    add_tls(p)
+
+
+def add_tls(p):
+    """Listener certificate and key."""
     p.add_argument('--cert', type=str, default=None,
                    help='Listener TLS certificate (default: certs/cert.pem '
                         'in the source tree, else a generated self-signed '

@@ -53,7 +53,7 @@ async def test_a_probe_passes_through_a_live_relay(use_quic):
 @_TRANSPORTS
 async def test_a_probe_fails_when_the_relay_drops_objects(use_quic,
                                                           monkeypatch):
-    async def _drop(self, *args, **kwargs):
+    def _drop(self, *args, **kwargs):
         return None
     monkeypatch.setattr(relay._RelayedTrack, "_forward_one", _drop)
     port = _BASE_PORT + 2 + (not use_quic)

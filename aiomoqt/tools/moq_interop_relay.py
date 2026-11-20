@@ -53,6 +53,10 @@ Limits:
     LANE_BYTES, shedding with CANCELLED. Past the track's
     MAX_CACHE_DURATION an object is neither sent nor served from the
     cache: a request for it goes upstream.
+  * A subscriber's SUBGROUP_DELIVERY_TIMEOUT (§8, the smaller non-zero of
+    the publisher's and its own) resets with DELIVERY_TIMEOUT a subgroup
+    stream the transport has not released that long after its FIN. A
+    subscriber's delivery timeouts are not sent upstream (§10.2.3-10.2.4).
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
@@ -145,8 +149,8 @@ from aiomoqt.types import (
     parse_draft_spec, to_stream_priority,
 )
 from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
-                              properties_charge,
-                              retained_object_bytes)
+                              SubgroupTimer, properties_charge,
+                              retained_object_bytes, END_DUE)
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
@@ -161,7 +165,8 @@ from aiomoqt.messages.params import (RANGE_FILTERS, U64_MAX, D20ParamType,
 from aiomoqt.messages.publish import Publish, PublishError
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe, SubscribeOk
-from aiomoqt.track import (PublishedTrack, SubscribedTrack, _UNFILTERED,
+from aiomoqt.track import (SUBGROUP_DELIVERY_TIMEOUT, PublishedTrack,
+                           SubscribedTrack, _UNFILTERED,
                            _filter_window, _largest_object_param, _min_nonzero,
                            _location_window, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
@@ -654,8 +659,8 @@ class _Downstream:
     __slots__ = ("session", "alias", "request_id", "forward", "window",
                  "joined_at", "replaying", "location_filter", "group_order",
                  "fills", "range_params", "filters", "lane", "lost",
-                 "fence", "timeout", "objects_sent", "bytes_sent",
-                 "largest_sent")
+                 "fence", "timeout", "subgroup_timeout", "objects_sent",
+                 "bytes_sent", "largest_sent")
 
     def __init__(self, session, alias, request_id, forward=True,
                  window=_UNFILTERED):
@@ -689,20 +694,28 @@ class _Downstream:
         # The track's fence when it joined: its joining FETCH and fills
         # start after that group.
         self.fence = None
-        # Its OBJECT_DELIVERY_TIMEOUT in ms (§8); 0 sets none.
+        # Its OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT in ms (§8); 0 sets
+        # none.
         self.timeout = 0
+        self.subgroup_timeout = 0
         # What its lane sent, counted with --trace-subscribers.
         self.objects_sent = self.bytes_sent = 0
         self.largest_sent = None
 
     def take_timeout(self, params) -> bool:
-        """Record the OBJECT_DELIVERY_TIMEOUT a SUBSCRIBE or REQUEST_UPDATE
-        carries; absent keeps it. True when it changed."""
-        value = (params or {}).get(ParamType.DELIVERY_TIMEOUT)
-        if not isinstance(value, int) or value == self.timeout:
-            return False
-        self.timeout = value
-        return True
+        """Record the OBJECT_ and (d18+) SUBGROUP_DELIVERY_TIMEOUT a
+        SUBSCRIBE or REQUEST_UPDATE carries; absent keeps each. True when
+        one changed."""
+        params = params or {}
+        changed = False
+        value = params.get(ParamType.DELIVERY_TIMEOUT)
+        if isinstance(value, int) and value != self.timeout:
+            self.timeout, changed = value, True
+        value = params.get(SUBGROUP_DELIVERY_TIMEOUT)
+        if (isinstance(value, int) and value != self.subgroup_timeout
+                and self.session._profile.vi64):
+            self.subgroup_timeout, changed = value, True
+        return changed
 
     def set_filters(self, params, track_properties) -> None:
         self.range_params = params
@@ -1535,10 +1548,11 @@ class _RelayDelivery:
                                   end=None if end is None else (end[5], end[9]))
         return True if rest is None else rest
 
-    def send_nowait(self, item) -> bool | None:
+    def send_nowait(self, item) -> object:
         """send(item) when it completes now: a live datagram, or an object
         or stream end on an open stream that the transport takes. True
-        once written; None, nothing written, when it has to wait."""
+        once written; None, nothing written, when it has to wait; END_DUE,
+        nothing written, for a new stream whose end is queued behind."""
         (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
          shape, encoded) = item
         if not live:
@@ -1548,6 +1562,10 @@ class _RelayDelivery:
                 ) and ((id(session), gid, sgid) not in track._streams
                        or (gid, sgid) in track._ends_due):
             # A stream end queued behind leaves with the lane's last write.
+            if ((id(session), gid, sgid) not in track._streams
+                    and (gid, sgid) in track._ends_due and oid is not None
+                    and status not in _STREAM_ENDS):
+                return END_DUE
             return None
         if track._forward_one(session, d.alias, gid, sgid, oid, payload,
                               exts, prio, status, shape, encoded,
@@ -1559,6 +1577,28 @@ class _RelayDelivery:
             track._bytes_out += len(payload or b"")
             if _born is not None:
                 track._tx_born[self.sid] = _born
+        return True
+
+    def send_whole_nowait(self, item, end) -> bool:
+        """Open, write and end a stream holding object `item` and the end
+        `end` queued behind it, when that completes now."""
+        (gid, _cost, live, _born, sgid, oid, payload, exts, prio, status,
+         shape, encoded) = item
+        if not live:
+            return False
+        track, d, session = self.track, self.d, self.session
+        if track._forward_one(session, d.alias, gid, sgid, oid, payload,
+                              exts, prio, status, shape, encoded,
+                              start=d.start, lost=d.lost,
+                              end=(end[5], end[9]),
+                              nowait=True) is _NOT_SENT:
+            return False
+        track._objects_out += 1
+        track._bytes_out += len(payload or b"")
+        if _born is not None:
+            track._tx_born[self.sid] = _born
+        if end[5] is not None:
+            track._objects_out += 1
         return True
 
     @staticmethod
@@ -1991,6 +2031,9 @@ class _RelayedTrack:
         # id(session) -> {(group, subgroup): stream_id} of the streams
         # opened, kept past FIN until the transport has drained them.
         self._tx_streams: dict = {}
+        # id(session) -> SubgroupTimer, for subscribers with a
+        # SUBGROUP_DELIVERY_TIMEOUT.
+        self._subgroup_timers: dict = {}
         # id(session) -> bytes written to its streams of the track.
         self._tx_written: dict = {}
         # id(session) -> arrival time of the newest object among them.
@@ -2213,6 +2256,10 @@ class _RelayedTrack:
     def close(self) -> None:
         """Release the fan-out: stop the drain and forget its streams."""
         self._closed = True
+        if self._done_timer is not None:
+            self._done_timer.cancel()
+            self._done_timer = None
+        self._pending_done = None
         self.release_upstream()
         self._release_standby()
         self._release_publish()
@@ -2271,10 +2318,35 @@ class _RelayedTrack:
 
     def time_lane(self, d) -> None:
         """Set `d`'s lane deadline: its delivery timeout, else --lag-limit,
-        capped by MAX_CACHE_DURATION."""
+        capped by MAX_CACHE_DURATION; and its subgroup timer."""
         if d.lane is not None:
             d.lane.deadline = _tightest(self._timeout_s(d) or _lag_limit,
                                         self._max_age_s())
+        self._time_subgroups(d)
+
+    def _time_subgroups(self, d) -> None:
+        """§8: `d`'s SUBGROUP_DELIVERY_TIMEOUT, the smaller non-zero of the
+        publisher's and its own, on its subgroup streams."""
+        pub = self.properties.get(SUBGROUP_DELIVERY_TIMEOUT)
+        ms = _min_nonzero(pub if isinstance(pub, int) else 0,
+                          d.subgroup_timeout)
+        timers = self._subgroup_timers
+        t = timers.get(id(d.session))
+        if t is not None and t.session is not d.session:
+            t = None
+        if t is None:
+            if not ms:
+                return
+            t = timers[id(d.session)] = SubgroupTimer(d.session)
+        t.timeout = ms / 1000 if ms else None
+
+    def _fin(self, session, stream_id) -> None:
+        """A subgroup stream to `session` is FINed: start its timer."""
+        timers = self._subgroup_timers
+        if timers:
+            t = timers.get(id(session))
+            if t is not None and t.session is session:
+                t.complete(stream_id)
 
     def _expire_cache(self) -> None:
         """Drop cached objects past MAX_CACHE_DURATION, and every object at
@@ -2382,6 +2454,7 @@ class _RelayedTrack:
             if k[0] == id(session):
                 if reset_code is None:
                     session.stream_write(sid, b"", end_stream=True)
+                    self._fin(session, sid)
                 else:
                     session.stream_reset(sid, int(reset_code))
                 self._streams.pop(k, None)
@@ -2738,6 +2811,9 @@ class _RelayedTrack:
         self._stopped = {k for k in self._stopped if k[0] != id(session)}
         self._sent_streams.pop(id(session), None)
         self._tx_streams.pop(id(session), None)
+        t = self._subgroup_timers.pop(id(session), None)
+        if t is not None:
+            t.cancel()
         self._tx_written.pop(id(session), None)
         self._tx_born.pop(id(session), None)
 
@@ -3115,6 +3191,10 @@ class _RelayedTrack:
             self._streams.pop(skey, None)
             return
         if entry is None:
+            if nowait:
+                return self._open_stream_nowait(
+                    session, alias, gid, sgid, oid, payload, exts, prio,
+                    status, shape, encoded, start, lost, end)
             return self._open_stream(
                 session, skey, alias, gid, sgid, oid, payload, exts, prio,
                 status, shape, encoded, start, lost, lane, end)
@@ -3130,6 +3210,7 @@ class _RelayedTrack:
             # the group end IS the FIN. Writing a marker here would be
             # inventing one the publisher never sent.
             session.stream_write(stream_id, b"", end_stream=True)
+            self._fin(session, stream_id)
             self._streams.pop(skey, None)
             return
         if status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
@@ -3138,6 +3219,7 @@ class _RelayedTrack:
                 payload=b"", status=status,
                 object_id=header.next_object_id if oid is None else oid)
             session.stream_write(stream_id, buf.data, end_stream=True)
+            self._fin(session, stream_id)
             self._count_tx(session, len(buf.data))
             self._streams.pop(skey, None)
             return
@@ -3187,6 +3269,7 @@ class _RelayedTrack:
         if end is None:
             return
         if ended:
+            self._fin(session, entry[0])
             self._streams.pop(skey, None)
         else:
             self._reset_stream(session, skey, entry)
@@ -3261,6 +3344,7 @@ class _RelayedTrack:
         self._sent_streams[id(session)] = \
             self._sent_streams.get(id(session), 0) + 1
         if whole:
+            self._fin(session, stream_id)
             return True
         if first is not None:
             if end is not None:
@@ -3271,6 +3355,53 @@ class _RelayedTrack:
                                  exts, prio, status, shape, encoded, start,
                                  lost, lane, end)
         return True if rest is None else await rest
+
+    def _open_stream_nowait(self, session, alias, gid, sgid, oid, payload,
+                            exts, prio, status, shape, encoded, start, lost,
+                            end):
+        """_open_stream for a stream written whole, without waiting: None
+        once submitted, else _NOT_SENT."""
+        if (end is None or status in _STREAM_ENDS or gid in lost
+                or self._short(gid, start)):
+            return _NOT_SENT
+        first_obj, eog, _inherited = shape or (False, False, False)
+        prof = session._profile
+        key = (alias, id(prof), end)
+        parts = None if encoded is None else encoded.get(key)
+        if parts is None:
+            header = SubgroupHeader(
+                track_alias=alias, group_id=gid, subgroup_id=sgid,
+                publisher_priority=prio, extensions_present=True,
+                end_of_group=eog, first_object=first_obj, prof=prof)
+            parts = (header.serialize().data,
+                     _object_data(header, payload, exts, oid, encoded),
+                     self._end_data(header, gid, end, start, lost))
+            if encoded is not None:
+                encoded[key] = parts
+        initial = b"".join(parts)
+        sched = getattr(session, 'stream_scheduling', None)
+        band = _band_of(prio if prio is not None and 0 <= prio <= 255 else 128,
+                        sched or STREAM_SCHEDULING)
+        tx = self._tx_streams.setdefault(id(session), {})
+        k = (gid, sgid)
+
+        def created(stream_id):
+            if stream_id:
+                tx[k] = stream_id
+                self._fin(session, stream_id)
+        if sched == "chain":
+            ok = session.open_uni_stream_nowait(
+                initial=initial, priority=band, chain=alias + 1, order=gid,
+                on_created=created)
+        else:
+            ok = session.open_uni_stream_nowait(
+                initial=initial, priority=band, on_created=created)
+        if not ok:
+            return _NOT_SENT
+        self._count_tx(session, len(initial))
+        self._sent_streams[id(session)] = \
+            self._sent_streams.get(id(session), 0) + 1
+        return None
 
     def _end_data(self, header, gid, end, start, lost):
         """The bytes before the FIN that ends a stream for `end`, its
@@ -3451,8 +3582,13 @@ def _forget_session(session) -> None:
             if track.fail_over(key):
                 continue
             # Upstream is gone: give each subscriber a clean terminal
-            # before dropping the fan-out.
-            track.finish()
+            # before dropping the fan-out, with the publisher's status if
+            # its PUBLISH_DONE was held for streams.
+            pending = track._pending_done
+            if pending is not None:
+                track.finish(status_code=pending[0], reason=pending[1])
+            else:
+                track.finish()
             track.close()
             _drop_track(key, track)
 
@@ -4778,7 +4914,8 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     d.group_order = getattr(msg, "group_order", None)
     d.set_filters(merge_range_filters({}, msg.parameters or {}),
                   track.properties)
-    d.take_timeout(msg.parameters)
+    if d.take_timeout(msg.parameters):
+        track.time_lane(d)
     session.register_request_cancel_handler(
         msg.request_id, lambda rid, t=track, s=session: t.drop_session(s))
     _start_fill(track, d, msg)

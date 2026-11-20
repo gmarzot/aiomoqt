@@ -919,26 +919,156 @@ def test_label_gives_the_id_moq_fabric_derives_on_every_start():
         parse_identity("0:0")
 
 
-def test_restart_under_the_same_id_resubscribes_past_held_marks(
-        monkeypatch):
-    # A peer holding a withdrawn seq takes the restarted node's first
-    # subscribe: its seq starts from the clock.
+def test_withdrawn_seq_marks_held_until_the_source_is_gone(monkeypatch):
     t = _transit()
     wa = _Wire(t, 1, _remote(A, "a"))
-    wb = _Wire(t, 2, _remote(B, "b"))
+    wc = _Wire(t, 2, _remote(C, "c"))
+    wc.send(MsgType.NODE_INFO_ADV, NodeInfo(A, path=(PathItem(C, 1, 100),)))
     wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=40))
     wa.send(MsgType.SUBSCRIBE_INFO_WD, _sub(A, NS, b"video", seq=41))
+    # A restart without its sequences: seq 1 is older than the held mark
+    # while A is reachable, however long that is.
     wa.close()
     wa = _Wire(t, 3, _remote(A, "a"))
     wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=1))
-    assert not t.transit.subscribes          # older than the held mark
-    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=900))
+    assert not t.transit.subscribes
+    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=42))
     assert t.transit.subscribes
-    # A withdrawn mark stops turning seqs away after the retention.
-    wa.send(MsgType.SUBSCRIBE_INFO_WD, _sub(A, NS, b"video", seq=901))
+    # Unreachable: its marks go SUB_MARK_RETAIN_S later.
     monkeypatch.setattr(transit_mod, "SUB_MARK_RETAIN_S", 0.0)
-    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=2))
-    assert t.transit.subscribes and wb
-    n1, n2 = FabricNode(label="r"), FabricNode(label="r")
-    assert n1._seq_base == n2._seq_base or abs(
-        n1._seq_base - n2._seq_base) <= 1
+    wa.close()
+    wc.send(MsgType.NODE_INFO_WD, NodeInfo(A))
+    assert A not in t.transit.best and not t.transit.subscribes
+    wa = _Wire(t, 4, _remote(A, "a"))
+    wa.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(A, NS, b"video", seq=1))
+    assert t.transit.subscribes
+
+
+def test_subscribe_seqs_persist_as_moq_fabric_does(tmp_path):
+    from aiomoqt.peering.node import (load_subscribe_seqs, parse_identity,
+                                      subscribe_seq_path)
+    node_id, label = parse_identity("via-1")
+    path = str(tmp_path / "subscribe-seq-via-1")
+    h = track_hashes(NS, b"video").fullname
+    n1 = FabricNode(node_id=node_id, label=label, subscribe_seq_file=path)
+    assert n1.subscribe(NS, b"video").seq == 1
+    n1.unsubscribe(NS, b"video")
+    head, row = open(path).read().splitlines()
+    assert head.startswith("2 ") and int(head.split()[1]) > 0
+    assert row == f"{h} 0 2"
+    n2 = FabricNode(node_id=node_id, label=label, subscribe_seq_file=path)
+    assert n2.subscribe(NS, b"video").seq == 3
+    # A label-derived id keeps them where moq-fabric does by default.
+    cert = str(tmp_path / "tls" / "cert.pem")
+    n3 = FabricNode(node_id=node_id, label=label, cert=cert)
+    assert n3.subscribe_seq_file == subscribe_seq_path(label, cert) == str(
+        tmp_path / "tls" / "subscribe-seq-via-1")
+    assert subscribe_seq_path("a b/c").endswith("subscribe-seq-a_b_c")
+    # A fresh id keeps none.
+    assert FabricNode(label="via-1").subscribe_seq_file is None
+    # Missing or unreadable: the counter starts over.
+    assert load_subscribe_seqs(str(tmp_path / "missing")) == {}
+    for text in ("", "junk", "3 5\n1 0 2\n", "2 0\n1 0 2\n",
+                 b"\xff\xfe".decode("latin-1")):
+        bad = tmp_path / "bad"
+        bad.write_text(text)
+        assert load_subscribe_seqs(str(bad)) == {}
+        n = FabricNode(node_id=node_id, label=label,
+                       subscribe_seq_file=str(bad))
+        assert n.subscribe(NS, b"video").seq == 1
+    # Version 1 has no epoch; out of range rows are skipped.
+    (tmp_path / "v1").write_text(f"1 7\n{h} 9\n5 70000\n")
+    assert load_subscribe_seqs(str(tmp_path / "v1")) == {h: (0, 9)}
+    (tmp_path / "v2").write_text(f"2 7\n{h} 0 9\n6 0 x\n")
+    assert load_subscribe_seqs(str(tmp_path / "v2")) == {h: (0, 9)}
+    # An unwritable path: the sequence still works in memory.
+    ro = FabricNode(node_id=node_id, label=label,
+                    subscribe_seq_file=str(tmp_path / "v2" / "under-a-file"))
+    assert ro.subscribe(NS, b"audio").seq == 1
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_restart_under_a_label_gets_past_held_marks(tmp_path):
+    from aiomoqt.peering.node import parse_identity
+    port = _BASE_PORT + 16
+    t = _listen(port, "T", transit=True)
+    node_id, label = parse_identity("edge-a")
+    seqs = str(tmp_path / "subscribe-seq-edge-a")
+
+    def edge(**kw):
+        return _dial([port], label, node_id=node_id, **kw)
+
+    key = (track_hashes(NS, b"video").fullname, node_id)
+    async with t:
+        a = edge(subscribe_seq_file=seqs)
+        async with a:
+            await _until(lambda: a.connected())
+            a.subscribe(NS, b"video")
+            await _until(lambda: key in t.transit.subscribes)
+            a.unsubscribe(NS, b"video")
+            await _until(lambda: key not in t.transit.subscribes)
+        # Restarted without its sequences: T still holds the mark.
+        a = edge(subscribe_seq_file="")
+        async with a:
+            await _until(lambda: a.connected())
+            assert a.subscribe(NS, b"video").seq == 1
+            await asyncio.sleep(0.2)
+            assert key not in t.transit.subscribes
+            a.unsubscribe(NS, b"video")
+        # With them: it continues past the mark.
+        a = edge(subscribe_seq_file=seqs)
+        async with a:
+            await _until(lambda: a.connected())
+            assert a.subscribe(NS, b"video").seq == 3
+            await _until(lambda: key in t.transit.subscribes)
+
+
+def test_peer_matching_is_exact_unless_one_host_session():
+    node = FabricNode(label="n", transit=True)
+    w1 = _Wire(node, 1, _remote(A, "a"), dial_key=("192.0.2.7", 4000))
+    w2 = _Wire(node, 2, _remote(C, "c"), dial_key=("192.0.2.7", 4001))
+    assert node.set_peer_metric("192.0.2.7", 4001, 300)
+    assert node.advertised_metric(2) == 300 and node.advertised_metric(1) == 100
+    with pytest.raises(ValueError, match="192.0.2.7:4000, 192.0.2.7:4001"):
+        node.set_peer_metric("192.0.2.7", 33434, 500)
+    with pytest.raises(ValueError, match="several"):
+        node.remove_peer("192.0.2.7", 33434)
+    assert w1.session.state == w2.session.state == "connected"
+    # add_peer applies its metric to the exact session only.
+    node.add_peer("192.0.2.7", 4002, metric=700)
+    assert node.advertised_metric(1) == 100
+    assert node.remove_peer("192.0.2.7", 4000)
+    assert w1.session.state == "closed" and w2.session.state == "connected"
+    # A dialed peer not up yet counts as another candidate.
+    with pytest.raises(ValueError, match="192.0.2.7:4001, 192.0.2.7:4002"):
+        node.set_peer_metric("192.0.2.7", 33434, 900)
+    assert node.remove_peer("192.0.2.7", 4002)
+    # One peer left on the host: a host-only match finds it.
+    assert node.set_peer_metric("192.0.2.7", 33434, 900)
+    assert node.advertised_metric(2) == 900
+    assert node.remove_peer("192.0.2.7", 33434)
+    assert w2.session.state == "closed"
+
+
+def test_live_subscribe_replayed_on_a_new_session_goes_to_the_publisher():
+    t = _transit()
+    wp = _Wire(t, 1, _remote(P, "pub"))
+    wm = _Wire(t, 2, _remote(C, "via"))
+    wp.send(MsgType.ANNOUNCE_INFO_ADV, _ann(P, NS, b"video"))
+    # B's subscribe first arrives through the other via, then B's own
+    # session comes up and replays it at the same seq.
+    wm.send(MsgType.NODE_INFO_ADV, NodeInfo(B, path=(PathItem(C, 1, 100),)))
+    sub = _sub(B, NS, b"video", seq=7)
+    wm.send(MsgType.SUBSCRIBE_INFO_ADV, sub)
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 1
+    wb = _Wire(t, 3, _remote(B, "b"))
+    wb.send(MsgType.SUBSCRIBE_INFO_ADV, sub)
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 2
+    # Not flooded elsewhere, and not back to the publisher's own replay.
+    assert _sent(wm, MsgType.SUBSCRIBE_INFO_ADV) == 0
+    wp.send(MsgType.SUBSCRIBE_INFO_ADV, sub)
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 2
+    # An older seq is still dropped.
+    wb.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(B, NS, b"video", seq=6))
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 2
