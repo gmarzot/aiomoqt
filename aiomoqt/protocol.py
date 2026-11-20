@@ -334,6 +334,10 @@ def _closed_reason(code: Any, reason: Any) -> str:
 _LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7f)}
 
 
+# Known MoQT session close codes.
+_SESSION_CLOSE_CODES = frozenset(int(c) for c in SessionCloseCode)
+
+
 def _log_safe_reason(reason: Any) -> str:
     """A Reason Phrase for a log line: cut to REASON_PHRASE_MAX bytes,
     anything outside printable ASCII backslash-escaped."""
@@ -3306,9 +3310,10 @@ class _MOQTSessionMixin:
         code without transmit is the peer's; local (see _local_cause) names
         a close the transport made itself; code 0 with neither is worded
         neutrally. kind (see _close_kind) picks the code table. Clean codes,
-        an idle timeout and our GOAWAY_TIMEOUT log INFO, a peer's or another
-        local error WARNING, our own error ERROR. Only a session's first
-        close is logged."""
+        an idle timeout and our GOAWAY_TIMEOUT log INFO; a peer's close, a
+        local transport close and ours for the peer's error (any MoQT code
+        but INTERNAL_ERROR) WARNING; ours for our own failure ERROR. Only a
+        session's first close is logged."""
         if self._close_logged:
             return
         self._close_logged = True
@@ -3360,7 +3365,8 @@ class _MOQTSessionMixin:
             logger.info(msg)
         elif transmit and kind is None and code == SessionCloseCode.GOAWAY_TIMEOUT:
             logger.info(msg)  # an orderly shutdown
-        elif transmit:
+        elif (transmit and (kind is not None or code == SessionCloseCode.INTERNAL_ERROR
+                            or code not in _SESSION_CLOSE_CODES)):
             logger.error(msg)
         else:
             logger.warning(msg)

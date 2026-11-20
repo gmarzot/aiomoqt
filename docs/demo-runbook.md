@@ -74,7 +74,7 @@ export RELAY_QUIC=moqt://aiomoqt-relay.marzresearch.net:4443
 
 It negotiates drafts 14 to 22. Draft 22 is a `--draft 22` on the tools,
 against a relay that serves it (aiomoqt-relay does; moqx-main serves 16
-and 18). The browser player's `v=` takes 14, 16 and 18, so a draft-22
+and 18). The browser player's `v=` takes 16, 18 and 22; this draft-22
 run is tool to tool: publisher first, then the wire check.
 
 ```
