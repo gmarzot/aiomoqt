@@ -1022,3 +1022,30 @@ async def test_restart_under_a_label_gets_past_held_marks(tmp_path):
             await _until(lambda: a.connected())
             assert a.subscribe(NS, b"video").seq == 3
             await _until(lambda: key in t.transit.subscribes)
+
+
+def test_peer_matching_is_exact_unless_one_host_session():
+    node = FabricNode(label="n", transit=True)
+    w1 = _Wire(node, 1, _remote(A, "a"), dial_key=("192.0.2.7", 4000))
+    w2 = _Wire(node, 2, _remote(C, "c"), dial_key=("192.0.2.7", 4001))
+    assert node.set_peer_metric("192.0.2.7", 4001, 300)
+    assert node.advertised_metric(2) == 300 and node.advertised_metric(1) == 100
+    with pytest.raises(ValueError, match="192.0.2.7:4000, 192.0.2.7:4001"):
+        node.set_peer_metric("192.0.2.7", 33434, 500)
+    with pytest.raises(ValueError, match="several"):
+        node.remove_peer("192.0.2.7", 33434)
+    assert w1.session.state == w2.session.state == "connected"
+    # add_peer applies its metric to the exact session only.
+    node.add_peer("192.0.2.7", 4002, metric=700)
+    assert node.advertised_metric(1) == 100
+    assert node.remove_peer("192.0.2.7", 4000)
+    assert w1.session.state == "closed" and w2.session.state == "connected"
+    # A dialed peer not up yet counts as another candidate.
+    with pytest.raises(ValueError, match="192.0.2.7:4001, 192.0.2.7:4002"):
+        node.set_peer_metric("192.0.2.7", 33434, 900)
+    assert node.remove_peer("192.0.2.7", 4002)
+    # One peer left on the host: a host-only match finds it.
+    assert node.set_peer_metric("192.0.2.7", 33434, 900)
+    assert node.advertised_metric(2) == 900
+    assert node.remove_peer("192.0.2.7", 33434)
+    assert w2.session.state == "closed"

@@ -1122,23 +1122,32 @@ class FabricNode:
             self._dials[(host, port)] = asyncio.ensure_future(
                 self._dial_loop(host, port))
 
-    def _sessions_of(self, host: str, port: int) -> List[PeerSession]:
+    def _sessions_of(self, host: str, port: int,
+                     loose: bool = True) -> List[PeerSession]:
         """Live sessions to a peer: the dial of (host, port), or accepted
-        from that address; from the host on any port when none matches
-        exactly (an accepted peer dials from an ephemeral port)."""
+        from that address. With `loose` and none exact, the one session
+        from that host on another port (an accepted peer dials from an
+        ephemeral one); ValueError naming them when the host has several
+        sessions or dialed peers."""
         exact, same_host = [], []
         for sid, proto in self._protocols.items():
             session = self.sessions.get(sid)
             if session is None or session.state == "closed":
                 continue
-            if proto.dialer:
-                if proto.dial_key == (host, port):
-                    exact.append(session)
+            addr = (proto.dial_key if proto.dialer
+                    else proto._quic.peer_address())
+            if not addr or addr[0] != host:
                 continue
-            addr = proto._quic.peer_address()
-            if addr and addr[0] == host:
-                (exact if addr[1] == port else same_host).append(session)
-        return exact or same_host
+            (exact if addr[1] == port else same_host).append((session, addr))
+        if exact or not loose:
+            return [s for s, _ in exact]
+        others = {tuple(a) for _, a in same_host}
+        others.update(k for k in self.peers if k[0] == host)
+        if len(others) > 1:
+            names = ", ".join(sorted(_addr_text(*a) for a in others))
+            raise ValueError(f"{_addr_text(host, port)} matches no peer "
+                             f"exactly; {host} has several: {names}")
+        return [s for s, _ in same_host]
 
     def _configured_metric(self, session: PeerSession) -> Optional[int]:
         proto = self._protocols.get(session.id)
@@ -1161,7 +1170,9 @@ class FabricNode:
         or by set_peer_metric() applies to every session to the peer."""
         key = (host, int(port))
         if metric is not None:
-            self.set_peer_metric(host, port, metric)
+            self._peer_metric[key] = metric
+            for session in self._sessions_of(*key, loose=False):
+                self.set_session_metric(session.id, metric)
         if key not in self.peers:
             self.peers.append(key)
         if self._started and not self._stopping:
@@ -1169,16 +1180,19 @@ class FabricNode:
 
     def remove_peer(self, host: str, port: int = DEFAULT_PORT) -> bool:
         """Stop dialing a peer and close its session, or close the
-        session accepted from that address. False when neither exists."""
+        session accepted from that address (or the one from that host).
+        False when neither exists; ValueError when the host has several
+        sessions and none matches exactly."""
         key = (host, int(port))
         found = key in self.peers or key in self._dials
+        sessions = self._sessions_of(*key, loose=not found)
         if key in self.peers:
             self.peers.remove(key)
         self._peer_metric.pop(key, None)
         task = self._dials.pop(key, None)
         if task is not None:
             task.cancel()
-        for session in self._sessions_of(*key):
+        for session in sessions:
             proto = self._protocols.get(session.id)
             if proto is not None:
                 found = True
@@ -1187,10 +1201,11 @@ class FabricNode:
 
     def set_peer_metric(self, host: str, port: int, metric: int) -> bool:
         """Set the metric of a peer's sessions, now and after a re-dial.
-        False when no session to the peer is up yet."""
+        False when no session to the peer is up yet; ValueError as
+        remove_peer when the host has several and none matches."""
         key = (host, int(port))
-        self._peer_metric[key] = metric
         sessions = self._sessions_of(*key)
+        self._peer_metric[key] = metric
         for session in sessions:
             self.set_session_metric(session.id, metric)
         return bool(sessions)
