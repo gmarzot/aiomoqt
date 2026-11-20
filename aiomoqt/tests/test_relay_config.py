@@ -106,8 +106,9 @@ def test_the_deploy_config_loads():
     assert args.status_dir == "/status" and args.log_dir == "/logs"
     assert args.control == "/status/control.sock"
     assert args.catalog_probe is True
-    assert args.cache_bytes == 268435456
+    assert args.cache_bytes == 2147483648
     assert args.cc_algo == "bbr"
+    assert args.workers == 3 and args.stall_trace == 100 and args.idle_timeout == 60
 
 
 @pytest.mark.skipif(not _DEPLOY_TOML.exists(), reason="no deploy tree")
