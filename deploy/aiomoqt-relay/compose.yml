@@ -13,9 +13,12 @@ services:
     # Past the relay's --drain-timeout (2 s, 5 s with --goaway-uri): SIGTERM
     # drains with GOAWAY.
     stop_grace_period: 15s
-    mem_limit: 2g
-    # Off CPU 0, which takes the NIC interrupts (host/relay-irq-affinity.service).
-    cpuset: "1,2"
+    # The 2 GiB cache (relay.toml) plus the heap it keeps.
+    mem_limit: 6g
+    # All three CPUs for its three workers, at the top CPU weight (cgroup cpu.weight 10000),
+    # so the relay wins any contention with the other services and admin work.
+    cpuset: "0,1,2"
+    cpu_shares: 262144
     # Core files land in ./cores; see README.md for the host's core_pattern.
     ulimits: {core: -1}
     # No capabilities, no privilege gain, read-only root: it binds UDP 4443 and
@@ -30,6 +33,8 @@ services:
       PYTHONFAULTHANDLER: "1"
       # Stream buffers (1 MiB) are mmapped, so freed ones go back to the OS.
       MALLOC_MMAP_THRESHOLD_: "1048576"
+      # Keep freed heap in the process: dropping a large cache skips the heap trims.
+      GLIBC_TUNABLES: "glibc.malloc.trim_threshold=4294967296"
       MOQT_ROLE: relay
       MOQT_DUAL: "1"
       MOQT_PORT: "4443"
