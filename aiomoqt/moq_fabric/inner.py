@@ -3,7 +3,7 @@
 A NEW_STREAM's inner bytes are one d18 subgroup stream: header type 0x51
 (subgroup 0) or 0x55, FIRST_OBJECT set, track alias = the track's
 fullname hash, the priority byte present and every object carrying an
-extension block, empty or not. A peering datagram carries one d18 object
+extension block, empty or not. A fabric datagram carries one d18 object
 datagram. Encoding and decoding use aiomoqt's d18 codecs.
 """
 from typing import Any, Dict, List, NamedTuple, Optional
@@ -16,14 +16,14 @@ from aiomoqt.messages import (MOQTMalformedKVP, MOQTUnderflow, ObjectStatus,
                               SUBGROUP_ID_ZERO)
 from aiomoqt.messages.data import (MOQTObjectTooLarge, ObjectDatagram,
                                    ObjectHeader, SubgroupHeader)
-from aiomoqt.peering.wire import DATAGRAM_HEADER_LEN, WireError
+from aiomoqt.moq_fabric.wire import DATAGRAM_HEADER_LEN, WireError
 from aiomoqt.types import MOQTProtocolViolation
 from aiomoqt.utils.buffer import Buffer, BufferReadError
 
 P18 = profile_for(18)
 # moqx drops larger objects.
 MAX_OBJECT = 1 << 20
-# A peering datagram frame (header + inner) stays within aiopquic's
+# A fabric datagram frame (header + inner) stays within aiopquic's
 # 1200-byte datagram payload cap; moq-fabric peers accept 1280.
 DATAGRAM_MAX_FRAME = 1200
 DATAGRAM_MAX_INNER = DATAGRAM_MAX_FRAME - DATAGRAM_HEADER_LEN

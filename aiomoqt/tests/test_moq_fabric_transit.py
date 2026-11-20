@@ -11,13 +11,13 @@ from aiopquic.quic.events import (DatagramFrameReceived, StreamDataReceived,
                                   StreamReset)
 
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering import FabricHop, FabricNode, HopRetiring, track_hashes
-from aiomoqt.peering import transit as transit_mod
-from aiomoqt.peering.inner import SubgroupWriter, encode_datagram
-from aiomoqt.peering.node import _PeerProtocol
-from aiomoqt.peering.wire import (DataHeader, DataType, MsgType, NodeInfo,
+from aiomoqt.moq_fabric import FabricHop, FabricNode, HopRetiring, track_hashes
+from aiomoqt.moq_fabric import transit as transit_mod
+from aiomoqt.moq_fabric.inner import SubgroupWriter, encode_datagram
+from aiomoqt.moq_fabric.node import _PeerProtocol
+from aiomoqt.moq_fabric.wire import (DataHeader, DataType, MsgType, NodeInfo,
                                   NodeSet, PathItem, rewrite_sns)
-from aiomoqt.tests.test_peering_edge import _ann, _remote, _sub, _Wire
+from aiomoqt.tests.test_moq_fabric_edge import _ann, _remote, _sub, _Wire
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -618,7 +618,7 @@ def _move_to_t2(w1):
 
 
 async def _hop_open(hop, h, gid):
-    from aiomoqt.tests.test_peering_edge import _relay_header
+    from aiomoqt.tests.test_moq_fabric_edge import _relay_header
     hdr = _relay_header(h, gid)
     sid = await hop.open_uni_stream(initial=hdr.serialize().data
                                     + hdr.next_object_bytes(
@@ -654,7 +654,7 @@ async def test_hop_retires_on_a_move_and_finishes_its_group():
 
 @pytest.mark.asyncio
 async def test_hop_drain_is_bounded(monkeypatch):
-    from aiomoqt.peering import node as node_mod
+    from aiomoqt.moq_fabric import node as node_mod
     monkeypatch.setattr(node_mod, "DRAIN_MAX_S", 0.05)
     pub, w1, w2, hops, track = _pub_two_paths()
     (hop1,) = hops.live(track)
@@ -715,7 +715,7 @@ async def _hop_group(hops, track, gid, per=6, at=None, then=None):
     """One group through the egress the way a relay writes it: opened on
     a hop taking new streams, written to its end there. `then` runs
     before object `at`. False when the group could not be finished."""
-    from aiomoqt.tests.test_peering_edge import _relay_header
+    from aiomoqt.tests.test_moq_fabric_edge import _relay_header
     live = hops.live(track)
     if not live:
         return False
@@ -904,7 +904,8 @@ async def test_ring_drops_a_stopped_node_without_ghost_routes():
 # -- identity ------------------------------------------------------------
 
 def test_label_gives_the_id_moq_fabric_derives_on_every_start():
-    from aiomoqt.peering import label_node_id, libstdcxx_hash, parse_identity
+    from aiomoqt.moq_fabric import (label_node_id, libstdcxx_hash,
+                                    parse_identity)
     a, b = parse_identity("via-1"), parse_identity("via-1")
     assert a == b == (libstdcxx_hash(b"via-1"), "via-1")
     assert label_node_id("via-1") == a[0]
@@ -945,7 +946,7 @@ def test_withdrawn_seq_marks_held_until_the_source_is_gone(monkeypatch):
 
 
 def test_subscribe_seqs_persist_as_moq_fabric_does(tmp_path):
-    from aiomoqt.peering.node import (load_subscribe_seqs, parse_identity,
+    from aiomoqt.moq_fabric.node import (load_subscribe_seqs, parse_identity,
                                       subscribe_seq_path)
     node_id, label = parse_identity("via-1")
     path = str(tmp_path / "subscribe-seq-via-1")
@@ -990,7 +991,7 @@ def test_subscribe_seqs_persist_as_moq_fabric_does(tmp_path):
 @requires_certs
 @pytest.mark.asyncio
 async def test_restart_under_a_label_gets_past_held_marks(tmp_path):
-    from aiomoqt.peering.node import parse_identity
+    from aiomoqt.moq_fabric.node import parse_identity
     port = _BASE_PORT + 16
     t = _listen(port, "T", transit=True)
     node_id, label = parse_identity("edge-a")
@@ -1034,6 +1035,8 @@ def test_peer_matching_is_exact_unless_one_host_session():
         node.set_peer_metric("192.0.2.7", 33434, 500)
     with pytest.raises(ValueError, match="several"):
         node.remove_peer("192.0.2.7", 33434)
+    with pytest.raises(ValueError, match="several"):
+        node.restart_peer("192.0.2.7", 33434)
     assert w1.session.state == w2.session.state == "connected"
     # add_peer applies its metric to the exact session only.
     node.add_peer("192.0.2.7", 4002, metric=700)

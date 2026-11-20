@@ -13,13 +13,13 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from aiomoqt.context import stream_reset_code
 from aiomoqt.messages.data import ObjectDatagram, ObjectHeader
-from aiomoqt.peering.hashing import track_hashes
-from aiomoqt.peering.inner import (DATAGRAM_MAX_FRAME, P18, DatagramObject,
+from aiomoqt.moq_fabric.hashing import track_hashes
+from aiomoqt.moq_fabric.inner import (DATAGRAM_MAX_FRAME, P18, DatagramObject,
                                    StreamObject)
-from aiomoqt.peering.node import (FabricNode, FabricTrack, Name, _bytes,
+from aiomoqt.moq_fabric.node import (FabricNode, FabricTrack, Name, _bytes,
                                   namespace_tuple)
-from aiomoqt.peering.session import Inbound, log
-from aiomoqt.peering.wire import (DATAGRAM_HEADER_LEN, DataHeader, DataType,
+from aiomoqt.moq_fabric.session import Inbound, log
+from aiomoqt.moq_fabric.wire import (DATAGRAM_HEADER_LEN, DataHeader, DataType,
                                   WireError)
 from aiomoqt.types import MOQTStreamStopped, StreamResetCode
 
@@ -183,7 +183,7 @@ class FabricHop:
             self.node._spawn(self._write_later(stream_id, data, end_stream))
             return
         except (AssertionError, AttributeError, ConnectionError) as e:
-            log.debug(f"peering: {self!r} stream {stream_id} write: {e!r}")
+            log.debug(f"fabric: {self!r} stream {stream_id} write: {e!r}")
         if end_stream:
             self._ended(stream_id)
 
@@ -217,7 +217,7 @@ class FabricHop:
         except (AssertionError, AttributeError, ConnectionError) as e:
             self._ended(stream_id)
             if self._writable():
-                log.debug(f"peering: {self!r} stream {stream_id} write: "
+                log.debug(f"fabric: {self!r} stream {stream_id} write: "
                           f"{e!r}")
                 raise MOQTStreamStopped() from e
             return False
@@ -283,7 +283,7 @@ class FabricHop:
         except BufferError:
             return False
         except (AssertionError, AttributeError, ConnectionError) as e:
-            log.debug(f"peering: {self!r} stream {stream_id} reset: {e!r}")
+            log.debug(f"fabric: {self!r} stream {stream_id} reset: {e!r}")
         return True
 
     async def _reset_later(self, stream_id: int, code: int) -> None:

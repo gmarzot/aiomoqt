@@ -4,17 +4,17 @@ originates announces and subscribes, and publishes and receives objects;
 a leaf, or with transit=True a node that forwards for others. The edge API
 (FabricHop, FabricSource) presents fabric sessions to a relay as MoQT d18
 downstream and upstream sessions."""
-from aiomoqt.peering.edge import (FabricHop, FabricPull, FabricSource,
+from aiomoqt.moq_fabric.edge import (FabricHop, FabricPull, FabricSource,
                                   HopRetiring, relay_object)
-from aiomoqt.peering.hashing import (city64, fresh_node_id, hash_combine,
+from aiomoqt.moq_fabric.hashing import (city64, fresh_node_id, hash_combine,
                                      libstdcxx_hash, node_id_format,
                                      node_id_parse, track_hashes)
-from aiomoqt.peering.node import (LEAF_METRIC, FabricNode, FabricTrack,
+from aiomoqt.moq_fabric.node import (LEAF_METRIC, FabricNode, FabricTrack,
                                   RxTrack, label_node_id, parse_identity,
                                   parse_track)
-from aiomoqt.peering.report import build_report, write_report
-from aiomoqt.peering.session import PeerSession, SessionEvent
-from aiomoqt.peering.wire import (ALPN, DEFAULT_PORT, AnnounceInfo, Connect,
+from aiomoqt.moq_fabric.report import build_report, write_report
+from aiomoqt.moq_fabric.session import PeerSession, SessionEvent
+from aiomoqt.moq_fabric.wire import (ALPN, DEFAULT_PORT, AnnounceInfo, Connect,
                                   ConnectResponse, ControlReader, DataHeader,
                                   MsgType, NodeInfo, NodeSet, NodeType,
                                   PathItem, SubscribeInfo, WireError)

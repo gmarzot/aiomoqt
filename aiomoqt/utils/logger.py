@@ -13,7 +13,7 @@ Category loggers cut across modules (names are stable):
   aiomoqt.fetch      FETCH streams and their objects
   aiomoqt.transport  QUIC/WebTransport events, stream ops, ALPN
   aiomoqt.relay      aiomoqt-relay (moq_interop_relay)
-  aiomoqt.peering    moq-fabric sessions (aiomoqt.peering)
+  aiomoqt.moq_fabric moq-fabric sessions
 
 Everything else logs to its module logger (aiomoqt.protocol, ...).
 
@@ -43,7 +43,7 @@ LEVELS: Dict[str, int] = {
 }
 
 CATEGORIES: Tuple[str, ...] = ("control", "data", "fetch", "transport",
-                               "relay", "peering")
+                               "relay", "moq_fabric")
 
 ENV_VAR = "AIOMOQT_LOG"
 

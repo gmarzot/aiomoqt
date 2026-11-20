@@ -6,8 +6,9 @@ re-advertised; a fabric withdraw ending the track downstream; a dropped
 peer redialed; a stuck fabric hop not stalling local viewers; transit
 to a far node beside the relay's own viewers, each leaving without loss
 to the other; a relay track moving between two next hops mid-group
-without loss; a stop that sends no transit withdraws; GET /fabric and
-POST /fabric/peer. Every case counts
+without loss; a stop that sends no transit withdraws; a peer restarted
+through the control socket, dialed and accepted; GET /moq-fabric and
+POST /moq-fabric/peer. Every case counts
 objects and duplicates."""
 import asyncio
 import contextlib
@@ -19,7 +20,7 @@ import pytest
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages import ObjectStatus
-from aiomoqt.peering import FabricNode
+from aiomoqt.moq_fabric import FabricNode
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack, SubscribedTrack
 
@@ -190,7 +191,7 @@ def _pub_node(fabric_port):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("draft", [18, 20, 22])
 @_TRANSPORTS
-async def test_fabric_tracks_reach_moqt_subscribers(draft, use_quic):
+async def test_moq_fabric_tracks_reach_moqt_subscribers(draft, use_quic):
     case = [18, 20, 22].index(draft) * 2 + (not use_quic)
     port, fport = _PORT + case, _FABRIC_PORT + case
     async with _relay(port, use_quic, draft, fabric_port=fport) as (
@@ -437,7 +438,7 @@ async def test_control_get_fabric_and_post_peer(short_dir):
     server = await asyncio.start_unix_server(relay._on_control, path=sock)
     port, fport, bport = _PORT + 48, _FABRIC_PORT + 48, _FABRIC_PORT + 49
     try:
-        status, body = await _http(sock, "GET", "/fabric")
+        status, body = await _http(sock, "GET", "/moq-fabric")
         assert status == 404
         b = FabricNode(label="b", bind="127.0.0.1", port=bport, cert=CERT,
                        key=KEY)
@@ -453,7 +454,7 @@ async def test_control_get_fabric_and_post_peer(short_dir):
                 await viewer.subscribe("video")
                 await _until(lambda: len(viewer.got["video"]) > 10)
 
-                status, rep = await _http(sock, "GET", "/fabric")
+                status, rep = await _http(sock, "GET", "/moq-fabric")
                 assert status == 200
                 assert rep["node_id"] == relay.node_id_format(
                     fabric.node.node_id)
@@ -489,7 +490,7 @@ async def test_control_get_fabric_and_post_peer(short_dir):
                     "fabric": "subscribed"}]
 
                 q = f"host=127.0.0.1&port={bport}"
-                assert (await _http(sock, "POST", "/fabric/peer?op=add&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=add&"
                                     + q + "&metric=170"))[0] == 200
                 await _until(lambda: len(b.connected()) == 1)
 
@@ -500,36 +501,36 @@ async def test_control_get_fabric_and_post_peer(short_dir):
                              and dialed()[0]["status"] == "connected")
                 # The metric advertised on the session: at least the node's.
                 await _until(lambda: dialed()[0]["metric"] == 170)
-                assert (await _http(sock, "POST", "/fabric/peer?op=metric&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=metric&"
                                     + q + "&metric=250"))[0] == 200
                 assert dialed()[0]["metric"] == 250
-                assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=remove&"
                                     + q))[0] == 200
                 await _until(lambda: not b.connected() and not dialed())
                 # Another port of a host with a session falls back to it.
                 nobody = f"host=192.0.2.1&port={bport}"
-                assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=remove&"
                                     + nobody))[0] == 404
-                assert (await _http(sock, "POST", "/fabric/peer?op=metric&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=metric&"
                                     + nobody + "&metric=1"))[0] == 404
                 # Two peers on one host, neither at this port: 409, naming
                 # both (pub's accepted session and the dialed b).
-                assert (await _http(sock, "POST", "/fabric/peer?op=add&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=add&"
                                     + q))[0] == 200
                 await _until(lambda: len(b.connected()) == 1)
                 status, rep = await _http(
-                    sock, "POST", "/fabric/peer?op=metric&host=127.0.0.1"
+                    sock, "POST", "/moq-fabric/peer?op=metric&host=127.0.0.1"
                     "&port=1&metric=5")
                 assert status == 409
                 assert f"127.0.0.1:{bport}" in rep["error"]
-                assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=remove&"
                                     "host=127.0.0.1&port=1"))[0] == 409
-                assert (await _http(sock, "POST", "/fabric/peer?op=remove&"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=remove&"
                                     + q))[0] == 200
-                for bad in ("op=restart&" + q, "op=add&host=x",
+                for bad in ("op=reboot&" + q, "op=add&host=x",
                             "op=metric&" + q, "op=add&host=x&port=0"):
                     assert (await _http(sock, "POST",
-                                        "/fabric/peer?" + bad))[0] == 400
+                                        "/moq-fabric/peer?" + bad))[0] == 400
                 await feeder.stop()
                 _complete(viewer.got["video"])
     finally:
@@ -692,3 +693,80 @@ async def test_a_relay_stop_sends_no_transit_withdraws():
             withdraws = {k: n for k, n in session.rx_msgs.items()
                          if k.endswith("_WD")}
             assert not withdraws, withdraws
+
+
+# -- POST /moq-fabric/peer?op=restart -----------------------------------
+
+async def _restarted(sock, fabric, viewer, q):
+    """Restart the peer `q` names; the session to it is replaced and the
+    viewer's objects resume."""
+    (first,) = fabric.node.connected()
+    before = len(viewer.got["video"])
+    assert (await _http(sock, "POST", "/moq-fabric/peer?op=restart&"
+                        + q))[0] == 200
+    await _until(lambda: first.state == "closed")
+    await _until(lambda: any(s.id != first.id
+                             for s in fabric.node.connected()))
+    await _until(lambda: len(viewer.got["video"]) > before + 20)
+    _no_dups(viewer.got["video"])
+    assert viewer.done["video"] is None
+
+
+@pytest.mark.asyncio
+async def test_restart_a_dialed_peer(short_dir):
+    sock = os.path.join(short_dir, "relay.sock")
+    server = await asyncio.start_unix_server(relay._on_control, path=sock)
+    port, pport = _PORT + 58, _FABRIC_PORT + 58
+    pub = FabricNode(label="pub", bind="127.0.0.1", port=pport, cert=CERT,
+                     key=KEY)
+    try:
+        async with pub:
+            async with _relay(port, peers=[("127.0.0.1", pport)]) as (
+                    fabric, connect):
+                await _until(lambda: pub.connected()
+                             and fabric.node.connected())
+                q = f"host=127.0.0.1&port={pport}"
+                assert (await _http(sock, "POST", "/moq-fabric/peer?"
+                                    "op=metric&" + q + "&metric=300"))[0] \
+                    == 200
+                video = pub.publish(NS, "video")
+                await _until(lambda: fabric.covers(NS_T, b"video"))
+                feeder = _Feeder({"video": video})
+                viewer = _Viewer(await connect(), names=("video",))
+                await viewer.subscribe("video")
+                await _until(lambda: len(viewer.got["video"]) > 20)
+                await _restarted(sock, fabric, viewer, q)
+                (row,) = fabric.node.peer_table()
+                assert row["origin"] == "dialed" and row["metric"] == 300
+                await feeder.stop()
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_an_accepted_peer_and_an_unknown_one(short_dir):
+    sock = os.path.join(short_dir, "relay.sock")
+    server = await asyncio.start_unix_server(relay._on_control, path=sock)
+    port, fport = _PORT + 60, _FABRIC_PORT + 60
+    try:
+        async with _relay(port, fabric_port=fport) as (fabric, connect):
+            pub = _pub_node(fport)
+            async with pub:
+                await _until(lambda: pub.connected()
+                             and fabric.node.connected())
+                assert (await _http(sock, "POST", "/moq-fabric/peer?"
+                                    "op=restart&host=192.0.2.1&port=33434")
+                        )[0] == 404
+                video = pub.publish(NS, "video")
+                await _until(lambda: fabric.covers(NS_T, b"video"))
+                feeder = _Feeder({"video": video})
+                viewer = _Viewer(await connect(), names=("video",))
+                await viewer.subscribe("video")
+                await _until(lambda: len(viewer.got["video"]) > 20)
+                (row,) = fabric.node.peer_table()
+                assert row["origin"] == "accepted"
+                await _restarted(sock, fabric, viewer,
+                                 f"host={row['host']}&port={row['port']}")
+                await feeder.stop()
+    finally:
+        server.close()

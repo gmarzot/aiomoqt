@@ -53,11 +53,11 @@ compat            --compat
 payload check     --verify-payload [N] (long only)
 fabric node       --peer HOST[:PORT] (repeatable) --node-id
                   --node-metric: a moq-fabric node. Dials raw QUIC, ALPN
-                  moq-fabric; no -k, peering never verifies certificates.
+                  moq-fabric; no -k, moq-fabric never verifies certificates.
                   aiomoqt-relay adds --peer-port and reuses its own --bind
                   --cert --key
-peering listener  --bind -p/--port --cert --key, on the peering tools
-peering           fabric node + peering listener
+fabric listener   --bind -p/--port --cert --key, on the fabric tools
+fabric            fabric node + fabric listener
 help              -h/-?/--help on every tool (-? is a shell glob: quote it)
 entry point       run(main) in place of asyncio.run: Ctrl-C reaches the
                   main task through the event loop, between callbacks;
@@ -75,8 +75,8 @@ import signal
 import threading
 
 from aiomoqt.cat import DEFAULT_TOKEN_TYPE, CatAuth
-from aiomoqt.peering.node import LEAF_METRIC
-from aiomoqt.peering.wire import DEFAULT_PORT as PEERING_PORT
+from aiomoqt.moq_fabric.node import LEAF_METRIC
+from aiomoqt.moq_fabric.wire import DEFAULT_PORT as MOQ_FABRIC_PORT
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, parse_draft_spec
 from aiomoqt.utils.logger import (CATEGORIES, LEVELS, configure_logging,
                                   parse_log_spec)
@@ -578,12 +578,12 @@ def add_timestamp_checking(p, default='cancel', default_help=None):
                         f'receiving (default: {default_help or default})')
 
 
-# -- peering ---------------------------------------------------------
+# -- fabric ----------------------------------------------------------
 
 def peer_address(value):
     """argparse type for --peer HOST[:PORT], [V6]:PORT for IPv6:
     (host, port)."""
-    host, port = value, str(PEERING_PORT)
+    host, port = value, str(MOQ_FABRIC_PORT)
     if value.startswith('['):
         host, sep, rest = value[1:].partition(']')
         if not sep or (rest and not rest.startswith(':')):
@@ -603,7 +603,7 @@ def add_fabric_node(p, metric=LEAF_METRIC):
                    default=None, metavar='HOST[:PORT]',
                    help=f'Peer to dial, raw QUIC (ALPN moq-fabric); '
                         f'repeatable. Re-dialed after a close. Default '
-                        f'port {PEERING_PORT}')
+                        f'port {MOQ_FABRIC_PORT}')
     p.add_argument('--node-id', type=str, default=None, metavar='ID|LABEL',
                    help='Node id as high:low (each a uint32 or u16.u16, '
                         'e.g. 9.9:1), or a contact LABEL, whose id is the '
@@ -616,7 +616,7 @@ def add_fabric_node(p, metric=LEAF_METRIC):
                         f'{LEAF_METRIC} routes no path through it)')
 
 
-def add_peering_listener(p, port=PEERING_PORT):
+def add_moq_fabric_listener(p, port=MOQ_FABRIC_PORT):
     """moq-fabric listener: address and TLS identity."""
     p.add_argument('--bind', type=str, default=None,
                    help='Bind address (default: all interfaces, IPv4 and IPv6)')
@@ -635,10 +635,10 @@ def add_tls(p):
                    help='Listener TLS key (default: beside --cert)')
 
 
-def add_peering(p, port=PEERING_PORT):
+def add_moq_fabric(p, port=MOQ_FABRIC_PORT):
     """A standalone moq-fabric leaf: node flags and its own listener."""
     add_fabric_node(p)
-    add_peering_listener(p, port=port)
+    add_moq_fabric_listener(p, port=port)
 
 
 # -- validation ------------------------------------------------------
