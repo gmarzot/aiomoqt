@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from .messages import SubgroupHeader
 from .types import MOQTStreamStopped, ObjectStatus, StreamResetCode
 from .messages.data import (
-    FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram, ObjectDatagramStatus,
+    FETCH_FLAGS_END_UNKNOWN, FetchObject, ObjectDatagram,
 )
 from .utils.logger import TRACE, get_category_logger, get_logger
 
@@ -388,8 +388,7 @@ class ObjectHistory:
 
 
 def _same_extensions(a, b) -> bool:
-    """True when two extension blocks encode alike: equal, in the same
-    order (d14 encodes them in order)."""
+    """True when two extension blocks encode alike."""
     if a is b:
         return True
     if a is None or b is None or a != b:
@@ -697,11 +696,9 @@ class SubgroupDelivery:
             return
         prof = self._prof
         if self.mapping is StreamMapping.DATAGRAM:
-            cls = (ObjectDatagram if prof is not None
-                   and prof.merged_datagram_layout else ObjectDatagramStatus)
-            msg = cls(track_alias=self.track_alias, group_id=group_id,
-                      object_id=0, publisher_priority=self.priority,
-                      status=ObjectStatus.END_OF_TRACK)
+            msg = ObjectDatagram(track_alias=self.track_alias, group_id=group_id,
+                                 object_id=0, publisher_priority=self.priority,
+                                 status=ObjectStatus.END_OF_TRACK)
             await self.session.dgram_write_drain(msg.serialize(prof=prof).data)
             return
         if self.chain is None:
@@ -862,9 +859,7 @@ class SubgroupDelivery:
         """Every field of this delivery its datagrams' bytes depend on."""
         prof = self._prof
         return (self.track_alias, self.priority,
-                prof is not None and prof.vi64,
-                prof is not None and prof.merged_datagram_layout,
-                prof is not None and prof.params_delta_coded)
+                prof is not None and prof.vi64)
 
     def _datagram_bytes(self, group_id: int, object_id: int, payload: bytes,
                         extensions, encoded: Optional[list]) -> bytes:

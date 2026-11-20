@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """aiomoqt-relay: a MoQT relay built on aiomoqt.
 
-Relays raw QUIC and WebTransport sessions at drafts 14, 16, 18, 20 and
+Relays raw QUIC and WebTransport sessions at drafts 16, 18, 20 and
 22. It runs the public aiomoqt-relay, and moxygen's moqtest conformance
 suite and the interop runner test against it. Written in Python, it
 carries less traffic than the Rust and C++ relays.
 
 Limits:
 
-  * Authorization only with --auth-key: SETUP and, from d16, each request
-    are checked against CAT grants. No rate limiting.
+  * Authorization only with --auth-key: SETUP and each request are
+    checked against CAT grants. No rate limiting.
   * A per-stream send budget (--max-inflight-bytes) and a send lane per
     subscriber holding what its deadline covers at the track's input
     rate, or LANE_BYTES with no rate or deadline yet or while the lanes
@@ -20,7 +20,7 @@ Limits:
   * Per session, at most --max-namespaces-per-session namespace requests
     (PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS) and
     --max-subscriptions-per-session SUBSCRIBEs held; past either, a
-    request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16).
+    request is refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d16).
   * At --max-subscribers, a session's first SUBSCRIBE is refused the same
     way, with a randomized Retry Interval. Sessions already subscribed may
     add tracks.
@@ -61,8 +61,8 @@ Limits:
 
 Routing model (cross-session, single relay instance):
   - PUBLISH_NAMESPACE: record the announcing session under the
-    namespace tuple, respond with the protocol's default RequestOk
-    (d16+) / PublishNamespaceOk (d14), and subscribe the announcer to
+    namespace tuple, respond with the protocol's default RequestOk,
+    and subscribe the announcer to
     each live track under the namespace.
   - SUBSCRIBE: find publishers that announced the namespace or a prefix
     of it (§2.4 Namespace Prefix Matching), subscribe each upstream once
@@ -70,12 +70,20 @@ Routing model (cross-session, single relay instance):
     fan the objects out to every downstream subscriber of that track. A
     Location's first copy is forwarded and later ones are dropped. When
     the serving publisher ends, another takes over. With no match, send
-    SUBSCRIBE_ERROR / REQUEST_ERROR with TRACK_DOES_NOT_EXIST (d14 code
-    0x04, d16+ code 0x10) so a conformance suite sees a spec-correct
+    REQUEST_ERROR with DOES_NOT_EXIST (0x10) so a conformance suite sees
+    a spec-correct
     rejection. For --startup-hold seconds after start, such a SUBSCRIBE
     first waits for a publisher, so viewers that reconnect after a
     restart before their publishers are answered.
   - PUBLISH_NAMESPACE_DONE: drop that session's hold on the namespace.
+
+moq-fabric (--peer, --peer-port): the relay is also a fabric node, on its
+own UDP port, forwarding for other nodes. A track the fabric announces
+is pulled from it when no
+local publisher serves it, its objects deduplicated by Location; local
+PUBLISH_NAMESPACEs and PUBLISHes are announced into the fabric, and a
+fabric subscribe to one is served from local publishers only. The fabric
+subscribe is withdrawn at --pause-after like any upstream.
 
 Run on UDP/4443 with the runner's /certs convention:
 
@@ -146,7 +154,7 @@ from aiomoqt.delivery import (LANE_BYTES, LANE_STALL_S, SendLane,
 from aiomoqt.messages import FetchHeader, SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.messages.data import (FETCH_FLAGS_END_TIMED_OUT, FetchObject,
-                                   ObjectDatagram, ObjectDatagramStatus)
+                                   ObjectDatagram)
 from aiomoqt.messages.fetch import _is_joining
 from aiomoqt.messages.params import (RANGE_FILTERS, U64_MAX, D20ParamType,
                                      D20RequestErrorCode,
@@ -154,7 +162,7 @@ from aiomoqt.messages.params import (RANGE_FILTERS, U64_MAX, D20ParamType,
                                      RangeFilter, RangeFilters, fill_range,
                                      merge_range_filters, range_filter_count,
                                      uses_location_filter)
-from aiomoqt.messages.publish import Publish, PublishError
+from aiomoqt.messages.publish import Publish
 from aiomoqt.messages.request import RequestError, RequestOk
 from aiomoqt.messages.subscribe import Subscribe, SubscribeOk
 from aiomoqt.track import (SUBGROUP_DELIVERY_TIMEOUT, PublishedTrack,
@@ -162,9 +170,12 @@ from aiomoqt.track import (SUBGROUP_DELIVERY_TIMEOUT, PublishedTrack,
                            _filter_window, _largest_object_param, _min_nonzero,
                            _location_window, _subscription_window)
 from aiomoqt.context import (canonical_request_error, canonical_stream_reset,
-                             is_draft16_or_later,
                              request_error_code)
 from aiomoqt.tools import relay_status
+from aiomoqt.moq_fabric import (FabricHop, FabricNode, FabricSource,
+                             HopRetiring, node_id_format, parse_identity)
+from aiomoqt.moq_fabric.wire import DEFAULT_NODE_METRIC
+from aiomoqt.moq_fabric.wire import DEFAULT_PORT as MOQ_FABRIC_PORT
 from aiomoqt import __version__ as AIOMOQT_VERSION
 from aiomoqt import delivery as _delivery
 from aiomoqt.utils.certs import (SERVER_KEY_NAMES, find_cert, find_key,
@@ -173,8 +184,9 @@ from aiomoqt.utils.logger import (get_category_logger, get_log_level,
                                   set_log_handler, set_log_level,
                                   step_log_level)
 from aiomoqt.utils.buffer import Buffer, BufferReadError
-from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth, add_help,
-                               add_logging, apply_logging, auth_from_args)
+from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth,
+                               add_fabric_node, add_help, add_logging,
+                               apply_logging, auth_from_args)
 from aiomoqt.utils.url import parse_relay_url
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
@@ -188,6 +200,7 @@ _RELAY_DRAFT_DEFAULT = (
 
 logger = get_category_logger("relay")
 control_log = get_category_logger("control")
+peer_log = get_category_logger("moq_fabric")
 
 
 # Cross-session announcement table: namespace tuple -> the publisher
@@ -423,9 +436,9 @@ def _announcers(ns: tuple) -> list:
     return out
 
 
-def _publishers_for(ns: tuple) -> list:
+def _publishers_for(ns: tuple, name=None) -> list:
     """Publisher sessions that announced `ns` or a prefix of it, then the
-    origins we dialled."""
+    origins we dialled, then the fabric when it announces the track."""
     out = _announcers(ns)
     seen = {id(s) for s in out}
     # An origin we dialled advertises nothing to us, so ask it last:
@@ -435,6 +448,9 @@ def _publishers_for(ns: tuple) -> list:
         if id(sess) not in seen:
             seen.add(id(sess))
             out.append(sess)
+    fabric = _fabric
+    if fabric is not None and fabric.covers(ns, name):
+        out.append(fabric.source)
     return out
 
 
@@ -446,6 +462,8 @@ def _fetch_sources(ns: tuple, track_name) -> list:
     track = _tracks.get((tuple(ns), name))
     owner = _track_owner(track) if track is not None else None
     pubs = _publishers_for(ns)
+    if isinstance(owner, FabricSource):
+        owner = None
     if not _session_live(owner) or any(p is owner for p in pubs):
         return pubs
     return [owner, *pubs]
@@ -1844,11 +1862,6 @@ class _Feed:
     def session(self):
         return getattr(self.sub, "session", None)
 
-    def _location(self) -> dict:
-        """d14 SUBSCRIBE_UPDATE fields of an update; empty takes our
-        SUBSCRIBE's."""
-        return {}
-
     def _owns(self, session, alias) -> bool:
         """The handlers under `alias` are still this feed's."""
         return True
@@ -1861,8 +1874,7 @@ class _Feed:
             return None
         try:
             sent = session.request_update(rid, forward=forward,
-                                          wait_response=reply,
-                                          **self._location())
+                                          wait_response=reply)
         except Exception:
             logger.debug("relay: updating a standby upstream failed",
                          exc_info=True)
@@ -1906,9 +1918,6 @@ class _PushedFeed(_Feed):
 
     def _on_object(self, msg, size, ts, group_id, subgroup_id):
         self.track.on_object(msg, size, ts, group_id, subgroup_id, feed=self)
-
-    def _location(self) -> dict:
-        return _publish_ok_location(self.msg)
 
     def _owns(self, session, alias) -> bool:
         # The publisher may reuse the alias once its PUBLISH is done.
@@ -2121,6 +2130,12 @@ class _RelayedTrack:
             self.feed.release()
         session = _upstream_session(self)
         if session is None or self.upstream_alias is None:
+            return
+        if isinstance(session, FabricSource):
+            session.unsubscribe(getattr(self.upstream, "request_id", None))
+            session.unregister_object_handler(self.upstream_alias)
+            session.unregister_stream_end_handler(self.upstream_alias)
+            self.upstream_alias = None
             return
         try:
             session.unregister_object_handler(self.upstream_alias)
@@ -2665,7 +2680,7 @@ class _RelayedTrack:
             return
         gid = getattr(msg, "group_id", None)
         gid = gid if gid is not None else group_id
-        dgram = isinstance(msg, (ObjectDatagram, ObjectDatagramStatus))
+        dgram = isinstance(msg, ObjectDatagram)
         if self._end_at is not None and (gid, msg.object_id) > self._end_at:
             return
         if self._copy(feed, gid, subgroup_id or 0, msg.object_id, dgram):
@@ -3137,19 +3152,12 @@ class _RelayedTrack:
         and the stream's header state as it was."""
         if isinstance(shape, tuple) and shape and shape[0] == "DGRAM":
             prof = session._profile
-            is_status = (status or ObjectStatus.NORMAL) != ObjectStatus.NORMAL
-            if is_status and not prof.merged_datagram_layout:
-                # d14 keeps status datagrams in their own message family.
-                dgram = ObjectDatagramStatus(
-                    track_alias=alias, group_id=gid, object_id=oid,
-                    publisher_priority=prio, extensions=exts, status=status)
-            else:
-                dgram = ObjectDatagram(
-                    track_alias=alias, group_id=gid, object_id=oid,
-                    publisher_priority=prio, extensions=exts,
-                    payload=payload or b"",
-                    end_of_group=bool(shape[1]),
-                    status=status or ObjectStatus.NORMAL)
+            dgram = ObjectDatagram(
+                track_alias=alias, group_id=gid, object_id=oid,
+                publisher_priority=prio, extensions=exts,
+                payload=payload or b"",
+                end_of_group=bool(shape[1]),
+                status=status or ObjectStatus.NORMAL)
             _send_datagram(session, dgram.serialize(prof=prof), alias, gid, oid)
             return
         skey = (id(session), gid, sgid)
@@ -3301,6 +3309,11 @@ class _RelayedTrack:
             else:
                 stream_id = await session.open_uni_stream(
                     initial=initial, priority=band, end_stream=whole)
+        except HopRetiring:
+            # The SNS moved: this subgroup goes to the new hop only.
+            self._count_tx(session, -len(initial))
+            self._stopped.add(skey)
+            return True
         except MOQTStreamStopped:
             self._stopped.add(skey)
             return True
@@ -3527,7 +3540,6 @@ def _forget_session(session) -> None:
     _ns_subs[:] = [e for e in _ns_subs if e[0] is not session]
     _ns_offered.difference_update(
         [k for k in _ns_offered if k[0] is session])
-    _announce_subs[:] = [e for e in _announce_subs if e[0] is not session]
     _dgram_drops.pop(id(session), None)
     _subscribing.pop(id(session), None)
     _cap_warned.difference_update(
@@ -3539,6 +3551,7 @@ def _forget_session(session) -> None:
                 not _announced[ns]:
             del _announced[ns]
             _retract_namespace(ns)
+    _fabric_changed()
     for lane in [lane for lane in _lanes if lane.d.session is session]:
         lane.track.drop_session(session)
     for key, track in list(_tracks.items()):
@@ -3578,7 +3591,7 @@ def _ns_tuple(namespace):
 def _session_namespaces(session) -> int:
     """Namespace requests the session holds."""
     held = sum(1 for sid, _ in _announce_requests if sid == id(session))
-    subs = {e[2] for table in (_ns_subs, _track_subs, _announce_subs)
+    subs = {e[2] for table in (_ns_subs, _track_subs)
             for e in table if e[0] is session}
     return held + len(subs)
 
@@ -3662,9 +3675,7 @@ async def _on_publish_namespace(session, msg):
         lambda rid, s=session: _withdraw_namespace(s, request_id=rid))
     logger.info(f"relay: announce ns={ns} -> {len(holders)} publisher(s)")
     _announce_namespace(ns)
-    _forward_announcements(ns, session)
-    # Reuse the protocol's built-in OK helper. It emits RequestOk on
-    # d16+ and PublishNamespaceOk on d14, matching peer expectation.
+    _fabric_changed()
     session.publish_namespace_ok(msg)
     _join_live_tracks(ns, session)
     if _catalog_probe and _probe_wanted(ns):
@@ -3672,9 +3683,7 @@ async def _on_publish_namespace(session, msg):
 
 
 async def _on_publish_namespace_done(session, msg):
-    """d14 names the namespace, d16 the PUBLISH_NAMESPACE request."""
-    ns = _ns_tuple(msg.namespace) if msg.namespace else None
-    _withdraw_namespace(session, request_id=msg.request_id, ns=ns)
+    _withdraw_namespace(session, request_id=msg.request_id)
 
 
 def _withdraw_namespace(session, request_id=None, ns=None) -> None:
@@ -3696,6 +3705,7 @@ def _withdraw_namespace(session, request_id=None, ns=None) -> None:
     if not holders:
         del _announced[ns]
         _retract_namespace(ns)
+        _fabric_changed()
     logger.info(f"relay: namespace_done ns={ns} -> "
                 f"{len(_announced.get(ns, {}))} publisher(s)")
 
@@ -3710,7 +3720,7 @@ def _track_properties(session, msg) -> dict:
     """The Track Properties a PUBLISH, SUBSCRIBE_OK or FETCH_OK carries.
     The codec lifts DEFAULT_PUBLISHER_GROUP_ORDER into group_order; a
     Descending one goes back in (omitted means Ascending)."""
-    if msg is None or not session._profile.track_properties:
+    if msg is None:
         return {}
     props = dict(getattr(msg, "track_extensions", None) or {})
     if (isinstance(msg, (Publish, SubscribeOk))
@@ -3726,10 +3736,10 @@ def _mandatory(session, props) -> bool:
             and any(t in _MANDATORY_PROPERTIES for t in props))
 
 
-def _upstream_refusal(err, profile, fetch=False) -> tuple:
+def _upstream_refusal(err, profile) -> tuple:
     """An upstream REQUEST_ERROR as (RequestErrorCode, reason), for the
     downstream reply to encode in its own draft."""
-    code = canonical_request_error(err.error_code, profile, fetch=fetch)
+    code = canonical_request_error(err.error_code, profile)
     if not isinstance(code, RequestErrorCode):
         code = RequestErrorCode.INTERNAL_ERROR
     return code, err.reason or "upstream error"
@@ -3750,6 +3760,8 @@ class _Establishing:
         self.filter: dict = {}
         # The SUBSCRIBE's NEW_GROUP_REQUEST, carried upstream (§10.2.13).
         self.params: dict = {}
+        # Local publishers only: the fabric is not asked.
+        self.local = False
         self.task = None
 
     def resolve(self, result) -> None:
@@ -3759,10 +3771,12 @@ class _Establishing:
             self.fut.set_result(result)
 
 
-async def _establish_upstream(ns, track_name, forward=True, sub=None):
+async def _establish_upstream(ns, track_name, forward=True, sub=None,
+                              local=False):
     """Subscribe upstream once per Full Track Name. Returns (fan-out,
     None), or (None, the last upstream refusal or None) when no
-    publisher accepts. Concurrent callers share one upstream SUBSCRIBE.
+    publisher accepts. Concurrent callers share one upstream SUBSCRIBE;
+    with `local` a new one asks no fabric source.
 
     Transport §"Relays": with no Established upstream subscription for
     the Track, the relay subscribes to each publisher that announced the
@@ -3782,6 +3796,7 @@ async def _establish_upstream(ns, track_name, forward=True, sub=None):
             track.close()
             _drop_track(key, track)
         entry = _Establishing(key)
+        entry.local = local
         entry.filter = _upstream_filter(sub)
         value = (getattr(sub, "parameters", None) or {}).get(
             ParamType.NEW_GROUP_REQUEST)
@@ -3811,16 +3826,11 @@ def _upstream_filter(sub) -> dict:
 
 
 def _filter_for(pub, kwargs: dict) -> dict:
-    """From d16 an omitted filter is unfiltered (§10.2.9); d14 has no
-    omission, so it carries AbsoluteStart {0, 0}. Before d20 a relative
+    """An omitted filter is unfiltered (§10.2.9). Before d20 a relative
     start is sent as Largest Object; _backfill() fetches the rest."""
     if "location_filter" in kwargs and not uses_location_filter(
             pub._profile):
         return {"filter_type": FilterType.LATEST_OBJECT}
-    if "filter_type" in kwargs and kwargs["filter_type"] is None and not (
-            is_draft16_or_later(pub.negotiated_draft)):
-        return {"filter_type": FilterType.ABSOLUTE_START,
-                "start_group": 0, "start_object": 0}
     return kwargs
 
 
@@ -3950,6 +3960,9 @@ def _drop_track(key, track) -> None:
     """Remove `track` from the table, only if `key` still maps to it."""
     if _tracks.get(key) is track:
         del _tracks[key]
+        if _fabric is not None:
+            _fabric.track_dropped(key, track)
+            _fabric.changed()
 
 
 def _live_published(key):
@@ -4023,10 +4036,14 @@ async def _subscribe_publishers(entry):
     ns, track_name = key
     refusal = None
     tried = []
-    for pub in _publishers_for(ns):
+    for pub in _publishers_for(ns, track_name):
         tried.append(pub)
         if entry.fut.done():
             break
+        if isinstance(pub, FabricSource):
+            if entry.local:
+                continue
+            return _subscribe_fabric(key, pub), None
         track = _RelayedTrack(key)
         track.attaching = True
         name = (track_name.decode() if isinstance(track_name, bytes)
@@ -4038,9 +4055,7 @@ async def _subscribe_publishers(entry):
             on_done=lambda done, t=track, k=key: _upstream_done(t, k, done))
         entry.pub = pub
         upstream_filter = _filter_for(pub, entry.filter)
-        # d14 defines no NEW_GROUP_REQUEST.
-        params = ({} if pub._profile.update_has_location
-                  else entry.params)
+        params = entry.params
         try:
             await upstream.subscribe(timeout=10.0, parameters=params,
                                      **upstream_filter)
@@ -4201,8 +4216,6 @@ def _still_wanted(session, request_id) -> bool:
     reply is sent then."""
     if not _session_live(session):
         return False
-    if not is_draft16_or_later(session.negotiated_draft):
-        return True
     return _subscribe_pending(session, request_id)
 
 
@@ -4324,7 +4337,7 @@ async def _on_publish_done(session, msg):
 
 async def _on_publish(session, msg):
     """Flow B: a publisher offers a track with no prior
-    PUBLISH_NAMESPACE (transport 0x1D, present in d14/d16/d18 alike).
+    PUBLISH_NAMESPACE (transport 0x1D, present in d16/d18 alike).
 
     The PUBLISH_OK is held while SUBSCRIBE_TRACKS subscribers are offered
     the track; otherwise it is answered with Forward State 0 until a
@@ -4388,6 +4401,7 @@ async def _on_publish(session, msg):
     _announce_namespace(ns)
     logger.info(f"relay: publish ns={ns} track={msg.track_name} "
                 f"alias={msg.track_alias}")
+    _fabric_changed()
     offered = _offer_to_track_subs(track)
     if crossing:
         _answer_publish(track, forward=any(entry.forwards))
@@ -4470,7 +4484,7 @@ def _answer_publish(track, forward=None) -> None:
     if getattr(msg, "content_exists", 0):
         track.note_largest((msg.largest_group_id, msg.largest_object_id))
     if forward:
-        track.complete_from = _publish_ok_location(msg)["start"]
+        track.complete_from = _publish_ok_start(msg)
     # From d20 PUBLISH_OK carries only EXPIRES and Forward State follows
     # in a REQUEST_UPDATE; publish_ok() sends the draft's shape.
     session.publish_ok(msg, forward=int(forward), priority=128,
@@ -4513,9 +4527,7 @@ def _forward_new_group(track, params) -> None:
     req = _upstream_request(track)
     if req is None or not _session_live(req[0]):
         return
-    session, rid, _location = req
-    if session._profile.update_has_location:
-        return
+    session, rid, _start = req
     try:
         session.request_update(
             rid, parameters={ParamType.NEW_GROUP_REQUEST: value})
@@ -4530,56 +4542,48 @@ def _forward_new_group(track, params) -> None:
 
 def _refuse_publish(session, msg, reason, code=None) -> None:
     """Refuse a PUBLISH, by default DUPLICATE_SUBSCRIPTION (NOT_SUPPORTED
-    from d20); PUBLISH_ERROR at d14."""
+    from d20)."""
     prof = session._profile
     if code is None:
         code = (RequestErrorCode.NOT_SUPPORTED if prof.param_table >= 20
                 else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
-    if is_draft16_or_later(session.negotiated_draft):
-        session.subscribe_error(msg.request_id, error_code=code,
-                                reason=reason)
-        return
-    reply = PublishError(request_id=msg.request_id,
-                         error_code=request_error_code(code, prof),
-                         reason=reason)
-    session.send_control_message(reply)
+    session.subscribe_error(msg.request_id, error_code=code,
+                            reason=reason)
 
 
-def _publish_ok_location(msg) -> dict:
-    """The d14 SUBSCRIBE_UPDATE fields our PUBLISH_OK set: a Largest
-    Object filter (§5.1.2), open-ended, priority 128."""
-    start = ((msg.largest_group_id, msg.largest_object_id + 1)
-             if getattr(msg, "content_exists", 0) else (0, 0))
-    return {"start": start, "end_group": 0, "priority": 128}
+def _publish_ok_start(msg) -> tuple:
+    """The Start Location of the Largest Object filter our PUBLISH_OK set
+    (§5.1.2)."""
+    return ((msg.largest_group_id, msg.largest_object_id + 1)
+            if getattr(msg, "content_exists", 0) else (0, 0))
 
 
 def _upstream_request(track):
-    """(session, request id, d14 SUBSCRIBE_UPDATE location) of the
+    """(session, request id, PUBLISH_OK Start Location or None) of the
     request feeding `track`, or None."""
     up = track.upstream
     if _is_session(up):
         msg = track.publish_msg
         if msg is None:
             return None
-        return up, msg.request_id, _publish_ok_location(msg)
+        return up, msg.request_id, _publish_ok_start(msg)
     session = getattr(up, "session", None)
     rid = getattr(up, "request_id", None)
     if session is None or rid is None:
         return None
-    return session, rid, {}
+    return session, rid, None
 
 
 def _resume_paused(track, wanted=False):
     """Raise a paused upstream's Forward State once a subscriber
     forwards, or is about to (`wanted`). With `wanted`, returns the
-    awaitable reply when the upstream draft has one (d16+), else None."""
+    awaitable reply, else None."""
     if not track.paused or not (wanted or _forwarding(track)):
         return None
     req = _upstream_request(track)
     if req is None:
         return None
-    session, rid, location = req
-    wait = wanted and not session._profile.update_has_location
+    session, rid, start = req
     if track.lowered and track.largest is not None:
         track.fence = track.largest[0]
         if track.pause_largest is not None:
@@ -4592,10 +4596,9 @@ def _resume_paused(track, wanted=False):
         track.complete_from = None
         track._resync = True
     elif track.publish_msg is not None:
-        track.complete_from = location["start"]
+        track.complete_from = start
     try:
-        reply = session.request_update(rid, forward=1, wait_response=wait,
-                                       **location)
+        reply = session.request_update(rid, forward=1, wait_response=wanted)
         logger.info(f"relay: resumed {track.key} upstream: REQUEST_UPDATE "
                     f"forward=1 request {rid}")
         for f in track.standby:
@@ -4604,7 +4607,7 @@ def _resume_paused(track, wanted=False):
         logger.debug("relay: raising the upstream forward state failed",
                      exc_info=True)
         return None
-    return reply if wait else None
+    return reply if wanted else None
 
 
 # Track key -> task taking the Largest from a resume's REQUEST_OK.
@@ -4698,11 +4701,9 @@ def _pause_upstream(track) -> None:
     req = _upstream_request(track)
     if req is None or not _session_live(req[0]):
         return
-    session, rid, location = req
-    wait = not session._profile.update_has_location
+    session, rid, _start = req
     try:
-        reply = session.request_update(rid, forward=0, wait_response=wait,
-                                       **location)
+        reply = session.request_update(rid, forward=0, wait_response=True)
     except Exception:
         logger.debug("relay: lowering the upstream forward state failed",
                      exc_info=True)
@@ -4713,8 +4714,8 @@ def _pause_upstream(track) -> None:
         f.update(0)
     track.open_gap()
     track.pause_largest = None
-    track.pause_reply = (asyncio.ensure_future(
-        _take_pause_largest(track, reply)) if wait else None)
+    track.pause_reply = asyncio.ensure_future(
+        _take_pause_largest(track, reply))
     logger.info(f"relay: paused {track.key} upstream, no forwarding "
                 f"subscriber for {_pause_after:g}s: REQUEST_UPDATE "
                 f"forward=0 request {rid}")
@@ -4811,7 +4812,7 @@ def _publisher_known(ns: tuple, track_name) -> bool:
     if (track is not None and _track_live(track)
             and (track.pending_publish or track.upstream)):
         return True
-    return bool(_publishers_for(ns) or _upstream_urls)
+    return bool(_publishers_for(ns, track_name) or _upstream_urls)
 
 
 def _rendezvous_s(session, msg) -> float:
@@ -5027,16 +5028,13 @@ async def _fail_fill(session, request_id) -> None:
 
 async def _on_request_update(session, msg):
     """A subscriber changes its Forward State or filter: REQUEST_UPDATE
-    from d16 (§10.9), SUBSCRIBE_UPDATE at d14 (Forward State only).
-    Updates to anything but a relayed subscription get the session's
-    default reply."""
-    d16 = is_draft16_or_later(session.negotiated_draft)
-    rid = (msg.existing_request_id if d16
-           else msg.subscription_request_id)
+    (§10.9). Updates to anything but a relayed subscription get the
+    session's default reply."""
+    rid = msg.existing_request_id
     found = _joined_subscription(session, rid)
     held = _held_updates.get((session, rid))
-    if d16 and (held is not None
-                or (found is None and _request_pending(session, rid))):
+    if (held is not None
+            or (found is None and _request_pending(session, rid))):
         # Applied in arrival order once its subscription is established:
         # its reply must not overtake the SUBSCRIBE_OK, and an offer's
         # subscriber is attached a loop turn after its PUBLISH_OK.
@@ -5048,13 +5046,10 @@ async def _on_request_update(session, msg):
                     f"subscription {rid} is established")
         return
     if found is None:
-        if d16:
-            _update_track_sub_filters(session, rid, msg.parameters or {})
-            await session._handle_request_update(msg)
-        else:
-            await session._handle_subscribe_update(msg)
+        _update_track_sub_filters(session, rid, msg.parameters or {})
+        await session._handle_request_update(msg)
         return
-    _apply_update(session, msg, found, d16)
+    _apply_update(session, msg, found)
 
 
 # (session, request id) -> REQUEST_UPDATEs waiting for its subscription.
@@ -5074,44 +5069,39 @@ async def _release_held_updates(session, rid) -> None:
     found = _joined_subscription(session, rid)
     for msg in _held_updates.pop((session, rid), []):
         if found is not None:
-            _apply_update(session, msg, found, True)
+            _apply_update(session, msg, found)
         else:
             await session._handle_request_update(msg)
 
 
-def _apply_update(session, msg, found, d16: bool) -> None:
+def _apply_update(session, msg, found) -> None:
     """Apply an update to a joined downstream subscription and answer it."""
     key, track, d = found
-    rid = msg.existing_request_id if d16 else msg.subscription_request_id
-    if d16 and not _update_filters(session, msg, track, d):
+    rid = msg.existing_request_id
+    if not _update_filters(session, msg, track, d):
         return
-    if d16:
-        forward = (msg.parameters or {}).get(ParamType.FORWARD)
-        window = _reply_window(session, msg, track.largest)
-        if window is not None:
-            d.window = window
-        lf = (msg.parameters or {}).get(ParamType.SUBSCRIPTION_FILTER)
-        if isinstance(lf, LocationFilter):
-            d.location_filter = lf
-        if d.take_timeout(msg.parameters):
-            track.time_lane(d)
-    else:
-        forward = msg.forward
+    forward = (msg.parameters or {}).get(ParamType.FORWARD)
+    window = _reply_window(session, msg, track.largest)
+    if window is not None:
+        d.window = window
+    lf = (msg.parameters or {}).get(ParamType.SUBSCRIPTION_FILTER)
+    if isinstance(lf, LocationFilter):
+        d.location_filter = lf
+    if d.take_timeout(msg.parameters):
+        track.time_lane(d)
     if forward is not None:
         if forward and not d.forward:
             d.joined_at = track.largest
         d.forward = bool(forward)
     logger.info(f"relay: update {key} request {rid}: "
                 f"forward={int(d.forward)} window={d.window}")
-    if d16:
-        params = ({} if track.largest is None
-                  else _largest_object_param(session, track.largest))
-        ok = RequestOk(request_id=msg.request_id, parameters=params)
-        session._send_reply(msg.request_id, ok)
-        _start_fill(track, d, msg)
+    params = ({} if track.largest is None
+              else _largest_object_param(session, track.largest))
+    ok = RequestOk(request_id=msg.request_id, parameters=params)
+    session._send_reply(msg.request_id, ok)
+    _start_fill(track, d, msg)
     _resume_paused(track)
-    if d16:
-        _forward_new_group(track, msg.parameters)
+    _forward_new_group(track, msg.parameters)
 
 
 def _update_filters(session, msg, track, d) -> bool:
@@ -5228,7 +5218,8 @@ async def _relay_subscribe(session, msg):
     if not _announced_match(ns) and not _upstreams and _upstream_urls:
         await _await_upstream()
     why = "not announced"
-    if _announced_match(ns) or _upstreams:
+    if (_announced_match(ns) or _upstreams
+            or _fabric_covers(ns, msg.track_name)):
         forward = msg.forward is None or bool(msg.forward)
         track, refusal = await _establish_upstream(ns, msg.track_name,
                                                    forward=forward, sub=msg)
@@ -5386,7 +5377,10 @@ def parse_args(argv=None):
                              "reports DEBUG logging, POST /debug toggles it, "
                              "GET /sessions reports each session's transport "
                              "state (and, with --trace-subscribers, what each "
-                             "subscription was sent)")
+                             "subscription was sent); with the fabric on, "
+                             "GET /moq-fabric reports the node and POST "
+                             "/moq-fabric/peer?op=add|remove|metric|restart"
+                             "&host=H&port=P[&metric=M] changes its peers")
     parser.add_argument("--status-dir", type=str, default=None, metavar="DIR",
                         help="Write DIR/status.json every "
                              f"{STATUS_INTERVAL_S:g}s for the dashboard: "
@@ -5466,6 +5460,12 @@ def parse_args(argv=None):
                         help="Enable debug logging (= --log-level debug). "
                              "SIGUSR1 steps the level at runtime: INFO, "
                              "DEBUG, TRACE, INFO")
+    add_fabric_node(parser, metric=DEFAULT_NODE_METRIC)
+    parser.add_argument("--peer-port", type=int, default=None, metavar="N",
+                        help="moq-fabric listen port, on --bind with "
+                             "--cert and --key; 0 = do not listen. The "
+                             "fabric is on with --peer or --peer-port. "
+                             f"Default with the fabric on: {MOQ_FABRIC_PORT}")
     add_auth(parser)
     add_logging(parser)
     add_help(parser)
@@ -5571,9 +5571,6 @@ _track_sub_filters: dict = {}
 # (session, prefix, request_id) for SUBSCRIBE_NAMESPACE subscribers sent
 # NAMESPACE / NAMESPACE_DONE: d18 on, and d16 when Subscribe Options ask.
 _ns_subs: list = []
-# (session, prefix, request_id) for d14 SUBSCRIBE_NAMESPACE subscribers,
-# forwarded PUBLISH_NAMESPACE / PUBLISH_NAMESPACE_DONE.
-_announce_subs: list = []
 # d16 SUBSCRIBE_NAMESPACE Subscribe Options.
 _SUBSCRIBE_OPTIONS_NAMESPACE = 0x01
 _SUBSCRIBE_OPTIONS_BOTH = 0x02
@@ -5586,7 +5583,7 @@ def _prefix_covers(prefix, ns) -> bool:
 
 def _own_track(session, track) -> bool:
     """From d18 SUBSCRIBE_TRACKS excludes tracks published by the
-    subscriber (d22 §3.6); d14 and d16 echo them back."""
+    subscriber (d22 §3.6); d16 echoes them back."""
     if not session._profile.two_level_discovery:
         return False
     pending = track.pending_publish
@@ -5673,8 +5670,8 @@ async def _offer_track(session, track, key, request_id=None):
 
 def _reply_window(session, reply, largest):
     """The filter window a PUBLISH_OK or REQUEST_UPDATE asks for against
-    `largest`, None when it carries no filter: fields at d14, a parameter
-    from d16, a Location Filter from d20."""
+    `largest`, None when it carries no filter: fields on a decoded
+    PUBLISH_OK, a parameter on an update, a Location Filter from d20."""
     if getattr(reply, "filter_type", None) is not None:
         return _filter_window(reply.filter_type, reply.start_group,
                               reply.start_object, reply.end_group, largest)
@@ -5787,7 +5784,7 @@ async def _fetch_upstream(ns, track_name, msg, timeout=10.0):
             logger.info(f"relay: upstream FETCH declined on {ns}: {e}")
             _fetch_sinks.pop(key, None)
             if isinstance(e, MOQTRequestError):
-                refusal = _upstream_refusal(e, pub._profile, fetch=True)
+                refusal = _upstream_refusal(e, pub._profile)
             continue
         if mandatory:
             logger.info(f"relay: upstream FETCH {ns}/{name} -> "
@@ -5817,7 +5814,7 @@ def _publisher_end(ok):
 def _fetch_range(msg, largest):
     """(start, end) Locations a FETCH asks for, both inclusive, the end at
     most `largest`: (group, 2^64-1) for a whole End Group below it, None
-    for no End with nothing published. d14-d18 End is the last Object
+    for no End with nothing published. d16-d18 End is the last Object
     plus one, Object 0 the whole End Group."""
     if msg.location_filter is not None:
         return msg.location_filter.resolve(largest, fetch=True)
@@ -5995,8 +5992,7 @@ async def _on_subscribe_namespace(session, msg):
     """Namespace discovery (§9.4). d18 answers NAMESPACE per namespace
     under the prefix — the subscriber then asks each one for its tracks
     with SUBSCRIBE_TRACKS. d16 sends NAMESPACE, a PUBLISH per matching
-    track, or both, as its Subscribe Options ask. d14 forwards matching
-    PUBLISH_NAMESPACEs and a PUBLISH per matching track."""
+    track, or both, as its Subscribe Options ask."""
     if _namespaces_full(session, msg):
         return
     prefix = _ns_tuple(msg.namespace_prefix)
@@ -6011,8 +6007,6 @@ async def _on_subscribe_namespace(session, msg):
                        if not (e[0] is s and e[2] == r)]
         _track_subs[:] = [e for e in _track_subs
                           if not (e[0] is s and e[2] == r)]
-        _announce_subs[:] = [e for e in _announce_subs
-                             if not (e[0] is s and e[2] == r)]
     session.register_request_cancel_handler(msg.request_id, _drop)
 
     if session._profile.two_level_discovery:
@@ -6024,12 +6018,7 @@ async def _on_subscribe_namespace(session, msg):
         return
 
     options = msg.subscribe_options
-    if not is_draft16_or_later(session.negotiated_draft):
-        _announce_subs.append((session, prefix, msg.request_id))
-        for ns in list(_announced):
-            if _prefix_covers(prefix, ns):
-                _forward_announce(session, ns)
-    elif options in (_SUBSCRIBE_OPTIONS_NAMESPACE, _SUBSCRIBE_OPTIONS_BOTH):
+    if options in (_SUBSCRIBE_OPTIONS_NAMESPACE, _SUBSCRIBE_OPTIONS_BOTH):
         _ns_subs.append((session, prefix, msg.request_id))
         for ns in _known_namespaces(prefix):
             _offer_namespace(session, msg.request_id, prefix, ns)
@@ -6051,7 +6040,8 @@ def _known_namespaces(prefix) -> list:
     """Namespaces the relay can serve under `prefix`: announced ones
     plus any track it already relays."""
     out, seen = [], set()
-    for ns in list(_announced) + [key[0] for key in _tracks]:
+    fabric = _fabric.namespaces() if _fabric is not None else []
+    for ns in list(_announced) + [key[0] for key in _tracks] + fabric:
         if ns in seen or not _prefix_covers(prefix, ns):
             continue
         seen.add(ns)
@@ -6085,26 +6075,8 @@ def _announce_namespace(ns) -> None:
             _offer_namespace(session, rid, prefix, ns)
 
 
-def _forward_announcements(ns, publisher) -> None:
-    """d14: forward a new PUBLISH_NAMESPACE to namespace subscribers."""
-    for session, prefix, _rid in list(_announce_subs):
-        if session is not publisher and _prefix_covers(prefix, ns):
-            _forward_announce(session, ns)
-
-
-def _forward_announce(session, ns) -> None:
-    """One PUBLISH_NAMESPACE to a d14 namespace subscriber, once."""
-    if not _session_live(session) or session.is_announced(ns):
-        return
-    try:
-        session.publish_namespace(namespace=ns)
-    except Exception:
-        logger.debug("relay: PUBLISH_NAMESPACE forward failed", exc_info=True)
-
-
 def _retract_namespace(ns) -> None:
-    """Tell prefix subscribers a namespace has gone (§10.8): NAMESPACE_DONE
-    from d16, PUBLISH_NAMESPACE_DONE at d14.
+    """Tell prefix subscribers a namespace has gone (§10.8): NAMESPACE_DONE.
 
     The counterpart to _announce_namespace: an observer that was told a
     namespace exists otherwise goes on believing it after the last
@@ -6120,14 +6092,6 @@ def _retract_namespace(ns) -> None:
                 session.namespace_done(ns[len(prefix):], request_id=rid)
             except Exception:
                 logger.debug("relay: NAMESPACE_DONE failed", exc_info=True)
-    for session, prefix, _rid in list(_announce_subs):
-        if (_prefix_covers(prefix, ns) and _session_live(session)
-                and session.is_announced(ns)):
-            try:
-                session.publish_namespace_done(namespace=ns)
-            except Exception:
-                logger.debug("relay: PUBLISH_NAMESPACE_DONE failed",
-                             exc_info=True)
 
 
 async def _on_subscribe_tracks(session, msg):
@@ -6173,14 +6137,9 @@ async def _on_track_status(session, msg):
     ns = _ns_tuple(msg.track_namespace)
     _watch_session(session, ns)
     track = _tracks.get((ns, msg.track_name))
-    d14 = not is_draft16_or_later(session.negotiated_draft)
     if track is None or not _track_live(track):
         logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                     f"-> DOES_NOT_EXIST")
-        if d14:
-            session._refuse_peer_request(msg, RequestErrorCode.DOES_NOT_EXIST,
-                                         "track not served here")
-            return
         err = RequestError(
             request_id=msg.request_id,
             error_code=request_error_code(RequestErrorCode.DOES_NOT_EXIST,
@@ -6195,9 +6154,6 @@ async def _on_track_status(session, msg):
               else _largest_object_param(session, largest))
     logger.info(f"relay: track-status ns={ns} track={msg.track_name} "
                 f"-> OK largest={largest}")
-    if d14:
-        session._d14_track_status_ok(msg.request_id, largest)
-        return
     ok = RequestOk(request_id=msg.request_id, parameters=params,
                    track_properties=track.properties)
     session._send_reply(msg.request_id, ok, fin=True)
@@ -6217,10 +6173,6 @@ def _answered(handler):
             if request_id is None:
                 return
             try:
-                if not is_draft16_or_later(session.negotiated_draft):
-                    session._refuse_peer_request(
-                        msg, RequestErrorCode.INTERNAL_ERROR, "relay error")
-                    return
                 session._send_reply(request_id, RequestError(
                     request_id=request_id,
                     error_code=int(RequestErrorCode.INTERNAL_ERROR),
@@ -6950,6 +6902,7 @@ class _Status:
             "history": self.history.to_json(),
             "track_history": {tid: {k: list(v) for k, v in series.items()}
                               for tid, series in self.track_history.items()},
+            "moq_fabric": _fabric.report() if _fabric is not None else None,
         }
 
     def _add_track_history(self, tracks) -> None:
@@ -7195,6 +7148,514 @@ def _toggle_debug() -> None:
         logger.info("relay: debug logging on")
 
 
+# -- moq-fabric node (--peer / --peer-port) ---------------------------
+
+# The relay's fabric node; None while the fabric is off.
+_fabric = None
+FABRIC_LABEL = "aiomoqt-relay"
+# A learned announce outlives its last withdraw this long, so a redial or
+# a path change does not end the tracks it covers.
+FABRIC_WITHDRAW_GRACE_S = 3.0
+# Redial delay for a lost fabric peer.
+FABRIC_REDIAL_S = 2.0
+
+
+def _fabric_covers(ns: tuple, name=None) -> bool:
+    """The fabric announces `ns` (with `name`, that track)."""
+    return _fabric is not None and _fabric.covers(ns, name)
+
+
+def _fabric_fed(track) -> bool:
+    return isinstance(_upstream_session(track), FabricSource)
+
+
+def _fabric_changed() -> None:
+    """Local publishers or tracks changed: resync the fabric soon."""
+    if _fabric is not None:
+        _fabric.changed()
+
+
+def _local_published(track) -> bool:
+    """A live track a local session PUBLISHed."""
+    if track.finished or track._closed:
+        return False
+    if track.pending_publish is not None:
+        return _session_live(track.pending_publish[0])
+    return _is_session(track.upstream) and _session_live(track.upstream)
+
+
+def _subscribe_fabric(key, source):
+    """Pull `key` from the fabric: SUBSCRIBE_INFO now, objects into a new
+    fan-out deduplicated by Location; no Largest is known."""
+    ns, name = key
+    track = _RelayedTrack(key)
+    track.attaching = True
+    track._multi = True
+    pull = source.subscribe(ns, name)
+    track.upstream = pull
+    track.upstream_alias = pull.track_alias
+    source.register_object_handler(pull.track_alias, track.on_object)
+    source.register_stream_end_handler(pull.track_alias,
+                                       track.on_stream_end)
+    old = _tracks.get(key)
+    if old is not None and old is not track:
+        old.close()
+    _tracks[key] = track
+    logger.info(f"relay: upstream established ns={ns} track={name} "
+                f"from the fabric, hash=0x{pull.track_alias:016x}")
+    return track
+
+
+def _addr_text(host, port) -> str:
+    return f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
+
+
+class _Egress:
+    """A local track the fabric subscribes to: its FabricTrack, one hop
+    per session holding an SNS for it, and the fan-out the hops are
+    downstreams of (None until established)."""
+
+    __slots__ = ("key", "ftrack", "hops", "track", "timeout_ms")
+
+    def __init__(self, key, ftrack):
+        self.key = key
+        self.ftrack = ftrack
+        self.hops: dict = {}
+        self.track = None
+        self.timeout_ms = 0
+
+
+class _Fabric:
+    """The relay's moq-fabric node and its bridges to the relay tables.
+
+    Learned announces make `source` a publisher of what they cover, last
+    in _publishers_for. Local announces and PUBLISHes become fabric
+    announces; a learned subscribe to one is served from local publishers
+    only, through a FabricHop per session holding its SNS."""
+
+    def __init__(self, node: FabricNode):
+        self.node = node
+        self.source = FabricSource(node)
+        # (fullname hash, source node) -> learned announce, held through
+        # its withdraw grace.
+        self.announced: dict = {}
+        self._expiring: dict = {}
+        # (ns, name) -> _Egress.
+        self.egress: dict = {}
+        self._attaching: set = set()
+        self._sync_due = False
+        node.on_announce = self._on_announce
+        node.on_subscribe = self._on_subscribe
+        node.on_sns = self._on_sns
+
+    async def start(self) -> None:
+        await self.node.start()
+        self.changed()
+
+    async def stop(self) -> None:
+        """node.stop() withdraws what this node originated and closes
+        every session at once; then the hops close and the relay's
+        fabric-fed tracks end downstream."""
+        await self.node.stop()
+        for e in list(self.egress.values()):
+            for sid in list(e.hops):
+                self._drop_hop(e, sid)
+        self.egress.clear()
+        self.source.close()
+        _forget_session(self.source)
+
+    # -- learned announces --------------------------------------------
+
+    def covers(self, ns: tuple, name=None) -> bool:
+        if name is not None and not isinstance(name, bytes):
+            name = str(name).encode()
+        for ann in self.announced.values():
+            if ann.is_namespace:
+                if ns[:len(ann.namespace)] == ann.namespace:
+                    return True
+            elif ann.namespace == ns and (name is None or ann.name == name):
+                return True
+        return False
+
+    def namespaces(self) -> list:
+        return list({ann.namespace for ann in self.announced.values()})
+
+    def _on_announce(self, ann, present) -> None:
+        if ann.source == self.node.node_id:
+            return
+        key = (ann.fullname_hash, ann.source)
+        if present:
+            timer = self._expiring.pop(key, None)
+            if timer is not None:
+                timer.cancel()
+            fresh = key not in self.announced
+            self.announced[key] = ann
+            if fresh:
+                logger.info(f"relay: fabric announces "
+                            f"{_ns_str(ann.namespace)}"
+                            + (f" track={_name_str(ann.name)}"
+                               if ann.name else " (namespace)")
+                            + f" from {node_id_format(ann.source)}")
+                if ann.namespace not in _announced:
+                    _announce_namespace(ann.namespace)
+        elif key in self.announced and key not in self._expiring:
+            self._expiring[key] = asyncio.get_running_loop().call_later(
+                FABRIC_WITHDRAW_GRACE_S, self._expire, key)
+
+    def _expire(self, key) -> None:
+        self._expiring.pop(key, None)
+        ann = self.announced.pop(key, None)
+        if ann is None:
+            return
+        logger.info(f"relay: fabric withdrew {_ns_str(ann.namespace)}"
+                    + (f" track={_name_str(ann.name)}" if ann.name else "")
+                    + f" from {node_id_format(ann.source)}")
+        for tkey, track in list(_tracks.items()):
+            if not _fabric_fed(track) or self.covers(*tkey):
+                continue
+            if track.fail_over(tkey):
+                continue
+            logger.info(f"relay: {tkey} no longer announced in the fabric "
+                        f"-> PUBLISH_DONE to {len(track.downstream)} "
+                        f"subscriber(s)")
+            track.finish(reason="fabric announce withdrawn")
+            track.close()
+            _drop_track(tkey, track)
+        ns = ann.namespace
+        if ns not in _announced and ns not in self.namespaces():
+            _retract_namespace(ns)
+
+    # -- local publishers to the fabric -------------------------------
+
+    def changed(self) -> None:
+        if not self._sync_due:
+            self._sync_due = True
+            asyncio.get_running_loop().call_soon(self.sync)
+
+    def sync(self) -> None:
+        self._sync_due = False
+        if self.node._stopping:
+            return
+        self._sync_announces()
+        self._sync_egress()
+
+    def _sync_announces(self) -> None:
+        want = {(ns, b"") for ns, holders in _announced.items()
+                if not _internal_ns(ns)
+                and any(_session_live(s) for s in holders)}
+        want.update(key for key, track in _tracks.items()
+                    if not _internal_ns(key[0]) and _local_published(track))
+        have = {(a.namespace, a.name)
+                for a in self.node.originated_announces()}
+        for ns, name in want - have:
+            self.node.announce(ns, name)
+            logger.info(f"relay: announcing {_ns_str(ns)}"
+                        + (f" track={_name_str(name)}" if name
+                           else " (namespace)") + " into the fabric")
+        for ns, name in have - want:
+            self.node.withdraw_announce(ns, name)
+            logger.info(f"relay: withdrew {_ns_str(ns)}"
+                        + (f" track={_name_str(name)}" if name else "")
+                        + " from the fabric")
+
+    def _on_subscribe(self, sub, present) -> None:
+        self.changed()
+
+    def _wanted(self) -> dict:
+        """(ns, name) -> delivery timeout of each track a remote node
+        subscribes to with Forward 1."""
+        out: dict = {}
+        for sub in self.node.remote_subscribes():
+            if sub.source == self.node.node_id or not sub.forward:
+                continue
+            key = (sub.namespace, sub.name)
+            out[key] = _min_nonzero(out.get(key, 0), sub.delivery_timeout_ms)
+        return out
+
+    def _sync_egress(self) -> None:
+        wanted = self._wanted()
+        for key in [k for k in self.egress if k not in wanted]:
+            self._unserve(key)
+        for key, timeout_ms in wanted.items():
+            e = self.egress.get(key)
+            if e is not None:
+                e.timeout_ms = timeout_ms
+                if e.track is not None and _track_live(e.track):
+                    continue
+                e.track = None
+            if key not in self._attaching:
+                self._attaching.add(key)
+                _spawn(self._serve(key, timeout_ms))
+
+    async def _local_track(self, key):
+        """The live fan-out of `key` local publishers feed, established
+        if needed; None when there is none or the fabric feeds it."""
+        ns, name = key
+        track = _tracks.get(key)
+        if track is not None and _track_live(track):
+            if _fabric_fed(track):
+                return None
+            if track.pending_publish is not None:
+                _answer_publish(track, forward=True)
+            if track.upstream is not None:
+                return track
+        if not (_announcers(ns) or _upstreams):
+            return None
+        track, _refusal = await _establish_upstream(ns, name, local=True)
+        if track is None or _fabric_fed(track):
+            return None
+        return track
+
+    async def _serve(self, key, timeout_ms) -> None:
+        try:
+            track = await self._local_track(key)
+        finally:
+            self._attaching.discard(key)
+        if track is None or key not in self._wanted() or self.node._stopping:
+            return
+        e = self.egress.get(key)
+        if e is None:
+            e = self.egress[key] = _Egress(key, self.node.publish(
+                key[0], key[1], announce=False))
+        e.timeout_ms = timeout_ms
+        e.track = track
+        logger.info(f"relay: serving {key} to the fabric")
+        for hop in list(e.hops.values()):
+            self._add_hop(e, hop)
+        self._sync_hops(e)
+        if track.attaching:
+            track.attaching = False
+            track._ensure_drain()
+        _resume_paused(track)
+
+    def _unserve(self, key) -> None:
+        e = self.egress.pop(key, None)
+        if e is None:
+            return
+        for sid in list(e.hops):
+            self._drop_hop(e, sid)
+        self.node.unpublish(e.ftrack)
+        logger.info(f"relay: {key} no longer subscribed in the fabric")
+
+    def _on_sns(self, ftrack, session_id, sns) -> None:
+        e = self.egress.get((ftrack.origin.namespace, ftrack.origin.name))
+        if e is not None and e.ftrack is ftrack:
+            self._sync_hops(e)
+
+    def _sync_hops(self, e) -> None:
+        """One hop per session holding the track's SNS."""
+        held = e.ftrack.origin.sns
+        for sid in [sid for sid in e.hops if sid not in held
+                    and not e.ftrack.retiring(sid)]:
+            self._drop_hop(e, sid)
+        for sid in held:
+            if sid in e.hops:
+                continue
+            hop = FabricHop(self.node, e.ftrack, sid)
+            if hop.closed:
+                continue
+            e.hops[sid] = hop
+            if e.track is not None:
+                self._add_hop(e, hop)
+
+    def _add_hop(self, e, hop) -> None:
+        track = e.track
+        if track.find(hop, None) is not None or track.finished:
+            return
+        window = _UNFILTERED
+        if track.largest is not None and any(
+                e.ftrack.retiring(sid) for sid in e.hops
+                if sid != hop.session_id):
+            # A route move: the old hop finishes the group in flight.
+            window = ((track.largest[0] + 1, 0), None)
+        d = track.add_downstream(hop, e.ftrack.fullname_hash, None,
+                                 window=window)
+        d.timeout = e.timeout_ms
+        logger.info(f"relay: fabric session {hop.session_id} "
+                    f"({self._peer_text(hop.session_id)}) joins {e.key} "
+                    f"-> fanout={len(track.downstream)}")
+        _resume_paused(track)
+
+    def _drop_hop(self, e, sid) -> None:
+        hop = e.hops.pop(sid, None)
+        if hop is None:
+            return
+        hop.close()
+        if e.track is not None:
+            e.track.drop_session(hop)
+        if e.track is not None:
+            logger.info(f"relay: fabric session {sid} leaves {e.key} "
+                        f"-> fanout={len(e.track.downstream)}")
+
+    def track_dropped(self, key, track) -> None:
+        e = self.egress.get(key)
+        if e is not None and e.track is track:
+            e.track = None
+
+    # -- peers ---------------------------------------------------------
+
+    def _peer_text(self, sid) -> str:
+        s = self.node.sessions.get(sid)
+        return s.peer if s is not None else "?"
+
+    # -- report --------------------------------------------------------
+
+    def _peer_rows(self) -> list:
+        keys = ("host", "port", "origin", "status", "identified", "contact",
+                "remote_node_id", "srtt_us", "metric", "node_metric",
+                "connect_time_us", "subscribe_tracks", "publishes",
+                "active_streams", "tx_streams", "rx_streams", "tx_bytes",
+                "rx_bytes", "tx_datagrams", "rx_datagrams")
+        for s in self.node.connected():
+            self.node.sample_srtt(s)
+        return [{k: row[k] for k in keys} for row in self.node.peer_table()]
+
+    def _node_rows(self) -> list:
+        node = self.node
+        if node.transit is not None:
+            rows = []
+            for n, sid, info in sorted(node.transit.routes()):
+                s = node.sessions.get(sid)
+                cost = node.advertised_metric(sid) - node.local.metric
+                rows.append({"node_id": node_id_format(n),
+                             "contact": info.contact,
+                             "best_peer": s.peer if s is not None else None,
+                             "path_metric": info.sum_metric() + cost,
+                             "hops": len(info.path) + 1})
+            return rows
+        return []
+
+    def _transit_rows(self) -> list:
+        """One row per ingress SNS and track hash it carried (None before
+        its first data)."""
+        node = self.node
+        if node.transit is None:
+            return []
+        rows = []
+        for ing in list(node.transit.ingress.values()):
+            s = node.sessions.get(ing.session_id)
+            egress = []
+            for sid, eg in ing.egress.items():
+                out = node.sessions.get(sid)
+                egress.append({
+                    "peer": out.peer if out is not None else None,
+                    "sns_id": eg.sns.sns_id,
+                    "nodes": [node_id_format(n) for n in eg.sns.nodes]})
+            for h in sorted(ing.hashes) or [None]:
+                rows.append({
+                    "fullname_hash": None if h is None else f"0x{h:016x}",
+                    "ingress": s.peer if s is not None else None,
+                    "sns_id": ing.sns.sns_id, "local": ing.local,
+                    "egress": egress, "streams": ing.streams,
+                    "bytes": ing.bytes})
+        return rows
+
+    def report(self) -> dict:
+        node = self.node
+        anns = [*node.originated_announces(), *self.announced.values()]
+        subs = [*node.originated_subscribes(), *node.remote_subscribes()]
+        tracks = []
+        for key, t in list(_tracks.items()):
+            fed = _fabric_fed(t)
+            tracks.append({
+                "namespace": _ns_str(key[0]), "name": _name_str(key[1]),
+                "local_viewers": sum(1 for d in t.downstream
+                                     if d.forward and not isinstance(
+                                         d.session, FabricHop)),
+                "fabric": ("none" if not fed
+                           else "paused" if t.paused else "subscribed")})
+        return {
+            "node_id": node_id_format(node.node_id),
+            "label": node.local.contact,
+            "metric": node.local.metric,
+            "listen": node.listen_text(),
+            "peers": self._peer_rows(),
+            "nodes": self._node_rows(),
+            "announces": [{"namespace": _ns_str(a.namespace),
+                           "name": _name_str(a.name),
+                           "source": node_id_format(a.source),
+                           "kind": "namespace" if a.is_namespace
+                           else "track"} for a in anns],
+            "subscribes": [{"namespace": _ns_str(s.namespace),
+                            "name": _name_str(s.name),
+                            "source": node_id_format(s.source),
+                            "fullname_hash": f"0x{s.fullname_hash:016x}"}
+                           for s in subs],
+            "transit": self._transit_rows(),
+            "tracks": tracks,
+        }
+
+
+async def _start_fabric(*, peers=(), port=MOQ_FABRIC_PORT, bind=None,
+                        cert=None, key=None, node_id=None,
+                        label=FABRIC_LABEL, metric=DEFAULT_NODE_METRIC,
+                        **node_kw) -> _Fabric:
+    """Start the relay's fabric node: dial `peers`, listen on `port`
+    (0: do not)."""
+    global _fabric
+    node_kw.setdefault("redial_interval", FABRIC_REDIAL_S)
+    node = FabricNode(node_id=node_id, label=label, metric=metric,
+                      bind=bind, port=port, cert=cert, key=key,
+                      transit=True, **node_kw)
+    for host, peer_port in peers:
+        node.add_peer(host, peer_port)
+    fabric = _Fabric(node)
+    _fabric = fabric
+    try:
+        await fabric.start()
+    except BaseException:
+        _fabric = None
+        await node.stop()
+        raise
+    return fabric
+
+
+async def _stop_fabric() -> None:
+    """Withdraw from the fabric and close its sessions."""
+    global _fabric
+    fabric, _fabric = _fabric, None
+    if fabric is not None:
+        await fabric.stop()
+        logger.info("relay: fabric node stopped")
+
+
+def _fabric_peer_op(fabric, query: str) -> tuple:
+    """POST /moq-fabric/peer: (HTTP status, body)."""
+    q = {k: v[-1] for k, v in urllib.parse.parse_qs(query).items()}
+    op, host = q.get("op"), q.get("host")
+    try:
+        port = int(q["port"])
+        metric = int(q["metric"]) if "metric" in q else None
+    except (KeyError, ValueError):
+        return "400 Bad Request", {"error": "host, port and metric: numbers"}
+    if (not host or not 0 < port < 65536
+            or (metric is not None and metric < 0)
+            or op not in ("add", "remove", "metric", "restart")
+            or (op == "metric" and metric is None)):
+        return "400 Bad Request", {
+            "error": "op=add|remove|metric|restart&host=H&port=P"
+                     "[&metric=M]"}
+    node = fabric.node
+    try:
+        if op == "add":
+            node.add_peer(host, port, metric)
+            peer_log.info(f"fabric: peer {_addr_text(host, port)} added")
+        elif op == "remove":
+            if not node.remove_peer(host, port):
+                return "404 Not Found", {"error": "no such peer"}
+            peer_log.info(f"fabric: peer {_addr_text(host, port)} removed")
+        elif op == "restart":
+            if not node.restart_peer(host, port):
+                return "404 Not Found", {"error": "no such peer"}
+            peer_log.info(f"fabric: peer {_addr_text(host, port)} restarted")
+        elif not node.set_peer_metric(host, port, metric):
+            return "404 Not Found", {"error": "no such peer"}
+    except ValueError as e:
+        # The host has several peers and none at this port.
+        return "409 Conflict", {"error": str(e)}
+    return "200 OK", {"ok": True}
+
+
 def _sent_fields(d) -> dict:
     return {"objects_sent": d.objects_sent, "bytes_sent": d.bytes_sent,
             "largest_sent": list(d.largest_sent) if d.largest_sent else None}
@@ -7247,8 +7708,15 @@ async def _on_control(reader, writer) -> None:
         method, path = (head.split(b"\r\n", 1)[0].decode("latin-1")
                         .split(" ")[:2])
         target = urllib.parse.urlsplit(path)
+        fabric = _fabric
         if path == "/sessions" and method == "GET":
             status, body = "200 OK", _sessions_report()
+        elif target.path.startswith("/moq-fabric") and fabric is None:
+            status, body = "404 Not Found", {"error": "the fabric is off"}
+        elif target.path == "/moq-fabric" and method == "GET" and fabric:
+            status, body = "200 OK", fabric.report()
+        elif target.path == "/moq-fabric/peer" and method == "POST" and fabric:
+            status, body = _fabric_peer_op(fabric, target.query)
         elif target.path == "/gc" and method == "GET":
             top = urllib.parse.parse_qs(target.query).get("top", ["40"])[0]
             if top.isdigit():
@@ -7465,6 +7933,14 @@ async def main():
     if args.idle_timeout is not None and args.idle_timeout <= 0:
         print("Error: --idle-timeout must be above 0", file=sys.stderr)
         sys.exit(2)
+    if args.peer_port is not None and not 0 <= args.peer_port < 65536:
+        sys.exit("error: --peer-port must be 0 to 65535")
+    if args.node_metric < 0:
+        sys.exit("error: --node-metric must be 0 or above")
+    try:
+        fabric_id, fabric_label = parse_identity(args.node_id, FABRIC_LABEL)
+    except ValueError as e:
+        sys.exit(f"error: --node-id: {e}")
     global MAX_SUBSCRIBERS
     MAX_SUBSCRIBERS = args.max_subscribers
     global MAX_NAMESPACES_PER_SESSION, MAX_SUBSCRIPTIONS_PER_SESSION
@@ -7497,6 +7973,12 @@ async def main():
     handles = [await (server.serve_dual() if args.dual else server.serve())
                for server, _port, _label in listeners]
     _begin_startup_hold(args.startup_hold)
+    if args.peer or args.peer_port is not None:
+        await _start_fabric(
+            peers=args.peer or (),
+            port=MOQ_FABRIC_PORT if args.peer_port is None else args.peer_port,
+            bind=args.bind, cert=cert, key=key, node_id=fabric_id,
+            label=fabric_label, metric=args.node_metric)
 
     # Dial origins after the listeners are up: an origin may itself be
     # waiting on us, and a failed dial retries rather than aborting.
@@ -7578,12 +8060,16 @@ async def main():
         await stop.wait()
         if watchdog is not None:
             watchdog.cancel()
+        await _stop_fabric()
         await _refuse_connections(handles)
         await _drain(servers, args.goaway_uri, args.drain_timeout,
                      stopped_by[0])
     except asyncio.CancelledError:
         wait = 0
     finally:
+        if _fabric is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(_stop_fabric(), 1.0)
         reason = _shutdown_reason(args.goaway_uri)
         for server in servers:
             server.refuse_sessions(reason)

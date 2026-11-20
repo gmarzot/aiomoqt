@@ -18,8 +18,8 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 16900
-_SERVER_DRAFTS = [22, 20, 18, 16, 14]
-_ASCENDING = [14, 16, 18, 20, 22]
+_SERVER_DRAFTS = [22, 20, 18, 16]
+_ASCENDING = [16, 18, 20, 22]
 
 _PROBE_PORT = _BASE_PORT + 7
 _probed = {}
@@ -102,7 +102,7 @@ async def _negotiate(port, use_quic, drafts):
 @pytest.mark.parametrize("dual", [False, True], ids=["serve", "serve_dual"])
 async def test_wt_ascending_offer_follows_the_selection_order(dual, wt_selection):
     """Server order picks the server's highest; client order picks the
-    client's first offer the server supports (d14 is never offered)."""
+    client's first offer the server supports."""
     port = _BASE_PORT + (1 if dual else 0)
     handle, seen = await _start(port, _SERVER_DRAFTS, use_quic=False, dual=dual)
     want = 22 if wt_selection == "server" else 16
@@ -142,7 +142,7 @@ async def test_wt_offer_with_no_supported_draft_is_refused(dual):
     """A d22-only client against a 18/16/14 server fails at CONNECT with
     the HTTP status, before any MoQT message is exchanged."""
     port = _BASE_PORT + 3 + (1 if dual else 0)
-    handle, seen = await _start(port, [18, 16, 14], use_quic=False,
+    handle, seen = await _start(port, [18, 16], use_quic=False,
                                 dual=dual)
     try:
         with pytest.raises(ConnectionError, match=r"refused \(HTTP 400\)"):
@@ -157,7 +157,7 @@ async def test_wt_offer_with_no_supported_draft_is_refused(dual):
 async def test_relay_probe_reports_a_wt_refusal():
     from aiomoqt.tools import relay_probe
     port = _BASE_PORT + 5
-    handle, _ = await _start(port, [18, 16, 14], use_quic=False)
+    handle, _ = await _start(port, [18, 16], use_quic=False)
     try:
         r = await relay_probe.probe_version(
             "localhost", port, "/", False, 22, verify_tls=False)
@@ -167,11 +167,3 @@ async def test_relay_probe_reports_a_wt_refusal():
         handle.close()
 
 
-async def test_wt_d14_client_offering_no_protocol_still_connects():
-    port = _BASE_PORT + 6
-    handle, _ = await _start(port, None, use_quic=False)
-    try:
-        draft, proto = await _negotiate(port, False, 14)
-        assert (draft, proto) == (14, None)
-    finally:
-        handle.close()

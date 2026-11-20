@@ -78,7 +78,7 @@ from aiomoqt.media.loc import (
 from aiomoqt.media.mpegts import opus_samples
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    MOQTMessageType, MOQTRequestError, RequestErrorCode, SubscribeErrorCode,
+    MOQTMessageType, MOQTRequestError, RequestErrorCode,
 )
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.certs import find_cert, find_key
@@ -273,7 +273,7 @@ async def _accept(args, stack: contextlib.AsyncExitStack):
     return await found
 
 
-_NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST, SubscribeErrorCode.TRACK_DOES_NOT_EXIST)
+_NO_SOURCE = (RequestErrorCode.DOES_NOT_EXIST,)
 _SOURCE_RETRY_S = (0.2, 5.0)  # first and longest wait between tries
 
 

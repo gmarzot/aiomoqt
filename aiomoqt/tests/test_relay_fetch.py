@@ -44,7 +44,7 @@ def _session(draft=18):
     s._served = []
     # Recorded as the wire value the session would send at this draft.
     s.fetch_error = lambda request_id, error_code, reason: (
-        s._errors.append((request_error_code(error_code, s._profile, fetch=True),
+        s._errors.append((request_error_code(error_code, s._profile),
                           reason)))
     s.fetch_ok = lambda **kw: s._oks.append(kw)
 
@@ -415,11 +415,11 @@ def test_an_upstream_whole_group_end_falls_back_to_the_last_object(
 
 
 @pytest.mark.parametrize("draft,does_not_exist,invalid_range,invalid_joining", [
-    (14, 0x4, 0x5, 0x7), (16, 0x10, 0x11, 0x32), (18, 0x10, 0x11, 0x32),
+    (16, 0x10, 0x11, 0x32), (18, 0x10, 0x11, 0x32),
     (20, 0x10, 0x11, 0x0), (22, 0x10, 0x11, 0x0)])
 def test_refusals_carry_the_drafts_wire_codes(draft, does_not_exist,
                                               invalid_range, invalid_joining):
-    # d14 has its own FETCH_ERROR codes; d20 has no INVALID_JOINING_REQUEST_ID.
+    # d20 has no INVALID_JOINING_REQUEST_ID.
     s = _session(draft)
     asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0)))
     t = _track()
@@ -437,14 +437,13 @@ def test_refusals_carry_the_drafts_wire_codes(draft, does_not_exist,
 
 def test_an_upstream_refusal_is_answered_in_the_subscribers_draft(
         monkeypatch):
-    # A d14 publisher's INVALID_RANGE (0x5) reaches a d18 subscriber as
-    # 0x11, with the publisher's reason.
+    # A d16 publisher's INVALID_RANGE reaches a d18 subscriber as 0x11,
+    # with the publisher's reason.
     s = _session(18)
-    refused = MOQTRequestError(error_code=0x5, reason="range gone")
+    refused = MOQTRequestError(error_code=0x11, reason="range gone")
 
     async def _upstream(ns, track_name, msg):
-        return None, None, relay._upstream_refusal(refused, profile_for(14),
-                                                   fetch=True)
+        return None, None, relay._upstream_refusal(refused, profile_for(16))
     monkeypatch.setattr(relay, "_fetch_upstream", _upstream)
     asyncio.run(relay._on_fetch(s, _fetch(start_group=0, start_object=0,
                                           end_group=1, end_object=0)))
@@ -1018,7 +1017,7 @@ async def _check_gap_fetches(rx, draft, tracks):
     the publisher's NOT_SUPPORTED; one up to its Largest gets all of
     them."""
     refused = request_error_code(RequestErrorCode.NOT_SUPPORTED,
-                                 profile_for(draft), fetch=True)
+                                 profile_for(draft))
     for name, track in tracks.items():
         relayed = _gap_track(name)
         assert relayed.paused, name

@@ -16,7 +16,7 @@ installed package. Keep its API boundary and traps consistent with this file.
 | `aiomoqt/track.py` | `Track`, `PublishedTrack`, `SubscribedTrack`, `VideoTrack` |
 | `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `SendLane`, `FanoutDelivery` |
 | `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
-| `aiomoqt/peering/` | moq-fabric mesh (moqx, LAPS) as a leaf node: wire codec, track hashes, `FabricNode`, d18 inner framing (`inner.py`), SNS per session (`ib.py`); `moq-peer-probe` (`tools/peer_probe.py`) observes and originates; `moq-peer-bench` (`tools/peer_bench.py`) sends and measures a track through the fabric |
+| `aiomoqt/moq_fabric/` | moq-fabric mesh (moqx, LAPS) as a leaf node: wire codec, track hashes, `FabricNode`, d18 inner framing (`inner.py`), SNS per session (`ib.py`); `moq-fabric-probe` (`tools/moq_fabric_probe.py`) observes and originates; `moq-fabric-bench` (`tools/moq_fabric_bench.py`) sends and measures a track through the fabric |
 | `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
 | `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
 | `aiomoqt/cat.py` | CAT credentials in the format moqx verifies: mint, verify, grants |
@@ -155,11 +155,10 @@ track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's 
 request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
 handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
-**Drafts.** 14, 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported. 14 is
-deprecated and will be removed in 0.15.0.
+**Drafts.** 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported.
 Draft numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the
-IETF code `0xff0000NN` and the ALPN (`moq-00` for d14, `moqt-NN` for d16+) exist only at the
-wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)`.
+IETF code `0xff0000NN` and the ALPN (`moqt-NN`) exist only at the
+wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16)`.
 Route behavior differences through `profile_for(draft)` / `DraftProfile` in `context.py`
 rather than scattering version checks. New wire shapes need a case in
 `test_wire_conformance.py`, including malformed ones: aiopquic's Cython codecs and our Python
@@ -173,12 +172,13 @@ message already logged, transport plumbing, per-stream lifecycle (open, close, r
 or track bookkeeping; its volume does not grow with the object count. TRACE (`TRACE = 5` in
 `aiomoqt.utils.logger`, registered by name only) is per object, per chunk, per datagram and wire
 hex: emit it as `log.log(TRACE, …)`, behind `log.isEnabledFor(TRACE)` on hot paths. WARNING is a
-tolerated peer deviation or a bound hit; ERROR ends a session.
+tolerated peer deviation, a bound hit, or a session we close for the peer's error; ERROR is a
+session we end for our own failure (INTERNAL_ERROR).
 
 Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
 (subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
 `aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the
-relay), `aiomoqt.peering` (moq-fabric sessions). A line that belongs to none uses its
+relay), `aiomoqt.moq_fabric` (moq-fabric sessions). A line that belongs to none uses its
 module logger. Tools take `--log-level {error,warning,info,debug,trace}` (`-d`/`--debug` =
 `debug`) and `--log CAT=LEVEL[,…]` from the
 grid (`add_logging`, `apply_logging`); `AIOMOQT_LOG` takes the same spec, where a bare `LEVEL`

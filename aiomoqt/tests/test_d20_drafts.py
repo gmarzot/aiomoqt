@@ -8,7 +8,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.context import profile_for
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (
-    MOQT_DEFAULT_DRAFTS, MOQT_VERSIONS, MOQTDraft, moqt_alpn_for_version,
+    MOQT_DEFAULT_DRAFTS, MOQTDraft, moqt_alpn_for_version,
     moqt_version_from_alpn, normalize_supported_drafts, parse_draft_spec,
     wire_control_type,
 )
@@ -28,14 +28,13 @@ def test_wire_control_type_for_an_unknown_draft_fails_closed(draft):
 
 
 def test_the_default_offer_is_every_even_draft_newest_first():
-    assert MOQT_DEFAULT_DRAFTS == (22, 20, 18, 16, 14)
-    assert normalize_supported_drafts(None) == [22, 20, 18, 16, 14]
-    assert MOQTClient("h", 1).supported_drafts == [22, 20, 18, 16, 14]
-    assert MOQT_VERSIONS == [0xff00000e, 0xff000010]
+    assert MOQT_DEFAULT_DRAFTS == (22, 20, 18, 16)
+    assert normalize_supported_drafts(None) == [22, 20, 18, 16]
+    assert MOQTClient("h", 1).supported_drafts == [22, 20, 18, 16]
 
 
 async def test_a_server_accepts_the_default_offer():
-    assert MOQTServer("h", 1, "c", "k").supported_drafts == [22, 20, 18, 16, 14]
+    assert MOQTServer("h", 1, "c", "k").supported_drafts == [22, 20, 18, 16]
     s = MOQTServer("h", 1, "c", "k", supported_drafts=[22, 20, 18])
     assert s.supported_drafts == [22, 20, 18]
 
@@ -86,5 +85,4 @@ def test_d22_only_flips_its_switches_on_the_d20_profile():
         == (True, False)
     for prof in (d20, d22):
         assert prof.vi64 and prof.control_uni_pair
-        assert not prof.setup_carries_versions
         assert not prof.reply_has_request_id

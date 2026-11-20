@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moq-peer-probe: join a moq-fabric mesh (moqx, LAPS) as a leaf node.
+"""moq-fabric-probe: join a moq-fabric mesh (moqx, LAPS) as a leaf node.
 
 Dials each --peer over raw QUIC (ALPN moq-fabric) and, with -p, accepts
 peers' dials. Logs and records every node, announce, subscribe and SNS set
@@ -15,13 +15,13 @@ first, 130 on a signal.
 
 Examples:
   # observe one relay for 30 s, no listener
-  moq-peer-probe --peer 10.0.0.2:33434 -p 0 -t 30 -o fabric.json
+  moq-fabric-probe --peer 10.0.0.2:33434 -p 0 -t 30 -o fabric.json
 
   # stop once anything under moq-test is announced
-  moq-peer-probe --peer 10.0.0.2 -p 0 --exit announce:moq-test
+  moq-fabric-probe --peer 10.0.0.2 -p 0 --exit announce:moq-test
 
   # mock agent on two relays: announce a track, subscribe to another
-  moq-peer-probe --peer 10.0.0.2 --peer 10.0.0.3 -p 0 \\
+  moq-fabric-probe --peer 10.0.0.2 --peer 10.0.0.3 -p 0 \\
       --announce aiomoqt/probe --subscribe moq-test/live/video -t 60
 """
 import argparse
@@ -32,9 +32,9 @@ import sys
 import time
 from typing import Optional, Tuple
 
-from aiomoqt.peering import (FabricNode, build_report, node_id_format,
+from aiomoqt.moq_fabric import (FabricNode, build_report, node_id_format,
                              parse_identity, parse_track, write_report)
-from aiomoqt.peering.report import summary_line
+from aiomoqt.moq_fabric.report import summary_line
 from aiomoqt.utils import cli as grid
 from aiomoqt.utils.certs import ensure_self_signed, find_cert, find_key
 
@@ -126,7 +126,7 @@ def parse_args(argv=None):
         description="Join a moq-fabric mesh as a leaf node: observe it "
                     "and originate announces and subscribes",
         epilog=__doc__)
-    grid.add_peering(p)
+    grid.add_moq_fabric(p)
     grid.add_run(p)
     grid.add_logging(p)
     grid.add_interval(p)
@@ -181,7 +181,7 @@ async def run(args) -> int:
                       peers=args.peer or (), bind=args.bind, port=args.port,
                       cert=cert, key=key, keepalive=args.keepalive)
     cond = args.exit_on
-    print(f"moq-peer-probe: node {node_id_format(node.node_id)} "
+    print(f"moq-fabric-probe: node {node_id_format(node.node_id)} "
           f"(0x{node.node_id:016x}) contact={label!r} "
           f"metric={args.node_metric} listen={node.listen_text() or 'off'} "
           f"peers={len(node.peers)} -t {grid.duration_label(args.duration)}"
@@ -260,7 +260,7 @@ def main(argv=None) -> int:
 
 
 def cli():
-    """Console entry point (moq-peer-probe)."""
+    """Console entry point (moq-fabric-probe)."""
     sys.exit(main())
 
 

@@ -138,7 +138,7 @@ def main():
     ap.add_argument('--rate', type=float, default=100.0)
     ap.add_argument('--object-size', type=int, default=4096)
     ap.add_argument('--duration', type=float, default=20.0)
-    ap.add_argument('--draft', type=int, default=16, choices=(14, 16, 18),
+    ap.add_argument('--draft', type=int, default=16, choices=(16, 18),
                     help='MoQT draft to negotiate')
     ap.add_argument('--port', type=int, default=47500)
     args = ap.parse_args()

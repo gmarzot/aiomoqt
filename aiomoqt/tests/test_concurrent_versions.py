@@ -1,13 +1,10 @@
 """Concurrent sessions on different drafts in one event loop must not
 perturb each other.
 
-This is the regression the process-global version context made
-impossible: a d16 session's handshake would clobber a d14 session's
-version (and vice versa). With per-session ``_draft`` and the read-only
-per-draft CONTROL_REGISTRY, four interleaved sessions — alternating
-d14/d16 — each settle and operate on their own draft. Raw QUIC, pinned
-clients against matching single-draft servers (no multi-offer, so this
-is independent of the picky-d14 ALPN-selector fast-follow).
+With per-session ``_draft`` and the read-only per-draft CONTROL_REGISTRY,
+four interleaved sessions — alternating d16/d18 — each settle and operate on
+their own draft. Raw QUIC, pinned clients against matching single-draft
+servers.
 """
 import asyncio
 
@@ -47,23 +44,23 @@ async def _handshake_draft(port, draft):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_d14_d16_no_leakage():
-    """Four interleaved d14/d16 handshakes run concurrently in one loop;
+async def test_concurrent_d16_d18_no_leakage():
+    """Four interleaved d16/d18 handshakes run concurrently in one loop;
     each settles its own draft (would clobber under a process global)."""
-    p14 = _BASE_PORT
-    p16 = _BASE_PORT + 1
-    s14 = await _start_server(p14, 14)
+    p16 = _BASE_PORT
+    p18 = _BASE_PORT + 1
     s16 = await _start_server(p16, 16)
+    s18 = await _start_server(p18, 18)
     try:
         async with asyncio.timeout(60):
             results = await asyncio.gather(
-                _handshake_draft(p14, 14),
                 _handshake_draft(p16, 16),
-                _handshake_draft(p14, 14),
+                _handshake_draft(p18, 18),
                 _handshake_draft(p16, 16),
+                _handshake_draft(p18, 18),
             )
-        assert results == [14, 16, 14, 16], \
+        assert results == [16, 18, 16, 18], \
             f"cross-draft leakage: {results}"
     finally:
-        s14.close()
         s16.close()
+        s18.close()

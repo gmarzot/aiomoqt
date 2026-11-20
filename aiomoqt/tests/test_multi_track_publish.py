@@ -15,7 +15,7 @@ from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (
-    MOQTMessageType, MOQTRequestError, RequestErrorCode, SubscribeErrorCode,
+    MOQTMessageType, MOQTRequestError, RequestErrorCode,
 )
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -23,7 +23,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 15900
-_DRAFTS = [14, 16, 18]
+_DRAFTS = [16, 18]
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
 _NS = "multi/track"
@@ -39,8 +39,7 @@ def _port(case: int, draft: int, use_quic: bool = True) -> int:
 
 
 def _does_not_exist(draft: int) -> int:
-    return (SubscribeErrorCode.TRACK_DOES_NOT_EXIST if draft == 14
-            else RequestErrorCode.DOES_NOT_EXIST)
+    return RequestErrorCode.DOES_NOT_EXIST
 
 
 def _track(session, namespace, name, size) -> PublishedTrack:
@@ -250,8 +249,7 @@ async def test_update_reaches_its_own_track(draft):
         by_name = {t.trackname: t for t in tracks}
         target = by_name[msgs[0].track_name.decode()]
         sub = rx.session
-        # d14 needs the Start a PUBLISH_OK of ours set: none here.
-        sub.request_update(msgs[0].request_id, forward=0, start=(0, 0))
+        sub.request_update(msgs[0].request_id, forward=0)
         paused = await _until(lambda: not target.forward)
         forward = {t.trackname: t.forward for t in tracks}
         assert paused, f"forward per track: {forward}"

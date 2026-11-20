@@ -222,17 +222,16 @@ async def test_replay_and_fetch_send_what_was_received():
             assert type(g[4]) in (dict, type(None)) and g[6] is w[6]
 
         def fetch_wire(rows, prof):
-            # As serve_fetch(): status objects only where FETCH carries them.
+            # As serve_fetch(): FETCH objects carry no Object Status.
             out, prior = [], None
             for fo in relay._counted_fetch(rows, None, "cache"):
                 fo.status = fo.status or ObjectStatus.NORMAL
-                if (not prof.fetch_object_status
-                        and fo.status != ObjectStatus.NORMAL):
+                if fo.status != ObjectStatus.NORMAL:
                     continue
                 out.append(bytes(fo.serialize(prof=prof, prior=prior).data))
                 prior = fo
             return out
-        for draft in (14, 16, 18, 22):
+        for draft in (16, 18, 22):
             prof = profile_for(draft)
             assert fetch_wire(got, prof) == fetch_wire(want, prof), draft
     finally:

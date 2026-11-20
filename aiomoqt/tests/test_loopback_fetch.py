@@ -179,7 +179,7 @@ def _make_subscribe_handler(cache: FetchTestCache):
 # Helpers
 # ---------------------------------------------------------------------------
 async def _start_server(port: int, cache: FetchTestCache,
-                          use_quic: bool = True, draft: int = 14):
+                          use_quic: bool = True, draft: int = 16):
     """Start a loopback MOQTServer with fetch + subscribe handlers.
 
     draft is explicit (not auto): the loopback exercises one negotiated
@@ -203,7 +203,7 @@ async def _start_server(port: int, cache: FetchTestCache,
     return await server.serve()
 
 
-async def _connect_client(port: int, use_quic: bool = True, draft: int = 14):
+async def _connect_client(port: int, use_quic: bool = True, draft: int = 16):
     """Create a client connected to localhost (explicit draft — see
     _start_server)."""
     return MOQTClient(
@@ -543,7 +543,7 @@ async def test_fetch_cancel_mid_stream(use_quic):
         certificate=CERT, private_key=KEY,
         path="/",
         use_quic=use_quic,
-        supported_drafts=14,
+        supported_drafts=16,
     )
     server.register_handler(MOQTMessageType.FETCH, _slow_fetch)
     server_handle = await server.serve()

@@ -69,7 +69,7 @@ def _header(draft, **kw):
 
 
 @pytest.mark.parametrize("draft, stream_type", [
-    (18, 0x110), (18, 0x90), (16, 0x50), (14, 0x30), (18, 0x16),
+    (18, 0x110), (18, 0x90), (16, 0x50), (18, 0x16),
 ])
 def test_unknown_uni_stream_type_closes_the_session(draft, stream_type):
     s = _stub(draft)
@@ -94,16 +94,14 @@ def test_undefined_object_status_closes_the_session():
     assert s.closed == [(0x3, "unknown object status 0x7")]
 
 
-def test_d14_only_status_is_a_violation_at_d18_but_fine_at_d14():
-    for draft, expect_close in ((18, True), (14, False)):
+def test_status_0x1_is_a_violation():
+    for draft in (16, 18):
         s = _stub(draft)
         hdr = _header(draft)
         s._on_stream_data(3, bytes(hdr.serialize().data), False)
         s._on_stream_data(3, bytes(hdr.next_object(
             status=ObjectStatus.DOES_NOT_EXIST).data), False)
-        assert bool(s.closed) is expect_close, draft
-        if not expect_close:
-            assert s.delivered == [(0, ObjectStatus.DOES_NOT_EXIST)]
+        assert s.closed, draft
 
 
 def test_properties_on_a_status_object_close_the_session():
@@ -116,7 +114,7 @@ def test_properties_on_a_status_object_close_the_session():
     # Our encoder refuses properties on a status object; craft the wire.
     buf = Buffer(capacity=64, vi64=True)
     buf.push_vint(0)                                  # delta -> object 1
-    MOQTMessage._extensions_encode(buf, {0x02: 5}, delta=True)
+    MOQTMessage._extensions_encode(buf, {0x02: 5})
     buf.push_vint(0)                                  # payload length
     buf.push_vint(int(EOG))
     s._on_stream_data(3, bytes(buf.data), False)

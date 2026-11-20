@@ -21,7 +21,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 17100
-_DRAFTS = [14, 16, 18, 20]
+_DRAFTS = [16, 18, 20]
 _NS = "trunc/ns"
 
 

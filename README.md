@@ -8,8 +8,8 @@ It follows the standard `asyncio` transport/protocol pattern via subclasses of `
 
 | | Supported |
 |---|---|
-| Drafts | draft-14 (deprecated; removed in 0.15.0), draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16, 14)` |
-| Transports | raw QUIC (ALPN `moq-00` / `moqt-NN`), H3/WebTransport (WT-Protocol) |
+| Drafts | draft-16, draft-18, draft-20, draft-22 — negotiated newest-first, default offer `(22, 20, 18, 16)` |
+| Transports | raw QUIC (ALPN `moqt-NN`), H3/WebTransport (WT-Protocol) |
 | Roles | publisher, subscriber, server (origin), single-port dual-transport server |
 | Data delivery | SubgroupHeader streams (TX + RX); OBJECT_DATAGRAM (TX + RX over raw QUIC and WT) |
 | Control | full message set with sync/async response handling; `MOQTRequestError` is draft-independent |
@@ -48,14 +48,14 @@ Probe a relay over raw QUIC:
 
 ```bash
 python -m aiomoqt.tools.relay_probe --url moqt://moqx-main.ci.openmoq.org:4433
-# moqt://moqx-main.ci.openmoq.org:4433              QUIC   ✓  draft-14,draft-16,draft-18  (540ms)
+# moqt://moqx-main.ci.openmoq.org:4433              QUIC   ✓  draft-16,draft-18  (540ms)
 ```
 
 Probe the same relay over H3/WebTransport:
 
 ```bash
 python -m aiomoqt.tools.relay_probe --url https://moqx-main.ci.openmoq.org:4433/moq-relay
-# https://moqx-main.ci.openmoq.org:4433/moq-relay   H3/WT  ✓  draft-14,draft-16,draft-18  (435ms)
+# https://moqx-main.ci.openmoq.org:4433/moq-relay   H3/WT  ✓  draft-16,draft-18  (435ms)
 ```
 
 The probe exits 0 if any draft handshakes, so it drops straight into a shell conditional.
@@ -174,7 +174,7 @@ print(ok.parameters.get(ParamType.AUTH_TOKEN))
 
 Auth is control-plane only; there is no per-object authentication.
 
-For session admission with a Common Access Token, `MOQTClient(auth=CatAuth(key_id, secret))` presents a token in SETUP that grants every action and does not expire, and `MOQTServer(auth=...)` refuses a session without a valid one. The tools and aiomoqt-relay take `--auth-key KID:SECRET` (or `AIOMOQT_AUTH_KEY`) and `--auth-token-type` (default 1; it must match the relay's). Tokens use the format moqx verifies, so moqx and aiomoqt-relay can share a key. From d16 a server checks each request too: the SETUP token's grants or a token on the request must cover its action, namespace and track. `CatAuth.mint(actions, namespace=..., track=...)` makes a narrower token. At d14 only SETUP is checked. The token flows are charted in [docs/cat-auth.md](docs/cat-auth.md).
+For session admission with a Common Access Token, `MOQTClient(auth=CatAuth(key_id, secret))` presents a token in SETUP that grants every action and does not expire, and `MOQTServer(auth=...)` refuses a session without a valid one. The tools and aiomoqt-relay take `--auth-key KID:SECRET` (or `AIOMOQT_AUTH_KEY`) and `--auth-token-type` (default 1; it must match the relay's). Tokens use the format moqx verifies, so moqx and aiomoqt-relay can share a key. From d16 a server checks each request too: the SETUP token's grants or a token on the request must cover its action, namespace and track. `CatAuth.mint(actions, namespace=..., track=...)` makes a narrower token. The token flows are charted in [docs/cat-auth.md](docs/cat-auth.md).
 
 ## Media
 
@@ -319,7 +319,7 @@ python -m aiomoqt.tools.pub_bench moqt://relay.ex.com -s 4096 -P 4 -r 120 -t 60
 
 ## Interop
 
-Validated against live public relays — OpenMoQ moqx, Meta moxygen, Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, OzU moqtail, Nokia — across draft-14/16/18 and both transports, using the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) cases plus a multi-subscriber pub-sub bench. The point-in-time matrix is in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time); the relay catalog with per-endpoint notes is [`tests/relays.json`](tests/relays.json).
+Validated against live public relays — OpenMoQ moqx, Meta moxygen, Cloudflare moq-rs, Quicr libquicr, Meetecho imquic, OzU moqtail, Nokia — across draft-16/18 and both transports, using the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) cases plus a multi-subscriber pub-sub bench. The point-in-time matrix is in [PERFORMANCE.md](PERFORMANCE.md#interop-matrix-point-in-time); the relay catalog with per-endpoint notes is [`tests/relays.json`](tests/relays.json).
 
 ### Interop client
 
@@ -334,7 +334,7 @@ python -m aiomoqt.tools.moq_interop_client -l                                   
 
 ### aiomoqt-relay
 
-`aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 14 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; one relay-wide budget (`--cache-bytes`, default 256 MiB) caps all tracks together by dropping the oldest group of the least recently used track, and past the budget plus 32 MiB the largest live group goes uncached. Cache and send lanes charge each object its payload, its properties and about 224 bytes of record overhead. A late subscriber starts at the live edge. For `--startup-hold` seconds after start (default 2, 0 = off), a SUBSCRIBE for a track no publisher serves yet waits for one, so viewers that reconnect after a restart before their publishers are answered, not refused. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
+`aiomoqt-relay` (module `moq_interop_relay`, also installed as `moq-interop-relay`) is a MoQT relay built on aiomoqt, serving raw QUIC and WebTransport at drafts 16 to 22. It forwards objects from an upstream publisher to downstream subscribers, fans one upstream subscription out to several subscribers, serves both publish flows (`PUBLISH_NAMESPACE` and bare `PUBLISH`), offers `PUBLISH` to `SUBSCRIBE_TRACKS` subscribers, and dials upstream origins with `--upstream`. A recent-object cache per track (8 groups, 32 MiB) answers standalone and joining FETCH; one relay-wide budget (`--cache-bytes`, default 256 MiB) caps all tracks together by dropping the oldest group of the least recently used track, and past the budget plus 32 MiB the largest live group goes uncached. Cache and send lanes charge each object its payload, its properties and about 224 bytes of record overhead. A late subscriber starts at the live edge. For `--startup-hold` seconds after start (default 2, 0 = off), a SUBSCRIBE for a track no publisher serves yet waits for one, so viewers that reconnect after a restart before their publishers are answered, not refused. It runs the public relay at `aiomoqt-relay.marzresearch.net`, and moxygen's moqtest conformance suite and the interop runner test against it.
 
 Limits: authorization only with `--auth-key` (SETUP and, from d16, each request) and no rate limiting; each subscriber's send lane holds what its delivery deadline covers at the track's input rate (4 MiB until that is known, or while the lanes together hold more than `--cache-bytes`), counting what its streams still hold in the transport, and a subscriber that falls further behind loses whole groups, their streams reset, and a lane that completes no write for 10 s logs one `lane stalled` WARNING; upstream Forward State is raised for a viewer and lowered once no viewer has forwarded the track for `--pause-after` seconds (default 60, 0 = never); a subscriber's objects older than its OBJECT_DELIVERY_TIMEOUT (the smaller of the publisher's and the subscriber's) or the track's MAX_CACHE_DURATION, or with neither set its live objects older than `--lag-limit` (default 5 s, 0 = never), are dropped, the subgroup reset with DELIVERY_TIMEOUT and the rest of the group skipped; past MAX_CACHE_DURATION a cached object is not served and a FETCH for it goes upstream. Written in Python, it carries less traffic than the Rust and C++ relays. Because the relay re-encodes everything it forwards, a conformance client checking those objects is checking aiomoqt's encoder, not merely its routing.
 
@@ -431,7 +431,7 @@ aiopquic:  0.7.0 (~/.venv/lib/python3.13/site-packages/aiopquic) [2026-10-27 17:
 ## Limitations
 
 - **`relay_probe -f` and `tests/relays.json` use different schemas.** The probe expects a top-level array of `{id, name, endpoints:[{url}]}`; the interop catalog is `{relays:[{name, urls:{...}, drafts:[...]}]}`. Use `--url` for single-endpoint probes until the loader accepts both.
-- **`aiomoqt-relay` authorizes only with `--auth-key` and has no rate limiting**; a subscriber that falls more than its send lane's bound behind loses whole groups. One session holds at most `--max-namespaces-per-session` (256) namespace requests and `--max-subscriptions-per-session` (1024) SUBSCRIBEs; more are refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d14/d16). Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups can exceed it by up to 32 MiB before the largest is dropped from the cache. See [aiomoqt-relay](#aiomoqt-relay).
+- **`aiomoqt-relay` authorizes only with `--auth-key` and has no rate limiting**; a subscriber that falls more than its send lane's bound behind loses whole groups. One session holds at most `--max-namespaces-per-session` (256) namespace requests and `--max-subscriptions-per-session` (1024) SUBSCRIBEs; more are refused with EXCESSIVE_LOAD (INTERNAL_ERROR at d16). Its cache budget (`--cache-bytes`) never drops a subscribed track's live group, so live groups can exceed it by up to 32 MiB before the largest is dropped from the cache. See [aiomoqt-relay](#aiomoqt-relay).
 
 ## Roadmap
 

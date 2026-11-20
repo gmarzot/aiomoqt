@@ -16,7 +16,7 @@ import pytest
 
 from aiomoqt.utils.url import moqt_setup_path, parse_relay_url
 from aiomoqt.types import (
-    MOQT_VERSION_DRAFT14, MOQT_VERSION_DRAFT16, MOQT_VERSIONS,
+    MOQT_VERSION_DRAFT16,
     moqt_version_from_draft, moqt_alpn_for_version,
 )
 
@@ -136,16 +136,15 @@ class TestMoqtSetupPath:
 
 class TestDraftNumberApi:
     """High-level aiomoqt APIs accept the integer draft number
-    (14, 16, ...). The wire-encoded IETF version code
+    (16, 18, ...). The wire-encoded IETF version code
     (0xff000010 etc.) is wire legacy — never enters the public API.
     """
 
     def test_known_drafts_normalize_to_wire_code(self):
-        assert moqt_version_from_draft(14) == 0xff00000e
         assert moqt_version_from_draft(16) == 0xff000010
 
     def test_unsupported_draft_raises_clearly(self):
-        # aiomoqt only knows d14 and d16 today; d15 / unrelated must reject
+        # d15 / unrelated must reject
         # with a message identifying the supported set, not silently fail.
         with pytest.raises(ValueError, match="not supported"):
             moqt_version_from_draft(15)
@@ -170,15 +169,9 @@ class TestDraftNumberApi:
 # =====================================================================
 
 class TestAlpnByDraft:
-    """ALPN convention from moq-transport-16 §3.1:
-    - pre-d15: legacy "moq-00"
-    - d15+: "moqt-NN"
+    """ALPN convention from moq-transport-16 §3.1: "moqt-NN".
     Used both for raw-QUIC ALPN handshake and for WT-Available-Protocols.
     """
-
-    def test_d14_uses_legacy_moq00(self):
-        # d14 raw-QUIC uses moq-00 ALPN; CLIENT_SETUP carries versions.
-        assert moqt_alpn_for_version(MOQT_VERSION_DRAFT14) == "moq-00"
 
     def test_d16_uses_moqt16(self):
         # d16+ raw-QUIC uses moqt-NN ALPN; version negotiated via ALPN.
@@ -191,7 +184,7 @@ class TestAlpnByDraft:
 
 class TestMoqtClientDraftValidation:
     """MOQTClient.supported_drafts is part of the public API contract;
-    it accepts draft NUMBERS (14, 16, ...) — a single int or a list —
+    it accepts draft NUMBERS (16, 18, ...) — a single int or a list —
     validates against the supported set, and normalizes to a non-empty
     list of draft numbers (newest first). Drafts stay representation-
     independent ints; the IETF wire form is only used when building or
@@ -202,8 +195,6 @@ class TestMoqtClientDraftValidation:
     def test_accepts_supported_draft_number(self):
         from aiomoqt.client import MOQTClient
         # Should not raise; a single int normalizes to a one-element list.
-        c = MOQTClient("localhost", 4433, supported_drafts=14)
-        assert c.supported_drafts == [14]
         c = MOQTClient("localhost", 4433, supported_drafts=16)
         assert c.supported_drafts == [16]
 
@@ -211,11 +202,11 @@ class TestMoqtClientDraftValidation:
         from aiomoqt.client import MOQTClient
         # Explicit lists keep the caller's order (so a relay's preferred
         # draft can be offered first); only the None auto-offer sorts.
-        c = MOQTClient("localhost", 4433, supported_drafts=[14, 16])
-        assert c.supported_drafts == [14, 16]
+        c = MOQTClient("localhost", 4433, supported_drafts=[16, 18])
+        assert c.supported_drafts == [16, 18]
         # duplicates collapse, order preserved
-        c = MOQTClient("localhost", 4433, supported_drafts=[16, 16, 14])
-        assert c.supported_drafts == [16, 14]
+        c = MOQTClient("localhost", 4433, supported_drafts=[18, 18, 16])
+        assert c.supported_drafts == [18, 16]
 
     def test_rejects_unsupported_draft_number(self):
         from aiomoqt.client import MOQTClient
@@ -237,24 +228,6 @@ class TestMoqtClientDraftValidation:
         # (newest first) and the server picks via ALPN / negotiation.
         from aiomoqt.client import MOQTClient
         c = MOQTClient("localhost", 4433, supported_drafts=None)
-        assert c.supported_drafts == [22, 20, 18, 16, 14]
+        assert c.supported_drafts == [22, 20, 18, 16]
 
 
-# =====================================================================
-# MOQT_VERSIONS canonical set
-# =====================================================================
-
-class TestSupportedVersions:
-    """The supported-versions set is what CLIENT_SETUP advertises in
-    legacy (d14) mode. Lock the set so accidental removal breaks a
-    test, not interop.
-    """
-
-    def test_d14_and_d16_both_present(self):
-        assert MOQT_VERSION_DRAFT14 in MOQT_VERSIONS
-        assert MOQT_VERSION_DRAFT16 in MOQT_VERSIONS
-
-    def test_no_unknown_versions(self):
-        # If a new entry lands without updating the matrix, tests for
-        # the new draft against real relays must pass first.
-        assert set(MOQT_VERSIONS) == {0xff00000e, 0xff000010}

@@ -158,7 +158,7 @@ async def _on_subscribe_namespace(session, msg, args):
     """Discovery responder: a subscriber sent SUBSCRIBE_NAMESPACE to
     learn what we publish (it omitted --trackname).
 
-    d14/d16 fuse discovery into this one request, so ack and announce.
+    d16 fuses discovery into this one request, so ack and announce.
     d18 reports only namespaces here; the tracks follow on
     SUBSCRIBE_TRACKS.
     """
@@ -214,7 +214,7 @@ async def main():
               file=sys.stderr)
         sys.exit(2)
 
-    # Public API takes the draft NUMBER (14, 16, ...); MOQTServer
+    # Public API takes the draft NUMBER (16, 18, ...); MOQTServer
     # normalizes to the wire-form internally. The MoQT session layer
     # needs the draft for either transport (raw QUIC or WT) to pick
     # the right message-encoding rules; only the QUIC ALPN derivation

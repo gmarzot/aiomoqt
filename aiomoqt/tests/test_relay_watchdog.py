@@ -133,7 +133,7 @@ async def test_the_watchdog_exits_after_consecutive_misses_only(
     monkeypatch.setattr(relay.os, "_exit", _exit)
     monkeypatch.setattr(relay.logging, "shutdown", lambda: None)
     with pytest.raises(_Exit) as exc:
-        await relay._watchdog(0.01, "127.0.0.1", 1, True, [14, 16, 18])
+        await relay._watchdog(0.01, "127.0.0.1", 1, True, [16, 18])
     assert exc.value.args == (relay.WATCHDOG_EXIT,)
     assert len(probes) == 6
     assert {args[3] for args in probes} == {18}       # newest draft only

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from . import MOQTMessage, BUF_SIZE
 from .params import LocationFilter
 from ..types import D16MessageType, MOQTProtocolViolation, ParamType
-from ..context import is_draft16_or_later, DraftProfile
+from ..context import DraftProfile
 from ..utils.buffer import Buffer
 from ..utils.logger import get_logger
 
@@ -34,7 +34,7 @@ class Publish(MOQTMessage):
     largest_object_id: Optional[int] = None
     forward: int = None
     parameters: Optional[Dict[int, Any]] = None
-    track_extensions: Optional[Dict[int, Any]] = None  # d16 only
+    track_extensions: Optional[Dict[int, Any]] = None
 
     def __post_init__(self):
         self.type = MOQTMessageType.PUBLISH
@@ -55,37 +55,27 @@ class Publish(MOQTMessage):
         payload.push_bytes(self.track_name)
         payload.push_vint(self.track_alias)
 
-        if is_draft16_or_later(prof.draft):
-            # d16: group_order, content_exists, forward all in params/extensions
-            params = dict(self.parameters or {})
-            if self.forward is not None:
-                params[ParamType.FORWARD] = self.forward
-            if self.largest_group_id is not None:
-                if ParamType.LARGEST_OBJECT in prof.location_params:
-                    # d18: inline Location value — (group, object) tuple
-                    params[ParamType.LARGEST_OBJECT] = (
-                        self.largest_group_id, self.largest_object_id or 0)
-                else:
-                    # d16: length-prefixed bytes(group varint + object varint)
-                    lbuf = Buffer(capacity=16)
-                    lbuf.push_uint_var(self.largest_group_id)
-                    lbuf.push_uint_var(self.largest_object_id or 0)
-                    params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
-            MOQTMessage._serialize_params(payload, params, prof=prof)
-            # Track Extensions; an omitted group order means Ascending.
-            exts = dict(self.track_extensions or {})
-            if self.group_order == GroupOrder.DESCENDING:
-                exts[0x22] = self.group_order
-            MOQTMessage._extensions_encode(payload, exts, with_length=False, delta=True)
-        else:
-            # d14: fixed fields
-            payload.push_uint8(self.group_order)
-            payload.push_uint8(self.content_exists)
-            if self.content_exists == ContentExistsCode.EXISTS:
-                payload.push_vint(self.largest_group_id)
-                payload.push_vint(self.largest_object_id)
-            payload.push_uint8(self.forward)
-            MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
+        # group_order, content_exists, forward all in params/extensions
+        params = dict(self.parameters or {})
+        if self.forward is not None:
+            params[ParamType.FORWARD] = self.forward
+        if self.largest_group_id is not None:
+            if ParamType.LARGEST_OBJECT in prof.location_params:
+                # d18: inline Location value — (group, object) tuple
+                params[ParamType.LARGEST_OBJECT] = (
+                    self.largest_group_id, self.largest_object_id or 0)
+            else:
+                # d16: length-prefixed bytes(group varint + object varint)
+                lbuf = Buffer(capacity=16)
+                lbuf.push_uint_var(self.largest_group_id)
+                lbuf.push_uint_var(self.largest_object_id or 0)
+                params[ParamType.LARGEST_OBJECT] = lbuf.data_slice(0, lbuf.tell())
+        MOQTMessage._serialize_params(payload, params, prof=prof)
+        # Track Extensions; an omitted group order means Ascending.
+        exts = dict(self.track_extensions or {})
+        if self.group_order == GroupOrder.DESCENDING:
+            exts[0x22] = self.group_order
+        MOQTMessage._extensions_encode(payload, exts, with_length=False)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -110,44 +100,33 @@ class Publish(MOQTMessage):
         forward = None
         track_extensions = None
 
-        if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
-                                                 scope=cls.__name__)
-            forward = params.pop(ParamType.FORWARD, None)
-            largest = params.pop(ParamType.LARGEST_OBJECT, None)
-            if largest is not None:
-                if isinstance(largest, tuple):
-                    # d18: inline Location value (group, object)
-                    largest_group_id, largest_object_id = largest
-                else:
-                    # d16: length-prefixed bytes(group varint + object varint)
-                    lbuf = Buffer(data=largest)
-                    largest_group_id = lbuf.pull_vint()
-                    largest_object_id = lbuf.pull_vint()
-                content_exists = ContentExistsCode.EXISTS
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                             scope=cls.__name__)
+        forward = params.pop(ParamType.FORWARD, None)
+        largest = params.pop(ParamType.LARGEST_OBJECT, None)
+        if largest is not None:
+            if isinstance(largest, tuple):
+                # d18: inline Location value (group, object)
+                largest_group_id, largest_object_id = largest
             else:
-                content_exists = ContentExistsCode.NO_CONTENT
-            track_extensions = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end, delta=True)
-            if prof.track_properties:
-                MOQTMessage._check_track_properties(track_extensions,
-                                                    prof=prof)
-            group_order = GroupOrder.ASCENDING
-            if track_extensions is not None:
-                go_val = track_extensions.pop(0x22, None)
-                if go_val is not None:
-                    MOQTMessage._check_range(
-                        "default publisher group order", go_val, 1, 2)
-                    group_order = go_val
+                # d16: length-prefixed bytes(group varint + object varint)
+                lbuf = Buffer(data=largest)
+                largest_group_id = lbuf.pull_vint()
+                largest_object_id = lbuf.pull_vint()
+            content_exists = ContentExistsCode.EXISTS
         else:
-            group_order = buf.pull_uint8()
-            content_exists = buf.pull_uint8()
-            if content_exists == ContentExistsCode.EXISTS:
-                largest_group_id = buf.pull_vint()
-                largest_object_id = buf.pull_vint()
-            forward = buf.pull_uint8()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
-                                                 scope=cls.__name__)
+            content_exists = ContentExistsCode.NO_CONTENT
+        track_extensions = MOQTMessage._extensions_decode(
+            buf, with_length=False, buf_end=buf_end)
+        MOQTMessage._check_track_properties(track_extensions,
+                                            prof=prof)
+        group_order = GroupOrder.ASCENDING
+        if track_extensions is not None:
+            go_val = track_extensions.pop(0x22, None)
+            if go_val is not None:
+                MOQTMessage._check_range(
+                    "default publisher group order", go_val, 1, 2)
+                group_order = go_val
 
         return cls(
             request_id=request_id,
@@ -168,10 +147,7 @@ class Publish(MOQTMessage):
 class PublishOk(MOQTMessage):
     """PUBLISH_OK (0x1E) — Subscriber accepts a PUBLISH.
 
-    Draft-14: Request ID, Forward (8), Priority (8), Group Order (8),
-              Filter Type (i), [Location], [End Group], Params
-    Draft-16: Request ID, Params
-              (all fixed fields moved to parameters)
+    Draft-16: Request ID, Params (the fields travel as parameters)
     Draft-20: a REQUEST_OK carrying only EXPIRES; the subscription
               fields ride a REQUEST_UPDATE (subscription_params()).
     """
@@ -231,14 +207,14 @@ class PublishOk(MOQTMessage):
             if self.expires is not None:
                 params[ParamType.EXPIRES] = self.expires
             MOQTMessage._serialize_params(payload, params, prof=prof)
-        elif is_draft16_or_later(prof.draft):
+        else:
             # d16: everything in params
             params = dict(self.parameters or {})
             if self.forward is not None:
                 params[ParamType.FORWARD] = self.forward
             if self.priority is not None:
                 params[ParamType.SUBSCRIBER_PRIORITY] = self.priority
-            # d16+ has no 0 value; omission means the publisher's order.
+            # No 0 value; omission means the publisher's order.
             if self.group_order not in (None, GroupOrder.PUBLISHER_DEFAULT):
                 params[ParamType.GROUP_ORDER] = self.group_order
             if self.filter_type is not None:
@@ -261,20 +237,8 @@ class PublishOk(MOQTMessage):
                     fbuf.push_vint(end)
                 params[ParamType.SUBSCRIPTION_FILTER] = fbuf.data_slice(0, fbuf.tell())
             MOQTMessage._serialize_params(payload, params, prof=prof)
-        else:
-            # d14: fixed fields
-            payload.push_uint8(self.forward)
-            payload.push_uint8(self.priority)
-            payload.push_uint8(self.group_order)
-            payload.push_vint(self.filter_type)
-            if self.filter_type in (3, 4):
-                payload.push_vint(self.start_group or 0)
-                payload.push_vint(self.start_object or 0)
-            if self.filter_type == 4:
-                payload.push_vint(self.end_group or 0)
-            MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
 
-        # d14/d16 define a distinct PUBLISH_OK (0x1E, d16 §9.14). From
+        # d16 defines a distinct PUBLISH_OK (0x1E, §9.14). From
         # d18, where replies ride the request stream, a PUBLISH is
         # answered with the universal REQUEST_OK (0x07); "PUBLISH_OK" is
         # the shorthand for it (§10.5).
@@ -309,45 +273,32 @@ class PublishOk(MOQTMessage):
             expires = params.pop(ParamType.EXPIRES, None)
             return cls(request_id=request_id, parameters=params,
                        expires=expires)
-        if is_draft16_or_later(prof.draft):
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
-                                                 scope=cls.__name__)
-            forward = params.pop(ParamType.FORWARD, None)
-            priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
-            group_order = params.pop(ParamType.GROUP_ORDER, None)
-            filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
-            if filter_raw is not None:
-                fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
-                filter_type = fbuf.pull_vint()
-                if filter_type not in (1, 2, 3, 4):
-                    # §5.1.2: filter types are 0x1-0x4; other values MUST
-                    # close the session with PROTOCOL_VIOLATION.
-                    raise MOQTProtocolViolation(
-                        f"unknown subscription filter type "
-                        f"0x{filter_type:x}")
-                if filter_type in (3, 4):
-                    start_group = fbuf.pull_vint()
-                    start_object = fbuf.pull_vint()
-                if filter_type == 4:
-                    end_group = fbuf.pull_vint()
-                    if prof.vi64:
-                        # d18: End Group arrives as a delta from Start.
-                        end_group += start_group or 0
-                        if end_group > (1 << 64) - 1:
-                            raise MOQTProtocolViolation(
-                                f"end group {end_group} exceeds 2^64-1")
-        else:
-            forward = buf.pull_uint8()
-            priority = buf.pull_uint8()
-            group_order = buf.pull_uint8()
-            filter_type = buf.pull_vint()
+        params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
+                                             scope=cls.__name__)
+        forward = params.pop(ParamType.FORWARD, None)
+        priority = params.pop(ParamType.SUBSCRIBER_PRIORITY, None)
+        group_order = params.pop(ParamType.GROUP_ORDER, None)
+        filter_raw = params.pop(ParamType.SUBSCRIPTION_FILTER, None)
+        if filter_raw is not None:
+            fbuf = Buffer(data=filter_raw, vi64=prof.vi64)
+            filter_type = fbuf.pull_vint()
+            if filter_type not in (1, 2, 3, 4):
+                # §5.1.2: filter types are 0x1-0x4; other values MUST
+                # close the session with PROTOCOL_VIOLATION.
+                raise MOQTProtocolViolation(
+                    f"unknown subscription filter type "
+                    f"0x{filter_type:x}")
             if filter_type in (3, 4):
-                start_group = buf.pull_vint()
-                start_object = buf.pull_vint()
+                start_group = fbuf.pull_vint()
+                start_object = fbuf.pull_vint()
             if filter_type == 4:
-                end_group = buf.pull_vint()
-            params = MOQTMessage._deserialize_params(buf, prof=prof, buf_end=buf_end,
-                                                 scope=cls.__name__)
+                end_group = fbuf.pull_vint()
+                if prof.vi64:
+                    # d18: End Group arrives as a delta from Start.
+                    end_group += start_group or 0
+                    if end_group > (1 << 64) - 1:
+                        raise MOQTProtocolViolation(
+                            f"end group {end_group} exceeds 2^64-1")
 
         return cls(
             request_id=request_id,
@@ -359,48 +310,5 @@ class PublishOk(MOQTMessage):
             start_object=start_object,
             end_group=end_group,
             parameters=params
-        )
-
-
-@dataclass(slots=True)
-class PublishError(MOQTMessage):
-    """PUBLISH_ERROR (0x1F) — Subscriber rejects a PUBLISH.
-
-    Wire format (Section 9.15) — same as SUBSCRIBE_ERROR:
-        Request ID (i), Error Code (i), Error Reason (Reason Phrase)
-    """
-    request_id: int = None
-    error_code: int = None
-    reason: str = None
-
-    def __post_init__(self):
-        self.type = MOQTMessageType.PUBLISH_ERROR
-
-    def serialize(self, *, prof: DraftProfile) -> bytes:
-        buf = Buffer(capacity=BUF_SIZE)
-        payload = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
-
-        payload.push_vint(self.request_id)
-        payload.push_vint(self.error_code.value if isinstance(self.error_code, PublishErrorCode) else self.error_code)
-
-        reason_bytes = self.reason.encode()
-        payload.push_vint(len(reason_bytes))
-        payload.push_bytes(reason_bytes)
-
-        buf.push_uint_var(self.type)
-        buf.push_uint16(payload.tell())
-        buf.push_bytes(payload.data_slice(0, payload.tell()))
-        return buf
-
-    @classmethod
-    def deserialize(cls, buf: Buffer, *, prof: DraftProfile, buf_end: Optional[int] = None) -> 'PublishError':
-        request_id = buf.pull_vint()
-        error_code = buf.pull_vint()
-        reason = MOQTMessage._pull_reason(buf)
-
-        return cls(
-            request_id=request_id,
-            error_code=error_code,
-            reason=reason,
         )
 

@@ -17,7 +17,7 @@ from aiomoqt.messages import SubgroupHeader
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.types import StreamResetCode
 
-DRAFTS = [14, 16, 18, 20]
+DRAFTS = [16, 18, 20]
 
 
 class _Ring:

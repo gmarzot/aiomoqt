@@ -16,7 +16,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 17260
-_DRAFTS = [14, 16, 18, 20]
+_DRAFTS = [16, 18, 20]
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
 
