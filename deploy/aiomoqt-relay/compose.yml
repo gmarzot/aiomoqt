@@ -78,36 +78,50 @@ services:
     network_mode: none
     # Off the relay's CPUs; yields to the NIC's softirq work on CPU 0.
     cpuset: "0"
-    cpu_shares: 64
+    cpu_shares: 2
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     read_only: true
     tmpfs: [/tmp]
-    # Every 5 minutes, from the current and rotated logs: visitors without
-    # crawlers, and crawlers alone. Each report replaces the old one whole.
-    # BusyBox zcat -f does not pass plain files through, so only .gz is zcat'd.
+    # Every 5 minutes each report (visitors without crawlers; crawlers alone) parses only the
+    # lines added since its last pass into its own database, which keeps 14 days. The latest
+    # second's lines wait a pass: goaccess drops lines no newer than the last it stored. After
+    # logrotate's copytruncate, the rest of access.log.1 comes first.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        logs() {
-          for f in /logs/access.log*; do
-            case "$$f" in *.gz) zcat "$$f" ;; *) cat "$$f" ;; esac
-          done 2>/dev/null
+        new_lines() {
+          seen=$$(cat "$$1/lines" 2>/dev/null || echo 0)
+          now=$$(wc -l < /logs/access.log)
+          head -n 1 /logs/access.log > "$$1/first.next"
+          echo "$$now" > "$$1/lines.next"
+          {
+            cat "$$1/carry" 2>/dev/null
+            if [ "$$now" -lt "$$seen" ] || { [ -s "$$1/first" ] && ! cmp -s "$$1/first" "$$1/first.next"; }; then
+              tail -n +$$((seen + 1)) /logs/access.log.1 2>/dev/null
+              seen=0
+            fi
+            tail -n +$$((seen + 1)) /logs/access.log | head -n $$((now - seen))
+          } | awk -v carry="$$1/carry.next" '$$4 != t { for (i = 0; i < n; i++) print b[i]; n = 0; t = $$4 }
+              { b[n++] = $$0 } END { printf "" > carry; for (i = 0; i < n; i++) print b[i] > carry }'
+        }
+        report() {
+          mkdir -p "$$1"
+          new_lines "$$1" | goaccess - --log-format=COMBINED --no-global-config --no-progress "$$4" \
+            --persist --restore --db-path="$$1" --keep-last=14 \
+            --html-report-title="$$3" -o "/report/new-$$2" || return
+          mv "/report/new-$$2" "/report/$$2"
+          for f in lines first carry; do mv "$$1/$$f.next" "$$1/$$f"; done
         }
         while :; do
-          logs | goaccess - --log-format=COMBINED \
-            --no-global-config --ignore-crawlers \
-            --html-report-title="aiomoqt-relay visitors" -o /report/new.html \
-            && mv /report/new.html /report/index.html
-          logs | goaccess - --log-format=COMBINED \
-            --no-global-config --crawlers-only \
-            --html-report-title="aiomoqt-relay crawlers" -o /report/new-crawlers.html \
-            && mv /report/new-crawlers.html /report/crawlers.html
+          report /db/visitors index.html "aiomoqt-relay visitors" --ignore-crawlers
+          report /db/crawlers crawlers.html "aiomoqt-relay crawlers" --crawlers-only
           sleep 300
         done
     volumes:
       - ./logs:/logs:ro
       - ./stats:/report
+      - ./goaccess-db:/db
     logging:
       options: {max-size: "10m", max-file: "3"}
 
