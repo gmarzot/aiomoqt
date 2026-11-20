@@ -762,11 +762,24 @@ class _Taking(_Fake):
     """A session whose transport takes a write without waiting unless
     `take` is False, recording each stream's bytes."""
 
-    def __init__(self, take=True):
+    def __init__(self, take=True, open_now=True):
         super().__init__()
         self.take = take
+        self.open_now = open_now
         self.wire = defaultdict(bytes)
         self.dgrams = []
+
+    def open_uni_stream_nowait(self, initial, priority=None, chain=None,
+                               order=0, on_created=None):
+        if not self.open_now:
+            return False
+        sid = self._next
+        self._next += 4
+        self.log.append(("open", sid, True))
+        self.wire[sid] += bytes(initial)
+        if on_created is not None:
+            on_created(sid)
+        return True
 
     async def open_uni_stream(self, initial=b"", priority=None,
                               end_stream=False):
@@ -876,9 +889,14 @@ async def test_a_refused_write_is_queued_and_sent_once_with_the_same_bytes(
         track.close()
 
 
-async def test_a_new_stream_still_opens_with_its_object_and_end(lane_sends):
+@pytest.mark.parametrize("open_now", [True, False],
+                         ids=["from-offer", "declined"])
+async def test_a_new_stream_still_opens_with_its_object_and_end(lane_sends,
+                                                                open_now):
+    # A one-object stream opens, writes and ends from offer(); a
+    # transport that declines leaves it to the lane task.
     track = relay._RelayedTrack(("ns", "t"))
-    sub = _Taking()
+    sub = _Taking(open_now=open_now)
     track.add_downstream(sub, 1, 1)
     try:
         for gid in range(3):
@@ -888,9 +906,52 @@ async def test_a_new_stream_still_opens_with_its_object_and_end(lane_sends):
         await _settle()
         assert sub.kinds("open") == [("open", sid, True) for sid in (3, 7, 11)]
         assert not sub.kinds("nowait") and not sub.kinds("fin")
-        assert lane_sends == [0, 0, 0]
+        assert lane_sends == ([] if open_now else [0, 0, 0])
+        assert track._objects_out == 3 and not track._ends_due
     finally:
         track.close()
+
+
+async def test_a_stream_opened_from_offer_starts_its_subgroup_timer(
+        lane_sends):
+    track = relay._RelayedTrack(("ns", "t"))
+    sub = _Taking()
+    track.add_downstream(sub, 1, 1)
+    fins = []
+
+    class _Timer:
+        session = sub
+
+        def complete(self, sid):
+            fins.append(sid)
+    track._subgroup_timers[id(sub)] = _Timer()
+    try:
+        for gid in range(2):
+            track.on_object(_obj(gid, 0), 0, 0, gid, 0)
+            track.on_stream_end(gid, 0)
+            await _settle(5)
+        await _settle()
+        assert fins == [3, 7] and lane_sends == []
+    finally:
+        track.close()
+
+
+async def test_a_stream_opened_from_offer_carries_the_lane_path_bytes():
+    wires = []
+    for open_now in (True, False):
+        track = relay._RelayedTrack(("ns", "t"))
+        sub = _Taking(open_now=open_now)
+        track.add_downstream(sub, 1, 1)
+        try:
+            for gid in range(3):
+                track.on_object(_obj(gid, 0, size=100 + gid), 0, 0, gid, 0)
+                track.on_stream_end(gid, 0)
+                await _settle(5)
+            await _settle()
+            wires.append(dict(sub.wire))
+        finally:
+            track.close()
+    assert wires[0] == wires[1] and len(wires[0]) == 3
 
 
 async def test_a_datagram_is_written_from_offer(lane_sends):

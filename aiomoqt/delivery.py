@@ -485,6 +485,86 @@ def _peer(session) -> str:
     return f"{addr[0]}:{addr[1]}" if addr else "peer"
 
 
+_unenforced_logged = False
+
+
+def _stream_released(session) -> Optional[Callable[[int], bool]]:
+    """The transport's stream_released(stream_id) query, None where it has
+    none; logged once."""
+    global _unenforced_logged
+    fn = getattr(getattr(session, "_quic", None), "stream_released", None)
+    if fn is None and not _unenforced_logged:
+        _unenforced_logged = True
+        logger.info("transport has no stream_released(): "
+                    "SUBGROUP_DELIVERY_TIMEOUT is not enforced")
+    return fn
+
+
+class SubgroupTimer:
+    """§8 SUBGROUP_DELIVERY_TIMEOUT for one session's subgroup streams: a
+    stream not released by the transport (all data acknowledged) within
+    `timeout` seconds of its FIN is reset with DELIVERY_TIMEOUT. FINed
+    streams queue in order; one timer sweeps those due."""
+
+    __slots__ = ("session", "timeout", "_released", "_due", "_handle",
+                 "expired")
+
+    def __init__(self, session, timeout: Optional[float] = None):
+        self.session = session
+        self.timeout = timeout or None
+        self._released = None
+        self._due: deque = deque()
+        self._handle = None
+        self.expired = 0         # streams reset by the timeout
+
+    def complete(self, stream_id: int) -> None:
+        """Stream `stream_id` holds its whole subgroup and is FINed."""
+        timeout = self.timeout
+        if timeout is None:
+            return
+        released = self._released
+        if released is None:
+            released = self._released = (
+                _stream_released(self.session) or False)
+        if released is False:
+            return
+        loop = asyncio.get_running_loop()
+        due = loop.time() + timeout
+        self._due.append((stream_id, due))
+        if self._handle is None:
+            self._handle = loop.call_at(due, self._sweep)
+
+    def _sweep(self) -> None:
+        self._handle = None
+        due = self._due
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        released = self._released
+        if not callable(released):
+            return
+        while due and due[0][1] <= now:
+            sid = due.popleft()[0]
+            try:
+                done = released(sid)
+            except Exception:
+                done = True
+            if not done:
+                self.expired += 1
+                data_log.debug(f"stream {sid}: subgroup delivery timeout, "
+                               f"reset")
+                self.session.stream_reset(sid,
+                                          StreamResetCode.DELIVERY_TIMEOUT)
+        if due:
+            self._handle = loop.call_at(due[0][1], self._sweep)
+
+    def cancel(self) -> None:
+        """Stop sweeping; queued streams are left alone."""
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._due.clear()
+
+
 class SubgroupDelivery:
     """One session's copy of an object sequence.
 
@@ -537,6 +617,22 @@ class SubgroupDelivery:
         self._tx_streams: dict = {}
         # Told of each PER_GROUP stream opened at a group start.
         self.head_trace: Optional[HeadTrace] = None
+        # SUBGROUP_DELIVERY_TIMEOUT (§8), set through subgroup_timeout.
+        self._subgroups: Optional[SubgroupTimer] = None
+
+    @property
+    def subgroup_timeout(self) -> Optional[float]:
+        """SUBGROUP_DELIVERY_TIMEOUT in seconds, None for none."""
+        t = self._subgroups
+        return None if t is None else t.timeout
+
+    @subgroup_timeout.setter
+    def subgroup_timeout(self, value: Optional[float]) -> None:
+        if self._subgroups is None:
+            if not value:
+                return
+            self._subgroups = SubgroupTimer(self.session)
+        self._subgroups.timeout = value or None
 
     @property
     def _prof(self):
@@ -571,6 +667,8 @@ class SubgroupDelivery:
         """Stream `sid` of `group_id` is FINed."""
         if self.lane is not None:
             self._tx_streams[sid] = group_id
+        if self._subgroups is not None:
+            self._subgroups.complete(sid)
         if sid == self._stream_id:
             self._stream_id = None
             self._header = None
@@ -592,10 +690,7 @@ class SubgroupDelivery:
                                   status=ObjectStatus.END_OF_TRACK)
             self.session.stream_write(self._stream_id, buf.data,
                                       end_stream=True)
-            if self.lane is not None:
-                self._tx_streams[self._stream_id] = hdr.group_id
-            self._stream_id = None
-            self._header = None
+            self._ended(self._stream_id, hdr.group_id)
             return
         group_id = 0 if largest is None else largest[0] + 1
         if self.passes is not None and not self.passes(group_id, 0):
@@ -626,8 +721,7 @@ class SubgroupDelivery:
         data = hdr.serialize().data + hdr.next_object(
             payload=b"", object_id=0, status=ObjectStatus.END_OF_TRACK).data
         self.session.stream_write(sid, data, end_stream=True)
-        if self.lane is not None:
-            self._tx_streams[sid] = group_id
+        self._ended(sid, group_id)
 
     async def write(self, group_id: int, object_id: int, payload: bytes, *,
                     extensions: Optional[Dict[int, Any]] = None,
@@ -898,8 +992,10 @@ class SubgroupDelivery:
     def expire(self, group_id: int) -> bool:
         """§8: an object past the delivery timeout is dropped; on a
         stream, its subgroup is reset with DELIVERY_TIMEOUT and not
-        reopened. True when the rest of the group is skipped."""
-        if self.mapping is StreamMapping.DATAGRAM:
+        reopened. True when the rest of the group, its one subgroup
+        under PER_GROUP, is skipped; a PER_OBJECT object is its own
+        subgroup, so only it is dropped."""
+        if self.mapping is not StreamMapping.PER_GROUP:
             return False
         if self.open_group == group_id:
             self.reset_group(StreamResetCode.DELIVERY_TIMEOUT)
@@ -941,6 +1037,10 @@ class SubgroupDelivery:
                     if used(sid):
                         self.session.stream_reset(
                             sid, StreamResetCode.CANCELLED)
+
+
+# send_nowait(): the item's stream end follows; hold the item for it.
+END_DUE = object()
 
 
 class SendLane:
@@ -1034,6 +1134,9 @@ class SendLane:
         self._wake = asyncio.Event()
         self._nowait = (getattr(writer, "send_nowait", None)
                         if self.write_through else None)
+        self._whole = (getattr(writer, "send_whole_nowait", None)
+                       if self.write_through else None)
+        self._held = None
         self.task = asyncio.ensure_future(self._run())
         self.task.add_done_callback(self._ended)
 
@@ -1108,6 +1211,26 @@ class SendLane:
                 self._probe_gid, self._probe_n = gid, 0
                 self._probe(floor)
             self._probe_n += 1
+        held = self._held
+        if held is not None:
+            self._held = None
+            items = self.items
+            send_whole = self._whole
+            if (send_whole is not None and len(items) == 1
+                    and items[0] is held and not self.busy
+                    and self.gate and not self.late
+                    and self.writer.ends_stream(held, item)):
+                try:
+                    whole = send_whole(held, item)
+                except Exception:
+                    whole = False
+                if whole:
+                    items.popleft()
+                    self._uncount(held)
+                    self.done += 2
+                    if self.on_sent is not None:
+                        self.on_sent(held)
+                    return False
         nowait = self._nowait
         if (nowait is not None and not self.items and not self.busy
                 and self.gate and not self.late
@@ -1118,6 +1241,17 @@ class SendLane:
                 if not self._failed(item, e):
                     self.stop()
                 return False
+            if sent is END_DUE:
+                if cost:
+                    self.objects += 1
+                    if live:
+                        self.bytes += cost
+                    else:
+                        self.replay_bytes += cost
+                self.items.append(item)
+                self._held = item
+                asyncio.get_running_loop().call_soon(self._release_held, item)
+                return True
             if sent is not None:
                 self.done += 1
                 if sent and self.on_sent is not None:
@@ -1134,6 +1268,12 @@ class SendLane:
         if live and self._over(item):
             self._shed(item)
         return True
+
+    def _release_held(self, item) -> None:
+        """A held item whose end did not follow this pass: send it."""
+        if self._held is item:
+            self._held = None
+            self._wake.set()
 
     def _probe(self, floor) -> None:
         """Read what the transport holds of the lane's groups from `floor`."""

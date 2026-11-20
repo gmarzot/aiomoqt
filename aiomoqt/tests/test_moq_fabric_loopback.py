@@ -98,9 +98,8 @@ async def test_announce_and_subscribe_both_ways_two_tracks():
                            ((b"a", b"live"), b"audio")}
         assert set(sb) == {((b"b", b"live"), b"video"),
                            ((b"b", b"live"), b"audio")}
-        assert all(rec.hash_ok for rec in [*sa.values(), *sb.values()])
-        assert all(rec.body.seq == b._seq_base for rec in sa.values())
-        assert all(rec.body.seq == a._seq_base for rec in sb.values())
+        assert all(rec.hash_ok and rec.body.seq == 1
+                   for rec in [*sa.values(), *sb.values()])
         assert all(rec.body.source == b.node_id for rec in sa.values())
 
         # Withdraws remove one track's record on the far side, not both.
@@ -119,8 +118,7 @@ async def test_announce_and_subscribe_both_ways_two_tracks():
         b.subscribe("a/live", "audio", forward=0)
         await a.wait_until(lambda: next(iter(_subs(a).values())).body.forward
                            == 0, TIMEOUT)
-        assert next(iter(_subs(a).values())).body.seq == (
-            b._seq_base + 1) & 0xFFFF
+        assert next(iter(_subs(a).values())).body.seq == 2
         assert sum(s.hash_mismatches for s in a.sessions.values()) == 0
 
 
@@ -152,7 +150,7 @@ async def test_redial_after_close_resyncs():
                                 and len(_tracks(a2)) == 1, TIMEOUT)
             second = b.connected()[0]
             assert second.id != first.id and second.remote.contact == "A2"
-            assert next(iter(_subs(a2).values())).body.seq == b._seq_base
+            assert next(iter(_subs(a2).values())).body.seq == 1
             assert [e["kind"] for e in b.events].count("connected") == 2
         finally:
             await a2.stop()
@@ -253,7 +251,7 @@ async def test_stop_withdraws_originated():
         await b.wait_until(lambda: not b.connected(), TIMEOUT)
         assert _withdrawn_before_close(b, session) == (2, 2)
         wd = [e for e in b.events if e["kind"] == "subscribe_withdrawn"]
-        assert [e["seq"] for e in wd] == [(a._seq_base + 1) & 0xFFFF] * 2
+        assert [e["seq"] for e in wd] == [2, 2]
         mine = [e["kind"] for e in a.events]
         assert mine.count("announce_withdrawn_originated") == 2
         assert mine.count("subscribe_withdrawn_originated") == 2

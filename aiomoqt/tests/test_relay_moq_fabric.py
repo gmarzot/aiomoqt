@@ -513,6 +513,20 @@ async def test_control_get_fabric_and_post_peer(short_dir):
                                     + nobody))[0] == 404
                 assert (await _http(sock, "POST", "/moq-fabric/peer?op=metric&"
                                     + nobody + "&metric=1"))[0] == 404
+                # Two peers on one host, neither at this port: 409, naming
+                # both (pub's accepted session and the dialed b).
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=add&"
+                                    + q))[0] == 200
+                await _until(lambda: len(b.connected()) == 1)
+                status, rep = await _http(
+                    sock, "POST", "/moq-fabric/peer?op=metric&host=127.0.0.1"
+                    "&port=1&metric=5")
+                assert status == 409
+                assert f"127.0.0.1:{bport}" in rep["error"]
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=remove&"
+                                    "host=127.0.0.1&port=1"))[0] == 409
+                assert (await _http(sock, "POST", "/moq-fabric/peer?op=remove&"
+                                    + q))[0] == 200
                 for bad in ("op=reboot&" + q, "op=add&host=x",
                             "op=metric&" + q, "op=add&host=x&port=0"):
                     assert (await _http(sock, "POST",
