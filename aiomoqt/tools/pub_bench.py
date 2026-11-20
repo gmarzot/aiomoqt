@@ -103,7 +103,7 @@ The URL scheme selects the transport:
                                'PUBLISH.')
     pub_mode.add_argument('--pub-both', action='store_true',
                           help='Hybrid: PUB_NS + PUBLISH (legacy relays '
-                               'that want both; breaks on CF d14).')
+                               'that want both).')
     parser.add_argument('--forward', type=int, nargs='?', const=1,
                         default=0, choices=(0, 1),
                         help='[EXPERIMENTAL] Initial Forward State in '

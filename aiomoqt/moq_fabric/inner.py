@@ -182,8 +182,7 @@ class SubgroupReader:
     def _read_object(self, chain, h: SubgroupHeader) -> StreamObject:
         obj = ObjectHeader(object_id=0)
         obj.deserialize_into(chain, chain.capacity, h.extensions_present,
-                             h._last_object_id, True, P18.params_delta_coded,
-                             self.max_object)
+                             h._last_object_id, True, self.max_object)
         h._last_object_id = obj.object_id
         if h.subgroup_id_mode == SUBGROUP_ID_FIRST_OBJ and h.subgroup_id is None:
             h.subgroup_id = obj.object_id

@@ -86,8 +86,7 @@ class MOQTMessage:
 
     @staticmethod
     def _extensions_encode(buf: Buffer, exts: Dict,
-                           with_length: bool = True,
-                           delta: bool = False) -> None:
+                           with_length: bool = True) -> None:
         # The KVP block SHAPE is draft-independent, but the varint
         # FLAVOR is not: d18 encodes varints as vi64. Follow the target
         # buffer's flavor via push_vint rather than hardcoding the
@@ -95,10 +94,10 @@ class MOQTMessage:
         # standard-varint extensions produces a frame the peer rejects
         # (moxygen closes the session with PROTOCOL_VIOLATION).
         #
-        # delta: d16+ §1.4.2/§1.4.3 KVP Type field is a DELTA from the
-        # previous Type (0 for the first). Deltas are unsigned, so types
-        # are emitted in ascending order; even/odd (value form) is a
-        # property of the ABSOLUTE type. d14 keeps absolute types.
+        # §1.4.2/§1.4.3: the KVP Type field is a DELTA from the previous
+        # Type (0 for the first). Deltas are unsigned, so types are
+        # emitted in ascending order; even/odd (value form) is a property
+        # of the ABSOLUTE type.
         if exts is None or len(exts) == 0:
             if with_length:
                 buf.push_vint(0)
@@ -106,11 +105,9 @@ class MOQTMessage:
 
         payload = Buffer(capacity=BUF_SIZE, vi64=buf.vi64)
         prev = 0
-        for ext_id, ext_value in (sorted(exts.items()) if delta
-                                  else exts.items()):
-            payload.push_vint(ext_id - prev if delta else ext_id)
-            if delta:
-                prev = ext_id
+        for ext_id, ext_value in sorted(exts.items()):
+            payload.push_vint(ext_id - prev)
+            prev = ext_id
             if ext_id % 2 == 0:  # even extension types are simple var int
                 payload.push_vint(ext_value)
             else:
@@ -222,7 +219,7 @@ class MOQTMessage:
         try:
             nested = MOQTMessage._extensions_decode(
                 Buffer(data=raw, vi64=prof.vi64), with_length=False,
-                buf_end=len(raw), delta=True, lenient=False) or {}
+                buf_end=len(raw), lenient=False) or {}
         except (BufferReadError, MOQTUnderflow, MOQTMalformedKVP,
                 ValueError) as e:
             raise MOQTProtocolViolation(
@@ -271,7 +268,7 @@ class MOQTMessage:
     def _pull_tuple(buf: Buffer, *, prof: DraftProfile,
                     buf_end: Optional[int] = None) -> tuple:
         """Track Namespace tuple; over the maximum field count is a
-        protocol violation, and at d16+ so is an empty field or a
+        protocol violation, and so is an empty field or a
         namespace over FULL_TRACK_NAME_MAX bytes. With buf_end, a field
         that would run past it is refused before it is read."""
         n = buf.pull_vint()
@@ -286,14 +283,13 @@ class MOQTMessage:
                 raise MOQTProtocolViolation("namespace field overruns frame")
             fields.append(MOQTMessage._pull_sized(buf, flen, "namespace field"))
         parts = tuple(fields)
-        if prof.draft >= 16:
-            if not all(parts):
-                raise MOQTProtocolViolation("empty namespace field")
-            size = sum(len(p) for p in parts)
-            if size > MOQTMessage.FULL_TRACK_NAME_MAX:
-                raise MOQTProtocolViolation(
-                    f"namespace is {size} bytes "
-                    f"(max {MOQTMessage.FULL_TRACK_NAME_MAX})")
+        if not all(parts):
+            raise MOQTProtocolViolation("empty namespace field")
+        size = sum(len(p) for p in parts)
+        if size > MOQTMessage.FULL_TRACK_NAME_MAX:
+            raise MOQTProtocolViolation(
+                f"namespace is {size} bytes "
+                f"(max {MOQTMessage.FULL_TRACK_NAME_MAX})")
         return parts
 
     @staticmethod
@@ -313,7 +309,6 @@ class MOQTMessage:
     @staticmethod
     def _extensions_decode(buf: Buffer, with_length: bool = True,
                            buf_end: Optional[int] = None,
-                           delta: bool = False,
                            lenient: bool = True) -> Optional[Dict[int, Union[int, bytes]]]:
         # Two framing modes:
         #   with_length=True  — Object Extensions (§10.2.1.2): the
@@ -388,16 +383,14 @@ class MOQTMessage:
             # lets the dispatcher process the message body (which we
             # already finished parsing) without a noisy traceback.
             try:
-                ext_id = buf.pull_vint()
-                if delta:
-                    # d16+ §1.4.2: Type is a delta from the previous
-                    # absolute Type; value form follows the ABSOLUTE.
-                    ext_id += prev
-                    if ext_id > MOQTMessage.KVP_TYPE_MAX:
-                        raise MOQTProtocolViolation(
-                            f"KVP Delta Type overflows the Type space: "
-                            f"{ext_id} > 2^64-1")
-                    prev = ext_id
+                # §1.4.2: Type is a delta from the previous absolute Type;
+                # value form follows the ABSOLUTE.
+                ext_id = buf.pull_vint() + prev
+                if ext_id > MOQTMessage.KVP_TYPE_MAX:
+                    raise MOQTProtocolViolation(
+                        f"KVP Delta Type overflows the Type space: "
+                        f"{ext_id} > 2^64-1")
+                prev = ext_id
                 if ext_id % 2 == 0:
                     # even type → varint value (self-bounded by varint prefix)
                     ext_value = buf.pull_vint()
@@ -687,8 +680,7 @@ class MOQTMessage:
 
     @staticmethod
     def _serialize_params(payload: Buffer, parameters: Dict[int, Any],
-                          *, prof: DraftProfile,
-                          delta_keys: bool = None) -> None:
+                          *, prof: DraftProfile) -> None:
         """
         Serialize parameters using Key-Value-Pair structure. Payload is modified in place.
 
@@ -696,18 +688,14 @@ class MOQTMessage:
         - Even type: Type (varint) + Value (varint)
         - Odd type: Type (varint) + Length (varint) + Value (bytes)
 
-        delta_keys defaults from the draft's profile (d16+ sorts keys
-        and writes deltas: key_on_wire = key - previous_key).
+        Keys are sorted and written as deltas: key_on_wire = key -
+        previous_key.
         """
         # Tag the buffer's varint flavor so push_vint encodes vi64 (d18) or
         # RFC9000 (pre-d18). All control integers except the 16-bit message
         # Length go through push_vint.
         payload.vi64 = prof.vi64
-        if delta_keys is None:
-            delta_keys = prof.params_delta_coded
-        if delta_keys:
-            # Sort by key for delta encoding
-            parameters = dict(sorted(parameters.items()))
+        parameters = dict(sorted(parameters.items()))
         items = list(parameters.items())
         if prof.draft >= 18 and prof.param_table >= 20:
             # A list value of a repeatable parameter is one instance each.
@@ -721,11 +709,8 @@ class MOQTMessage:
         payload.push_vint(len(items))
         prev_key = 0
         for param_type, param_value in items:
-            if delta_keys:
-                payload.push_vint(param_type - prev_key)
-                prev_key = param_type
-            else:
-                payload.push_vint(param_type)  # Type
+            payload.push_vint(param_type - prev_key)
+            prev_key = param_type
 
             if prof.draft >= 18:
                 # d18 §10.2: the Value encoding comes from each
@@ -829,7 +814,7 @@ class MOQTMessage:
     @staticmethod
     def _pull_location_param(buf: Buffer, *, prof: DraftProfile,
                              buf_end: Optional[int], remaining: int,
-                             prev_key: int, delta_keys: bool) -> tuple:
+                             prev_key: int) -> tuple:
         """Pull a Location parameter value (d18 LARGEST_OBJECT 0x09).
 
         Conformant form (§10.2): two bare varints. Deviant peer form:
@@ -862,7 +847,7 @@ class MOQTMessage:
         if inline and prefixed and buf_end is not None \
                 and inline[1] != prefixed[1]:
             args = dict(prof=prof, buf_end=buf_end, remaining=remaining,
-                        prev_key=prev_key, delta_keys=delta_keys)
+                        prev_key=prev_key)
             if not MOQTMessage._suffix_parses(buf, inline[1], **args) \
                     and MOQTMessage._suffix_parses(buf, prefixed[1], **args):
                 inline = None
@@ -877,8 +862,8 @@ class MOQTMessage:
 
     @staticmethod
     def _suffix_parses(buf: Buffer, start: int, *, prof: DraftProfile,
-                       buf_end: int, remaining: int, prev_key: int,
-                       delta_keys: bool) -> bool:
+                       buf_end: int, remaining: int,
+                       prev_key: int) -> bool:
         """True when the bytes from `start` form a valid message suffix:
         `remaining` more parameters, then a Key-Value-Pair run ending
         exactly at buf_end (the d18 messages that carry a Location
@@ -888,10 +873,8 @@ class MOQTMessage:
             buf.seek(start)
             pk = prev_key
             for _ in range(remaining):
-                raw = buf.pull_vint()
-                ptype = pk + raw if delta_keys else raw
-                if delta_keys:
-                    pk = ptype
+                ptype = pk + buf.pull_vint()
+                pk = ptype
                 if ptype in prof.location_params:
                     buf.pull_vint()
                     buf.pull_vint()
@@ -927,7 +910,6 @@ class MOQTMessage:
     @staticmethod
     def _deserialize_params(buf: Buffer, *, prof: DraftProfile,
                             buf_end: Optional[int] = None,
-                            delta_keys: bool = None,
                             scope: Optional[str] = None) -> Dict[int, Any]:
         """Deserialize a parameter block (see _pull_params).
 
@@ -940,7 +922,7 @@ class MOQTMessage:
         fill = []
         try:
             params = MOQTMessage._pull_params(
-                buf, prof=prof, buf_end=buf_end, delta_keys=delta_keys,
+                buf, prof=prof, buf_end=buf_end,
                 scope=scope, fill_seen=fill)
             if not fill or buf_end is None or buf.tell() == buf_end:
                 return params
@@ -954,7 +936,7 @@ class MOQTMessage:
         buf.seek(start)
         try:
             return MOQTMessage._pull_params(
-                buf, prof=prof, buf_end=buf_end, delta_keys=delta_keys,
+                buf, prof=prof, buf_end=buf_end,
                 scope=scope, fill_counted=True)
         except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow) as e:
             # Report the reading that got further.
@@ -994,7 +976,6 @@ class MOQTMessage:
     @staticmethod
     def _pull_params(buf: Buffer, *, prof: DraftProfile,
                      buf_end: Optional[int] = None,
-                     delta_keys: bool = None,
                      scope: Optional[str] = None,
                      fill_counted: bool = False,
                      fill_seen: Optional[list] = None,
@@ -1002,8 +983,7 @@ class MOQTMessage:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
-        delta_keys defaults from the draft's profile (d16+ keys are
-        delta-decoded). When buf_end is supplied the parameter block is
+        Keys are delta-decoded. When buf_end is supplied the parameter block is
         bounded to it: a declared count or length that would read past
         buf_end raises MOQTProtocolViolation (spec §9 — the Length
         field is the authoritative message extent). bare reads
@@ -1015,8 +995,6 @@ class MOQTMessage:
         # Tag the buffer's varint flavor so pull_vint decodes vi64 (d18) or
         # RFC9000 (pre-d18). Only the 16-bit message Length is fixed-width.
         buf.vi64 = prof.vi64
-        if delta_keys is None:
-            delta_keys = prof.params_delta_coded
         params = {}
         param_count = None if bare else buf.pull_vint()
         prev_key = 0
@@ -1031,12 +1009,8 @@ class MOQTMessage:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
                     f"exhausted at {buf.tell()}/{buf_end}")
-            raw_key = buf.pull_vint()
-            if delta_keys:
-                param_type = prev_key + raw_key
-                prev_key = param_type
-            else:
-                param_type = raw_key
+            param_type = prev_key + buf.pull_vint()
+            prev_key = param_type
 
             if prof.draft >= 18:
                 # d18 §10.2: per-definition Value encodings; an unknown
@@ -1058,7 +1032,7 @@ class MOQTMessage:
                     param_value = MOQTMessage._pull_location_param(
                         buf, prof=prof, buf_end=buf_end,
                         remaining=param_count - param_index - 1,
-                        prev_key=prev_key, delta_keys=delta_keys)
+                        prev_key=prev_key)
                 elif kind == "location_filter":
                     param_value = LocationFilter.decode(
                         buf, prof=prof, buf_end=buf_end)
@@ -1122,7 +1096,7 @@ class MOQTMessage:
                 param_value = MOQTMessage._pull_location_param(
                     buf, prof=prof, buf_end=buf_end,
                     remaining=param_count - param_index - 1,
-                    prev_key=prev_key, delta_keys=delta_keys)
+                    prev_key=prev_key)
             elif param_type % 2 == 1:  # Odd type - includes Length field
                 param_len = buf.pull_vint()
                 if param_len > 65535:  # 2^16-1 maximum
@@ -1155,7 +1129,7 @@ class MOQTMessage:
             bounds = MOQTMessage.PARAM_VALUE_RANGES.get(param_type)
             if bounds is None and d20:
                 bounds = VALUE_RANGES.get(param_type)
-            if bounds is not None and prof.draft >= 16:
+            if bounds is not None:
                 MOQTMessage._check_range(
                     f"parameter 0x{param_type:x}", param_value, *bounds)
             if d20 and param_type in params:

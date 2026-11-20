@@ -4,7 +4,7 @@ Structural coverage only: the d18 version / profile / registry slots exist
 and the AIOMOQT_ENABLE_D18 gate keeps d18 opt-in. The d18 wire (type
 renumbering, Request-ID drops, vi64 data plane) lands in later phases, so
 these tests do NOT assert d18 wire-correctness — only that the tier is
-present and d14/d16 are unaffected.
+present and d16 are unaffected.
 """
 import pytest
 
@@ -13,7 +13,7 @@ from aiomoqt.types import (
     moqt_version_from_draft, moqt_version_from_alpn, moqt_alpn_for_version,
     parse_draft_spec,
 )
-from aiomoqt.context import PROFILES, profile_for, is_draft16_or_later
+from aiomoqt.context import PROFILES, profile_for
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.client import MOQTClient
 from aiomoqt.messages.base import MOQTMessage
@@ -35,9 +35,6 @@ def test_draft18_profile():
     prof = profile_for(18)
     assert prof.draft == 18
     # d18 negotiates out-of-band (ALPN/WT-Protocol), delta-coded params.
-    assert prof.setup_carries_versions is False
-    assert prof.params_delta_coded is True
-    assert is_draft16_or_later(18) is True
     assert MOQTDraft.DRAFT_18 in PROFILES
 
 
@@ -50,14 +47,13 @@ def test_draft18_profile_wire_columns():
     assert prof.reply_has_request_id is False
 
 
-def test_d14_d16_profile_wire_columns_unchanged():
-    # d14/d16 keep RFC9000 varints, a single bidi control stream, and
-    # Request-ID-bearing replies — Phase 3 must not perturb them.
-    for d in (14, 16):
-        prof = profile_for(d)
-        assert prof.varint == "rfc9000"
-        assert prof.control_uni_pair is False
-        assert prof.reply_has_request_id is True
+def test_d16_profile_wire_columns_unchanged():
+    # d16 keeps RFC9000 varints, a single bidi control stream, and
+    # Request-ID-bearing replies.
+    prof = profile_for(16)
+    assert prof.varint == "rfc9000"
+    assert prof.control_uni_pair is False
+    assert prof.reply_has_request_id is True
 
 
 def test_draft18_registry_slot_distinct():
@@ -96,11 +92,10 @@ def test_d18_selectable_without_env_var(monkeypatch):
 
 def test_default_client_offers_every_draft(monkeypatch):
     # The no-args default offers every draft we can speak, newest first,
-    # and falls back to older ones. Derived from MOQTDraft, not
-    # MOQT_VERSIONS (the d14 in-band list).
+    # and falls back to older ones. Derived from MOQTDraft.
     monkeypatch.delenv("AIOMOQT_ENABLE_D18", raising=False)
     c = MOQTClient("localhost", 4433)
-    assert c.supported_drafts == [22, 20, 18, 16, 14]
+    assert c.supported_drafts == [22, 20, 18, 16]
     assert c.supported_drafts == sorted((int(d) for d in MOQTDraft), reverse=True)
 
 
@@ -108,13 +103,13 @@ def test_supported_drafts_accepts_int_or_list():
     # supported_drafts is an int (a single draft) or a list; either form
     # normalizes to a non-empty list of draft numbers, newest first.
     assert MOQTClient("h", 1, supported_drafts=18).supported_drafts == [18]
-    c = MOQTClient("h", 1, supported_drafts=[18, 16, 14])
-    assert c.supported_drafts == [18, 16, 14]
+    c = MOQTClient("h", 1, supported_drafts=[18, 16])
+    assert c.supported_drafts == [18, 16]
     # Caller order is preserved (deduped); only the None auto-offer sorts.
-    assert MOQTClient("h", 1, supported_drafts=[14, 16]).supported_drafts == [14, 16]
+    assert MOQTClient("h", 1, supported_drafts=[16, 18]).supported_drafts == [16, 18]
     # parse_draft_spec maps the --draft CLI value to the same int|list form.
     assert parse_draft_spec("16") == 16
-    assert parse_draft_spec("18,16,14") == [18, 16, 14]
+    assert parse_draft_spec("20,18,16") == [20, 18, 16]
 
 
 def test_draft_spec_accepts_registry_spellings():

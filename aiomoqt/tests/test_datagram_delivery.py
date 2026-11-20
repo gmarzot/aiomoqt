@@ -5,7 +5,7 @@ Covers the pull-model datagram publish path (PublishedTrack
 forwarding=DATAGRAM → dgram_write_drain → aiopquic record ring →
 prepare_datagram) and its guards:
 
-- delivery e2e per draft (d14/16/18), objects arrive via
+- delivery e2e per draft (d16/18), objects arrive via
   on_object_received with correct ids, payloads, and end-of-group bits
 - oversize object_size refused at publish() (frames cannot fragment)
 - concurrent stream + datagram tracks on one connection, both
@@ -94,7 +94,7 @@ async def _collect(session, want, timeout=5.0):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_datagram_track_e2e(draft):
     port = _BASE_PORT + draft
     moqt = _server(port, draft=draft)

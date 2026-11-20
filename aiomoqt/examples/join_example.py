@@ -6,7 +6,7 @@ from aiomoqt.types import ParamType, MOQTException, parse_draft_spec
 from aiomoqt.client import MOQTClient
 from aiomoqt.utils.cli import add_help, run
 from aiomoqt.utils.url import parse_relay_url
-from aiomoqt.messages import SubscribeError, SubscribeNamespaceError
+from aiomoqt.messages import RequestError
 from aiomoqt.utils.logger import *
 
 def parse_args():
@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument('-k', '--insecure', action='store_true',
                         help='Skip TLS certificate verification')
     parser.add_argument('--draft', type=parse_draft_spec, default=None,
-                        help='MoQT draft version: 14, 16, or 18')
+                        help='MoQT draft version: 16, 18, 20 or 22')
     parser.add_argument('-t', '--duration', type=int, default=0,
                         help='Duration seconds (default: 30)')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output')
@@ -70,7 +70,7 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                     wait_response=True
                 )
 
-                if isinstance(response, SubscribeNamespaceError):
+                if isinstance(response, RequestError):
                     logger.error(f"MOQT app: {response}")
                     raise MOQTException(response.error_code, response.reason)
 
@@ -86,7 +86,7 @@ async def main(host: str, port: int, path: str, namespace: str, track_name: str,
                     wait_response=True
                 )
 
-                if isinstance(sub_response, SubscribeError):
+                if isinstance(sub_response, RequestError):
                     logger.error(f"MOQT app: {sub_response}")
                     raise MOQTException(sub_response.error_code, sub_response.reason)
 

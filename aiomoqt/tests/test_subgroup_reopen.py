@@ -32,7 +32,7 @@ def _obj(s, sid, hdr, object_id, fin=False):
         payload=b"x", object_id=object_id).data), fin)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20])
+@pytest.mark.parametrize("draft", [16, 18, 20])
 def test_reopened_subgroup_survives_the_old_streams_reset(draft):
     s = _stub(draft)
     s.stream_stop_sending = lambda sid, code: None

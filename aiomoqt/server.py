@@ -114,7 +114,7 @@ class MOQTServer(MOQTPeer):
         self.path = path
         self.use_quic = use_quic
         # Public API: supported_drafts is the set of IETF draft numbers
-        # (e.g. 16, or [16, 14]) this server accepts; None means "accept
+        # (e.g. 16, or [18, 16]) this server accepts; None means "accept
         # every supported draft". Stored as a non-empty list of draft
         # numbers, newest first; the wire forms (ALPN / IETF version
         # code) are only translated when building ALPN or (de)serializing
@@ -272,11 +272,8 @@ class MOQTServer(MOQTPeer):
 
         # WT-Protocol allowlist in supported_drafts order, as for raw-QUIC
         # ALPN: aiopquic selects the first one the client offered and
-        # refuses an offer with no match. Drafts >= 15 negotiate this way
-        # ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
-        wt_supported = [f"moqt-{d}"
-                        for d in self.supported_drafts
-                        if d >= 15] or None
+        # refuses an offer with no match.
+        wt_supported = [f"moqt-{d}" for d in self.supported_drafts]
         return serve_webtransport(
             self.host, self.port, self.path or "",
             handler=handler,

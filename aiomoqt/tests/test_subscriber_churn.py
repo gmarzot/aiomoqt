@@ -131,7 +131,7 @@ async def test_publish_done_handler_fires_once():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 async def test_unsubscribe_reaches_the_owner_before_d18(draft):
     # d18 cancels by terminating the request stream; earlier drafts send
     # UNSUBSCRIBE. Both must reach the track.

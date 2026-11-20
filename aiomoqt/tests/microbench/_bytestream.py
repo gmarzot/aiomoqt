@@ -26,7 +26,7 @@ def make_subgroup_stream(
     """Build a complete subgroup stream: header + n_objects.
 
     payload_size is the length of each object's payload. `draft` selects
-    the wire codec (vi64 for d18, RFC9000 for d14/d16) so the corpus is
+    the wire codec (vi64 for d18, RFC9000 for d16) so the corpus is
     valid wire for that draft. Returns the concatenated bytes ready to
     feed to the parser.
     """

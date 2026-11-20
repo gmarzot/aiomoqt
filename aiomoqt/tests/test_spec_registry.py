@@ -20,29 +20,6 @@ from aiomoqt.messages.base import MOQTMessage
 
 
 # -- transcribed from the specs, by hand ------------------------------
-# draft-ietf-moq-transport-14 §9.2 "MOQT Control Messages"
-SPEC_D14 = {
-    0x20: "CLIENT_SETUP",       0x21: "SERVER_SETUP",
-    0x10: "GOAWAY",             0x15: "MAX_REQUEST_ID",
-    0x1A: "REQUESTS_BLOCKED",   0x03: "SUBSCRIBE",
-    0x04: "SUBSCRIBE_OK",       0x05: "SUBSCRIBE_ERROR",
-    0x02: "SUBSCRIBE_UPDATE",   0x0A: "UNSUBSCRIBE",
-    0x0B: "PUBLISH_DONE",       0x1D: "PUBLISH",
-    0x1E: "PUBLISH_OK",         0x1F: "PUBLISH_ERROR",
-    0x16: "FETCH",              0x18: "FETCH_OK",
-    0x19: "FETCH_ERROR",        0x17: "FETCH_CANCEL",
-    0x0D: "TRACK_STATUS",       0x0E: "TRACK_STATUS_OK",
-    0x0F: "TRACK_STATUS_ERROR", 0x06: "PUBLISH_NAMESPACE",
-    0x07: "PUBLISH_NAMESPACE_OK",
-    0x08: "PUBLISH_NAMESPACE_ERROR",
-    0x09: "PUBLISH_NAMESPACE_DONE",
-    0x0C: "PUBLISH_NAMESPACE_CANCEL",
-    0x11: "SUBSCRIBE_NAMESPACE",
-    0x12: "SUBSCRIBE_NAMESPACE_OK",
-    0x13: "SUBSCRIBE_NAMESPACE_ERROR",
-    0x14: "UNSUBSCRIBE_NAMESPACE",
-}
-
 # draft-ietf-moq-transport-16 §9.2
 SPEC_D16 = {
     0x20: "CLIENT_SETUP",       0x21: "SERVER_SETUP",
@@ -93,7 +70,7 @@ SPEC_D20 = {
 # draft-22 §9 Table 5: the same rows as d20.
 SPEC_D22 = dict(SPEC_D20)
 
-SPEC = {14: SPEC_D14, 16: SPEC_D16, 18: SPEC_D18,
+SPEC = {16: SPEC_D16, 18: SPEC_D18,
         20: SPEC_D20, 22: SPEC_D22}
 
 # Removed in d18 — sending any of these is a wire violation there.
@@ -122,7 +99,7 @@ class _Msg:
 _guard = MOQTSessionQuic._assert_type_defined_by_draft
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 def test_runtime_table_matches_the_spec(draft):
     assert CONTROL_MESSAGE_TYPES[draft] == frozenset(SPEC[draft]), (
         f"draft-{draft} table disagrees with the spec transcription; "
@@ -132,7 +109,7 @@ def test_runtime_table_matches_the_spec(draft):
         f"{sorted(set(SPEC[draft]) - CONTROL_MESSAGE_TYPES[draft])}")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 def test_every_spec_type_is_sendable_on_its_draft(draft):
     for type_, name in SPEC[draft].items():
         _guard(_Sess(draft), _Msg(type_))  # must not raise
@@ -178,9 +155,8 @@ def test_the_tx_guard_fails_closed_for_a_draft_without_a_table(draft):
 
 def test_d18_removed_types_remain_legal_on_older_drafts():
     # The guard must gate on the draft, not blanket-ban the type.
-    _guard(_Sess(14), _Msg(0x09))
     _guard(_Sess(16), _Msg(0x09))
-    _guard(_Sess(14), _Msg(0x0A))
+    _guard(_Sess(16), _Msg(0x0A))
     _guard(_Sess(16), _Msg(0x17))
 
 
@@ -210,10 +186,8 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     prev = 0
     seen = {}
     for _ in range(count):
-        key = r.pull_vint()
-        if prof.params_delta_coded:
-            key += prev
-            prev = key
+        key = r.pull_vint() + prev
+        prev = key
         if draft >= 18 and key == 0x09:
             seen[key] = (r.pull_vint(), r.pull_vint())  # §10.2 Location
         elif key % 2 == 0:
@@ -225,7 +199,7 @@ def test_serialized_params_obey_the_odd_even_length_rule(draft):
     assert set(seen) == set(params)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 def test_unknown_subscription_filter_type_is_fatal(draft):
     """§5.1.2: subscription filter types are 0x1-0x4; any other value
     MUST close the session with PROTOCOL_VIOLATION. moxygen#225: a peer
@@ -281,7 +255,7 @@ def test_d18_namespace_prefix_param_is_a_tuple():
     assert out[0x34] == (b"live", b"cam")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 def test_rx_dispatch_matches_the_spec_tables(draft):
     """RX dispatches exactly the types the spec defines for the draft —
     a type outside the table closes the session, never a silent skip

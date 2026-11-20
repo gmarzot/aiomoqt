@@ -25,7 +25,7 @@ _MIN_OBJECTS = 5
 
 
 def _port(case: int, draft: int, use_quic: bool) -> int:
-    return _BASE_PORT + 20 * case + 2 * (draft - 14) + (not use_quic)
+    return _BASE_PORT + 20 * case + 2 * (draft - 16) + (not use_quic)
 
 
 class _Receiver:

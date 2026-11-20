@@ -1,4 +1,4 @@
-"""Both ends send MOQT_IMPLEMENTATION in their SETUP at d14, d16 and d18 over
+"""Both ends send MOQT_IMPLEMENTATION in their SETUP at d16 and d18 over
 raw QUIC and WebTransport; implementation= sets the value and None omits it.
 """
 import asyncio
@@ -59,12 +59,12 @@ async def _exchange(port, draft, use_quic, client_impl, server_impl):
 
 
 def _port(draft, use_quic, case):
-    return (_BASE_PORT + {14: 0, 16: 4, 18: 8}[draft] + case * 2
+    return (_BASE_PORT + {16: 4, 18: 8}[draft] + case * 2
             + (0 if use_quic else 1))
 
 
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_both_ends_send_implementation(draft, use_quic):
     to_server, to_client = await _exchange(
         _port(draft, use_quic, 0), draft, use_quic, USER_AGENT, "test-server/1")
@@ -73,7 +73,7 @@ async def test_both_ends_send_implementation(draft, use_quic):
 
 
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_implementation_none_omits_the_option(draft, use_quic):
     to_server, to_client = await _exchange(
         _port(draft, use_quic, 1), draft, use_quic, None, None)
