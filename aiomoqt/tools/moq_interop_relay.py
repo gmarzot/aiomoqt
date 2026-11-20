@@ -2405,8 +2405,7 @@ class _RelayedTrack:
                 self._close_streams(d.session, StreamResetCode.CANCELLED)
         self.downstream.clear()
         self._ds_ver += 1
-        for k in [k for k in self._fanout_hist if k not in draining]:
-            del self._fanout_hist[k]
+        self._fanout_hist.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
         for k in [k for k in self._tx_streams if k not in draining]:
@@ -3232,6 +3231,8 @@ class _RelayedTrack:
         if last is not None:
             m.header.advance(last)
         m.fanout.outsiders[id(m.d)] = m.d
+        # Kept only for the marks: no links back to the track.
+        m.d = m.lane = m.fanout = None
         if total > m.base:
             sk = m.skey[0]
             tx = self._tx_written
