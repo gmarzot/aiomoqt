@@ -781,9 +781,11 @@ class PacketOrder:
     The first object pushed sets the start. Objects of a later group wait
     while the current group is open; end_group() (its stream ended, or an
     End of Group) releases them, and so does timeout() once they have
-    waited `hold_s` with no progress, skipping what is missing
-    (`skipped`). An object behind what was released is dropped (`late`).
-    Items are opaque; None stands for a rejected object."""
+    waited `hold_s` with no progress, or until `hold_until` if later,
+    skipping what is missing (`skipped`). Groups passed to wait() are
+    being repaired: the order stops at each until its end_group(). An
+    object behind what was released is dropped (`late`). Items are
+    opaque; None stands for a rejected object."""
 
     def __init__(self, hold_s: float = HOLD_S):
         self.hold_s = hold_s
@@ -794,13 +796,18 @@ class PacketOrder:
         self._held: Dict[int, Dict[int, Any]] = {}
         self._ended: Set[int] = set()
         self._since: Optional[float] = None
+        self._waiting: Set[int] = set()
+        self.hold_until: Optional[float] = None
         self.late = 0
         self.skipped = 0
 
     @property
     def deadline(self) -> Optional[float]:
         """When timeout() gives up waiting; None when nothing waits."""
-        return None if self._since is None else self._since + self.hold_s
+        if self._since is None:
+            return None
+        due = self._since + self.hold_s
+        return due if self.hold_until is None else max(due, self.hold_until)
 
     @property
     def held(self) -> int:
@@ -828,9 +835,15 @@ class PacketOrder:
         self._settle(now, out)
         return out
 
+    def wait(self, groups) -> None:
+        """Objects of `groups` are still to come, from a repair."""
+        self._waiting.update(g for g in groups
+                             if not self._started or g >= self._group)
+
     def end_group(self, group: int, now: float) -> List[tuple]:
         """Group `group` delivers nothing more."""
         out: List[tuple] = []
+        self._waiting.discard(group)
         if not self._started or group < self._group:
             return out
         if group == self._group:
@@ -877,13 +890,18 @@ class PacketOrder:
             if g in self._ended:
                 self._ended.discard(g)
                 self._done = True
-            if self._done and self._held:
-                nxt = min(self._held)
-                if 0 in self._held[nxt]:
+            if self._done:
+                nxt = min(self._held) if self._held else None
+                gap = [w for w in self._waiting if w > g]
+                if gap and (nxt is None or min(gap) < nxt):
+                    self._group, self._next, self._done = min(gap), 0, False
+                    continue
+                if nxt is not None and 0 in self._held[nxt]:
                     self._group, self._next, self._done = nxt, 0, False
                     continue
             break
         self._ended = {e for e in self._ended if e > self._group}
+        self._waiting = {w for w in self._waiting if w >= self._group}
         if not self._held:
             self._since = None
         elif progressed or self._since is None:
@@ -985,7 +1003,13 @@ class MsftsTrackSubscriber(LocTrackSubscriber):
     object_id) gets the objects in Group ID and Object ID order through
     a PacketOrder; on_arrival sees them as they arrive. An object that is
     not whole source packets of `packet_size` is rejected
-    (`objects_rejected`). `order` counts late and skipped objects."""
+    (`objects_rejected`). `order` counts late and skipped objects.
+
+    With `repair_s`, Objects the subscription will not deliver (the rest
+    of a group whose stream was reset, groups skipped over) are FETCHed
+    from the publisher, ahead of live objects, and the order waits up to
+    `repair_s` for them: `repairs` FETCHes sent, `repaired` Objects they
+    brought, `repairs_expired` given up."""
 
     def __init__(self, session, namespace: str,
                  trackname: Optional[str] = None, *,
@@ -993,13 +1017,21 @@ class MsftsTrackSubscriber(LocTrackSubscriber):
                  on_frame: Optional[Callable] = None,
                  on_arrival: Optional[Callable] = None,
                  auth_token: Optional[bytes] = None,
-                 timestamp_errors: str = 'cancel'):
+                 timestamp_errors: str = 'cancel',
+                 repair_s: float = 0.0):
         super().__init__(session, namespace, cast(str, trackname),
                          on_frame=on_frame, auth_token=auth_token,
                          on_arrival=on_arrival,
                          timestamp_errors=timestamp_errors)
         self.packet_size = packet_size
         self.order = PacketOrder(hold_s)
+        self.repair_s = repair_s
+        self.repairs = 0
+        self.repaired = 0
+        self.repairs_expired = 0
+        self._top: Dict[int, int] = {}
+        self._top_group: Optional[int] = None
+        self._repairing: Dict[int, Tuple[range, float]] = {}
         self._timer = None
         self._due: Optional[float] = None
         # Set at End of Track or PUBLISH_DONE; on_end() is then called.
@@ -1014,10 +1046,16 @@ class MsftsTrackSubscriber(LocTrackSubscriber):
 
     def _stream_ended(self, group_id, subgroup_id, clean=True,
                       reset_code=0) -> None:
+        if not clean and self.repair_s:
+            self._repair(group_id, self._top.get(group_id, -1) + 1, group_id)
+            return
         self._release(self.order.end_group(group_id, _loop_time()))
 
     def _on_object(self, msg, size, recv_us, group_id, subgroup_id) -> None:
         status = getattr(msg, "status", None)
+        if self.repair_s and status in (None, ObjectStatus.NORMAL):
+            gid = getattr(msg, 'group_id', None)
+            self._seen(group_id if gid is None else gid, msg.object_id)
         super()._on_object(msg, size, recv_us, group_id, subgroup_id)
         if status in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
             gid = getattr(msg, 'group_id', None)
@@ -1025,6 +1063,67 @@ class MsftsTrackSubscriber(LocTrackSubscriber):
             self._release(self.order.end_group(gid, _loop_time()))
         if status == ObjectStatus.END_OF_TRACK:
             self._done(None)
+
+    def _seen(self, group: int, obj: int) -> None:
+        """Track the highest Object per group; a jump over whole groups
+        repairs them."""
+        top = self._top_group
+        if top is not None and group > top + 1:
+            self._repair(top + 1, 0, group - 1)
+        if top is None or group > top:
+            self._top_group = group
+            for g in [g for g in self._top if g < group - 8]:
+                del self._top[g]
+        if obj > self._top.get(group, -1):
+            self._top[group] = obj
+
+    def _repair(self, first_group: int, first_object: int,
+                last_group: int) -> None:
+        """FETCH {first_group, first_object} to the end of last_group,
+        and hold the order for them up to repair_s."""
+        groups = range(first_group, last_group + 1)
+        self.order.wait(groups)
+        due = _loop_time() + self.repair_s
+        try:
+            msg = self.session.fetch(
+                self.namespace, self.trackname, subscriber_priority=0,
+                start_group=first_group, start_object=first_object,
+                end_group=last_group, end_object=0,
+                on_object=self._on_fetch_object)
+        except Exception as e:
+            logger.warning(f"msfts: {self.trackname}: repair of groups "
+                           f"{first_group}-{last_group} not sent: {e}")
+            self._end_repair(groups)
+            return
+        self.repairs += 1
+        self._repairing[msg.request_id] = (groups, due)
+        self.order.hold_until = max(self.order.hold_until or 0.0, due)
+        asyncio.ensure_future(self._await_repair(msg.request_id))
+
+    def _on_fetch_object(self, msg, size, recv_us, request_id) -> None:
+        if request_id not in self._repairing:
+            return
+        if getattr(msg, "status", None) in (None, ObjectStatus.NORMAL):
+            self.repaired += 1
+        self._on_object(msg, size, recv_us, msg.group_id,
+                        getattr(msg, 'subgroup_id', 0))
+
+    async def _await_repair(self, request_id: int) -> None:
+        groups, due = self._repairing[request_id]
+        done = await self.session.await_fetch_done(
+            request_id, timeout=max(0.0, due - _loop_time()))
+        self._repairing.pop(request_id, None)
+        if not done:
+            self.repairs_expired += 1
+            self.session.unregister_fetch_object_handler(request_id)
+        self.order.hold_until = max(
+            (d for _, d in self._repairing.values()), default=None)
+        self._end_repair(groups)
+
+    def _end_repair(self, groups: range) -> None:
+        now = _loop_time()
+        for g in groups:
+            self._release(self.order.end_group(g, now))
 
     def _done(self, msg) -> None:
         if self.ended:

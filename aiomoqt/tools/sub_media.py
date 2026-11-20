@@ -150,6 +150,13 @@ def parse_args():
              'PCR) / 27 MHz, across PCR discontinuities. Default: as '
              'objects arrive.')
     ts_group.add_argument(
+        '--repair', type=int, default=0, metavar='MS',
+        help='FETCH the Objects the subscription will not deliver (the rest '
+             'of a group whose stream was reset, groups skipped over) from '
+             'the publisher, and hold the output up to MS for them. The '
+             'publisher must keep history (pub_media --fetch-history). '
+             'Default: 0, no repair')
+    ts_group.add_argument(
         '--ts-late', choices=('drop', 'emit'), default='drop',
         help='A packet past its release time: drop it (default) or emit it '
              'at once; counted late either way')
@@ -223,6 +230,8 @@ def parse_args():
         parser.error('--analyze writes no media; drop --pipe')
     if args.report and not args.analyze:
         parser.error('--report requires --analyze')
+    if args.repair < 0:
+        parser.error('--repair: milliseconds, or 0 for none')
     if args.ts_playout is not None:
         if args.ts_playout <= 0:
             parser.error('--ts-playout must be positive')
@@ -579,6 +588,10 @@ class _TsLane:
             p.dups = self.track.order.late
         body = (p.interval() if kind == 'interval' else
                 p.summary() if final else p.totals())
+        t = self.track
+        if kind != 'interval' and t is not None and t.repair_s:
+            body['repair'] = dict(fetches=t.repairs, objects=t.repaired,
+                                  expired=t.repairs_expired)
         return {"type": kind, "track": self.name, "t0": round(t0, 3),
                 "t1": round(t1, 3), **body}
 
@@ -1031,7 +1044,7 @@ async def run(args):
             session, args.namespace, discover=args.discover,
             track_filter=_select,
             timestamp_errors=_timestamp_policy(args),
-            on_catalog=_on_catalog)
+            on_catalog=_on_catalog, repair_s=args.repair / 1000)
         writers = (None if args.analyze or ts_mode
                    else _Writers(args.out, sub, pipe_role=args.pipe,
                                  wanted=functools.partial(_wanted, args)))
@@ -1157,6 +1170,9 @@ def _ts_status(args, lane: _TsLane) -> int:
     if track is not None:
         line += (f", {track.objects_rejected} rejected, "
                  f"{track.order.late} late, {track.order.skipped} skipped")
+        if track.repair_s:
+            line += (f", repair {track.repairs} FETCHes, {track.repaired} "
+                     f"objects, {track.repairs_expired} expired")
     if lane.switches:
         line += f", {lane.switches} track switches"
     p = lane.player
