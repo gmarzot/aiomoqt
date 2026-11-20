@@ -69,7 +69,7 @@ class _Rx:
     """One subscription's objects and PUBLISH_DONE."""
 
     def __init__(self, name: str):
-        self.size = _SIZES[name]
+        self.size = _SIZES.get(name)
         self.objects: list = []
         self.sizes: set = set()
         self.done = asyncio.get_running_loop().create_future()
@@ -396,3 +396,42 @@ async def test_relay_refuses_a_second_downstream_subscribe(draft, use_quic):
         handle.close()
         for t in tables:
             t.clear()
+
+
+def _catalog():
+    from aiomoqt.media import Catalog, CatalogTrack
+    return Catalog(generatedAt=1_753_000_000_000, tracks=[
+        CatalogTrack(name="video", packaging="loc", isLive=True,
+                     role="video", codec="avc1.640028", width=640,
+                     height=360, framerate=30, bitrate=1_000_000)])
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+@_D20
+async def test_catalog_refuses_a_second_subscribe(draft, use_quic):
+    """The catalog's one emitter serves one subscription per session: a
+    second is NOT_SUPPORTED and the first keeps receiving, while a data
+    track on the session takes two."""
+    from aiomoqt.media import CatalogTrackPublisher
+    peer = _Peer()
+    async with _loopback(_port(7, draft, "generate", use_quic), draft,
+                         use_quic, peer) as session:
+        catalog = CatalogTrackPublisher(session, _NS, _catalog())
+        catalog.attach()
+        _track(session, "video", "generate").attach()
+        _, first = await peer.subscribe("catalog")
+        assert await _until(lambda: len(first.objects) >= 1)
+        with pytest.raises(MOQTRequestError) as err:
+            await peer.subscribe("catalog")
+        assert err.value.response is not None, "timed out, no reply"
+        assert err.value.error_code == RequestErrorCode.NOT_SUPPORTED
+        await catalog.publish_catalog(_catalog())
+        assert await _until(lambda: len(first.objects) >= 2), (
+            "first catalog subscription stopped")
+        assert len(set(first.objects)) == len(first.objects)
+        _, a = await peer.subscribe("video")
+        _, b = await peer.subscribe("video")
+        for rx in (a, b):
+            assert await _until(lambda: len(rx.objects) >= _MIN_OBJECTS)
+            rx.check()
