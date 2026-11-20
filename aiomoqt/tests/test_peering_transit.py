@@ -1049,3 +1049,26 @@ def test_peer_matching_is_exact_unless_one_host_session():
     assert node.advertised_metric(2) == 900
     assert node.remove_peer("192.0.2.7", 33434)
     assert w2.session.state == "closed"
+
+
+def test_live_subscribe_replayed_on_a_new_session_goes_to_the_publisher():
+    t = _transit()
+    wp = _Wire(t, 1, _remote(P, "pub"))
+    wm = _Wire(t, 2, _remote(C, "via"))
+    wp.send(MsgType.ANNOUNCE_INFO_ADV, _ann(P, NS, b"video"))
+    # B's subscribe first arrives through the other via, then B's own
+    # session comes up and replays it at the same seq.
+    wm.send(MsgType.NODE_INFO_ADV, NodeInfo(B, path=(PathItem(C, 1, 100),)))
+    sub = _sub(B, NS, b"video", seq=7)
+    wm.send(MsgType.SUBSCRIBE_INFO_ADV, sub)
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 1
+    wb = _Wire(t, 3, _remote(B, "b"))
+    wb.send(MsgType.SUBSCRIBE_INFO_ADV, sub)
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 2
+    # Not flooded elsewhere, and not back to the publisher's own replay.
+    assert _sent(wm, MsgType.SUBSCRIBE_INFO_ADV) == 0
+    wp.send(MsgType.SUBSCRIBE_INFO_ADV, sub)
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 2
+    # An older seq is still dropped.
+    wb.send(MsgType.SUBSCRIBE_INFO_ADV, _sub(B, NS, b"video", seq=6))
+    assert _sent(wp, MsgType.SUBSCRIBE_INFO_ADV) == 2

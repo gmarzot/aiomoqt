@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- A transit `FabricNode` forwards a live subscribe that a peer replays at its current seq, as after a session restart, one hop toward each publisher of the track, as moq-fabric does; it dropped it as a duplicate, so the publisher's side kept a stale path until the subscriber re-advertised.
 - `FabricNode.remove_peer` and `set_peer_metric` match a peer's host and port exactly; a host alone matches only when the host has one session or dialed peer, and otherwise they raise `ValueError` naming the candidates.
 - `--node-id LABEL` (`parse_identity`) gives the id moq-fabric derives from that name, libstdc++ `std::hash<std::string>`, the same on every start, so a restarted node rejoins under its id; without `--node-id` the id is still fresh. Such a node keeps its subscribe sequences in moq-fabric's `subscribe-seq-<label>` file, beside its TLS certificate or in the temp directory (`FabricNode(subscribe_seq_file=)`), so after a restart it continues past the sequences peers still hold; transit keeps a source's sequences until 30 s after it becomes unreachable.
 - A transit `FabricNode` withdraws its route to a node from each peer that holds it but may not take the new best path, such as the session the new path arrived on: the peer kept the stale path and, after the node stopped, could route to it in a loop.

@@ -360,11 +360,26 @@ class Transit:
             resume = (sub.seq == seq and not withdrawn
                       and key not in self.subscribes)
             if not seq_newer(sub.seq, seq) and not resume:
+                if sub.seq == seq and not withdrawn:
+                    self._relay_live(session, sub)
                 return
         self.subscribes[key] = sub
         self._sub_marks[key] = [sub.epoch, sub.seq, False,
                                 None if mark is None else mark[3]]
         self._flood(session, MsgType.SUBSCRIBE_INFO_ADV, sub)
+
+    def _relay_live(self, origin: PeerSession, sub: SubscribeInfo) -> None:
+        """A live subscribe replayed at its current seq, as by a restarted
+        session: on toward each publisher of the track, one hop, so the
+        publisher's side sets up its path again (moq-fabric
+        RelayLiveSubscribe)."""
+        for (h, source) in self.announces:
+            if h != sub.fullname_hash or source in (self.node_id,
+                                                     sub.source, 0):
+                continue
+            s = self._route(source)
+            if s is not None and s is not origin:
+                self._send(s, MsgType.SUBSCRIBE_INFO_ADV, sub)
 
     def _subscribe_withdrawn(self, session: PeerSession,
                              sub: SubscribeInfo) -> None:
