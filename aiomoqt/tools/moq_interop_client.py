@@ -153,6 +153,28 @@ def _format_exc(e: BaseException) -> str:
     return f"{cls}: {msg}" if cls not in msg else msg
 
 
+class _NoReply(Exception):
+    """A request ended by our session closing, not by the peer's answer."""
+
+
+def _check_reply(e: MOQTRequestError) -> MOQTRequestError:
+    """`e` if the peer sent it; _NoReply if the request failed because the
+    session closed (INTERNAL_ERROR with a "session closed" reason)."""
+    if (int(e.error_code) == int(RequestErrorCode.INTERNAL_ERROR)
+            and str(e.reason or "").startswith("session closed")):
+        raise _NoReply(f"no reply before the {e.reason}") from e
+    return e
+
+
+def _refused(step: str, e: MOQTRequestError) -> str:
+    """A failed request for a report: the peer's refusal, or our close."""
+    try:
+        _check_reply(e)
+    except _NoReply as closed:
+        return f"{step}: {closed}"
+    return f"{step} refused: code={e.error_code} {e.reason}"
+
+
 async def _probe_setup_ok(host, port, path, use_quic, tls_disable_verify,
                           debug, draft=None, timeout: float = 5.0) -> bool:
     """Probe whether SETUP completes for a given offer. draft=None offers
@@ -642,7 +664,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                     )
                 except MOQTRequestError as e:
                     session.close()
-                    code = int(e.error_code)
+                    code = int(_check_reply(e).error_code)
                     spec_ok = code in TRACK_NOT_FOUND_CODES
                     if spec_ok:
                         return TestResult(
@@ -731,7 +753,7 @@ async def test_rendezvous_timeout(host, port, path, use_quic,
                             wait_response=True)
                     code = None
                 except MOQTRequestError as e:
-                    code = int(e.error_code)
+                    code = int(_check_reply(e).error_code)
                 session.close()
     except Exception as e:
         return TestResult(
@@ -832,7 +854,11 @@ async def test_announce_subscribe(host, port, path, use_quic,
                         passed = True
                         pending_hold = True
                     except MOQTRequestError as e:
-                        msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        try:
+                            _check_reply(e)
+                            msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        except _NoReply as closed:
+                            msg = f"upstream subscribe: {closed}"
                         passed = False
 
                     sub_session.close()
@@ -998,7 +1024,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                         async with asyncio.timeout(2.0):
                             sub_response = await sub_task
                     except MOQTRequestError as e:
-                        sub_response = e  # error is a valid outcome
+                        sub_response = _check_reply(e)  # a valid outcome
                     except asyncio.TimeoutError:
                         sub_response = None
 
@@ -1350,7 +1376,7 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
     except TimeoutError:
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except MOQTStreamStopped:
         return result(False, f"relay stopped the subgroup stream for group "
                              f"{pub.group}")
@@ -1610,7 +1636,8 @@ async def test_fetch_error_recovery(host, port, path, use_quic,
                 refusal.append(None)
             except MOQTRequestError as e:
                 refusal.append(canonical_request_error(
-                    int(e.error_code), session._profile, fetch=True))
+                    int(_check_reply(e).error_code), session._profile,
+                    fetch=True))
             if refusal[0] == RequestErrorCode.INVALID_RANGE:
                 await _fetch_groups(session, namespace, group, group, fetched)
 
@@ -2321,7 +2348,7 @@ async def _moq_test_attempt(name: str, host: str, port: int, path: str,
         return result(False, f"{refusal}; {timed_out}" if refusal
                       else timed_out)
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
     finally:
@@ -2506,7 +2533,7 @@ async def test_publish_namespace_done_track(host, port, path, use_quic,
     except TimeoutError:
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
     finally:
@@ -2624,7 +2651,7 @@ async def test_subscribe_cancel_live(host, port, path, use_quic,
                       expected=f"{_CANCEL_AFTER} objects, then none",
                       received=f"{len(before)} objects")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
 
@@ -2829,7 +2856,7 @@ async def test_publish_namespace_multi_publisher_retention(
     except TimeoutError:
         return failed(f"timed out at {step} (limit {_RETENTION_S:g}s)")
     except MOQTRequestError as e:
-        return failed(f"{step} refused: code={e.error_code} {e.reason}")
+        return failed(_refused(step, e))
     except Exception as e:
         return failed(f"{step} failed: {_format_exc(e)}")
 
