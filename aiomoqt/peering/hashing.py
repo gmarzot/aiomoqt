@@ -198,9 +198,7 @@ def node_id_format(node_id: int) -> str:
 
 
 def fresh_node_id(label: str) -> int:
-    """A new non-zero id per call: city64 of label:random64. Peers keep
-    a vanished node's subscribes for 30 s, so a restart must not reuse
-    its id."""
+    """A new non-zero id per call: city64 of label:random64."""
     while True:
         node_id = city64(f"{label}:{secrets.randbits(64)}".encode())
         if node_id:

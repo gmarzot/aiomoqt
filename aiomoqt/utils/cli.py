@@ -607,9 +607,10 @@ def add_peering(p, port=PEERING_PORT):
                    help=f'Listen port; 0: do not listen (default: {port})')
     p.add_argument('--node-id', type=str, default=None, metavar='ID|LABEL',
                    help='Node id as high:low (each a uint32 or u16.u16, '
-                        'e.g. 9.9:1), or a contact LABEL. Default: label '
-                        'aiomoqt-peer; without an ID the id is fresh on '
-                        'every start')
+                        'e.g. 9.9:1), or a contact LABEL, whose id is the '
+                        'one moq-fabric derives from it, the same on every '
+                        'start. Default: label aiomoqt-peer with a fresh '
+                        'id each start')
     p.add_argument('--node-metric', type=int, default=LEAF_METRIC,
                    help=f'Metric advertised for this node; peers prefer '
                         f'lower path sums (default: {LEAF_METRIC}, so no '
