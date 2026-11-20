@@ -28,7 +28,8 @@ from aiomoqt.peering.wire import (AnnounceInfo, DataHeader, MsgType, NodeInfo,
 if TYPE_CHECKING:
     from aiomoqt.peering.node import FabricNode, _PeerProtocol
 
-# How long a withdrawn subscribe's seq still turns away older ones.
+# How long a source's subscribe seqs are kept after it becomes
+# unreachable, as moq-fabric's kSubscribeSeqRetention.
 SUB_MARK_RETAIN_S = 30.0
 # Data held per session for SNS ids not yet advertised.
 STASH_MAX_BYTES = 1 << 20
@@ -166,9 +167,9 @@ class Transit:
         # Accepted learned announces and subscribes, by (hash, source).
         self.announces: Dict[Key, AnnounceInfo] = {}
         self.subscribes: Dict[Key, SubscribeInfo] = {}
-        # (hash, source) -> (epoch, seq, withdrawn at, or None) last
-        # accepted.
-        self._sub_marks: Dict[Key, Tuple[int, int, Optional[float]]] = {}
+        # (hash, source) -> [epoch, seq, withdrawn, discard at] last
+        # accepted; discarded SUB_MARK_RETAIN_S after its source is gone.
+        self._sub_marks: Dict[Key, list] = {}
         self.ingress: Dict[Key, Ingress] = {}
         self._in: Dict[Key, _In] = {}
         # Session id -> sns id -> stashed ("s", stream id) / ("d", bytes).
@@ -317,10 +318,13 @@ class Transit:
 
     def _source_gone(self, node_id: int) -> None:
         """Withdraw what an unreachable node announced and subscribed."""
+        deadline = time.monotonic() + SUB_MARK_RETAIN_S
+        for key, mark in self._sub_marks.items():
+            if key[1] == node_id and (mark[3] is None or deadline < mark[3]):
+                mark[3] = deadline
         for key in [k for k in self.subscribes if k[1] == node_id]:
-            sub = self.subscribes.pop(key)
-            self._sub_marks.pop(key, None)
-            self._flood(None, MsgType.SUBSCRIBE_INFO_WD, sub)
+            self._flood(None, MsgType.SUBSCRIBE_INFO_WD,
+                        self.subscribes.pop(key))
         for key in [k for k in self.announces if k[1] == node_id]:
             self._flood(None, MsgType.ANNOUNCE_INFO_WD,
                         self.announces.pop(key))
@@ -345,19 +349,21 @@ class Transit:
             return
         key = (sub.fullname_hash, sub.source)
         mark = self._sub_marks.get(key)
-        if mark is not None and mark[2] is not None and \
-                time.monotonic() - mark[2] > SUB_MARK_RETAIN_S:
+        if mark is not None and mark[3] is not None and \
+                time.monotonic() >= mark[3]:
+            del self._sub_marks[key]
             mark = None
         if mark is not None:
-            epoch, seq, withdrawn = mark
+            epoch, seq, withdrawn, _ = mark
             if sub.epoch != epoch:
                 return
-            resume = (sub.seq == seq and withdrawn is None
+            resume = (sub.seq == seq and not withdrawn
                       and key not in self.subscribes)
             if not seq_newer(sub.seq, seq) and not resume:
                 return
         self.subscribes[key] = sub
-        self._sub_marks[key] = (sub.epoch, sub.seq, None)
+        self._sub_marks[key] = [sub.epoch, sub.seq, False,
+                                None if mark is None else mark[3]]
         self._flood(session, MsgType.SUBSCRIBE_INFO_ADV, sub)
 
     def _subscribe_withdrawn(self, session: PeerSession,
@@ -368,7 +374,8 @@ class Transit:
                 sub.seq == held.seq or seq_newer(sub.seq, held.seq)):
             return
         del self.subscribes[key]
-        self._sub_marks[key] = (sub.epoch, sub.seq, time.monotonic())
+        discard = self._sub_marks.get(key, [None] * 4)[3]
+        self._sub_marks[key] = [sub.epoch, sub.seq, True, discard]
         self._flood(session, MsgType.SUBSCRIBE_INFO_WD, sub)
 
     # -- subscribe node sets ---------------------------------------------

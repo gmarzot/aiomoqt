@@ -16,7 +16,10 @@ import asyncio
 import dataclasses
 import functools
 import ipaddress
+import os
 import ssl
+import tempfile
+import time
 from collections import Counter
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
                     Set, Tuple, Union, cast)
@@ -103,6 +106,67 @@ def label_node_id(label: str) -> int:
     if node_id == 0:
         raise ValueError(f"label {label!r} hashes to the reserved id 0")
     return node_id
+
+
+def subscribe_seq_path(label: str, cert: Optional[str] = None) -> str:
+    """Where moq-fabric keeps a node's subscribe sequences:
+    subscribe-seq-<label> beside the TLS certificate, else in the temp
+    directory; characters other than [A-Za-z0-9_-] become '_'."""
+    safe = "".join(c if c.isascii() and (c.isalnum() or c in "-_") else "_"
+                   for c in label) or "node"
+    folder = os.path.dirname(cert) if cert else ""
+    return os.path.join(folder or tempfile.gettempdir(),
+                        f"subscribe-seq-{safe}")
+
+
+def load_subscribe_seqs(path: str) -> Dict[int, Tuple[int, int]]:
+    """Fullname hash -> (epoch, seq) from a moq-fabric sequence file
+    (versions 1 and 2); empty when it is missing or unreadable."""
+    try:
+        with open(path) as f:
+            words = f.read().split()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    try:
+        version, stamp = int(words[0]), int(words[1])
+    except (IndexError, ValueError):
+        return {}
+    if version not in (1, 2) or stamp <= 0:
+        return {}
+    width = 2 if version == 1 else 3
+    out: Dict[int, Tuple[int, int]] = {}
+    body = words[2:]
+    for i in range(0, len(body) - width + 1, width):
+        try:
+            row = [int(w) for w in body[i:i + width]]
+        except ValueError:
+            break
+        h, epoch, seq = (row[0], 0, row[1]) if version == 1 else row
+        if 0 <= epoch <= 0xFFFF and 0 <= seq <= 0xFFFF:
+            out[h] = (epoch, seq)
+    return out
+
+
+def save_subscribe_seqs(path: str, rows: Dict[int, Tuple[int, int]]) -> bool:
+    """Write the version 2 file through a temporary and a rename."""
+    tmp = path + ".tmp"
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(tmp, "w") as f:
+            f.write(f"2 {int(time.time() * 1000)}\n")
+            for h, (epoch, seq) in rows.items():
+                f.write(f"{h} {epoch} {seq}\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        log.debug(f"peering: subscribe sequences not saved to {path}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def parse_identity(spec: Optional[str], label: str = DEFAULT_LABEL
@@ -540,6 +604,7 @@ class FabricNode:
                  connect_timeout: float = CONNECT_TIMEOUT,
                  engine: Optional[QuicClientEngine] = None,
                  transit: bool = False,
+                 subscribe_seq_file: Optional[str] = None,
                  clock: Callable[[], Stamp] = now_stamp):
         if metric is None:
             metric = DEFAULT_NODE_METRIC if transit else LEAF_METRIC
@@ -569,12 +634,15 @@ class FabricNode:
         self._rx: Dict[int, RxTrack] = {}
         # Fullname hash -> pull() sink; the sessions decode these hashes.
         self._sinks: Dict[int, Any] = {}
-        # Seq of the last withdraw per hash, so a re-subscribe goes on.
-        self._withdrawn_seq: Dict[int, int] = {}
-        # First seq of a track's subscribe: the wall clock in seconds, so
-        # after a restart under the same id it is newer than the last one
-        # peers still hold.
-        self._seq_base = (self.start_unix_ns // 1_000_000_000) & 0xFFFF
+        # Fullname hash -> (epoch, seq) last sent for our own subscribe,
+        # kept for the process; with a label-derived id also on disk.
+        self._last_seq: Dict[int, Tuple[int, int]] = {}
+        if subscribe_seq_file is None and self.node_id == libstdcxx_hash(
+                label.encode()):
+            subscribe_seq_file = subscribe_seq_path(label, cert)
+        self.subscribe_seq_file = subscribe_seq_file or None
+        if self.subscribe_seq_file:
+            self._last_seq.update(load_subscribe_seqs(self.subscribe_seq_file))
         # Learned announces and subscribes across sessions: present while
         # any session holds them.
         self._remote_announces: Dict[LearnedKey, AnnounceInfo] = {}
@@ -1339,20 +1407,23 @@ class FabricNode:
         if not nm:
             raise ValueError("a subscribe names a track")
         th = track_hashes(ns, nm)
-        prev = self._subscribes.get(th.fullname)
-        last = (prev.seq if prev is not None
-                else self._withdrawn_seq.pop(th.fullname, None))
+        epoch, last = self._last_seq.get(th.fullname, (0, 0))
         sub = SubscribeInfo(
             self.node_id, ns, nm, th.namespace, th.name, th.fullname,
-            epoch=0,
-            seq=(last + 1) & 0xFFFF if last is not None else self._seq_base,
+            epoch=epoch, seq=(last + 1) & 0xFFFF,
             priority=priority, delivery_timeout_ms=delivery_timeout_ms,
             expires_ms=expires_ms, forward=forward)
         self._subscribes[th.fullname] = sub
+        self._note_seq(sub)
         self._record("subscribe_originated", hash=f"0x{th.fullname:016x}",
                      track=track_text(ns, nm), seq=sub.seq)
         self._send_all(MsgType.SUBSCRIBE_INFO_ADV, sub)
         return sub
+
+    def _note_seq(self, sub: SubscribeInfo) -> None:
+        self._last_seq[sub.fullname_hash] = (sub.epoch, sub.seq)
+        if self.subscribe_seq_file:
+            save_subscribe_seqs(self.subscribe_seq_file, self._last_seq)
 
     def subscribed(self, namespace: Name, name: Union[str, bytes]) -> bool:
         """This node advertises a subscribe to the track."""
@@ -1366,7 +1437,7 @@ class FabricNode:
         if prev is None:
             raise KeyError(f"not subscribed: {track_text(ns, nm)}")
         wd = dataclasses.replace(prev, seq=(prev.seq + 1) & 0xFFFF)
-        self._withdrawn_seq[wd.fullname_hash] = wd.seq
+        self._note_seq(wd)
         self._record("subscribe_withdrawn_originated",
                      hash=f"0x{wd.fullname_hash:016x}",
                      track=track_text(ns, nm), seq=wd.seq)
