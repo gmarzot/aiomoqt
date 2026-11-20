@@ -11,7 +11,7 @@ from aiomoqt.types import RequestErrorCode
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 _BASE_PORT = 19100
-_DRAFTS = [14, 16, 18, 20, 22]
+_DRAFTS = [16, 18, 20, 22]
 _TRANSPORTS = pytest.mark.parametrize("use_quic", [True, False],
                                       ids=["quic", "wt"])
 _LIFECYCLE = "subscribe-namespace-lifecycle"
@@ -31,7 +31,7 @@ def _clean_tables():
 
 
 def _port(case, draft, use_quic):
-    return (_BASE_PORT + 20 * _CASES.index(case) + 2 * (draft - 14)
+    return (_BASE_PORT + 20 * _CASES.index(case) + 2 * (draft - 16)
             + (not use_quic))
 
 
@@ -68,14 +68,6 @@ async def test_namespace_lifecycle_through_the_relay(draft, use_quic):
     assert r.passed and not r.skipped, r.message
     assert r.spec_revision == client.SUBSCRIBE_NAMESPACE_LIFECYCLE_REVISION
     _assert_sessions(r, draft, use_quic, ("subscriber", "publisher"))
-
-
-@requires_certs
-@_TRANSPORTS
-async def test_namespace_lifecycle_skips_draft_14(use_quic):
-    r = await _run(_LIFECYCLE, _port(_LIFECYCLE, 14, use_quic), 14, use_quic)
-    assert r.skipped and r.passed
-    assert r.skip_reason == "NAMESPACE is draft-16; negotiated draft-14"
 
 
 @requires_certs

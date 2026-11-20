@@ -2,7 +2,7 @@
 consumer like their subgroup-stream counterparts; consumers filter on
 msg.status."""
 from aiomoqt.context import profile_for
-from aiomoqt.messages.data import ObjectDatagram, ObjectDatagramStatus
+from aiomoqt.messages.data import ObjectDatagram
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.types import ObjectStatus
 from aiopquic.buffer import Buffer
@@ -37,12 +37,3 @@ def test_merged_layout_status_datagram_is_delivered_at_d16_and_d18():
                             status=ObjectStatus.END_OF_GROUP)
         _feed(s, bytes(dg.serialize(prof=profile_for(draft)).data))
         assert s.delivered == [(4, 9, 3, ObjectStatus.END_OF_GROUP)], draft
-
-
-def test_d14_status_datagram_is_delivered():
-    s = _session(14)
-    ds = ObjectDatagramStatus(track_alias=4, group_id=9, object_id=3,
-                              publisher_priority=1,
-                              status=ObjectStatus.END_OF_TRACK)
-    _feed(s, bytes(ds.serialize(prof=profile_for(14)).data))
-    assert s.delivered == [(4, 9, 3, ObjectStatus.END_OF_TRACK)]

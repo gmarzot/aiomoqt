@@ -10,10 +10,6 @@ import time
 from aiomoqt.utils.buffer import Buffer, BufferReadError
 from aiomoqt.messages.data import SubgroupHeader, ObjectHeader
 from aiomoqt.types import MOQT_TIMESTAMP_EXT, ObjectStatus
-import aiomoqt.types as types
-
-# Set version context
-types._moqt_ctx_version = 0xff00000e
 
 
 def build_stream_data(num_objects: int = 100, object_size: int = 4096) -> bytes:

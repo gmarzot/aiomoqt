@@ -129,7 +129,7 @@ def main():
     ap.add_argument('--subgroups', type=int, default=1,
                     help='subgroups per group (each = separate QUIC stream)')
     ap.add_argument('--duration', type=float, default=30.0)
-    ap.add_argument('--draft', type=int, default=16, choices=(14, 16, 18),
+    ap.add_argument('--draft', type=int, default=16, choices=(16, 18),
                     help='MoQT draft to negotiate')
     ap.add_argument('--port', type=int, default=47445)
     args = ap.parse_args()

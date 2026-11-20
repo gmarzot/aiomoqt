@@ -102,8 +102,7 @@ def test_aiomoqt_d18_decoder_reads_our_stream():
     seen = []
     while buf.tell() < len(wire):
         o = ObjectHeader(object_id=0)
-        o.deserialize_into(buf, len(wire), True, prev, True,
-                           P18.params_delta_coded)
+        o.deserialize_into(buf, len(wire), True, prev, True)
         prev = o.object_id
         seen.append((o.object_id, o.payload, o.extensions, o.status))
     assert seen == [(1, b"a" * 10, {LOC_TIMESTAMP: 1794777763064534},

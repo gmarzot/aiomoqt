@@ -17,13 +17,13 @@ from aiomoqt.context import profile_for
 from aiomoqt.messages.base import MOQTUnderflow
 from aiomoqt.messages.data import (
     FetchHeader, FetchObject, MOQTObjectTooLarge, ObjectDatagram,
-    ObjectDatagramStatus, ObjectHeader, SubgroupHeader)
+    ObjectHeader, SubgroupHeader)
 from aiomoqt.protocol import _MOQTSessionMixin
 from aiomoqt.types import DataStreamType, MOQTException, ObjectStatus
 from aiomoqt.utils.buffer import Buffer, BufferReadError
 from aiopquic.streamchain import StreamChain
 
-DRAFTS = (14, 16, 18, 20, 22)
+DRAFTS = (16, 18, 20, 22)
 ITERATIONS = int(os.environ.get('AIOMOQT_FUZZ_ITERATIONS', '1000'))
 SEED = int(os.environ.get('AIOMOQT_FUZZ_SEED', '0x5eed'), 0)
 MAX_OBJECT = 1 << 20
@@ -196,7 +196,7 @@ def parse_stream(raw, prof, fused=True):
         while chain.tell() < chain.capacity:
             obj.deserialize_into(chain, chain.capacity,
                                  hdr.extensions_present, hdr._last_object_id,
-                                 hdr._vi64, hdr._kvp_delta, MAX_OBJECT)
+                                 hdr._vi64, MAX_OBJECT)
             hdr._last_object_id = obj.object_id
     elif stream_type == DataStreamType.FETCH_HEADER:
         FetchHeader.deserialize(chain)
@@ -209,11 +209,7 @@ def parse_stream(raw, prof, fused=True):
 def parse_datagram(raw, prof):
     buf = Buffer(data=raw, vi64=prof.vi64)
     dtype = buf.pull_vint()
-    if prof.merged_datagram_layout or dtype <= 0x07:
-        ObjectDatagram.deserialize(buf, buf.capacity, type_val=dtype,
-                                   prof=prof)
-    else:
-        ObjectDatagramStatus.deserialize(buf, type_val=dtype, prof=prof)
+    ObjectDatagram.deserialize(buf, buf.capacity, type_val=dtype, prof=prof)
 
 
 def stream_seeds(prof):
@@ -245,14 +241,9 @@ def datagram_seeds(prof):
     seeds = [bytes(ObjectDatagram(track_alias=1, group_id=2, object_id=3,
                                   extensions={2: 4, 7: b"q"},
                                   payload=b"data").serialize(prof=prof).data)]
-    if prof.merged_datagram_layout:
-        seeds.append(bytes(ObjectDatagram(
-            track_alias=1, group_id=2, object_id=3,
-            status=ObjectStatus.END_OF_GROUP).serialize(prof=prof).data))
-    else:
-        seeds.append(bytes(ObjectDatagramStatus(
-            track_alias=1, group_id=2, object_id=3, extensions={2: 4},
-            status=ObjectStatus.END_OF_GROUP).serialize(prof=prof).data))
+    seeds.append(bytes(ObjectDatagram(
+        track_alias=1, group_id=2, object_id=3,
+        status=ObjectStatus.END_OF_GROUP).serialize(prof=prof).data))
     return seeds
 
 

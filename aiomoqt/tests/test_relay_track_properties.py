@@ -74,8 +74,6 @@ class _Propertied(PublishedTrack):
         self.props = props or {}
 
     def _track_properties(self, session):
-        if not session._profile.track_properties:
-            return None
         return {**(super()._track_properties(session) or {}), **self.props}
 
 

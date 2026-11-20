@@ -230,10 +230,8 @@ def test_unresolved_joining_fetch_fails_closed():
         Fetch, attrs, {ParamType.AUTH_TOKEN: narrow})) is not None
 
 
-@pytest.mark.parametrize("draft, is_client", [(14, False), (18, True)],
-                         ids=["d14", "client-side"])
-def test_requests_not_checked(draft, is_client):
-    assert _session(None, draft, is_client)._authorize_request(
+def test_client_side_requests_not_checked():
+    assert _session(None, is_client=True)._authorize_request(
         _request(Subscribe, _TRACK)) is None
 
 

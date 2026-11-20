@@ -155,11 +155,10 @@ track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's 
 request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
 handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
 
-**Drafts.** 14, 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported. 14 is
-deprecated and will be removed in 0.15.0.
+**Drafts.** 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported.
 Draft numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the
-IETF code `0xff0000NN` and the ALPN (`moq-00` for d14, `moqt-NN` for d16+) exist only at the
-wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16, 14)`.
+IETF code `0xff0000NN` and the ALPN (`moqt-NN`) exist only at the
+wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16)`.
 Route behavior differences through `profile_for(draft)` / `DraftProfile` in `context.py`
 rather than scattering version checks. New wire shapes need a case in
 `test_wire_conformance.py`, including malformed ones: aiopquic's Cython codecs and our Python
@@ -173,7 +172,8 @@ message already logged, transport plumbing, per-stream lifecycle (open, close, r
 or track bookkeeping; its volume does not grow with the object count. TRACE (`TRACE = 5` in
 `aiomoqt.utils.logger`, registered by name only) is per object, per chunk, per datagram and wire
 hex: emit it as `log.log(TRACE, …)`, behind `log.isEnabledFor(TRACE)` on hot paths. WARNING is a
-tolerated peer deviation or a bound hit; ERROR ends a session.
+tolerated peer deviation, a bound hit, or a session we close for the peer's error; ERROR is a
+session we end for our own failure (INTERNAL_ERROR).
 
 Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
 (subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),

@@ -13,7 +13,6 @@ Usage, from the repo root:
 
     # Limit to one relay
     tests/release_regression_test.py --only moqx-main
-    tests/release_regression_test.py --only cloudflare-d14
 
     # Adaptive throughput bench (manual dispatch only)
     tests/release_regression_test.py --test-tier bench
@@ -64,7 +63,6 @@ TIERS = {
                     # draft × transport matrix — catches session-setup /
                     # framing breaks in our own tools across every draft
                     # and transport (the kind that slipped through 0.9.7-9).
-                    "loopback-bench-d14-wt", "loopback-bench-d14-quic",
                     "loopback-bench-d16-wt", "loopback-bench-d16-quic",
                     "loopback-bench-d18-wt", "loopback-bench-d18-quic",
                     "loopback-bench-d20-wt", "loopback-bench-d20-quic",
@@ -72,7 +70,7 @@ TIERS = {
                     # adaptive BW over the multi-process loopback path
                     # (the in-process loopback misses the pub/sub-worker
                     # start path — see the 0.9.10 BW clobber).
-                    "loopback-adaptive-mp-d14", "loopback-adaptive-mp-d16",
+                    "loopback-adaptive-mp-d16",
                     "loopback-adaptive-mp-d18", "loopback-adaptive-mp-d20",
                     "loopback-adaptive-mp-d22",
                     # adaptive BW in relay mode over raw QUIC
@@ -833,14 +831,14 @@ def main() -> int:
             status, detail = _loopback_pub_sub_paced(log_dir)
             record_and_print((status, "loopback-pub-sub-paced", detail,
                               log_dir / "loopback-pub-sub-paced.log"))
-        for draft in (14, 16, 18, 20, 22):
+        for draft in (16, 18, 20, 22):
             for quic in (False, True):
                 suite = f"loopback-bench-d{draft}-{'quic' if quic else 'wt'}"
                 if suite in enabled:
                     status, detail = _loopback_bench_combo(log_dir, draft, quic)
                     record_and_print((status, suite, detail,
                                       log_dir / f"{suite}.log"))
-        for draft in (14, 16, 18, 20, 22):
+        for draft in (16, 18, 20, 22):
             suite = f"loopback-adaptive-mp-d{draft}"
             if suite in enabled:
                 status, detail = _loopback_adaptive_mp(log_dir, draft)

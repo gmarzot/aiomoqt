@@ -30,7 +30,6 @@ from ..delivery import StreamMapping
 from ..track import PublishedTrack, SubscribedTrack
 from ..types import ObjectStatus
 from ..utils.logger import get_logger
-from ..utils.timing import OBJECT_TIMESTAMP
 from .sources import avcc_param_sets, hvcc_param_sets, lp_to_annexb
 
 logger = get_logger(__name__)
@@ -167,7 +166,7 @@ class LocTrackPublisher(PublishedTrack):
 
         MOQT d18 §15.8 registers 0x06 (SUBGROUP_DELIVERY_TIMEOUT) and
         0x02 (OBJECT_DELIVERY_TIMEOUT) as Track-scope properties, so an
-        Object Property under either id is refused there. d14/d16 carry
+        Object Property under either id is refused there. d16 carries
         no scope rule, which is where the loc-02 ecosystem lives. An
         unknown draft emits only 0x10, the id that is legal everywhere.
         """
@@ -206,8 +205,7 @@ class LocTrackPublisher(PublishedTrack):
 
     def _track_properties(self, session) -> Optional[Dict[int, Any]]:
         props = super()._track_properties(session)
-        if (self.config_property != 'track' or self.config is None
-                or not session._profile.track_properties):
+        if self.config_property != 'track' or self.config is None:
             return props
         return {**(props or {}), self._config_id: self.config}
 
@@ -247,9 +245,6 @@ class LocTrackPublisher(PublishedTrack):
                            session=None) -> Dict[int, Any]:
         exts: Dict[int, Any] = dict(frame.extensions or ())
         session = session or self.session
-        if (OBJECT_TIMESTAMP in exts
-                and not session._profile.track_properties):
-            del exts[OBJECT_TIMESTAMP]      # d14: no TIMESCALE to go with it
         ts = (frame.timestamp if frame.timestamp is not None
               else self._now())
         for prop_id in self._timestamp_ids(session):

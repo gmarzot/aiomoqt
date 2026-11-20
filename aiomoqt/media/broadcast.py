@@ -370,8 +370,7 @@ class MediaPublisher:
         from ..messages import RequestUpdate
         # d16 REQUEST_UPDATE references the original request via
         # existing_request_id (its request_id is the update's own);
-        # d18 dropped that field — its request_id IS the reference —
-        # and d14 SUBSCRIBE_UPDATE keys on request_id directly.
+        # d18 dropped that field — its request_id IS the reference.
         rid = (msg.existing_request_id
                if isinstance(msg, RequestUpdate)
                and msg.existing_request_id is not None
@@ -381,10 +380,7 @@ class MediaPublisher:
             logger.warning(f"MediaPublisher: update for unknown "
                            f"request_id={rid}")
             return
-        if isinstance(msg, RequestUpdate):
-            await track._on_request_update(session, msg)
-        else:
-            await track._on_subscribe_update(session, msg)
+        await track._on_request_update(session, msg)
 
 
 class MediaSubscriber:

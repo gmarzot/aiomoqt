@@ -1,5 +1,5 @@
 """Logged messages name their parameters from the negotiated draft's table:
-0x04 is MAX_CACHE_DURATION at d14/d16 and RENDEZVOUS_TIMEOUT from d18."""
+0x04 is MAX_CACHE_DURATION at d16 and RENDEZVOUS_TIMEOUT from d18."""
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +15,7 @@ def _msg():
                             parameters={0x02: 100, 0x04: 5000})
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_pre_d18_names(draft):
     text = _msg().describe(profile_for(draft))
     assert "MAX_CACHE_DURATION=5000" in text

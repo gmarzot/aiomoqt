@@ -101,7 +101,7 @@ flowchart LR
 ```
 
 - A joining FETCH is checked against the track of the subscription it joins.
-- REQUEST_UPDATE is not checked; at d14 only SETUP is.
+- REQUEST_UPDATE is not checked.
 - A running subscription is not re-checked when its token expires.
 - moqx also accepts a request its `anonymous_claim` covers, and ignores request tokens under
   `allow_request_token_override: false`; aiomoqt-relay has neither setting.

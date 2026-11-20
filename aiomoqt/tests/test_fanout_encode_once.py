@@ -170,9 +170,9 @@ def _streams(session):
 
 @pytest.mark.asyncio
 async def test_per_group_peers_share_one_encode_per_state(monkeypatch):
-    # d18 and d22 share a state; d16 and d14 each have their own.
+    # d18 and d22 share a state; d16 has its own.
     peers = [_Session("a", 18), _Session("b", 18), _Session("c", 22),
-             _Session("d", 16), _Session("e", 14)]
+             _Session("d", 16)]
     fan = FanoutDelivery()
     for alias, s in enumerate(peers, 1):
         fan.add(SubgroupDelivery(s, alias), joining=False)
@@ -186,8 +186,8 @@ async def test_per_group_peers_share_one_encode_per_state(monkeypatch):
                                              in _OBJECTS if gg == g])
                   for g in (0, 1)]
         assert _streams(s) == expect, s.name
-    # Three states per object; _by_peer splits the shared one by peer.
-    assert spy.objects == 3 * len(_OBJECTS) + 2
+    # Two states per object; _by_peer splits the shared one by peer.
+    assert spy.objects == 2 * len(_OBJECTS) + 2
 
 
 @pytest.mark.asyncio
