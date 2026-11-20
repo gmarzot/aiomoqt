@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `sub_media --repair MS` FETCHes the mpeg2ts Objects a subscription will not deliver (the rest of a group whose stream was reset, groups skipped over) from the publisher and holds the in-order output up to MS for them; `MsftsTrackSubscriber(repair_s=)`, `MediaSubscriber(repair_s=)`.
 - `sub_media --analyze` on a track declaring per-object wall-clock timestamps takes its end-to-end delay from them alone; a media timeline record that arrives first no longer adds a sample.
 - A peer's stream reset before its subgroup header is logged at DEBUG (`aiomoqt.data`): no track can count it in a PUBLISH_DONE Stream Count (§9.9).
 - WebTransport sessions no longer leave one queued event per peer-opened stream for the session's life (aiopquic `queue_new_streams`); on aiomoqt-relay a WT publisher's audio added one per frame.
