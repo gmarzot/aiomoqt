@@ -41,7 +41,6 @@ def _clear_relay():
         table.clear()
     relay._ns_subs.clear()
     relay._track_subs.clear()
-    relay._announce_subs.clear()
 
 
 @pytest.fixture(autouse=True)

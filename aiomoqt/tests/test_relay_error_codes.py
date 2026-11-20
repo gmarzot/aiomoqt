@@ -12,7 +12,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 _PORT = 17520
 _NS = "codes/live"
-# Track -> (the code the d14 publisher refuses with, its d18 wire value).
+# Track -> (the code the d16 publisher refuses with, its d18 wire value).
 _REFUSALS = {"a": (RequestErrorCode.INVALID_RANGE, 0x11),
              "b": (RequestErrorCode.UNAUTHORIZED, 0x1)}
 
@@ -39,13 +39,12 @@ async def _refuse(session, msg):
 
 @requires_certs
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-async def test_a_d14_refusal_reaches_a_d18_subscriber_in_its_codes(use_quic):
-    # d14 INVALID_RANGE is 0x5 and d18's is 0x11: the relay passes on what
-    # the code means, not the number, and one track's refusal is not
-    # another's.
+async def test_a_d16_refusal_reaches_a_d18_subscriber_in_its_codes(use_quic):
+    # The relay passes on what the code means, not the number, and one
+    # track's refusal is not another's.
     port = _PORT + (not use_quic)
     server = relay._build_server("localhost", port, CERT, KEY,
-                                 use_quic=use_quic, draft=[18, 14])
+                                 use_quic=use_quic, draft=[18, 16])
     handle = await server.serve()
     try:
         async with contextlib.AsyncExitStack() as stack:
@@ -59,10 +58,10 @@ async def test_a_d14_refusal_reaches_a_d18_subscriber_in_its_codes(use_quic):
                 await s.client_session_init()
                 return s
 
-            pub = await connect(14, [(MOQTMessageType.SUBSCRIBE, _refuse)])
+            pub = await connect(16, [(MOQTMessageType.SUBSCRIBE, _refuse)])
             await pub.publish_namespace(namespace=_NS, wait_response=True)
             sub = await connect(18)
-            assert (pub.negotiated_draft, sub.negotiated_draft) == (14, 18)
+            assert (pub.negotiated_draft, sub.negotiated_draft) == (16, 18)
             for name, (_, wire) in _REFUSALS.items():
                 with pytest.raises(MOQTRequestError) as refused:
                     await sub.subscribe(_NS, name, wait_response=True)

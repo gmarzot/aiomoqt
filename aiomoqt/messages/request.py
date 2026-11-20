@@ -3,7 +3,6 @@
 REQUEST_OK (0x07) — universal positive response for REQUEST_UPDATE,
     TRACK_STATUS, SUBSCRIBE_NAMESPACE, PUBLISH_NAMESPACE.
 REQUEST_ERROR (0x05) — universal error response for all request types.
-    Adds Retry Interval field not present in draft-14 error messages.
 NAMESPACE (0x08) — sent on SUBSCRIBE_NAMESPACE response stream.
 NAMESPACE_DONE (0x0E) — indicates namespace no longer published.
 """
@@ -44,7 +43,7 @@ class RequestOk(MOQTMessage):
         MOQTMessage._serialize_params(payload, self.parameters or {}, prof=prof)
         if prof.draft >= 18 and self.track_properties:
             MOQTMessage._extensions_encode(payload, self.track_properties,
-                                           with_length=False, delta=True)
+                                           with_length=False)
 
         buf.push_uint_var(self.type)
         buf.push_uint16(payload.tell())
@@ -60,7 +59,7 @@ class RequestOk(MOQTMessage):
         props = None
         if prof.draft >= 18 and buf_end is not None and buf.tell() < buf_end:
             props = MOQTMessage._extensions_decode(
-                buf, with_length=False, buf_end=buf_end, delta=True)
+                buf, with_length=False, buf_end=buf_end)
             MOQTMessage._check_track_properties(props, prof=prof)
         return cls(request_id=request_id, parameters=params,
                    track_properties=props)

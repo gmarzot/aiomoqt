@@ -22,9 +22,8 @@ import pytest
 from types import SimpleNamespace
 
 from aiomoqt.protocol import _MOQTSessionMixin
-from aiomoqt.messages.namespace import PublishNamespaceOk
 from aiomoqt.messages.request import RequestOk, RequestError
-from aiomoqt.messages.subscribe import SubscribeError, SubscribeOk
+from aiomoqt.messages.subscribe import SubscribeOk
 from aiomoqt.types import GroupOrder, MOQTRequestError
 from aiomoqt.context import profile_for
 from aiomoqt.utils.buffer import Buffer
@@ -316,7 +315,7 @@ async def test_publish_wait_response_resolves_even_if_ack_first():
 
 
 # --- per-draft correlation: where the Request ID lives + how it correlates
-# The resolution flow must bridge a real wire difference: d14/d16 carry the
+# The resolution flow must bridge a real wire difference: d16 carry the
 # Request ID in-band in the reply; d18 omits it and correlates the reply to
 # its request by the request *stream* it arrives on.
 
@@ -330,31 +329,29 @@ def _drive_session(draft):
     return s
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 def test_request_ok_request_id_on_wire_per_draft(draft):
     prof = profile_for(draft)
     wire = bytes(RequestOk(request_id=7, parameters={}).serialize(prof=prof).data)
     payload = wire[3:]  # skip type(1B varint) + length(2B) header
     got = RequestOk.deserialize(Buffer(data=payload), prof=prof,
                                 buf_end=len(payload))
-    if prof.reply_has_request_id:      # d14 / d16 — in-band
+    if prof.reply_has_request_id:      # d16 — in-band
         assert got.request_id == 7
     else:                              # d18 — omitted, stream-correlated
         assert got.request_id is None
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_response_resolves_correct_future_per_draft(draft):
     # End-to-end through the real dispatch path: a peer OK resolves the
-    # matching pending future via the in-band id (d14/d16) or the
-    # stream-injected id (d18). REQUEST_OK is d16+; d14 uses its code
-    # point's PUBLISH_NAMESPACE_OK.
+    # matching pending future via the in-band id (d16) or the
+    # stream-injected id (d18).
     s = _drive_session(draft)
     rid = s._allocate_request_id()
     fut = s._loop.create_future()
     s._pending_requests[rid] = fut
-    ok = (PublishNamespaceOk(request_id=rid) if draft < 16
-          else RequestOk(request_id=rid, parameters={}))
+    ok = RequestOk(request_id=rid, parameters={})
     wire = bytes(ok.serialize(prof=s._profile).data)
     stream_rid = None if s._profile.reply_has_request_id else rid
     s._moqt_handle_control_message(Buffer(data=wire), request_id=stream_rid)
@@ -431,7 +428,7 @@ def _reply(s, msg, rid):
     s._moqt_handle_control_message(Buffer(data=wire), request_id=stream_rid)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_subscribe_ok_binds_the_object_handler_as_it_is_parsed(draft):
     # Objects drained in SUBSCRIBE_OK's batch run before its handler task:
     # the alias must route to the subscriber's handler at parse time.
@@ -449,17 +446,15 @@ async def test_subscribe_ok_binds_the_object_handler_as_it_is_parsed(draft):
     await asyncio.sleep(0)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_a_refused_request_drops_what_it_registered(draft):
     s = _routed_session(draft)
     for table in (s._pending_object_handlers, s._publish_done_handlers,
                   s._fetch_object_handlers):
         table[4] = print
     s._announced[4] = (b"agent",)
-    err = (SubscribeError(request_id=4, error_code=0x4, reason="no")
-           if draft < 16 else
-           RequestError(request_id=4, error_code=0x4, retry_interval=0,
-                        reason="no"))
+    err = RequestError(request_id=4, error_code=0x4, retry_interval=0,
+                       reason="no")
     _reply(s, err, 4)
     assert s._pending_object_handlers == {}
     assert s._publish_done_handlers == s._fetch_object_handlers == {}

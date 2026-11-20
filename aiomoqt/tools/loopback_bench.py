@@ -114,14 +114,11 @@ def parse_args():
              'per subscriber, as LOC media tracks build them, instead of '
              'the generator\'s one dict per object.')
     parser.add_argument(
-        '--draft', type=parse_draft_spec, default=14,
-        help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
-             'default: 14). Applied to BOTH the loopback publisher '
-             '(server) and subscriber (client) so the raw-QUIC ALPN '
-             '("moq-00" for d14, "moqt-NN" for d16+) and the WT version '
-             'match. Auto-negotiation is intentionally not used here: a '
-             'd14 server offers only "moq-00" while a d16+ client offers '
-             '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
+        '--draft', type=parse_draft_spec, default=None,
+        help='MoQT draft version to negotiate (e.g. 16 or 18; default: '
+             'the default offer, which negotiates the newest draft). '
+             'Applied to BOTH the loopback publisher (server) and '
+             'subscriber (client).')
     parser.add_argument(
         '--cc-algo', type=str, default='bbr',
         help='Congestion control (bbr | bbr1 | c4 | cubic | dcubic | '
@@ -268,7 +265,7 @@ def print_banner(args):
     print("─" * 56)
     print("  aiomoqt-bench loopback (no relay)")
     print("─" * 56)
-    row("draft", args.draft)
+    row("draft", "default offer" if args.draft is None else args.draft)
     row("url", url)
     row("transport", transport_label)
     row("delivery", ("DATAGRAM" if args.datagram else "subgroup streams")
@@ -325,7 +322,7 @@ class _FanoutTrack(PublishedTrack):
         if self.timestamps == 'loc':
             return loc
         full = self._timestamp_writer().stamp(group_id, object_id)
-        return lambda s: full if s._profile.track_properties else loc
+        return lambda s: full
 
     async def produce(self, out) -> None:
         pad = self._payload_tail()
@@ -405,7 +402,7 @@ async def _on_subscribe(session, msg, args, tracks):
     # both sides print to the same terminal, causing interleaved output
     track._stats_header_printed = True  # skip header
     track._quiet = True  # checked in _generate_subgroup
-    # d14 direct connection: respond with subscribe_ok and generate
+    # Direct connection: respond with subscribe_ok and generate
     ok = session.subscribe_ok(
         request_msg=msg, track_properties=track._track_properties(session))
     track.track_alias = ok.track_alias

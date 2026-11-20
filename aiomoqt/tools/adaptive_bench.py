@@ -2867,9 +2867,7 @@ async def main():
                     f"https://localhost:{loopback_port}/")
                 # Self-test: server and sub must agree on a draft. The WT
                 # client auto-resolves to the newest draft (d16), so pin
-                # the server to match — leaving it None keeps the server
-                # at d14 while the sub speaks d16, and the server's
-                # CLIENT_SETUP parse reads out of bounds.
+                # the server to match.
                 mp_draft = args.draft if args.draft is not None else 16
                 pub_cfg = dict(
                     host="localhost", port=loopback_port,

@@ -15,7 +15,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 17200
-_DRAFTS = [14, 16, 18]
+_DRAFTS = [16, 18]
 # Track name -> End Location the publisher answers with.
 _ENDS = {"good": (5, 0), "bad": (2, 1)}
 

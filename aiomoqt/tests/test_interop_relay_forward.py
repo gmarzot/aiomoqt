@@ -124,7 +124,7 @@ async def test_malformed_upstream_ends_downstream_and_drops_the_fanout():
         _tracks.pop(key, None)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+@pytest.mark.parametrize("draft", [16, 18, 22])
 @pytest.mark.parametrize("exts", [None, {0x10: 7}, {0x10: 7, 0x0B: b"ab"}])
 def test_fast_object_encoding_matches_next_object(draft, exts):
     # The relay forwards with next_object_bytes; it must equal next_object.

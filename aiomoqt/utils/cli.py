@@ -538,7 +538,7 @@ def add_compat(p):
                    help='Comma-separated relay compat tolerances: '
                         'lenient-extensions (truncated trailing-'
                         'extensions block on control messages), '
-                        'missing-request-credit (a d14/d16 peer SETUP '
+                        'missing-request-credit (a d16 peer SETUP '
                         'without MAX_REQUEST_ID), libquicr, all')
 
 

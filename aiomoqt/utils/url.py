@@ -1,7 +1,7 @@
 """MoQT URL parsing utility.
 
 Scheme determines transport:
-  moqt://host:port           -> raw QUIC (ALPN: moq-00)
+  moqt://host:port           -> raw QUIC (ALPN: moqt-NN)
   https://host:port/path     -> H3/WebTransport
 
 Default ports: moqt:// -> 443, https:// -> 443

@@ -40,7 +40,7 @@ def _stub(draft):
     return s
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 def test_a_delivered_object_can_be_printed(draft):
     s = _stub(draft)
     seen = []

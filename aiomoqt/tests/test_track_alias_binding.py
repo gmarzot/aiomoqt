@@ -87,7 +87,7 @@ def _client(port, draft=18):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_registry_keyed_from_subscribe_ok(draft):
     # The peer's alias (>= 1000) must be the registry key; a guessed
     # low alias must not survive the OK.

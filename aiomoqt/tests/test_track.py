@@ -111,8 +111,8 @@ class TestPublishedTrack:
 
     # ----- Flow B: bare PUBLISH (default) -----
 
-    def test_publish_flow_b_default_d14(self):
-        """d14 default: Flow B — bare PUBLISH, no PUB_NS."""
+    def test_publish_flow_b_default(self):
+        """Default: Flow B — bare PUBLISH, no PUB_NS."""
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
@@ -144,8 +144,8 @@ class TestPublishedTrack:
 
     # ----- Flow A: PUB_NS only -----
 
-    def test_publish_flow_a_d14(self):
-        """d14 Flow A: PUB_NS only, no PUBLISH; waits for SUBSCRIBE."""
+    def test_publish_flow_a(self):
+        """Flow A: PUB_NS only, no PUBLISH; waits for SUBSCRIBE."""
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
@@ -211,8 +211,8 @@ class TestPublishedTrack:
 
     # ----- Hybrid: both PUB_NS and PUBLISH -----
 
-    def test_publish_hybrid_d14(self):
-        """d14 hybrid: PUB_NS + PUBLISH (legacy relays that want both)."""
+    def test_publish_hybrid(self):
+        """Hybrid: PUB_NS + PUBLISH (legacy relays that want both)."""
         async def _test():
             session = self._pub_session()
             t = PublishedTrack(session, "bench", "track")
@@ -274,8 +274,8 @@ class TestSubscribedTrack:
 
     # ----- Pathway A: direct SUBSCRIBE (explicit trackname) -----
 
-    def test_subscribe_d14_direct(self):
-        """d14 + explicit trackname → direct SUBSCRIBE, no namespace."""
+    def test_subscribe_direct(self):
+        """Explicit trackname → direct SUBSCRIBE, no namespace."""
         async def _test():
             session = MagicMock()
             session.subscribe_namespace = AsyncMock(
@@ -320,13 +320,13 @@ class TestSubscribedTrack:
 
     # ----- Pathway B: namespace discovery (trackname=None) -----
 
-    def test_subscribe_d14_discover(self):
-        """d14 + trackname=None → subscribe_namespace, learn from PUBLISH."""
+    def test_subscribe_discover(self):
+        """trackname=None → subscribe_namespace, learn from PUBLISH."""
         async def _test():
             session = MagicMock()
             pub_msg = MagicMock(spec=[])
             pub_msg.track_namespace = (b"bench",)
-            pub_msg.track_name = b"discovered-d14"
+            pub_msg.track_name = b"discovered-track"
             pub_msg.request_id = 3
             pub_msg.forward = 0
             session.subscribe_namespace = AsyncMock(
@@ -336,14 +336,14 @@ class TestSubscribedTrack:
             session.on_object_received = None
 
             session._profile.two_level_discovery = False
-            session.negotiated_draft = 14  # exercise real PublishOk.serialize at d14
+            session.negotiated_draft = 16  # exercise real PublishOk.serialize
             t = SubscribedTrack(session, "bench")
             assert t.trackname is None
             await t.subscribe()
 
             session.subscribe_namespace.assert_called_once()
             session.await_publish.assert_called_once()
-            assert t.trackname == "discovered-d14"
+            assert t.trackname == "discovered-track"
             assert t.state == TrackState.SUBSCRIBED
 
         asyncio.run(_test())
@@ -491,7 +491,7 @@ class TestD18Discovery:
         asyncio.run(_test())
 
     def test_pre_d18_does_not_subscribe_tracks(self):
-        """d14/d16 must keep the single-request flow."""
+        """d16 must keep the single-request flow."""
         async def _test():
             session = self._d18_session()
             session._profile.two_level_discovery = False

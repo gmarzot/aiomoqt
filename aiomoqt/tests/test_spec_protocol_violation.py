@@ -20,7 +20,7 @@ def test_violation_maps_to_protocol_violation_code():
     assert exc.error_code == SessionCloseCode.PROTOCOL_VIOLATION
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_param_count_overrun_raises(draft):
     """Declared param count exceeds the bytes within buf_end."""
     buf = Buffer(capacity=64)
@@ -35,7 +35,7 @@ def test_param_count_overrun_raises(draft):
         MOQTMessage._deserialize_params(buf, prof=profile_for(draft), buf_end=end)
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_param_length_overrun_raises(draft):
     """A length-prefixed param whose Length runs past buf_end."""
     buf = Buffer(capacity=64)
@@ -65,7 +65,7 @@ def test_setup_with_short_length_raises():
         ServerSetup.deserialize(buf, prof=profile_for(16), buf_end=end)
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_well_formed_params_round_trip(draft):
     """Sanity: params that fit exactly within buf_end parse cleanly
     (encode + decode under the same draft so key coding matches)."""
@@ -111,9 +111,6 @@ def _truncated_track_extension():
 _MALFORMED = {
     # Invalid UTF-8 in the New Session URI.
     "goaway-uri": (16, False, lambda: _wire(16, 0x10, b"\x04\xff\xfe\xfd\xfc")),
-    # Group Order 9 in a d14 TRACK_STATUS_OK.
-    "group-order": (14, False, lambda: _wire(
-        14, 0x0E, bytes([0, 1, 0, 9, 0, 0]))),
     "track-extension": (16, False, _truncated_track_extension),
     # A namespace field declaring 2^63 bytes, on a d18 request stream.
     "namespace-length": (18, True, lambda: _wire(

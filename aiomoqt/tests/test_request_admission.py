@@ -168,12 +168,6 @@ async def test_requests_after_our_goaway_are_refused(draft, refused):
     assert got == (RequestErrorCode.GOING_AWAY if refused else None)
 
 
-async def test_d14_requests_are_not_checked():
-    s = _session(14)
-    assert await _refused(s, _sub(1)) is None
-    assert await _refused(s, _sub(3)) is None
-
-
 # -- over real sessions: the refusal reaches the peer ------------------
 
 _BASE_PORT = 16000

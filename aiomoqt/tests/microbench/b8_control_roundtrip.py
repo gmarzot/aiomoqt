@@ -1,4 +1,4 @@
-"""B8 — MoQT CONTROL message round-trip microbench (d14/d16/d18).
+"""B8 — MoQT CONTROL message round-trip microbench (d16/d18).
 
 Isolates the per-draft control-plane layout/codec cost: length-prefixed
 vs delta-coded KVP params, uint8 vs varint param values, reply Request-ID
@@ -13,8 +13,8 @@ For each (message, draft) the bench:
   3. times encode and decode separately with time_loop.
 
 Output: an ENCODE table and a DECODE table (one row per message, one
-column per draft, ns/op), then a SUMMARY with relative ratios (d18/d16,
-d14/d16) and a one-line verdict computed from the measured numbers.
+column per draft, ns/op), then a SUMMARY with relative ratios (d18/d16)
+and a one-line verdict computed from the measured numbers.
 
 Run: python -m aiomoqt.tests.microbench.b8_control_roundtrip
 """
@@ -42,7 +42,7 @@ from ._stats import time_loop
 logging.disable(logging.WARNING)
 
 
-DRAFTS = (14, 16, 18)
+DRAFTS = (16, 18)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def _make_publish_ok() -> PublishOk:
 
 def _make_request_update() -> RequestUpdate:
     # FORWARD (0x10) is a uint8-valued param at d18 — exercises the uint8
-    # param-value codec path there, the varint one at d14/d16.
+    # param-value codec path there, the varint one at d16.
     return RequestUpdate(
         request_id=7,
         existing_request_id=5,
@@ -233,7 +233,7 @@ def _print_table(title: str, rows: dict) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="MoQT control-message round-trip microbench (d14/d16/d18)")
+        description="MoQT control-message round-trip microbench (d16/d18)")
     p.add_argument("--duration", type=float, default=2.0)
     p.add_argument("--warmup", type=float, default=0.3)
     args = p.parse_args()

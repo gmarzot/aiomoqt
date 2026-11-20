@@ -321,14 +321,14 @@ def fmt_row(r: dict) -> str:
 # Cross-draft TX-framing comparison (--draft all / --compare)
 # ---------------------------------------------------------------------------
 
-_COMPARE_DRAFTS = (14, 16, 18)
+_COMPARE_DRAFTS = (16, 18)
 
 
 def run_compare(sz: int, ext: bool, duration: float, warmup: float,
                 batch: int, drafts=_COMPARE_DRAFTS) -> int:
-    """Run the key TX-framing rows for d14/d16/d18, threading each draft's
+    """Run the key TX-framing rows for d16/d18, threading each draft's
     DraftProfile so the header/object integers genuinely encode that draft's
-    wire form (RFC9000 for d14/d16, vi64 for d18). Prints a cross-draft
+    wire form (RFC9000 for d16, vi64 for d18). Prints a cross-draft
     ns/obj table with a relative-vs-d16 column and a SUMMARY verdict."""
 
     # (row label, factory(prof) -> fn, batch_per_iter)
@@ -384,11 +384,11 @@ def main() -> int:
     p.add_argument("--csv", default=None)
     p.add_argument("--draft", default="16", type=parse_draft_spec,
                    help="draft number, or a comma-separated list "
-                        "(e.g. 14,16,18) for the cross-draft "
+                        "(e.g. 16,18) for the cross-draft "
                         "TX-framing comparison")
     p.add_argument("--compare", action="store_true",
                    help="cross-draft TX-framing comparison over every "
-                        "supported draft (same as --draft 14,16,18)")
+                        "supported draft (same as --draft 16,18)")
     args = p.parse_args()
 
     ext = bool(args.extensions)

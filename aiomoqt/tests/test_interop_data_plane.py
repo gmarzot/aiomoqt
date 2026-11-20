@@ -37,7 +37,7 @@ async def _run(port, draft, use_quic):
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 async def test_canonical_case_through_the_relay(draft, use_quic):
     port = _BASE_PORT + 2 * draft + (0 if use_quic else 1)
     r = await _run(port, draft, use_quic)
@@ -411,7 +411,7 @@ _FETCHED = {"fetch": 5, "fetch-descending": 10, "fetch-error-recovery": 5}
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 @pytest.mark.parametrize("name", _HISTORY)
 async def test_history_cases_deliver_objects(name, draft, use_quic):
     port = (_BASE_PORT + 100 + 2 * draft + (0 if use_quic else 1)
@@ -499,7 +499,7 @@ def _lifecycle_port(name, draft, use_quic):
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 async def test_subscribe_cancel_live_through_the_relay(draft, use_quic):
     name = "subscribe-cancel-live"
     r = await _run_case(client.TEST_FUNCTIONS[name],
@@ -554,16 +554,6 @@ async def test_done_track_fails_when_publish_done_trails_the_withdrawal(
     assert not r.passed
     assert ("NAMESPACE_DONE, PUBLISH_DONE, expected NAMESPACE, PUBLISH_DONE, "
             "NAMESPACE_DONE in that order") in r.message, r.message
-
-
-@requires_certs
-@pytest.mark.asyncio
-@pytest.mark.parametrize("name", _LIFECYCLE[1:])
-async def test_namespace_cases_skip_below_draft_16(name):
-    r = await _run_case(client.TEST_FUNCTIONS[name],
-                        _lifecycle_port(name, 14, True), 14, True)
-    assert r.passed and r.skipped
-    assert r.skip_reason == "NAMESPACE is draft-16; negotiated draft-14"
 
 
 @requires_certs
