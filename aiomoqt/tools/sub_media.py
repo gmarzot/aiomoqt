@@ -471,6 +471,10 @@ class _TsLane:
                 pcr_pid=entry.extra.get('mpeg2tsPcrPid'),
                 arrival_log=self._log,
                 release=args.ts_playout is not None and self.sink is not None)
+            timing = getattr(track, 'timing', None)
+            if timing is not None and timing.declared and timing.wall_clock:
+                # Every object carries its time: no timeline samples.
+                self.player.e2e_source = SOURCE_FRINDELL
         if self.player is not None and self.player.release:
             self._task = asyncio.ensure_future(self._play())
 
