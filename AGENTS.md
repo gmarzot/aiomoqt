@@ -172,7 +172,8 @@ message already logged, transport plumbing, per-stream lifecycle (open, close, r
 or track bookkeeping; its volume does not grow with the object count. TRACE (`TRACE = 5` in
 `aiomoqt.utils.logger`, registered by name only) is per object, per chunk, per datagram and wire
 hex: emit it as `log.log(TRACE, …)`, behind `log.isEnabledFor(TRACE)` on hot paths. WARNING is a
-tolerated peer deviation or a bound hit; ERROR ends a session.
+tolerated peer deviation, a bound hit, or a session we close for the peer's error; ERROR is a
+session we end for our own failure (INTERNAL_ERROR).
 
 Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
 (subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
