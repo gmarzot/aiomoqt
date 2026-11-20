@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- From d20 a `PublishedTrack` serves several concurrent SUBSCRIBEs to it on one session (§3.1), each with its own alias, filter, Forward State, producers and PUBLISH_DONE stream count, including a SUBSCRIBE beside our own PUBLISH; they were refused with NOT_SUPPORTED. d16 and d18 still refuse a second one with DUPLICATE_SUBSCRIPTION.
 - moq_interop_client reports a request that its own session's close ended, such as by the PROTOCOL_VIOLATION close §9.12 requires on a malformed FETCH_OK, as no reply before the close, instead of as the relay's REQUEST_ERROR code=0x0; `subscribe-error` and the other refusal cases no longer accept it as the relay's answer.
 - A session close aiomoqt sends for the peer's error (any MoQT close code but INTERNAL_ERROR, such as PROTOCOL_VIOLATION when a peer closes its control stream) logs at WARNING instead of ERROR; ERROR is left for our own failures.
 - aiomoqt-relay's `POST /moq-fabric/peer?op=remove|restart|metric` answers 409 naming the candidates when the host has several peers and none at the given port.

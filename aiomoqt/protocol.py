@@ -4710,10 +4710,10 @@ class _MOQTSessionMixin:
     def _refuse_request(self, msg: MOQTMessage) -> Optional[Callable]:
         """Session-level request rules, applied before the application
         sees the request (d16+): a reserved namespace (d18 §3.2.1-2), a
-        duplicate subscription (§5.1), an overlapping namespace prefix
-        (§10.18-19). Returns the handler that answers a refused request
-        with REQUEST_ERROR, else None; records an admitted subscription
-        until it ends."""
+        duplicate subscription before d20 (§5.1), an overlapping
+        namespace prefix (§10.18-19). Returns the handler that answers a
+        refused request with REQUEST_ERROR, else None; records an
+        admitted subscription until it ends."""
         d20 = self._profile.param_table >= 20
         if isinstance(msg, PublishStateNotify):
             self._check_publish_state_notify(msg)
@@ -4747,15 +4747,13 @@ class _MOQTSessionMixin:
             reason = f"reserved namespace {ns[0].decode()}"
         elif kind is Subscribe:
             key = (ns, bytes(msg.track_name or b""))
-            # d20 allows several subscriptions to a track and drops
-            # DUPLICATE_SUBSCRIPTION; a track here serves one per session.
-            duplicate = (RequestErrorCode.NOT_SUPPORTED if d20
-                         else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
-            if (kind, key) in self._peer_requests.values():
-                code = duplicate
+            # From d20 a session may hold several subscriptions to a track
+            # (§3.1); before, a second is DUPLICATE_SUBSCRIPTION (§5.1).
+            if not d20 and (kind, key) in self._peer_requests.values():
+                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
                 reason = "track already subscribed in this session"
-            elif self._publishing(key):
-                code = duplicate
+            elif not d20 and self._publishing(key):
+                code = RequestErrorCode.DUPLICATE_SUBSCRIPTION
                 reason = "our PUBLISH of the track holds its subscription"
         elif kind in (SubscribeNamespace, SubscribeTracks):
             key = ns

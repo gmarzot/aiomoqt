@@ -33,11 +33,6 @@ def _port(case: int, draft: int, use_quic: bool) -> int:
             + (0 if use_quic else 1))
 
 
-def _duplicate(draft: int) -> int:
-    return (RequestErrorCode.NOT_SUPPORTED if draft >= 20
-            else RequestErrorCode.DUPLICATE_SUBSCRIPTION)
-
-
 class _Gated(PublishedTrack):
     """Holds a SUBSCRIBE after the session admits it, until `release`."""
 
@@ -160,10 +155,11 @@ async def test_publish_after_subscribe_sends_no_publish(draft, use_quic):
 
 @pytest.mark.asyncio
 @_TRANSPORTS
-@pytest.mark.parametrize("draft", _DRAFTS)
+@pytest.mark.parametrize("draft", [18])
 async def test_subscribe_after_publish_is_refused(draft, use_quic):
     """PUBLISH established, then a SUBSCRIBE for the track: refused, and
-    the PUBLISH subscription keeps flowing."""
+    the PUBLISH subscription keeps flowing. From d20 both are served
+    (test_multi_subscribe.py)."""
     peer = _Peer()
     async with _loopback(_port(1, draft, use_quic), draft, use_quic,
                          peer) as session:
@@ -182,7 +178,7 @@ async def test_subscribe_after_publish_is_refused(draft, use_quic):
             await peer.session.subscribe(_NS, "video", forward=1,
                                          wait_response=True)
         assert err.value.response is not None, "timed out, no reply"
-        assert err.value.error_code == _duplicate(draft)
+        assert err.value.error_code == RequestErrorCode.DUPLICATE_SUBSCRIPTION
         for name, a in alias.items():
             assert await _keeps_flowing(peer, a), (
                 f"{name} stopped at {peer.count(a)} objects")

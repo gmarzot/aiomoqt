@@ -49,8 +49,8 @@ class _Catalog(PublishedTrack):
     def _payload(self):
         return b"c" * _SIZES[self.trackname]
 
-    async def _start_generating(self, session, trigger):
-        sub = self._sub_for(session)
+    async def _start_generating(self, session, trigger, sub=None):
+        sub = sub or self._sub_for(session)
         self.current += _STEP
         self.retained.add(self.current)
         self._remember(self.current, 0, self._payload())
