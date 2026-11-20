@@ -540,6 +540,8 @@ class SubgroupTimer:
         loop = asyncio.get_running_loop()
         now = loop.time()
         released = self._released
+        if not callable(released):
+            return
         while due and due[0][1] <= now:
             sid = due.popleft()[0]
             try:
