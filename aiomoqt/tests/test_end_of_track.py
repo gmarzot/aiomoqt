@@ -276,7 +276,7 @@ class _Out:
         self.datagrams.append(bytes(data))
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+@pytest.mark.parametrize("draft", [16, 18, 22])
 async def test_a_datagram_track_ends_in_a_status_datagram(draft):
     out = _Out(draft)
     d = SubgroupDelivery(out, 7, priority=9, mapping=StreamMapping.DATAGRAM)
@@ -309,19 +309,18 @@ def _end_of_track_object(prof, status=EOT):
 def _decode(raw, prof):
     obj = ObjectHeader(object_id=0)
     obj.deserialize_into(Buffer(data=raw, vi64=prof.vi64), len(raw), True,
-                         None, vi64=prof.vi64,
-                         kvp_delta=prof.params_delta_coded)
+                         None, vi64=prof.vi64)
     return obj
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 def test_end_of_track_object_round_trips(draft):
     prof = profile_for(draft)
     obj = _decode(_end_of_track_object(prof), prof)
     assert (obj.object_id, obj.status, obj.payload) == (3, EOT, b"")
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 def test_an_unknown_object_status_is_a_protocol_violation(draft):
     prof = profile_for(draft)
     raw = _end_of_track_object(prof, status=0x07)

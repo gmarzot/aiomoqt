@@ -57,7 +57,7 @@ track's natural close.
 
 Publisher flow selection for relays that require a specific message
 pattern: `--pub-ns` (PUBLISH_NAMESPACE only, wait for SUBSCRIBE),
-`--pub-both` (both — required by Cloudflare d14), default PUBLISH only.
+`--pub-both` (both), default PUBLISH only.
 
 ## What governs latency: paced vs unpaced
 
@@ -115,7 +115,7 @@ Interop against live public relays runs as the `interop` tier of
 `tests/release_regression_test.py`: the
 [moq-interop-runner](https://github.com/englishm/moq-interop-runner)
 control-message cases plus pub-sub, discovery, join, fetch and data
-checks, per relay, draft (14 to 22) and transport. The weekly
+checks, per relay, draft (16 to 22) and transport. The weekly
 `interop-regression` workflow posts the per-relay table in its job
 summary. [`tests/relays.json`](tests/relays.json) is the catalog, with
 per-endpoint drafts, notes, and non-gating or disabled suites.

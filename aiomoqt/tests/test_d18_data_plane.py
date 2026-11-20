@@ -3,7 +3,7 @@
 Exercises the vi64 wiring of the subgroup header + objects and the
 OBJECT_DATAGRAM relayout. Values >= 64 are used so vi64 and RFC9000
 genuinely diverge (vi64 1-byte vs RFC9000 2-byte), proving the d18 codec
-is actually taken. d14/d16 paths are covered by the existing suite.
+is actually taken. d16 paths are covered by the existing suite.
 """
 import pytest
 from aiomoqt.utils.buffer import Buffer
@@ -101,8 +101,6 @@ class _Prof:
     def __init__(self, vi64):
         self.vi64 = vi64
         self.draft = 18 if vi64 else 16
-        self.params_delta_coded = True  # KVP delta types, d16+ §1.4.2
-        self.merged_datagram_layout = True
 
 
 def test_d18_extensions_use_vi64_not_standard_varint():

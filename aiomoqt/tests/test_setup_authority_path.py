@@ -1,5 +1,5 @@
 """PATH and AUTHORITY are client SETUP options for native QUIC only
-(d18 §10.3.1.1-2, the same rule at d14/d16): from a server or over
+(d18 §10.3.1.1-2, the same rule at d16): from a server or over
 WebTransport they close the session, and we never send them there."""
 import asyncio
 
@@ -14,7 +14,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
 pytestmark = requires_certs
 
-_DRAFTS = [14, 16, 18, 20, 22]
+_DRAFTS = [16, 18, 20, 22]
 _OPTIONS = [(SetupParamType.PATH, "/x", SessionCloseCode.INVALID_PATH),
             (SetupParamType.AUTHORITY, "h:1",
              SessionCloseCode.INVALID_AUTHORITY)]

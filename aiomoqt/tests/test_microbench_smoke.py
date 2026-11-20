@@ -10,7 +10,7 @@ from aiomoqt.tests.microbench.b1_parser import _parse_subgroup_stream
 _N_OBJECTS = 20
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 @pytest.mark.parametrize("extensions", [False, True])
 @pytest.mark.parametrize("chunk_size", [0, 1500])
 def test_b1_parses_every_object(draft, extensions, chunk_size):

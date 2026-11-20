@@ -35,20 +35,19 @@ async def _start_server(port, supported_drafts):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("server_draft", [16, 14])
+@pytest.mark.parametrize("server_draft", [18, 16])
 async def test_multi_offer_settles_server_draft(server_draft):
-    """Client offers [16, 14]; settles on whichever draft the single-draft
-    server speaks. Settling on the lower offered draft (d14) works now that
-    the client offers the full ALPN list (request_alpn_list) and the server
-    confirms its one ALPN — the former picky-d14 limitation is fixed."""
+    """Client offers [18, 16]; settles on whichever draft the single-draft
+    server speaks: the client offers the full ALPN list (request_alpn_list)
+    and the server confirms its one ALPN."""
     port = _BASE_PORT + server_draft
     server = await _start_server(port, server_draft)
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=True,
-            verify_tls=False, supported_drafts=[16, 14],
+            verify_tls=False, supported_drafts=[18, 16],
         )
-        assert client.supported_drafts == [16, 14]
+        assert client.supported_drafts == [18, 16]
         async with client.connect() as session:
             await session.client_session_init()
             assert session._moqt_session_setup.result() is True
@@ -79,10 +78,10 @@ async def test_pinned_client_against_matching_server():
 @pytest.mark.asyncio
 async def test_non_intersecting_alpn_fails():
     """Negative (raw QUIC): client offers only d16, server speaks only
-    d14 → no common ALPN → connect MUST fail cleanly, not hang (the
+    d18 → no common ALPN → connect MUST fail cleanly, not hang (the
     aiopquic clean-fail surfaces WRONG_ALPN as a prompt ConnectionError)."""
     port = _BASE_PORT + 40
-    server = await _start_server(port, 14)
+    server = await _start_server(port, 18)
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=True,
@@ -98,18 +97,18 @@ async def test_non_intersecting_alpn_fails():
 
 @pytest.mark.asyncio
 async def test_wt_multi_draft_server_and_client_settle_d18():
-    """A WT server and client both offering 18, 16, 14 settle on d18."""
+    """A WT server and client both offering 18, 16 settle on d18."""
     port = _BASE_PORT + 60
     server = MOQTServer(
         host="localhost", port=port,
         certificate=CERT, private_key=KEY, path="/",
-        use_quic=False, supported_drafts=[18, 16, 14],
+        use_quic=False, supported_drafts=[18, 16],
     )
     handle = await server.serve()
     try:
         client = MOQTClient(
             "localhost", port, path="/", use_quic=False,
-            verify_tls=False, supported_drafts=[18, 16, 14],
+            verify_tls=False, supported_drafts=[18, 16],
         )
         async with client.connect() as session:
             await session.client_session_init()
@@ -129,7 +128,7 @@ async def test_wt_negotiates_protocol_from_wt_protocol():
     deterministic: negotiated_protocol == "moqt-16" proves the draft came
     from the in-band WT-Protocol selection, not the max-supported fallback.
     The 'highest-of-several' selection mechanics are covered at the
-    aiopquic layer (tests/test_negotiation.py) with moqt-18/16/14.
+    aiopquic layer (tests/test_negotiation.py) with moqt-18/16.
     """
     port = _BASE_PORT + 80
     server = MOQTServer(

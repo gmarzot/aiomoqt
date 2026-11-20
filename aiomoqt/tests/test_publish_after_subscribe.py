@@ -29,7 +29,7 @@ _MIN_OBJECTS = 10
 
 
 def _port(case: int, draft: int, use_quic: bool) -> int:
-    return (_BASE_PORT + 20 * case + 2 * [14, 18, 20, 22].index(draft)
+    return (_BASE_PORT + 20 * case + 2 * [18, 20, 22].index(draft)
             + (0 if use_quic else 1))
 
 
@@ -187,12 +187,11 @@ async def test_subscribe_after_publish_is_refused(draft, use_quic):
 
 @pytest.mark.asyncio
 @_TRANSPORTS
-@pytest.mark.parametrize("draft", [14, *_DRAFTS])
+@pytest.mark.parametrize("draft", _DRAFTS)
 async def test_publish_ok_pauses_only_its_own_subscription(draft, use_quic):
     """SUBSCRIBE admitted by the session but not yet by the track when
     publish() runs, then every PUBLISH accepted with forward=0: the
-    SUBSCRIBE keeps flowing. From d16 the crossing track sends no
-    PUBLISH; d14 has no session-level admission to consult."""
+    SUBSCRIBE keeps flowing. The crossing track sends no PUBLISH."""
     peer = _Peer()
     async with _loopback(_port(2, draft, use_quic), draft, use_quic,
                          peer) as session:
@@ -207,7 +206,7 @@ async def test_publish_ok_pauses_only_its_own_subscription(draft, use_quic):
         ok = await peer.session._await_response(pending.request_id,
                                                 timeout=5.0)
         peer.watch(ok.track_alias)
-        expect = ["audio"] if draft >= 16 else ["audio", "video"]
+        expect = ["audio"]
         assert await _until(lambda: peer.publishes.qsize() >= len(expect))
         await asyncio.sleep(0.1)
         assert sorted(peer.names()) == expect

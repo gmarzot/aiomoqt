@@ -1,6 +1,6 @@
 """Track discovery — handler registration, the ack, and the walk.
 
-d14/d16 fuse discovery into one request: SUBSCRIBE_NAMESPACE, answered
+d16 fuse discovery into one request: SUBSCRIBE_NAMESPACE, answered
 with a PUBLISH per track. d18 splits it in two — SUBSCRIBE_NAMESPACE
 reports which namespaces exist (NAMESPACE), and SUBSCRIBE_TRACKS then
 asks one of them for its tracks — so a broad prefix cannot oblige a
@@ -22,7 +22,6 @@ from aiomoqt.types import (
     D18MessageType, HANDLER_ALIASES, MOQTMessageType,
 )
 from aiomoqt.messages.request import Namespace, RequestOk
-from aiomoqt.messages.namespace import SubscribeNamespaceOk
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -97,8 +96,7 @@ def _fake_session(draft):
 
 
 @pytest.mark.parametrize("draft,expect", [
-    (14, SubscribeNamespaceOk),   # 0x12
-    (16, RequestOk),              # 0x12 was removed in d16
+    (16, RequestOk),
     (18, RequestOk),
 ])
 def test_subscribe_namespace_ack_type_per_draft(draft, expect):
@@ -109,7 +107,7 @@ def test_subscribe_namespace_ack_type_per_draft(draft, expect):
     assert isinstance(s.sent[0], expect)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 def test_ack_reports_no_namespace_of_its_own(draft):
     """The ack must not assert that the prefix is a namespace we serve —
     only the application knows what it serves."""
@@ -149,7 +147,7 @@ async def _publish(session):
 
 
 async def _on_subscribe_namespace(session, msg):
-    """Registered by the d14/d16 name only — on d18 it fires solely
+    """Registered by the d16 name only — on d18 it fires solely
     because register_handler expanded it to 0x50."""
     stream_id = session._bidi_streams.get(msg.request_id)
     session.subscribe_namespace_ok(msg, stream_id=stream_id)

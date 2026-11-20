@@ -1,4 +1,4 @@
-"""d14/d16 FETCH_CANCEL resets the fetch stream the publisher serves,
+"""d16 FETCH_CANCEL resets the fetch stream the publisher serves,
 and only that one."""
 import asyncio
 import contextlib
@@ -16,7 +16,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 17230
-_DRAFTS = [14, 16]
+_DRAFTS = [16]
 _TRACKS = ("video", "audio")
 
 

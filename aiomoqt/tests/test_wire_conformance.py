@@ -67,22 +67,22 @@ def test_rfc9000_matches_reference(v):
 
 # -- KVP extension blocks: hand-derived wire images -------------------
 #
-# d14 §1.4.2: absolute Type. d16/d18 §1.4.2/§1.4.3: Type is a DELTA
+# d16/d18 §1.4.2/§1.4.3: Type is a DELTA
 # from the previous Type (unsigned → ascending emission); even/odd
 # (value form) follows the ABSOLUTE type. d18 varints are vi64.
 
 _EXTS = {6: 1000, 2: 7, 13: b"ab"}  # deliberately unsorted insertion
 
 
-def _encode(exts, *, vi64, delta):
+def _encode(exts, *, vi64):
     buf = Buffer(capacity=64, vi64=vi64)
-    MOQTMessage._extensions_encode(buf, exts, delta=delta)
+    MOQTMessage._extensions_encode(buf, exts)
     return bytes(buf.data_slice(0, buf.tell()))
 
 
-def _decode(raw, *, vi64, delta):
+def _decode(raw, *, vi64):
     buf = Buffer(data=raw, vi64=vi64)
-    return MOQTMessage._extensions_decode(buf, delta=delta)
+    return MOQTMessage._extensions_decode(buf)
 
 
 def test_d16_delta_block_exact_bytes():
@@ -91,10 +91,10 @@ def test_d16_delta_block_exact_bytes():
     expect = bytes([0x02, 0x07,
                     0x04, 0x43, 0xE8,
                     0x07, 0x02]) + b"ab"
-    assert _encode(_EXTS, vi64=False, delta=True) == (
+    assert _encode(_EXTS, vi64=False) == (
         bytes([len(expect)]) + expect)
     assert _decode(bytes([len(expect)]) + expect,
-                   vi64=False, delta=True) == _EXTS
+                   vi64=False) == _EXTS
 
 
 def test_d18_delta_block_exact_bytes():
@@ -103,17 +103,10 @@ def test_d18_delta_block_exact_bytes():
     expect = bytes([0x02, 0x07,
                     0x04, 0x83, 0xE8,
                     0x07, 0x02]) + b"ab"
-    assert _encode(_EXTS, vi64=True, delta=True) == (
+    assert _encode(_EXTS, vi64=True) == (
         bytes([len(expect)]) + expect)
     assert _decode(bytes([len(expect)]) + expect,
-                   vi64=True, delta=True) == _EXTS
-
-
-def test_d14_absolute_block_round_trip():
-    raw = _encode(_EXTS, vi64=False, delta=False)
-    # absolute ids appear literally on the wire, insertion order
-    assert raw[1] == 6 and raw[0] == len(raw) - 1
-    assert _decode(raw, vi64=False, delta=False) == _EXTS
+                   vi64=True) == _EXTS
 
 
 def test_delta_parity_follows_absolute_type():
@@ -123,8 +116,8 @@ def test_delta_parity_follows_absolute_type():
     # 5 is odd but leads to absolute 13 (odd, bytes) via accumulation,
     # while absolute-8 (even, varint) came from delta 6.
     exts = {2: 1, 8: 2, 13: b"z"}
-    raw = _encode(exts, vi64=False, delta=True)
-    assert _decode(raw, vi64=False, delta=True) == exts
+    raw = _encode(exts, vi64=False)
+    assert _decode(raw, vi64=False) == exts
 
 
 # -- Cython hot-path twins agree with the python codec ----------------
@@ -146,7 +139,7 @@ def test_cython_subgroup_object_kvp_delta(vi64):
     # And the Cython encoder's ext block matches the python encoder's.
     pybuf = Buffer(capacity=64, vi64=vi64)
     pybuf.push_vint(0)
-    MOQTMessage._extensions_encode(pybuf, _EXTS, delta=True)
+    MOQTMessage._extensions_encode(pybuf, _EXTS)
     pyhead = bytes(pybuf.data_slice(0, pybuf.tell()))
     assert body.startswith(pyhead)
 
@@ -179,7 +172,7 @@ def test_kvp_overrunning_its_block_is_refused_by_both_codecs(vi64):
 
     buf = Buffer(data=block + v(3) + b"pay", vi64=vi64)
     with pytest.raises(MOQTMalformedKVP, match="exceeds its block"):
-        MOQTMessage._extensions_decode(buf, delta=True)
+        MOQTMessage._extensions_decode(buf)
 
     # The fused parser refuses the declared length before pulling it.
     chain = StreamChain()
@@ -200,7 +193,7 @@ def test_kvp_exactly_filling_its_block_is_accepted(vi64):
     assert len(block) - len(v(4)) == 4
 
     buf = Buffer(data=block, vi64=vi64)
-    assert MOQTMessage._extensions_decode(buf, delta=True) == {1: b"ab"}
+    assert MOQTMessage._extensions_decode(buf) == {1: b"ab"}
 
     chain = StreamChain()
     chain.extend(v(0) + block + v(3) + b"pay")
@@ -223,7 +216,7 @@ def test_kvp_delta_type_overflow_is_a_protocol_violation():
 
     buf = Buffer(data=block, vi64=True)
     with pytest.raises(MOQTProtocolViolation, match="Delta Type"):
-        MOQTMessage._extensions_decode(buf, delta=True)
+        MOQTMessage._extensions_decode(buf)
 
     from aiomoqt.messages.data import ObjectHeader
     body = v(0) + block + v(3) + b"pay"
@@ -232,7 +225,7 @@ def test_kvp_delta_type_overflow_is_a_protocol_violation():
     with pytest.raises(MOQTProtocolViolation, match="overflow"):
         ObjectHeader(object_id=0).deserialize_into(
             chain, buf_len=len(body), extensions_present=True,
-            vi64=True, kvp_delta=True)
+            vi64=True)
 
 
 # -- d18 FETCH data plane (§11.4.4): vi64 + group/object deltas -------
@@ -338,10 +331,9 @@ def test_d18_fetch_zero_length_carries_no_status():
     assert [g.payload for _, g in chain] == [b"tt", b""]
 
 
-# d14 §10.4.4 keeps the Status after a zero Payload Length; d16
-# §10.2.1.1 and d18 §11.2.1.1: absent in Objects delivered via a FETCH.
+# d16 §10.2.1.1 and d18 §11.2.1.1: no Status after a zero Payload Length in
+# Objects delivered via a FETCH.
 @pytest.mark.parametrize("draft, raw", [
-    (14, "05000c80000000"),
     (16, "1f05000c8000"),
     (18, "1c050c8000"),
 ])
@@ -353,16 +345,6 @@ def test_fetch_zero_length_object_status_by_draft(draft, raw):
         Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
     assert (got.object_id, got.payload, got.status) == (
         12, b"", ObjectStatus.NORMAL)
-
-
-def test_d14_fetch_end_of_group_keeps_its_status():
-    prof = profile_for(14)
-    raw = bytes(FetchObject(group_id=5, object_id=12, publisher_priority=128,
-                            status=ObjectStatus.END_OF_GROUP)
-                .serialize(prof=prof).data)
-    assert raw == bytes.fromhex("05000c80000003")
-    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
-    assert got.status == ObjectStatus.END_OF_GROUP
 
 
 @pytest.mark.parametrize("draft", [16, 18])
@@ -572,7 +554,7 @@ def test_d18_new_subgroup_sets_first_object():
     assert _subgroup_type(18) & 0x40
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_first_object_is_never_written_before_d18(draft):
     # 0x40 is not a subgroup type bit before d18.
     assert not _subgroup_type(draft) & 0x40
@@ -651,12 +633,6 @@ def test_d16_subscriber_priority_over_255_is_a_protocol_violation():
 def test_empty_namespace_field_is_a_protocol_violation(draft):
     with pytest.raises(MOQTProtocolViolation, match="empty namespace field"):
         _decode_subscribe(draft, _subscribe_body(draft, ns=(b"n", b"")))
-
-
-def test_empty_namespace_field_is_legal_at_d14():
-    got = MOQTMessage._pull_tuple(Buffer(data=b"\x01\x00"),
-                                  prof=profile_for(14))
-    assert got == (b"",)
 
 
 @pytest.mark.parametrize("draft", [16, 18])
@@ -1017,33 +993,26 @@ def test_d20_publish_state_notify_exact_bytes(draft):
     assert out.parameters == {}
 
 
-# -- d14/d16/d18 bytes are unchanged by d20 --------------------------
+# -- d16/d18 bytes are unchanged by d20 --------------------------
 #
 # Golden images of the setup messages and of the two types d18 renumbers
 # on the wire, as the tree before d20 support encoded them.
 
-def test_d14_d16_d18_setup_bytes_unchanged():
+def test_d16_d18_setup_bytes_unchanged():
     from aiomoqt.messages.d18 import Setup as D18Setup
     from aiomoqt.messages.session_setup import ClientSetup, ServerSetup
 
     def hx(msg, draft):
         return bytes(msg.serialize(prof=profile_for(draft)).data).hex()
 
-    assert hx(ClientSetup(versions=[0xff00000e],
-                          parameters={1: b"/", 2: 100}), 14) \
-        == "20001001c0000000ff00000e0201012f024064"
-    assert hx(ServerSetup(selected_version=0xff00000e,
-                          parameters={2: 100}), 14) \
-        == "21000cc0000000ff00000e01024064"
-    assert hx(ClientSetup(versions=[],
-                          parameters={7: b"x", 1: b"/", 2: 100}), 16) \
+    assert hx(ClientSetup(parameters={7: b"x", 1: b"/", 2: 100}), 16) \
         == "20000a0301012f014064050178"
     assert hx(ServerSetup(parameters={2: 100}), 16) == "21000401024064"
     assert hx(D18Setup(options={7: b"x", 1: b"/", 5: b"h:1"}), 18) \
         == "af00000b01012f0403683a31020178"
 
 
-def test_d14_d16_d18_renumbered_type_bytes_unchanged():
+def test_d16_d18_renumbered_type_bytes_unchanged():
     from aiomoqt.messages.namespace import SubscribeNamespace
     from aiomoqt.messages.publish import PublishOk
 
@@ -1058,7 +1027,6 @@ def test_d14_d16_d18_renumbered_type_bytes_unchanged():
         return PublishOk(request_id=2, forward=1, priority=128,
                          group_order=1, filter_type=2)
 
-    assert hx(sub_ns(), 14) == "1100050201016e00"
     assert hx(sub_ns(), 16) == "1100060201016e0000"
     assert hx(sub_ns(), 18) == "5000050201016e00"
     assert hx(pub_ok(), 16) == "1e000c020410011040800101020101"
@@ -1457,7 +1425,7 @@ def test_d20_fetch_exact_bytes():
 
 
 def test_d20_fetch_ok_end_location_is_inclusive():
-    # The field keeps the d14-d18 form (last Object + 1); the wire is
+    # The field keeps the d16-d18 form (last Object + 1); the wire is
     # the last Object.
     ok = FetchOk(request_id=None, end_of_track=1, largest_group_id=5,
                  largest_object_id=4)
@@ -1538,7 +1506,7 @@ def test_d22_fetch_every_parameter_exact_bytes():
     assert got.location_filter == LocationFilter.absolute(1, 0, 2, 3)
     assert (got.subscriber_priority, got.group_order) == (7, 2)
     assert got.parameters == {0x0A: 0, 0x35: 0}
-    # The d14-d18 view of the inclusive End {2, 3} is {2, 4}.
+    # The d16-d18 view of the inclusive End {2, 3} is {2, 4}.
     assert (got.start_group, got.start_object, got.end_group,
             got.end_object) == (1, 0, 2, 4)
 
@@ -1630,7 +1598,7 @@ def test_padding_exact_bytes(draft, datagram, ptype, size):
     assert wire == ref_vi64(ptype) + bytes(size)
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_padding_does_not_exist_before_d18(draft):
     from aiomoqt.messages.data import encode_padding
     with pytest.raises(ValueError):
@@ -1701,7 +1669,7 @@ def test_received_immutable_properties_decode(draft, kind):
     assert msg.track_extensions == {0x0B: inner, 0x3D: b"xyz"}
     nested = MOQTMessage._extensions_decode(
         Buffer(data=inner, vi64=profile_for(draft).vi64),
-        with_length=False, buf_end=len(inner), delta=True)
+        with_length=False, buf_end=len(inner))
     assert nested == _IMM_INNER
 
 
@@ -1743,7 +1711,7 @@ def test_object_immutable_properties_agree_across_codecs(vi64):
     assert fused(True, 16 * 1024, True) == (0, exts, 0, b"pay")
     buf = Buffer(data=body, vi64=vi64)
     buf.pull_vint()
-    assert MOQTMessage._extensions_decode(buf, delta=True) == exts
+    assert MOQTMessage._extensions_decode(buf) == exts
 
 
 # -- d16 DELIVERY_TIMEOUT 0 (§9.2.2.2, §11.1) ---------------------------
@@ -1859,7 +1827,7 @@ def test_frindell_track_properties_encode_exact_bytes(draft):
     s = SimpleNamespace(_profile=profile_for(draft))
     buf = Buffer(capacity=64, vi64=vi64)
     MOQTMessage._extensions_encode(buf, track._track_properties(s),
-                                   with_length=False, delta=True)
+                                   with_length=False)
     assert bytes(buf.data_slice(0, buf.tell())) == _ref_delta_kvps(draft, [
         (TIMESTAMP_MAPPING, _ref_mapping(0, 7, 1000, 10)),
         (TIMESCALE, 1000)])
@@ -1909,8 +1877,7 @@ def _object_block(draft, pairs):
 def test_object_timestamp_zigzag_both_codecs(draft, correction, wire):
     vi64 = profile_for(draft).vi64
     block = _object_block(draft, [(0x10, _W), (OBJECT_TIMESTAMP, wire)])
-    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64),
-                                        delta=True)
+    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64))
     chain = StreamChain()
     chain.extend(_ref_vint(draft, 0) + block + _ref_vint(draft, 3) + b"pay")
     fused = (chain.parse_object_subgroup_vi64 if vi64
@@ -1924,8 +1891,7 @@ def test_object_timestamp_zigzag_both_codecs(draft, correction, wire):
 def test_explicit_object_timestamp_both_codecs(draft):
     vi64 = profile_for(draft).vi64
     block = _object_block(draft, [(OBJECT_TIMESTAMP, _W)])
-    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64),
-                                        delta=True)
+    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64))
     assert py == {OBJECT_TIMESTAMP: _W}
     assert capture_time_us(TrackTiming(timescale=1_000_000), 0, 0, py) == (
         _W, "frindell")
@@ -1958,7 +1924,7 @@ def test_malformed_frindell_objects(draft, case):
                       4, [], "outside"),
     }[case]
     py = MOQTMessage._extensions_decode(
-        Buffer(data=_object_block(draft, pairs), vi64=vi64), delta=True)
+        Buffer(data=_object_block(draft, pairs), vi64=vi64))
     with pytest.raises(TimestampMalformed, match=why):
         check_object(timing, gid, 0, py)
 
@@ -2005,12 +1971,12 @@ def _parse_subgroup(draft, raw, fused):
         buf = Buffer(data=raw, vi64=vi64)
     obj = ObjectHeader(object_id=0)
     obj.deserialize_into(buf, len(raw), extensions_present=True, vi64=vi64,
-                         kvp_delta=draft >= 16, max_payload=_LIMIT)
+                         max_payload=_LIMIT)
     return obj
 
 
 @pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
-@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("draft", [16, 18, 20, 22])
 @pytest.mark.parametrize("declared", [_LIMIT + 1, 1 << 40])
 def test_subgroup_object_over_the_limit_is_refused_at_its_length(
         draft, fused, declared):
@@ -2021,7 +1987,7 @@ def test_subgroup_object_over_the_limit_is_refused_at_its_length(
 
 
 @pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
-@pytest.mark.parametrize("draft", [14, 18])
+@pytest.mark.parametrize("draft", [18])
 def test_subgroup_object_at_the_limit_is_accepted(draft, fused):
     obj = _parse_subgroup(draft, _subgroup_object(draft, _LIMIT, _LIMIT),
                           fused)
@@ -2035,7 +2001,7 @@ def test_a_complete_object_over_the_limit_is_refused(fused):
                         fused)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+@pytest.mark.parametrize("draft", [16, 18, 22])
 def test_fetch_object_over_the_limit_is_refused_at_its_length(draft):
     prof = profile_for(draft)
     obj = FetchObject(group_id=1, subgroup_id=0, object_id=0,
@@ -2058,9 +2024,8 @@ def test_fetch_object_over_the_limit_is_refused_at_its_length(draft):
 # Each case once escaped as a Python error (UnicodeDecodeError,
 # ValueError, OverflowError, RuntimeError) rather than a protocol error.
 
-from aiomoqt.messages.data import ObjectDatagramStatus  # noqa: E402
+from aiomoqt.messages.data import ObjectDatagram  # noqa: E402
 from aiomoqt.messages.session_setup import GoAway  # noqa: E402
-from aiomoqt.messages.subscribe import TrackStatusOk  # noqa: E402
 
 
 def _control(cls, draft, body, chain=False):
@@ -2083,15 +2048,10 @@ def test_reason_phrase_with_invalid_utf8_is_read_leniently(draft):
     assert msg.reason == "a�b"
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 def test_goaway_uri_with_invalid_utf8_is_a_protocol_violation(draft):
     with pytest.raises(MOQTProtocolViolation, match="not UTF-8"):
         _control(GoAway, draft, b"\x04\xff\xfe\xfd\xfc")
-
-
-def test_d14_track_status_ok_group_order_out_of_range():
-    with pytest.raises(MOQTProtocolViolation, match="group order 9"):
-        _control(TrackStatusOk, 14, bytes([0, 1, 0, 9, 0, 0]))
 
 
 @pytest.mark.parametrize("chain", [False, True], ids=["buffer", "chain"])
@@ -2119,7 +2079,7 @@ def test_truncated_trailing_track_property_is_malformed(draft, monkeypatch):
 
 
 @pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 @pytest.mark.parametrize("case", ["value-overrun", "block-over-limit"])
 def test_object_properties_that_do_not_parse_agree_across_codecs(
         draft, case, fused):
@@ -2141,7 +2101,7 @@ def test_kvp_value_over_2_16_is_a_protocol_violation():
     buf = Buffer(data=kvps + b"x" * 8)
     with pytest.raises(MOQTProtocolViolation, match="2\\^16-1"):
         MOQTMessage._extensions_decode(buf, with_length=False,
-                                       buf_end=len(kvps) + 8, delta=True)
+                                       buf_end=len(kvps) + 8)
 
 
 def test_d18_fetch_object_id_past_2_64_is_a_protocol_violation():
@@ -2154,14 +2114,9 @@ def test_d18_fetch_object_id_past_2_64_is_a_protocol_violation():
         _fetch_stream(raw + nxt, 18)
 
 
-@pytest.mark.parametrize("raw, parse", [
-    # d14 FETCH object: zero-length payload with Status 2.
-    (bytes([1, 0, 0, 0x80, 0, 0, 2]),
-     lambda b: FetchObject.deserialize(b, prof=profile_for(14))),
-    # d14 OBJECT_DATAGRAM_STATUS with Status 9.
-    (bytes([1, 2, 3, 0x80, 9]),
-     lambda b: ObjectDatagramStatus.deserialize(b, prof=profile_for(14))),
-], ids=["d14-fetch", "d14-status-datagram"])
-def test_unknown_object_status_is_a_protocol_violation(raw, parse):
+def test_unknown_datagram_object_status_is_a_protocol_violation():
+    # d16 OBJECT_DATAGRAM with the STATUS bit: Status 9.
+    raw = bytes([1, 2, 3, 0x80, 9])
     with pytest.raises(MOQTProtocolViolation, match="unknown object status"):
-        parse(Buffer(data=raw))
+        ObjectDatagram.deserialize(Buffer(data=raw), len(raw), 0x20,
+                                   prof=profile_for(16))

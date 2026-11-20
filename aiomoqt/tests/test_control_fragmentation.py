@@ -14,9 +14,7 @@ from collections import deque
 import pytest
 
 from aiomoqt.protocol import _MOQTSessionMixin
-from aiomoqt.messages.namespace import PublishNamespaceOk
 from aiomoqt.messages.request import RequestError, RequestOk
-from aiomoqt.messages.subscribe import SubscribeError
 from aiomoqt.context import profile_for
 from aiomoqt.types import SessionCloseCode
 
@@ -78,12 +76,8 @@ def _feed_reply(s, data, end=False):
 
 
 def _ok_wire(s, rid=7):
-    """A reply that exists at the session's draft: REQUEST_OK is d16+,
-    and its code point is PUBLISH_NAMESPACE_OK at d14."""
-    if s._profile.draft < 16:
-        msg = PublishNamespaceOk(request_id=rid)
-    else:
-        msg = RequestOk(request_id=rid, parameters={})
+    """A reply that exists at every draft: REQUEST_OK."""
+    msg = RequestOk(request_id=rid, parameters={})
     return bytes(msg.serialize(prof=s._profile).data)
 
 
@@ -102,7 +96,7 @@ def _spy_parses(s):
     return parsed
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 @pytest.mark.parametrize("cut", [1, 2, 3])
 async def test_header_split_reassembles(draft, cut):
     # Split inside the type+length header — the exact d18 crash shape.
@@ -120,7 +114,7 @@ async def test_header_split_reassembles(draft, cut):
     assert s._closed == []
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_body_split_reassembles(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
@@ -136,7 +130,7 @@ async def test_body_split_reassembles(draft):
     assert s._closed == []
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_whole_message_single_event(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
@@ -146,17 +140,14 @@ async def test_whole_message_single_event(draft):
     assert s._closed == []
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_a_body_past_its_length_closes_the_session(draft):
     # Length is the message extent. Declare 2 bytes fewer than the body
     # holds: parsing the body would run into the next message.
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    if draft == 14:
-        err = SubscribeError(request_id=7, error_code=4, reason="gone")
-    else:
-        err = RequestError(request_id=7, error_code=0x10, retry_interval=0,
-                           reason="gone")
+    err = RequestError(request_id=7, error_code=0x10, retry_interval=0,
+                       reason="gone")
     wire = bytearray(err.serialize(prof=s._profile).data)
     declared = int.from_bytes(wire[1:3], "big")
     wire[1:3] = (declared - 2).to_bytes(2, "big")
@@ -167,19 +158,16 @@ async def test_a_body_past_its_length_closes_the_session(draft):
     assert "past its Length" in s._closed[0][1]
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_a_body_short_of_its_length_closes_the_session(draft):
     # Declare one byte more than the body holds and supply it: the
     # decoder stops short of the Length. REQUEST_ERROR ends at its Reason
     # Phrase; a d18 REQUEST_OK would read the byte as Track Properties.
     s = _control_session(draft)
     parsed = _spy_parses(s)
-    if draft == 14:
-        wire = bytearray(_ok_wire(s))
-    else:
-        wire = bytearray(RequestError(
-            request_id=7, error_code=0x10, retry_interval=0,
-            reason="gone").serialize(prof=s._profile).data)
+    wire = bytearray(RequestError(
+        request_id=7, error_code=0x10, retry_interval=0,
+        reason="gone").serialize(prof=s._profile).data)
     declared = int.from_bytes(wire[1:3], "big")
     wire[1:3] = (declared + 1).to_bytes(2, "big")
     _feed_reply(s, bytes(wire) + b"\x00")
@@ -201,7 +189,7 @@ async def test_a_message_that_fails_to_parse_is_logged_in_hex(caplog):
     assert f"head_hex={bytes(wire).hex()}" in caplog.text
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_two_messages_one_event(draft):
     s = _control_session(draft)
     parsed = _spy_parses(s)
@@ -400,7 +388,7 @@ async def test_d18_goaway_once_per_stream():
     assert s._closed[0][0] == SessionCloseCode.PROTOCOL_VIOLATION
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_second_goaway_on_control_stream_closes(draft):
     from aiomoqt.types import SessionCloseCode
     s = _control_session(draft)
@@ -594,7 +582,7 @@ async def test_unknown_type_closes_the_session():
 # inside deserialize means the peer sent a malformed body — waiting for
 # more bytes would stall the control stream forever.
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_malformed_body_closes_not_stalls(draft):
     # Draft-portable malformation: declare a zero-length body — the frame
     # is complete per the header, but every draft's decoder must pull at
@@ -640,8 +628,9 @@ def test_truncated_extensions_tolerated_both_buffers(make_buf):
     # from a Buffer (BufferReadError) or a StreamChain (StreamUnderflow).
     from aiomoqt.messages.base import MOQTMessage
     from aiomoqt.utils.buffer import Buffer
-    # one whole KVP (id=1 odd, len=2, b"ab") + one truncated (id=3, len=5)
-    data = bytes([1, 2]) + b"ab" + bytes([3, 5]) + b"xy"
+    # one whole KVP (id=1 odd, len=2, b"ab") + one truncated (id=3 as a
+    # delta of 2, len=5)
+    data = bytes([1, 2]) + b"ab" + bytes([2, 5]) + b"xy"
     src = make_buf(data)
     buf = Buffer(data=src) if isinstance(src, bytes) else src
     prev = MOQTMessage._tolerate_trailing_extensions
@@ -654,7 +643,7 @@ def test_truncated_extensions_tolerated_both_buffers(make_buf):
     assert exts == {1: b"ab"}       # partial dict returned, no exception
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_message_and_a_half(draft):
     # One whole message plus a partial: parse the first, retain the rest.
     s = _control_session(draft)
@@ -758,7 +747,7 @@ async def test_replies_to_a_cancelled_request_are_dropped(draft, how):
     assert s._closed == []
 
 
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 @pytest.mark.parametrize("cancel", ["FetchCancel", "Unsubscribe"])
 async def test_replies_after_a_control_stream_cancel_are_dropped(draft,
                                                                  cancel):

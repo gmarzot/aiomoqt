@@ -47,26 +47,6 @@ def use_quic(request):
 
 
 @pytest.mark.asyncio
-async def test_setup_draft14(use_quic):
-    """Client + server complete the d14 handshake on both transports."""
-    port = _BASE_PORT + (1 if use_quic else 4)
-    server = await _start_server(
-        port, supported_drafts=14, use_quic=use_quic)
-    try:
-        client = MOQTClient(
-            "localhost", port, path="/",
-            use_quic=use_quic,
-            verify_tls=False, supported_drafts=14,
-        )
-        async with client.connect() as session:
-            await session.client_session_init()
-            assert session._moqt_session_setup.done()
-            assert session._moqt_session_setup.result() is True
-    finally:
-        server.close()
-
-
-@pytest.mark.asyncio
 async def test_setup_draft16(use_quic):
     """Client + server complete the d16 handshake on both transports."""
     port = _BASE_PORT + (2 if use_quic else 5)

@@ -344,7 +344,7 @@ class LocationFilter:
                     f"LOCATION_FILTER end group {fields[2]} exceeds 2^64-1")
         return cls(ftype, *fields)
 
-    # -- the d14-d18 field forms the message classes also expose --------
+    # -- the d16-d18 field forms the message classes also expose --------
 
     @classmethod
     def from_subscription_filter(cls, filter_type: int,
@@ -352,7 +352,7 @@ class LocationFilter:
                                  start_object: Optional[int] = None,
                                  end_group: Optional[int] = None,
                                  ) -> 'LocationFilter':
-        """The d14-d18 Filter Type 0x1-0x4 as a Location Filter."""
+        """The d16-d18 Filter Type 0x1-0x4 as a Location Filter."""
         if filter_type == 0x1:
             return cls.relative(0)
         if filter_type == 0x2:
@@ -366,7 +366,7 @@ class LocationFilter:
 
     def subscription_filter(self) -> Optional[Tuple[Optional[int], ...]]:
         """(filter_type, start_group, start_object, end_group) in the
-        d14-d18 form, None when no Filter Type says the same. The
+        d16-d18 form, None when no Filter Type says the same. The
         unfiltered form is (None, None, None, None)."""
         t = self.type
         if t == LocationFilterType.NONE:
@@ -386,7 +386,7 @@ class LocationFilter:
                          start_object: Optional[int],
                          end_group: Optional[int],
                          end_object: Optional[int]) -> 'LocationFilter':
-        """A d14-d18 FETCH range: End Location is the last Object plus
+        """A d16-d18 FETCH range: End Location is the last Object plus
         one, and Object 0 asks for the whole End Group. No End means up
         to Largest Object."""
         sg, so = start_group or 0, start_object or 0
@@ -399,7 +399,7 @@ class LocationFilter:
     def fetch_range(self) -> Optional[Tuple[int, int, Optional[int],
                                             Optional[int]]]:
         """(start_group, start_object, end_group, end_object) in the
-        d14-d18 FETCH form, None for the forms relative to Largest
+        d16-d18 FETCH form, None for the forms relative to Largest
         Object. No End is (.., None, None)."""
         t = self.type
         if t == LocationFilterType.NONE:

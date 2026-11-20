@@ -103,7 +103,7 @@ async def _run(port, pub_ns, sub_ns, draft=18):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [18, 16, 14])
+@pytest.mark.parametrize("draft", [18, 16])
 async def test_objects_traverse_the_relay(draft):
     got, err = await _run(_BASE_PORT + 10 + draft, "relay/ns", "relay/ns",
                           draft=draft)
@@ -241,7 +241,7 @@ async def test_publish_first_is_answered_then_raised():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16, 18])
+@pytest.mark.parametrize("draft", [16, 18])
 async def test_no_subscriber_to_offer_means_the_reply_is_answered(draft):
     """With nobody the track can be offered to, no reply is coming from
     anywhere, so the PUBLISH is answered with Forward State 0 rather
@@ -926,41 +926,23 @@ async def test_a_subscribe_tracks_offer_carries_largest_and_the_cache(
         assert rx._close_err is None
 
 
-@requires_certs
-@pytest.mark.asyncio
-@_TRANSPORTS
-async def test_d14_paused_publishes_are_raised_by_subscribe_update(use_quic):
-    # d14 §9.10: the update that raises a paused PUBLISH is SUBSCRIBE_UPDATE,
-    # which carries Start, End Group, Priority and Forward as fields.
-    async with _flowing(_flow_port(6, use_quic), use_quic,
-                        draft=14) as subscriber:
-        rx, objects = await subscriber()
-        for name in _SIZES:
-            await rx.subscribe(_FLOW_NS, name, forward=1, wait_response=True)
-        for _ in range(150):
-            if all(objects[n] for n in _SIZES):
-                break
-            await asyncio.sleep(0.02)
-        assert all(objects[n] for n in _SIZES), objects
-        assert not any(_relayed(n).paused for n in _SIZES)
-        assert rx._close_err is None
+
 
 
 # (publisher draft, subscriber draft): the upstream SUBSCRIBE takes the
 # publisher's draft.
-_FILTER_DRAFTS = [(18, 18), (22, 22), (14, 18)]
+_FILTER_DRAFTS = [(18, 18), (22, 22), (16, 18)]
 
 
 @requires_certs
 @pytest.mark.asyncio
 @_TRANSPORTS
 @pytest.mark.parametrize("pub_draft,sub_draft", _FILTER_DRAFTS,
-                         ids=["d18", "d22", "d14-pub"])
+                         ids=["d18", "d22", "d16-pub"])
 async def test_upstream_subscribe_keeps_each_subscribers_start(
         use_quic, pub_draft, sub_draft):
     # §10.2.9: a SUBSCRIBE with no filter is unfiltered. The shared upstream
-    # SUBSCRIBE must stay unfiltered (omitted from d16, AbsoluteStart {0, 0}
-    # at d14, which has no omission), and must not end where one
+    # SUBSCRIBE must stay unfiltered (omitted), and must not end where one
     # subscriber's range ends.
     i = _FILTER_DRAFTS.index((pub_draft, sub_draft))
     port = _BASE_PORT + 160 + 2 * i + (not use_quic)
@@ -1000,44 +982,13 @@ async def test_upstream_subscribe_keeps_each_subscribers_start(
         _reset_relay_state()
     got = {name: (m.filter_type, m.start_group, m.start_object)
            for name, m in upstream.items()}
-    unfiltered = ((FilterType.ABSOLUTE_START, 0, 0) if pub_draft == 14
-                  else (None, None, None))
-    assert got == {b"all": unfiltered,
+    assert got == {b"all": (None, None, None),
                    b"range": (FilterType.ABSOLUTE_START, 2, 1)}, got
     # Omitted, not a Location Filter of type None (0x00).
     assert upstream[b"all"].location_filter is None
 
 
-@requires_certs
-@pytest.mark.asyncio
-@_TRANSPORTS
-async def test_d14_request_update_repeats_each_subscriptions_location(
-        use_quic):
-    # d14 §9.10: Start never decreases, so an update that only pauses a
-    # subscription repeats the Start its filter resolved to and its range.
-    async with _flowing(_flow_port(8, use_quic), use_quic,
-                        draft=14) as subscriber:
-        rx, _objects = await subscriber()
-        latest = await rx.subscribe(_FLOW_NS, "video", forward=1, priority=7,
-                                    wait_response=True)
-        ranged = await rx.subscribe(_FLOW_NS, "audio", forward=1,
-                                    filter_type=FilterType.ABSOLUTE_RANGE,
-                                    start_group=1, start_object=2,
-                                    end_group=9, wait_response=True)
-        video = rx.request_update(latest.request_id, forward=0)
-        audio = rx.request_update(ranged.request_id, forward=0)
-        with pytest.raises(ValueError):
-            rx.request_update(latest.request_id + 100, forward=0)
-        await asyncio.sleep(0.2)
-        assert rx._close_err is None
-    assert latest.largest_group_id is not None
-    assert (video.subscription_request_id, video.start_group,
-            video.start_object, video.end_group, video.priority,
-            video.forward) == (latest.request_id, latest.largest_group_id,
-                               latest.largest_object_id + 1, 0, 7, 0)
-    assert (audio.subscription_request_id, audio.start_group,
-            audio.start_object, audio.end_group, audio.forward) == (
-                ranged.request_id, 1, 2, 10, 0)
+
 
 
 @requires_certs

@@ -76,7 +76,7 @@ def _session(draft=18):
     s._profile = profile_for(draft)
     s._errors, s._served = [], []
     s.fetch_error = lambda request_id, error_code, reason: s._errors.append(
-        request_error_code(error_code, s._profile, fetch=True))
+        request_error_code(error_code, s._profile))
     s.fetch_ok = lambda **kw: None
 
     async def _serve(request_id, objects, group_order=None, fin=True,

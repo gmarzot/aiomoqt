@@ -112,62 +112,56 @@ def _sub_msg():
 
 MATRIX = [
     # -- initiators --
-    ("subscribe", (14, 16, 18), "request",
+    ("subscribe", (16, 18), "request",
      lambda s: s.subscribe(namespace="a/b", track_name="t",
                            wait_response=False)),
-    ("fetch", (14, 16, 18), "request",
+    ("fetch", (16, 18), "request",
      lambda s: s.fetch(namespace="a", track_name="t", start_group=0,
                        start_object=0, end_group=1, end_object=0,
                        wait_response=False)),
-    ("publish", (14, 16, 18), "request",
+    ("publish", (16, 18), "request",
      lambda s: s.publish(namespace="a", track_name="t")),
-    ("publish_namespace", (14, 16, 18), "request",
+    ("publish_namespace", (16, 18), "request",
      lambda s: s.publish_namespace(namespace="a")),
-    ("subscribe_namespace", (14, 16, 18), "request",
+    ("subscribe_namespace", (16, 18), "request",
      lambda s: s.subscribe_namespace(namespace_prefix="a")),
     ("subscribe_tracks", (18,), "request",
      lambda s: s.subscribe_tracks(namespace="a")),
-    ("goaway", (14, 16, 18), "control",
+    ("goaway", (16, 18), "control",
      lambda s: s.goaway()),
     # -- withdrawals: messages where they exist, stream ends after --
-    ("unsubscribe", (14, 16), "control",
+    ("unsubscribe", (16,), "control",
      lambda s: s.unsubscribe(request_id=7)),
     ("unsubscribe@18", (18,), "reset",
      lambda s: s.unsubscribe(request_id=7)),
-    ("publish_namespace_done@14", (14,), "control",
-     lambda s: s.publish_namespace_done(namespace=(b"a",))),
-    ("publish_namespace_done@14-str", (14,), "control",
-     lambda s: s.publish_namespace_done(namespace="a/b")),
     ("publish_namespace_done", (16,), "control",
      lambda s: s.publish_namespace_done(request_id=7)),
     ("publish_namespace_done@18", (18,), "reset",
      lambda s: s.publish_namespace_done(request_id=7)),
-    ("unsubscribe_namespace@14", (14,), "control",
-     lambda s: s.unsubscribe_namespace(namespace_prefix="a")),
     ("unsubscribe_namespace", (16, 18), "reset",
      lambda s: s.unsubscribe_namespace(request_id=7)),
     # -- replies --
-    ("subscribe_ok", (14, 16, 18), "reply",
+    ("subscribe_ok", (16, 18), "reply",
      lambda s: s.subscribe_ok(request_msg=_sub_msg())),
-    ("subscribe_error", (14, 16, 18), "reply",
+    ("subscribe_error", (16, 18), "reply",
      lambda s: s.subscribe_error(request_id=7)),
-    ("subscribe_done", (14, 16, 18), "reply",
+    ("subscribe_done", (16, 18), "reply",
      lambda s: s.subscribe_done(request_id=7)),
-    ("fetch_ok", (14, 16, 18), "reply",
+    ("fetch_ok", (16, 18), "reply",
      lambda s: s.fetch_ok(request_id=7)),
-    ("fetch_error", (14, 16, 18), "reply",
+    ("fetch_error", (16, 18), "reply",
      lambda s: s.fetch_error(request_id=7)),
-    ("publish_namespace_ok", (14, 16, 18), "reply",
+    ("publish_namespace_ok", (16, 18), "reply",
      lambda s: s.publish_namespace_ok(
          PublishNamespace(request_id=7, namespace=(b"a",),
                           parameters={}))),
-    ("publish_namepace_ok", (14, 16, 18), "reply",
+    ("publish_namepace_ok", (16, 18), "reply",
      lambda s: s.publish_namepace_ok(
          PublishNamespace(request_id=7, namespace=(b"a",),
                           parameters={}))),
     # Namespace-family replies ride the request bidi from d16 on
     # (d16 already moved SUBSCRIBE_NAMESPACE to its own stream).
-    ("subscribe_namespace_ok", (14, 16, 18), "nsreply",
+    ("subscribe_namespace_ok", (16, 18), "nsreply",
      lambda s: s.subscribe_namespace_ok(
          SubscribeNamespace(request_id=7, namespace_prefix=(b"a",),
                             parameters={}), stream_id=9)),
@@ -178,13 +172,13 @@ MATRIX = [
     ("namespace", (16, 18), "nsreply",
      lambda s: s.namespace(namespace_suffix=(b"a",), stream_id=9)),
     # -- formerly GAPS --
-    ("track_status", (14, 16, 18), "request",
+    ("track_status", (16, 18), "request",
      lambda s: s.track_status(namespace=(b"a",), track_name="t")),
     # d16: control stream with Existing Request ID; d18: the updated
     # request's own stream (bound 7 -> 9 in the stub).
     ("request_update", (16, 18), "reply",
      lambda s: s.request_update(existing_request_id=7, forward=1)),
-    ("publish_ok", (14, 16, 18), "reply",
+    ("publish_ok", (16, 18), "reply",
      lambda s: s.publish_ok(request_msg=Publish(
          request_id=7, track_namespace=(b"a",), track_name=b"t",
          track_alias=1))),
@@ -214,7 +208,7 @@ def test_verb_emits_a_legal_frame(name, drafts, expected, call):
             if expected == "reply":
                 want = "request" if draft >= 18 else "control"
             elif expected == "nsreply":
-                want = "request" if draft >= 16 else "control"
+                want = "request"
             else:
                 want = expected
             # Initiators pre-d18 legally ride the control stream.
@@ -240,7 +234,7 @@ def test_gap_is_still_open(verb):
         f"'{verb}' now exists — move it from GAPS into MATRIX")
 
 
-def test_d16_setup_send_log_names_the_draft_not_a_d14_code(caplog):
+def test_d16_setup_send_log_names_the_draft(caplog):
     from aiomoqt import protocol
     lg = protocol.control_log
     prev = lg.level
@@ -251,7 +245,7 @@ def test_d16_setup_send_log_names_the_draft_not_a_d14_code(caplog):
         s.send_control_message = s._log_send
         s._is_wt = False
         s.server_setup()
-        s.client_setup(versions=[0xff00000e])
+        s.client_setup()
     finally:
         lg.setLevel(prev)
         lg.removeHandler(caplog.handler)
@@ -259,5 +253,4 @@ def test_d16_setup_send_log_names_the_draft_not_a_d14_code(caplog):
             if r.getMessage().startswith("MOQT send:")]
     assert len(sent) == 2
     for line in sent:
-        assert "0xff00000e" not in line
         assert line.endswith("draft-16")

@@ -1,4 +1,4 @@
-"""Delivery timeouts (d18 §8; d14/d16 DELIVERY_TIMEOUT): an object older
+"""Delivery timeouts (d18 §8; d16 DELIVERY_TIMEOUT): an object older
 than the subscription's timeout is not sent. On a stream its subgroup is
 reset with DELIVERY_TIMEOUT (0x2) and not reopened; a datagram is
 dropped."""
@@ -148,7 +148,6 @@ _TIMEOUT_PROPS = (0x02, 0x06)
 
 
 @pytest.mark.parametrize("draft, timeouts, want", [
-    (14, (200, 50), None),
     (16, (200, 50), {0x02: 200}),
     (18, (200, 50), {0x02: 200, 0x06: 50}),
     (20, (200, 50), {0x02: 200, 0x06: 50}),
