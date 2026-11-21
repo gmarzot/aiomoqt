@@ -637,6 +637,13 @@ class SubgroupDelivery:
     def _prof(self):
         return self.session._profile
 
+    def set_stream_priority(self, band: int) -> None:
+        """Band for this delivery's streams from now on, the open one
+        included."""
+        self.stream_priority = band
+        if self._stream_id is not None:
+            self.session.set_stream_priority(self._stream_id, band)
+
     def _note_largest(self, group_id: int, object_id: int) -> None:
         """Largest Location is a max: group send order is not guaranteed
         monotonic (§2.3.1)."""

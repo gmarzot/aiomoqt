@@ -681,6 +681,42 @@ def test_order_starts_mid_group_and_drains_in_order():
     assert o.held == 0 and o.deadline is None
 
 
+def test_order_waits_for_a_repaired_group():
+    o = PacketOrder(hold_s=0.5)
+    o.push(0, 0, 'a', 0)
+    o.push(0, 1, 'b', 0)
+    o.wait([0])                             # its stream was reset
+    o.hold_until = 2.0
+    assert o.push(1, 0, 'c', 0.1) == [] and o.deadline == 2.0
+    assert o.timeout(1.0) == []
+    assert o.push(0, 2, 'r', 0.2) == [(0, 2, 'r')]
+    assert o.end_group(0, 0.3) == [(1, 0, 'c')]
+
+
+def test_order_stops_at_skipped_groups_under_repair():
+    o = PacketOrder(hold_s=0.5)
+    o.push(0, 0, 'a', 0)
+    o.wait(range(1, 3))
+    o.push(3, 0, 'd', 0.1)
+    assert o.end_group(0, 0.2) == []        # groups 1 and 2 are on the way
+    assert o.push(2, 0, 'c', 0.3) == []
+    assert o.push(1, 0, 'b', 0.4) == [(1, 0, 'b')]
+    assert o.end_group(1, 0.5) == [(2, 0, 'c')]
+    assert o.end_group(2, 0.6) == [(3, 0, 'd')]
+    o.wait([1])                             # behind the order: ignored
+    assert o.end_group(3, 0.7) == []
+
+
+def test_order_skips_a_repair_that_never_ends():
+    o = PacketOrder(hold_s=0.5)
+    o.push(0, 0, 'a', 0)
+    o.wait([0])
+    o.hold_until = 1.0
+    o.push(1, 0, 'c', 0.1)
+    assert o.timeout(0.9) == []
+    assert o.timeout(1.0) == [(1, 0, 'c')] and o.skipped == 1
+
+
 # -- two tracks on one session, through the relay -------------------------
 
 _PORT = 32000

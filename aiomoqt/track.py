@@ -26,6 +26,7 @@ Usage:
 """
 import asyncio
 import time
+from functools import partial
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -305,7 +306,8 @@ class _SubgroupSender:
         self.track_alias = track_alias
         self.subgroup_id = subgroup_id
         self.priority = priority
-        self.band = track._stream_band(session, priority)
+        track._hold_priority(sub)
+        self.band = track._stream_band(session, priority, sub)
         self.chain = track._chain(session, track_alias)
         self.group_id = 0
         self.header = None
@@ -522,7 +524,7 @@ class _Subscription:
                  '_window', 'open_streams', 'end_status', 'senders',
                  'fill_streams', 'fills', 'location_filter', 'group_order',
                  'object_timeout', 'subgroup_timeout', 'updated_request',
-                 'tasks')
+                 'priorities', 'tasks')
 
     def __init__(self, session):
         self.session = session
@@ -565,8 +567,16 @@ class _Subscription:
         self.subgroup_timeout = 0
         # Request whose Forward State a REQUEST_UPDATE has set.
         self.updated_request = None
+        # Request id -> its SUBSCRIBER_PRIORITY (§5.1.1).
+        self.priorities: Dict[int, int] = {}
         # generate() producer tasks serving this subscription.
         self.tasks: set = set()
+
+    @property
+    def priority(self) -> int:
+        """Subscriber priority the peer's objects go under: its most
+        urgent request's, 128 with none (§9.20.7)."""
+        return min(self.priorities.values()) if self.priorities else 128
 
     @property
     def forward(self):
@@ -842,6 +852,9 @@ class PublishedTrack(Track):
         track's own state has to live somewhere."""
         if self._out is not None:
             self._out.drop_session(session)
+        for s in self._subs:
+            if s.session is session:
+                self._hold_priority(s, release=True)
         if len(self._subs) > 1:
             self._subs = [s for s in self._subs if s.session is not session]
 
@@ -883,13 +896,52 @@ class PublishedTrack(Track):
             return "fifo"
         return sched
 
-    def _stream_band(self, session, priority: Optional[int] = None) -> int:
-        """Transport band for this track's data streams on `session`."""
+    def _stream_band(self, session, priority: Optional[int] = None,
+                     sub=None, subscriber_priority: Optional[int] = None) -> int:
+        """Transport band for this track's data streams on `session`, under
+        the peer's subscriber priority (§5.1.2) or `subscriber_priority`."""
         if self.stream_priority is not None:
             return self.stream_priority
-        return to_stream_priority(
-            self.priority if priority is None else priority,
-            discipline=self._scheduling(session))
+        pub = self.priority if priority is None else priority
+        table = getattr(session, 'band_table', None)
+        if table is None:
+            return to_stream_priority(pub,
+                                      discipline=self._scheduling(session))
+        if subscriber_priority is None:
+            subscriber_priority = (self._sub_for(session) if sub is None
+                                   else sub).priority
+        return table(subscriber_priority, self._scheduling(session))[pub]
+
+    def _set_priority(self, sub, request_id: int,
+                      priority: Optional[int]) -> None:
+        """Record a request's SUBSCRIBER_PRIORITY; omitted keeps what the
+        request had, 128 at first (§9.20.7)."""
+        if priority is None:
+            priority = sub.priorities.get(request_id, 128)
+        sub.priorities[request_id] = priority
+        self._hold_priority(sub)
+
+    def _hold_priority(self, sub, release: bool = False) -> None:
+        """Tell the peer's session the subscriber priority it sends
+        under, or that it sends nothing (`release`)."""
+        hold = getattr(sub.session, 'hold_subscriber_priority', None)
+        if hold is not None:
+            hold(sub, None if release else sub.priority,
+                 partial(self._reband, sub))
+
+    def _reband(self, sub) -> None:
+        """Move the peer's streams to the bands its subscriber priority
+        maps to now; a stream already open moves too (§5.1.1)."""
+        if self.stream_priority is not None:
+            return
+        session = sub.session
+        d = sub.delivery
+        if d is not None:
+            d.set_stream_priority(self._stream_band(session, d.priority, sub))
+        for sender in sub.senders:
+            sender.band = self._stream_band(session, sender.priority, sub)
+            if sender.stream_id is not None:
+                session.set_stream_priority(sender.stream_id, sender.band)
 
     def _chain(self, session, track_alias: int) -> Optional[int]:
         """Transport stream chain of this track's streams to `session`
@@ -912,11 +964,12 @@ class PublishedTrack(Track):
                 self._out.head_trace = HeadTrace(self.trackname)
         if sub.delivery is not None:
             self._out.drop(sub.delivery)
+        self._hold_priority(sub)
         sub.delivery = SubgroupDelivery(sub.session, sub.track_alias,
                                         priority=self.priority,
                                         mapping=self.mapping,
                                         stream_priority=self._stream_band(
-                                            sub.session),
+                                            sub.session, sub=sub),
                                         chain=self._chain(sub.session,
                                                           sub.track_alias))
         sub._filter()
@@ -1429,6 +1482,7 @@ class PublishedTrack(Track):
             return
         self._take_timeouts(sub, getattr(msg, 'parameters', None),
                             session._profile)
+        self._set_priority(sub, msg.request_id, getattr(msg, 'priority', None))
         # An omitted FORWARD means 1 everywhere but REQUEST_UPDATE.
         self._set_forward(sub, 1 if msg.forward is None else msg.forward)
         if sub.forward:
@@ -1460,8 +1514,10 @@ class PublishedTrack(Track):
         if sub.updated_request == request_id:
             forward = None
         logger.info(f"Track: PUBLISH_OK (REQUEST_OK): forward={forward}")
-        self._take_timeouts(sub, getattr(reply, 'parameters', None),
-                            sub.session._profile)
+        params = getattr(reply, 'parameters', None)
+        self._take_timeouts(sub, params, sub.session._profile)
+        self._set_priority(sub, request_id, (params or {}).get(
+            ParamType.SUBSCRIBER_PRIORITY))
         self._set_forward(sub, forward)
         if sub.forward:
             await self._start_generating(sub.session, "PUBLISH_OK",
@@ -1484,6 +1540,9 @@ class PublishedTrack(Track):
         sub = self._sub_of(session, msg.existing_request_id)
         logger.info(f"Track: REQUEST_UPDATE: {msg}")
         self._take_timeouts(sub, msg.parameters, session._profile)
+        priority = (msg.parameters or {}).get(ParamType.SUBSCRIBER_PRIORITY)
+        if priority is not None:
+            self._set_priority(sub, msg.existing_request_id, priority)
         forward = (msg.parameters.get(ParamType.FORWARD)
                    if msg.parameters else None)
         raw_filter = (msg.parameters.get(ParamType.SUBSCRIPTION_FILTER)
@@ -1554,6 +1613,7 @@ class PublishedTrack(Track):
         sub.track_alias = ok.track_alias
         sub.subscribe_request_id = msg.request_id
         sub.subscribers.add(msg.request_id)
+        self._set_priority(sub, msg.request_id, getattr(msg, 'priority', None))
         # §3.3.2: the subscriber cancels by terminating the request
         # stream — stop generating when it does.
         session.register_request_cancel_handler(
@@ -1603,7 +1663,7 @@ class PublishedTrack(Track):
                 msg, self._history, largest,
                 subscription_filter=sub.location_filter,
                 group_order=sub.group_order,
-                stream_priority=self._stream_band(session))
+                stream_priority=self._stream_band(session, sub=sub))
         except asyncio.CancelledError:
             pass  # serve_fetch reset the stream
         except Exception:
@@ -1735,11 +1795,19 @@ class PublishedTrack(Track):
         task = asyncio.current_task()
         session.register_request_cancel_handler(rid, lambda _: task.cancel())
         session._bind_fetch(rid, self)
+        prio = getattr(msg, 'subscriber_priority', None)
+        prio = 128 if prio is None else prio
+        holder = ('fetch', id(self), rid)
+        hold = getattr(session, 'hold_subscriber_priority', None)
+        if hold is not None:
+            hold(holder, prio)
         try:
             await session.serve_fetch(rid, objects, group_order=int(order),
                                       stream_priority=self._stream_band(
-                                          session))
+                                          session, subscriber_priority=prio))
         finally:
+            if hold is not None:
+                hold(holder, None)
             session._request_cancel_handlers.pop(rid, None)
             session._unbind_request(rid)
         logger.info(f"Track: FETCH {rid} served {len(objects)} object(s) "
@@ -1751,6 +1819,8 @@ class PublishedTrack(Track):
         subscriber there goes, and restarts for the next one."""
         sub = self._subs[0] if sub is None else sub
         sub.subscribers.discard(request_id)
+        if sub.priorities.pop(request_id, None) is not None:
+            self._hold_priority(sub, release=not sub.priorities)
         # d22 §3.4.1: a cancelled subscription resets its fill streams.
         for task in list(sub.fills):
             task.cancel()
@@ -1832,6 +1902,8 @@ class PublishedTrack(Track):
             sub.session, sub.end_status,
             final=sub.end_status == SubscribeDoneCode.TRACK_ENDED, sub=sub)
         sub.subscribers.clear()
+        sub.priorities.clear()
+        self._hold_priority(sub, release=True)
 
     def _send_publish_done(self, session, status_code=0x2,
                            final: bool = True,
