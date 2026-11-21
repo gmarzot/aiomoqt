@@ -392,17 +392,27 @@ class _SubgroupSender:
                     initial += data if end is None else data + end
                 if session._close_err is not None:
                     raise asyncio.CancelledError
+                # Held open from here: PUBLISH_DONE waits for the open.
+                self.track._stream_opened(self.sub)
                 if self.chain is None:
-                    self.stream_id = await session.open_uni_stream(
+                    opening = session.open_uni_stream(
                         initial=initial, priority=self.band,
                         end_stream=end is not None)
                 else:
-                    self.stream_id = await session.open_uni_stream(
+                    opening = session.open_uni_stream(
                         initial=initial, priority=self.band,
                         end_stream=end is not None, chain=self.chain,
                         order=self.group_id)
+                opening = asyncio.ensure_future(opening)
+                try:
+                    self.stream_id = await asyncio.shield(opening)
+                except asyncio.CancelledError:
+                    opening.add_done_callback(self._opened_late)
+                    raise
+                except BaseException:
+                    self.track._stream_closed(self.sub)
+                    raise
                 self.sub.stream_count += 1
-                self.track._stream_opened(self.sub)
                 self.sub.senders.add(self)
                 for earlier in head:
                     await session.stream_write_drain(self.stream_id, earlier)
@@ -421,6 +431,16 @@ class _SubgroupSender:
             self.stop()
             return 0
         return len(data)
+
+    def _opened_late(self, opening) -> None:
+        """An open that outlived its producer: the stream, with the data
+        it carried, counts toward the subscription (§9.9) and is reset."""
+        if not opening.cancelled() and opening.exception() is None:
+            self.sub.stream_count += 1
+            if self.session._close_err is None:
+                self.session.stream_reset(opening.result(),
+                                          StreamResetCode.CANCELLED)
+        self.track._stream_closed(self.sub)
 
     def _head(self, object_id: int) -> list:
         """A stream opening past the first object the window admits in
