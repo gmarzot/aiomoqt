@@ -7,7 +7,7 @@ dashboard, and the G5 Broadcast and G5 Player test pages. The relay is open, wit
 |---|---|---|
 | `relay` | `aiomoqt-relay` | `moq_interop_relay` on UDP 4443, raw QUIC and WebTransport, drafts 22/20/18/16, `--watchdog 30`, pauses a track upstream once no viewer has watched it for 60 s (`--pause-after`), writes `status/` and `relay-logs/` |
 | `web` | `relay-web` | nginx on 80/443: landing page, `/g5-broadcast/`, `/g5-player/`, `/relay/` dashboard, `/relay/platform/` and `/relay/logs/`, `/status/{status,platform}.json`, `/private/`, `/stats/` |
-| `goaccess` | `relay-goaccess` | rebuilds the visitor reports in `stats/` every 5 minutes from `logs/`; no network |
+| `goaccess` | `relay-goaccess` | updates the visitor reports in `stats/` every 5 minutes from new lines in `logs/`; no network |
 | `peers` | `relay-peers` | `peers.py`: samples `status/status.json` every 5 s into `peers/peers.db` (IPs, roles, namespaces and tracks published or subscribed; 90 days of detail, daily totals kept) and writes `stats/peers.json` every minute for `/private/peers/`; no network |
 
 Host: `ssh ubuntu@aiomoqt-relay.marzresearch.net` (OCI, Ubuntu 24.04 aarch64,
@@ -39,7 +39,8 @@ status/                   status.json and platform.json, written by the relay, r
 relay-logs/               relay.log (10 MB, 4 rotations) and crash.log, written by the relay,
                           read-only to nginx
 cores/                    relay core files
-logs/                     nginx access log, read by GoAccess
+logs/                     nginx access log, rotated daily with 14 kept, read by GoAccess
+goaccess-db/              GoAccess databases (14 days) and each report's read position
 relay-swap.sh, relay-rollback.sh
                           make an image the relay, and undo that (deploy/aiomoqt-relay here)
 rollback/                 per swap: the image it replaced (also tagged aiomoqt:rollback),
@@ -58,14 +59,16 @@ place and `/stats/` fails.
 ```sh
 tar -C deploy/aiomoqt-relay -cf - compose.yml nginx.conf relay.toml relay-swap.sh relay-rollback.sh site | ssh ubuntu@aiomoqt-relay.marzresearch.net 'mkdir -p ~/aiomoqt-relay && tar -C ~/aiomoqt-relay -xf -'
 ssh -t ubuntu@aiomoqt-relay.marzresearch.net
-cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats peers
+cd ~/aiomoqt-relay && mkdir -p status relay-logs cores logs stats peers goaccess-db
 # The relay, GoAccess and the peer log run with no capabilities, so root must own what they write.
-sudo chown root:ubuntu status relay-logs cores stats peers && sudo chmod 2775 status relay-logs cores stats peers
+sudo chown root:ubuntu status relay-logs cores stats peers goaccess-db && sudo chmod 2775 status relay-logs cores stats peers goaccess-db
 printf 'moqadmin:%s\n' "$(openssl passwd -6)" > stats.htpasswd    # prompts for the password
+sudo apt-get install -y logrotate    # minimal images lack it
 sudo tee /etc/logrotate.d/aiomoqt-relay >/dev/null <<'ROT'
 /home/ubuntu/aiomoqt-relay/logs/access.log {
+    su root ubuntu
     daily
-    rotate 30
+    rotate 14
     compress
     delaycompress
     missingok
@@ -88,8 +91,8 @@ sudo netfilter-persistent save
 
 ## Host tuning
 
-The relay's picoquic worker thread is the bottleneck under fan-out, mostly per-packet kernel work, so
-the host keeps other per-packet work off its cores:
+The relay's picoquic worker threads are the bottleneck under fan-out, mostly per-packet kernel work,
+so the host keeps other work from competing with them:
 
 - **No connection tracking for the relay's port**, in the iptables `raw` table. The `INPUT` rule for
   UDP 4443 still admits the untracked packets. `/etc/iptables/rules.v4` holds curated Docker chains,
@@ -102,15 +105,19 @@ the host keeps other per-packet work off its cores:
   sudo sh -c 'iptables-restore --test < /etc/iptables/rules.v4'    # after editing the file
   ```
 
-- **NIC interrupts on CPU 0, the relay on CPUs 1-2.** `host/relay-irq-affinity.sh` pins the NIC's
-  queue interrupts to CPU 0, and `host/relay-irq-affinity.service` runs it at boot (irqbalance is
-  off). The relay service has `cpuset: "1,2"`. GoAccess runs on CPU 0 at a low CPU share, so its
-  report runs don't take the relay's CPUs.
+- **The relay outranks everything else for CPU.** It runs three workers on all three CPUs
+  (`cpuset: "0,1,2"`) at the top CPU weight (`cpu_shares: 262144`, cgroup `cpu.weight` 10000).
+  GoAccess and the peer log stay on CPU 0 at low weights, and SSH sessions (samplers, analysis,
+  apt) run in `user.slice` at weight 10, so admin work gets only what the relay leaves.
+  `host/relay-irq-affinity.sh` pins the NIC's queue interrupts to CPU 0, and
+  `host/relay-irq-affinity.service` runs it at boot (irqbalance is off).
 
   ```sh
   sudo install -m 755 host/relay-irq-affinity.sh /usr/local/sbin/
   sudo install -m 644 host/relay-irq-affinity.service /etc/systemd/system/
   sudo systemctl daemon-reload && sudo systemctl enable --now relay-irq-affinity.service
+  sudo systemctl set-property user.slice CPUWeight=10
+  docker update --cpu-shares 262144 aiomoqt-relay    # applies the weight without a restart
   ```
 
 ## Relay image
@@ -166,7 +173,7 @@ tar -C examples/dist -cf - assets g5-broadcast g5-player | ssh ubuntu@aiomoqt-re
 ## Relay settings
 
 `relay.toml` holds the relay's flags, mounted read-only and read with `--config`. Its keys are the
-long flag names (`cache-bytes = 268435456`, `catalog-probe = true`, lists for repeatable flags);
+long flag names (`cache-bytes = 2147483648`, `catalog-probe = true`, lists for repeatable flags);
 an unknown key or a wrong type stops the relay with an error naming it. Flags added to the
 compose `command:` override the file. Port, certificate and transports stay in the `MOQT_*`
 environment. After copying an edited file over, run `docker compose restart relay`.
