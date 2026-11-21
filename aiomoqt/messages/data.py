@@ -14,6 +14,10 @@ from ..utils.buffer import Buffer, BufferReadError
 from ..utils.logger import get_logger
 from aiopquic._binding._streamchain import (
     encode_object_subgroup, encode_object_subgroup_vi64)
+try:
+    from aiopquic.exceptions import LengthFieldError
+except ImportError:  # older aiopquic: overflows stay raw OverflowErrors
+    LengthFieldError = ()
 
 logger = get_logger(__name__)
 
@@ -456,6 +460,13 @@ class ObjectHeader(MOQTMessage):
             try:
                 delta, exts, status, payload = fused(
                     extensions_present, MOQTMessage.EXTENSIONS_LEN_LIMIT, True)
+            except LengthFieldError as e:
+                # A KVP length past its bound is a malformed KVP; a
+                # payload length no stream can carry closes the session.
+                err = (MOQTProtocolViolation if e.field == "payload_len"
+                       else MOQTMalformedKVP)
+                raise err(f"object {e.field} {e.value} exceeds limit "
+                          f"{e.limit} at offset {e.offset}") from e
             except OverflowError as e:
                 # The fused codec is MoQT-agnostic and cannot raise our
                 # types: a value overrunning its KVP block is a KVP that
