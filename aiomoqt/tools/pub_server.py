@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import signal
 import sys
+from typing import Any
 
 from aiomoqt.server import MOQTServer
 from aiomoqt.types import (D18MessageType, MOQT_DEFAULT_DRAFTS, MOQTMessageType,
@@ -157,7 +158,7 @@ async def _on_subscribe_namespace(session, msg, args):
     """Discovery responder: a subscriber sent SUBSCRIBE_NAMESPACE to
     learn what we publish (it omitted --trackname).
 
-    d14/d16 fuse discovery into this one request, so ack and announce.
+    d16 fuses discovery into this one request, so ack and announce.
     d18 reports only namespaces here; the tracks follow on
     SUBSCRIBE_TRACKS.
     """
@@ -213,7 +214,7 @@ async def main():
               file=sys.stderr)
         sys.exit(2)
 
-    # Public API takes the draft NUMBER (14, 16, ...); MOQTServer
+    # Public API takes the draft NUMBER (16, 18, ...); MOQTServer
     # normalizes to the wire-form internally. The MoQT session layer
     # needs the draft for either transport (raw QUIC or WT) to pick
     # the right message-encoding rules; only the QUIC ALPN derivation
@@ -226,7 +227,7 @@ async def main():
         _tx_max = None  # explicit opt-out
     else:
         _tx_max = args.max_inflight_bytes
-    _server_kwargs = dict(
+    _server_kwargs: dict[str, Any] = dict(
         host=args.host, port=args.port,
         certificate=args.cert, private_key=args.key,
         path="/",
@@ -294,13 +295,13 @@ async def main():
 def cli():
     """Console entry point (moq-pub-server)."""
     try:
-        asyncio.run(main())
+        _cli.run(main())
     except KeyboardInterrupt:
         print("\n  Interrupted.")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        _cli.run(main())
     except KeyboardInterrupt:
         print("\nInterrupted.")

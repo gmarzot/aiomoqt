@@ -52,7 +52,7 @@ def parse_args():
         help='Object payload size bytes (default: 4096)')
     parser.add_argument(
         '-g', '--group-size', type=int, default=4096,
-        help='Objects per group (default: 10000)')
+        help='Objects per group (default: 4096)')
     parser.add_argument(
         '-P', '--streams', type=int, default=1,
         help='Parallel subgroup streams (default: 1)')
@@ -62,8 +62,8 @@ def parse_args():
              'default: max). Per-stream emit rate is rate/streams. '
              '-P only changes parallelism, not offered load.')
     parser.add_argument(
-        '-t', '--duration', type=int, default=20,
-        help='Duration seconds (default: 20)')
+        '-t', '--duration', type=int, default=0,
+        help='Run time in seconds; 0 (default): no limit')
     parser.add_argument(
         '-i', '--interval', type=float, default=5.0,
         help='Report interval seconds (default: 5)')
@@ -114,14 +114,11 @@ def parse_args():
              'per subscriber, as LOC media tracks build them, instead of '
              'the generator\'s one dict per object.')
     parser.add_argument(
-        '--draft', type=parse_draft_spec, default=14,
-        help='MoQT draft version to negotiate (e.g. 14, 16, or 18, '
-             'default: 14). Applied to BOTH the loopback publisher '
-             '(server) and subscriber (client) so the raw-QUIC ALPN '
-             '("moq-00" for d14, "moqt-NN" for d16+) and the WT version '
-             'match. Auto-negotiation is intentionally not used here: a '
-             'd14 server offers only "moq-00" while a d16+ client offers '
-             '"moqt-NN", so the asymmetric ALPN offer fails to connect.')
+        '--draft', type=parse_draft_spec, default=None,
+        help='MoQT draft version to negotiate (e.g. 16 or 18; default: '
+             'the default offer, which negotiates the newest draft). '
+             'Applied to BOTH the loopback publisher (server) and '
+             'subscriber (client).')
     parser.add_argument(
         '--cc-algo', type=str, default='bbr',
         help='Congestion control (bbr | bbr1 | c4 | cubic | dcubic | '
@@ -130,6 +127,10 @@ def parse_args():
         '--cc-options', type=str, default=None, metavar='OPTS',
         help='Option string for the congestion controller, e.g. Q0.02: '
              'bbr sends bursts of 20 ms of pacing rate')
+    parser.add_argument(
+        '--pacing-trains', action='store_true',
+        help='When pacing holds a connection back, send up to 10 packets '
+             'at once instead of one or two')
     parser.add_argument(
         '--fc-window', type=int, default=None, metavar='BYTES',
         help='QUIC flow-control window, per stream and per connection; the '
@@ -264,14 +265,15 @@ def print_banner(args):
     print("─" * 56)
     print("  aiomoqt-bench loopback (no relay)")
     print("─" * 56)
-    row("draft", args.draft)
+    row("draft", "default offer" if args.draft is None else args.draft)
     row("url", url)
     row("transport", transport_label)
     row("delivery", ("DATAGRAM" if args.datagram else "subgroup streams")
         + (", fanout lane" if args.fanout else "")
         + (", per-peer props" if args.per_peer_props else ""))
     row("cc algorithm", args.cc_algo
-        + (f" {args.cc_options}" if args.cc_options else ""))
+        + (f" {args.cc_options}" if args.cc_options else "")
+        + (" trains" if args.pacing_trains else ""))
     if args.fc_window:
         row("fc window", f"{args.fc_window} B")
     if _emulated(args):
@@ -287,7 +289,7 @@ def print_banner(args):
         row("payload", f"checked (every {args.verify_payload})")
     row("object size", f"{args.object_size} B")
     row("object rate", rate_s)
-    row("duration", f"{args.duration}s")
+    row("duration", _cli.duration_label(args.duration))
     row("cpu", cpu_summary())
     print("─" * 56)
 
@@ -320,7 +322,7 @@ class _FanoutTrack(PublishedTrack):
         if self.timestamps == 'loc':
             return loc
         full = self._timestamp_writer().stamp(group_id, object_id)
-        return lambda s: full if s._profile.track_properties else loc
+        return lambda s: full
 
     async def produce(self, out) -> None:
         pad = self._payload_tail()
@@ -400,7 +402,7 @@ async def _on_subscribe(session, msg, args, tracks):
     # both sides print to the same terminal, causing interleaved output
     track._stats_header_printed = True  # skip header
     track._quiet = True  # checked in _generate_subgroup
-    # d14 direct connection: respond with subscribe_ok and generate
+    # Direct connection: respond with subscribe_ok and generate
     ok = session.subscribe_ok(
         request_msg=msg, track_properties=track._track_properties(session))
     track.track_alias = ok.track_alias
@@ -420,8 +422,9 @@ async def run_server(args, tracks):
         supported_drafts=args.draft,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
-        # None = honor protocol default (16 MB); 0 = opt out.
+        # Unset keeps the 1 MiB default; 0 removes the budget.
         **({'tx_max_inflight_bytes':
             (None if args.max_inflight_bytes == 0
              else args.max_inflight_bytes)}
@@ -448,6 +451,7 @@ async def run_subscriber(args, stats, tracks):
         debug=args.debug,
         congestion_control_algorithm=args.cc_algo,
         congestion_control_options=args.cc_options,
+        packet_train_mode=args.pacing_trains,
         flow_control_window=args.fc_window,
     )
 
@@ -463,11 +467,11 @@ async def run_subscriber(args, stats, tracks):
                 timestamp_errors=args.timestamp_errors,
             )
             stats.stats.timing = track.timing
+            # Objects can arrive before subscribe() returns.
+            print("  Subscriber connected, receiving...\n")
             # Loopback server does not send PUBLISH; use direct SUBSCRIBE.
             # Loopback passes explicit trackname → auto-routes to direct.
             await track.subscribe()
-
-            print("  Subscriber connected, receiving...\n")
             stats.start()
 
             if not await wait_cond_timeout(
@@ -484,8 +488,9 @@ async def run_subscriber(args, stats, tracks):
         print(f"  Subscriber error: {e}")
 
 
-async def main():
-    args = parse_args()
+async def main(args=None):
+    if args is None:
+        args = parse_args()
     if _emulated(args) and not os.environ.get(NETNS_ENV):
         return _reexec_in_netns(args)
     _cli.apply_logging(args)
@@ -582,7 +587,11 @@ async def main():
 def cli():
     """Console entry point (moq-loopback-bench)."""
     try:
-        sys.exit(asyncio.run(main()))
+        args = parse_args()
+        if _emulated(args) and not os.environ.get(NETNS_ENV):
+            # Before any event loop, so the child's exit code is ours.
+            sys.exit(_reexec_in_netns(args))
+        sys.exit(_cli.run(main(args)))
     except KeyboardInterrupt:
         print("\n  Interrupted.")
         sys.exit(130)

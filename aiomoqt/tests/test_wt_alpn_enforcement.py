@@ -1,6 +1,5 @@
 """A WebTransport client settles its draft from the server's WT-Protocol when
-it is one we offered; with no WT-Protocol, a d14 offer settles d14 in-band.
-Anything else closes the WT session with WT_ALPN_ERROR
+it is one we offered. Anything else closes the WT session with WT_ALPN_ERROR
 (draft-ietf-webtrans-http3-16 §3.3) and raises MOQTNegotiationError.
 """
 
@@ -63,10 +62,10 @@ async def test_missing_wt_protocol_closes_a_d18_offer():
     await _assert_alpn_error(_BASE_PORT, [18], r"None not in offer \['moqt-18'\]")
 
 
-async def test_unoffered_wt_protocol_closes_even_with_d14_offered(monkeypatch):
+async def test_unoffered_wt_protocol_closes(monkeypatch):
     monkeypatch.setattr(MOQTSessionWTClient, "negotiated_protocol",
                         property(lambda self: "moqt-20"))
-    await _assert_alpn_error(_BASE_PORT + 1, [18, 14], "'moqt-20' not in offer")
+    await _assert_alpn_error(_BASE_PORT + 1, [18], "'moqt-20' not in offer")
 
 
 async def _settles(port, client_drafts, server_drafts, expected):
@@ -83,13 +82,5 @@ async def _settles(port, client_drafts, server_drafts, expected):
         handle.close()
 
 
-async def test_mixed_offer_without_wt_protocol_settles_d14():
-    assert await _settles(_BASE_PORT + 2, [18, 16, 14], [14], 14) is None
-
-
-async def test_d14_only_offer_settles_d14():
-    assert await _settles(_BASE_PORT + 3, [14], [14], 14) is None
-
-
 async def test_multi_draft_offer_settles_the_servers_choice():
-    assert await _settles(_BASE_PORT + 4, [18, 16, 14], [16, 14], 16) == "moqt-16"
+    assert await _settles(_BASE_PORT + 4, [18, 16], [16], 16) == "moqt-16"

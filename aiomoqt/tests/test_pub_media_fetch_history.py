@@ -109,5 +109,5 @@ async def test_media_tracks_refuse_fetch_without_history(
                     ns, name, wait_response=True, **_groups_0_1(18)), 10)
             assert err.value.response is not None, "timed out, no reply"
             assert canonical_request_error(
-                err.value.error_code, rx._profile, fetch=True) == \
+                err.value.error_code, rx._profile) == \
                 RequestErrorCode.NOT_SUPPORTED, name

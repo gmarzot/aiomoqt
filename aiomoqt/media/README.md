@@ -10,13 +10,14 @@ QUIC, `https://host:port/path` (or bare `host:port`) is WebTransport.
 ## Sources
 
 One source per run: `--mp4`, `--h264`, `--ts` and `--input` are exclusive. With none, the
-broadcast is audio only, a synthesized tone.
+broadcast is audio only, a synthesized tone. `--mp4` repeats for several video tracks; see
+[Several video tracks](#several-video-tracks).
 
 | Flag | Input | Video | Audio | Timing |
 |---|---|---|---|---|
 | `--mp4 FILE` | mp4 file | H.264, H.265, AV1 | the file's AAC or Opus; tone with `--tone` | sample tables, edit list honoured |
 | `--h264 FILE\|-` | live H.264 Annex B (ffmpeg, OBS) | H.264 | tone; none with `--no-audio` | stamped on arrival |
-| `--ts FILE\|-` | live MPEG-TS | H.264, H.265 | AAC (ADTS), Opus | PES timestamps |
+| `--ts FILE\|-\|udp://[@][HOST]:PORT` | live MPEG-TS | H.264, H.265, every stream | AAC (ADTS), Opus: the first stream | PES timestamps |
 | `--input URL` | anything FFmpeg opens: HLS, DASH, files | H.264, H.265, AV1 | AAC, Opus | paced to the source timestamps |
 | none | | | pcm-s16 tone at `--freq` Hz (440) | generated |
 
@@ -24,7 +25,7 @@ broadcast is audio only, a synthesized tone.
   is not sent and an empty edit delays its track; an unsupported edit list is ignored with a
   WARNING. `--loop` repeats the clip for the whole duration, every track on one period (the
   presented duration), so audio and video do not drift apart pass by pass.
-- **MPEG-TS.** One pipe carries both tracks with the encoder's own timing. The stream head (PMT,
+- **MPEG-TS.** One pipe carries every track with the encoder's own timing. The stream head (PMT,
   codec configs) is read before any relay session opens, so start the encoder first. Make the
   muxer flush per frame, or ffmpeg packs about 300 ms of audio into one PES:
   `-f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1`.
@@ -50,6 +51,19 @@ Short GOPs and no B-frames keep join latency low: `-g <2×fps> -sc_threshold 0 -
 - **locmaf** (draft-einarsson-moq-locmaf, `locmafVersion` 0.3): the same chunks with the moof
   sent as a compact header, a delta of the previous one in the group. Receivers rebuild the
   CMAF chunk byte for byte.
+- **mpeg2ts** (draft-gregoire-moq-msfts-02, MSFTS), `--ts ... --msfts`: the TS packets
+  themselves, unmodified, as one track named from the PAT (`program-<number>`, or `mux` for a
+  multi-program stream; `-T NAME` prefixes it), `--msfts-packets` (7) to an object, sent as they
+  arrive or 5 ms after an object's first packet. Groups start at the first program's random
+  access points, led by the PSI right before them; the PAT and PMT ride the catalog
+  `initDataList`. The catalog matches moq2ts `--unmodified`, with an MSF media timeline track,
+  `<name>.timeline`: a record per group at its first packet's arrival on the wall clock, 300 s
+  kept. `--timestamp-mapping` adds draft-frindell timing: TIMESCALE 90 kHz, TIMESTAMP_MAPPING
+  anchored at the track's start, and on every object an OBJECT_TIMESTAMP, its first packet's PCR
+  time on the ingest wall clock. A PSI change to a field the track declares (program number, or
+  one program against several) ends the track and publishes the next alone in a new catalog; it
+  starts at the next random access point, like a live start, its group IDs going on from the
+  last, and waits up to 2 s for its first subscriber.
 
 LOC options for receivers that need something different:
 
@@ -61,7 +75,6 @@ LOC options for receivers that need something different:
 | `--loc-codecstring` | Every object carries its codec string and, on video, frame marking: players without a catalog |
 | `--loc-timescale TICKS` | Timestamps as media time with TIMESCALE, instead of wall-clock µs |
 | `--loc01-compat` | Timestamps also under loc-01's property ID |
-| `--loc-bare` | No empty Private Properties block, for receivers predating loc-04 §2.2 |
 
 ## Groups, objects and streams
 
@@ -82,7 +95,29 @@ complete catalog.
   (default 1; 0 sends it once at start).
 - `--target-latency MS` sets `targetLatency`, from which players size their playout buffer.
 - `--catalog-bitrate BPS` and `--catalog-audio-bitrate BPS` set the advertised bitrates. Default:
-  the mp4's mean; `--ts` measures it and leaves it out until measured.
+  the mp4's mean; `--ts` measures it and leaves it out until measured. Repeat `--catalog-bitrate`
+  for each video track, in order.
+
+## Several video tracks
+
+`--mp4` given several times, or an MPEG-TS with several video streams, publishes one broadcast
+with video tracks `video`, `video_1`, `video_2`, … in order. The first mp4 gives the audio, the
+others add video only. With `--ts`, every H.264/H.265 stream in the PMT is a track, in PMT order;
+audio is the first audio stream.
+
+- `--video-alt one|each`: one catalog altGroup for all video tracks, an ABR ladder (default), or
+  one per track, for views. A single video track has no altGroup.
+- `--video-label TEXT` and `--catalog-bitrate BPS`, repeated, set each video track's catalog
+  `label` and `bitrate` in track order; fewer values than tracks is fine.
+- **Alignment.** Under `--timestamp-mapping`, tracks on the same frame duration and GOP length
+  in seconds (timescales may differ) carry the same group and object IDs for one capture time.
+  pub_media refuses video tracks that differ. Encode renditions from one source on a fixed
+  GOP: `-g 60 -keyint_min 60 -sc_threshold 0 -bf 0`. `--ts-cadence` applies to every stream.
+- **Loops.** With `--loop` every track loops on the shortest clip's duration; longer clips are
+  trimmed to it with a WARNING.
+- The run's start and `--start-at` follow the first video track. With cmaf or locmaf each track
+  has its own CMAF header (`v0`, `v1`, …).
+- `--video-alt` and `--video-label` take `--mp4` or `--ts` only.
 
 ## Timing
 
@@ -171,23 +206,83 @@ python -m aiomoqt.tools.pub_media $RELAY -N abr --input https://cdn.example/live
 # One broadcast on two relays, redialing either if it drops
 python -m aiomoqt.tools.pub_media moqt://relay-a:4433 moqt://relay-b:4433 -N demo/live --mp4 clip.mp4 --loop --reconnect -t 0
 
+# An ABR ladder: renditions of one source, one altGroup, the same group and object IDs
+python -m aiomoqt.tools.pub_media $RELAY -N demo/abr --mp4 720.mp4 --mp4 480.mp4 --mp4 240.mp4 --video-label 720p --video-label 480p --video-label 240p --loop --timestamp-mapping -t 0
+
+# Two camera views on one MPEG-TS pipe, an altGroup each
+ffmpeg -i 'srt://0.0.0.0:9000?mode=listener' -map 0:v:0 -map 0:v:1 -map 0:a:0 -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 -flush_packets 1 - | python -m aiomoqt.tools.pub_media $RELAY -N live/views --ts - --ts-cadence fps=30,gop=60 --video-alt each --video-label wide --video-label close -t 0
+
 # For a player without a catalog
 python -m aiomoqt.tools.pub_media $RELAY -N demo/bare --mp4 clip.mp4 --loop --no-catalog --loc-codecstring
 ```
+
+## ABR ladder
+
+`abr_ingest` sits in front of a relay. The source publisher dials it, and it publishes the source
+unchanged plus an H.264 or AV1 ladder of its video, under the same namespace with one catalog. It needs
+[cymedia](https://github.com/gmarzot/cymedia), an optional extra that builds against the system's
+FFmpeg development files: `uv pip install 'aiomoqt[abr]'`.
+
+```bash
+python -m aiomoqt.tools.abr_ingest -Q -p 4443 -N live/x $RELAY
+python -m aiomoqt.tools.pub_media moqt://localhost:4443 -k --pub-ns -N live/x --mp4 clip.mp4 --loop -t 0
+```
+
+- **Source.** LOC, announced with PUBLISH_NAMESPACE (`pub_media --pub-ns`). `--source URL`
+  subscribes it from a relay instead, waiting up to the setup timeout (`-t`, else 30 s) for it to
+  be published; publishing back to that relay needs another namespace, `--out-ns`. The video track (`-T`, default the catalog's first) must be H.264. Every LOC track
+  passes through unchanged.
+- **Rungs.** `--rung WxH:BPS`, repeated. By default, those of 1440p, 1080p, 720p, 540p, 360p and
+  180p (13.5, 6.75, 3.75, 2.25, 0.9 and 0.3 Mbps) below the source height. Rung tracks are named
+  `video_<height>p` and join the source video's catalog altGroup.
+- **IDs.** Each rung keeps the source's group and object IDs and timestamps, with a key frame at
+  each group start. A rung that falls behind ends that group early and resumes at the next group
+  start, so a group never has a hole in it. Equally numbered groups line up across the source
+  video and its rungs, so a player, or a stitcher building one track from several rungs, can
+  switch at any group start; each rung has its own init data in the catalog. With
+  `--packaging cmaf`, tfdt follows the source timestamps on every track (audio to within half a
+  frame), and a frame at or behind its track's last tfdt is dropped.
+- **Profiles.** `--profile nvenc` (NVDEC, `scale_cuda`, NVENC; default), `videotoolbox` (macOS,
+  H.264 only) or `cpu` (software).
+- **Codec.** `--codec h264` (default) or `av1`: `av1_nvenc` on `nvenc`, libaom in realtime mode
+  on `cpu`. AV1 rungs carry an av1C in the catalog and a sequence header on each key frame.
+  The source passes through as H.264.
+- **Track Properties** pass through, timing ones to the rungs as well.
+- **Packaging.** `--packaging cmaf` publishes every output track as CMSF: one CMAF chunk per object, led by a `prft` with the capture time, the CMAF header in the catalog `initDataList`. Tracks whose codec no header covers (H.264, H.265, AV1, AAC and Opus do) are left out.
+- **Several outputs.** `--output NS[,packaging=loc|cmaf][,codec=h264|av1][,rung=WxH:BPS]...`,
+  repeated, publishes each namespace with its own catalog from one source subscription and one
+  decode: for instance an H.264 CMAF ladder for one player and an AV1 LOC one for another. Fields
+  left out take `--packaging`, `--codec` and `--rung`; rungs of one size, rate and codec share an
+  encoder. A source group dropped at the decoder is missing from every output.
+- **Report.** Every `-i` seconds, per output track: frames, frames skipped while no subscriber
+  took the track (`idle`), drops, and the delay from a source frame's arrival to its hand-off to
+  the output track; rungs also show the encoder's share. `--no-ladder` passes the source
+  through, to measure the hand-off alone.
+- **Limits.** Publishing starts once the first source group is encoded, so the catalog is
+  complete from its first object. LOC H.264 sources only. Source catalog updates and
+  reconnects are not carried.
 
 ## Receiving
 
 `sub_media` reads the catalog, subscribes every media track it describes, and writes playable
 files to `--out` (default `./media-out`):
-- `video.h264` (Annex B);
+- `video.h264` (Annex B), or `<name>.h264` per track when there are several;
 - `audio.wav` (pcm-s16);
-- `<role>.mp4` for CMAF and LOCMAF tracks.
+- `<role>.mp4` for CMAF and LOCMAF tracks;
+- `<name>.ts` for an mpeg2ts track, its packets in Group and Object order; with `--ts-out`, a
+  catalog that replaces the track is followed into the next one.
 
 Its other options:
 
 | Flag | Effect |
 |---|---|
 | `--pipe video\|audio` | Streams one track to stdout for a player |
+| `--ts-out udp://HOST:PORT\|FILE\|-` | Writes the mpeg2ts track's packets as its objects arrive, seven to a UDP datagram; LOC tracks are refused |
+| `--ts-playout MS` | With `--ts-out`: each packet at first PCR arrival + MS + (PCR − first PCR) / 27 MHz; a late one is dropped, or with `--ts-late emit` sent at once; a gap of `--break-ms` (200) is an output break |
+| `--repair MS` | FETCHes the mpeg2ts Objects the subscription will not deliver (the rest of a group whose stream was reset, groups skipped over) from the publisher, ahead of live, and holds the in-order output up to MS for them; the publisher needs `--fetch-history` |
+| `--analyze` on an mpeg2ts track | JSON lines per `-i` interval, each followed by the summary so far, and the run's summary: TS packets, CC errors per PID, PCR interval and jitter, delay variation and the cushion for no late packet, late packets and breaks at the `--ts-playout` buffer and at 100–1000 ms, object loss, track switches, and delay from the publisher's wall clock (draft-frindell timing when the track declares it, else the media timeline track; the clocks must agree) |
+| `--arrival-log FILE` | A JSON line per PCR: `pcr`, `arrival_ns`, `release_ns` |
+| `--frame-log FILE` | A JSON line per LOC frame: track, group, object, key, size, `sha1` of the payload, `arrival_ns` |
 | `--inspect N` | Prints wire detail for each track's first N frames |
 | `--show-catalog` | Prints the catalog and every update |
 | `--analyze` | Measures delivery instead of writing files: latency, jitter, loss and reorder, group integrity, a playout model; `--report` writes them as CSV |
@@ -211,13 +306,15 @@ python -m aiomoqt.tools.sub_media $RELAY -N demo/live --analyze -t 60 -i 5 --rep
 | `media/mpegts.py` | MPEG-TS demux to access units and audio frames, keeping the PES timestamps |
 | `media/dash.py` | MPD parsing and segment addressing |
 | `media/ingest.py` | PyAV ingest: any FFmpeg input to per-track CMAF chunks |
+| `media/abr.py` | `AbrLadder`: an H.264 LOC track to H.264 or AV1 rungs through cymedia, on the source's IDs; `ladder_catalog()` |
 | `fanout.py` | `FanoutPublisher`: one broadcast on several relays |
 
 The top-level [README](../../README.md#api) has a short publisher and subscriber example.
 
 ## Known limits
 
-- One video track per run, except `--input --rendition all`.
+- Several video tracks come from repeated `--mp4`, one MPEG-TS or `--input --rendition all`;
+  one audio track per run.
 - `--rendition all` fetches renditions in turn; large ladders fall behind real time.
 - Every `--catalog-interval` resend carries a new `generatedAt`, so a player that compares it sees
   a catalog update each interval.

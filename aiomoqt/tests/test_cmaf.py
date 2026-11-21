@@ -121,3 +121,60 @@ def test_init_codec_string(tmp_path):
     assert init_codec_string(init.replace(b'avc1', b'avc3', 1)) == "avc3.64001F"
     assert init_codec_string(b'') is None
     assert init_codec_string(init[:40]) is None
+
+
+# -- sample entries from decoder config ---------------------------------
+
+def _config_tracks():
+    from aiomoqt.media.cmaf import aac_track, opus_track, video_track
+    from aiomoqt.media.sources import av1c_from_sequence_header, avcc_from_sps_pps
+    from aiomoqt.tests import _fake_cymedia as fake
+    avcc = avcc_from_sps_pps(fake.sps(9), fake.PPS)
+    av1c = av1c_from_sequence_header(fake.AV1_SEQUENCE_HEADER)
+    return {
+        'avc1': (video_track('avc1', avcc, 320, 240), avcc, 'avc1.', 90000),
+        'av01': (video_track('av01', av1c, 160, 120), av1c, 'av01.', 90000),
+        'aac': (aac_track(bytes([0x11, 0x90])), bytes([0x11, 0x90]),
+                'mp4a.40.2', 48000),
+        'opus': (opus_track(2), None, 'opus', 48000),
+    }
+
+
+@pytest.mark.parametrize('kind', ['avc1', 'av01', 'aac', 'opus'])
+def test_config_track_init_round_trips(tmp_path, kind):
+    from aiomoqt.media.cmaf import init_timescale
+    from aiomoqt.media.sources import Mp4Reader
+    track, config, codec, timescale = _config_tracks()[kind]
+    init = CmafChunker(track).init_segment()
+    assert init_codec_string(init).startswith(codec)
+    assert init_timescale(init) == timescale
+    path = tmp_path / 'init.mp4'
+    path.write_bytes(init)
+    reader = Mp4Reader(str(path))
+    t = reader.video or reader.audio
+    assert t.codec_string == init_codec_string(init)
+    assert t.timescale == timescale
+    if track.width is not None:
+        assert (t.width, t.height) == (track.width, track.height)
+        assert (t.avcc if kind == 'avc1' else t.av1c) == config
+    else:
+        assert reader.video is None
+        assert (t.samplerate, t.channels) == (48000, 2)
+        if kind == 'aac':
+            assert t.asc == config
+
+
+def test_asc_info():
+    from aiomoqt.media.cmaf import asc_info
+    assert asc_info(bytes([0x11, 0x90])) == (48000, 2, 1024)
+    assert asc_info(bytes([0x12, 0x0C])) == (44100, 1, 960)
+    # explicit 24-bit rate (index 15): 37800 Hz, 2 channels, 1024
+    bits = (2 << 35) | (15 << 31) | (37800 << 7) | (2 << 3)
+    assert asc_info(bits.to_bytes(5, 'big')) == (37800, 2, 1024)
+
+
+def test_esds_long_asc():
+    from aiomoqt.media.cmaf import esds_box
+    from aiomoqt.media.sources import esds_asc
+    asc = bytes([0x11, 0x90]) + bytes(200)
+    assert esds_asc(esds_box(asc), 8) == (0x40, asc)

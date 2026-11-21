@@ -3,13 +3,15 @@ import errno
 import socket
 import weakref
 from asyncio.futures import Future
-from typing import Any, Coroutine, Iterable, List, Optional, Tuple, Union
+from typing import (Any, Callable, Coroutine, Iterable, List, Optional,
+                    Tuple, Union)
 
 from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.asyncio.dispatch import serve_dispatch
 from aiopquic.asyncio.webtransport import serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
+from .cat import CatAuth
 from .protocol import (DEFAULT_TX_MAX_INFLIGHT_BYTES, MOQTPeer,
                         MOQTSessionQuic, MOQTSessionWTServer, USER_AGENT)
 from .messages.data import DEFAULT_MAX_OBJECT_BYTES
@@ -90,15 +92,19 @@ class MOQTServer(MOQTPeer):
         tx_max_queued_bytes: Optional[int] = None,
         congestion_control_algorithm: Optional[str] = "bbr",
         congestion_control_options: Optional[str] = None,
+        packet_train_mode: bool = False,
         flow_control_window: Optional[int] = None,
         keep_alive_interval: Optional[float] = None,
+        idle_timeout: Optional[float] = None,
         socket_buffer_size: Optional[int] = None,
         stream_ring_cap: Optional[int] = None,
         max_connections: Optional[int] = None,
+        workers: int = 1,
         implementation: Optional[str] = USER_AGENT,
         quiet_peers: Iterable[str] = (),
         max_filter_ranges: int = 0,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        auth: Optional[CatAuth] = None,
     ):
         super().__init__(tx_max_inflight_bytes=tx_max_inflight_bytes,
                          implementation=implementation,
@@ -108,7 +114,7 @@ class MOQTServer(MOQTPeer):
         self.path = path
         self.use_quic = use_quic
         # Public API: supported_drafts is the set of IETF draft numbers
-        # (e.g. 16, or [16, 14]) this server accepts; None means "accept
+        # (e.g. 16, or [18, 16]) this server accepts; None means "accept
         # every supported draft". Stored as a non-empty list of draft
         # numbers, newest first; the wire forms (ALPN / IETF version
         # code) are only translated when building ALPN or (de)serializing
@@ -125,12 +131,17 @@ class MOQTServer(MOQTPeer):
         self.congestion_control_algorithm = congestion_control_algorithm
         # Algorithm option string, e.g. "Q0.02" for bbr.
         self.congestion_control_options = congestion_control_options
+        # Paced sends release up to 10 packets at once (picoquic train mode).
+        self.packet_train_mode = packet_train_mode
         # QUIC flow-control window, per stream and per connection; None = 16 MiB.
         self.flow_control_window = flow_control_window
         # QUIC keep-alive interval (seconds). None = disabled. PING
         # frames hold a flow-controlled, consumer-stalled connection
         # open past the idle timeout instead of dropping it.
         self.keep_alive_interval = keep_alive_interval
+        # QUIC idle timeout (seconds) this server offers; a connection uses
+        # the lower of both ends'. None = aiopquic default (30 s).
+        self.idle_timeout = idle_timeout
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
@@ -142,10 +153,16 @@ class MOQTServer(MOQTPeer):
         # Most connections held at once (aiopquic >= 0.5.1). None =
         # aiopquic default (256).
         self.max_connections = max_connections
+        # picoquic contexts sharing the port, one network thread each
+        # (aiopquic workers=, Linux).
+        self.workers = int(workers)
         # Sessions whose peer's SETUP names an implementation starting
         # with one of these log below WARNING at DEBUG (a health probe's
         # sessions, say).
         self.quiet_peers = tuple(quiet_peers)
+        # Requires a token in SETUP and checks requests against it; None
+        # admits everything.
+        self.auth = auth
         # MAX_FILTER_RANGES sent at d20+ (§9.1.6). Nonzero only where the
         # application applies Range Filters; 0 refuses them all.
         self.max_filter_ranges = int(max_filter_ranges)
@@ -157,6 +174,7 @@ class MOQTServer(MOQTPeer):
         self._refusal: Optional[str] = None
         # Sessions this server closed, until their connections end.
         self._closing: weakref.WeakSet = weakref.WeakSet()
+        self._session_handlers: List[Callable[[Any], None]] = []
 
     def serve(self) -> Coroutine[Any, Any, Any]:
         """Start the MOQT server."""
@@ -181,12 +199,16 @@ class MOQTServer(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.congestion_control_options is not None:
                 cfg.congestion_control_options = self.congestion_control_options
+            if self.packet_train_mode:
+                cfg.packet_train_mode = True
             if self.flow_control_window is not None:
                 cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
                 cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
             if self.keep_alive_interval is not None:
                 cfg.keep_alive_interval = self.keep_alive_interval
+            if self.idle_timeout is not None:
+                cfg.idle_timeout = self.idle_timeout
             if self.socket_buffer_size is not None:
                 cfg.socket_buffer_size = self.socket_buffer_size
             if self.stream_ring_cap is not None:
@@ -200,6 +222,7 @@ class MOQTServer(MOQTPeer):
                 self.host, self.port,
                 configuration=cfg,
                 create_protocol=protocol,
+                **self._worker_args(),
             )
 
         # WebTransport mode (use_quic=False): serve_webtransport with
@@ -230,12 +253,16 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             wt_cfg.congestion_control_options = self.congestion_control_options
+        if self.packet_train_mode:
+            wt_cfg.packet_train_mode = True
         if self.flow_control_window is not None:
             wt_cfg.max_data = wt_cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
             wt_cfg.keep_alive_interval = self.keep_alive_interval
+        if self.idle_timeout is not None:
+            wt_cfg.idle_timeout = self.idle_timeout
         if self.socket_buffer_size is not None:
             wt_cfg.socket_buffer_size = self.socket_buffer_size
         if self.stream_ring_cap is not None:
@@ -245,11 +272,8 @@ class MOQTServer(MOQTPeer):
 
         # WT-Protocol allowlist in supported_drafts order, as for raw-QUIC
         # ALPN: aiopquic selects the first one the client offered and
-        # refuses an offer with no match. Drafts >= 15 negotiate this way
-        # ("moqt-NN"); d14 uses the legacy in-band CLIENT_SETUP path.
-        wt_supported = [f"moqt-{d}"
-                        for d in self.supported_drafts
-                        if d >= 15] or None
+        # refuses an offer with no match.
+        wt_supported = [f"moqt-{d}" for d in self.supported_drafts]
         return serve_webtransport(
             self.host, self.port, self.path or "",
             handler=handler,
@@ -257,6 +281,7 @@ class MOQTServer(MOQTPeer):
             session_factory=factory,
             configuration=wt_cfg,
             wt_supported_protocols=wt_supported,
+            **self._worker_args(),
         )
 
     def serve_dual(self) -> Coroutine[Any, Any, Any]:
@@ -283,12 +308,16 @@ class MOQTServer(MOQTPeer):
                 self.congestion_control_algorithm)
         if self.congestion_control_options is not None:
             cfg.congestion_control_options = self.congestion_control_options
+        if self.packet_train_mode:
+            cfg.packet_train_mode = True
         if self.flow_control_window is not None:
             cfg.max_data = cfg.max_stream_data = self.flow_control_window
         if self.tx_max_queued_bytes is not None:
             cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
         if self.keep_alive_interval is not None:
             cfg.keep_alive_interval = self.keep_alive_interval
+        if self.idle_timeout is not None:
+            cfg.idle_timeout = self.idle_timeout
         if self.socket_buffer_size is not None:
             cfg.socket_buffer_size = self.socket_buffer_size
         if self.stream_ring_cap is not None:
@@ -315,13 +344,37 @@ class MOQTServer(MOQTPeer):
             wt_handler=wt_handler,
             wt_session_factory=wt_factory,
             wt_supported_protocols=wt_supported,
+            **self._worker_args(),
         )
+
+    def _worker_args(self) -> dict:
+        # Omitted at 1, so an aiopquic without workers= still serves.
+        return {"workers": self.workers} if self.workers != 1 else {}
+
+    def register_session_handler(self,
+                                 handler: Callable[[Any], None]) -> None:
+        """Call handler(session) as each session arriving from now on
+        completes setup."""
+        self._session_handlers.append(handler)
 
     def _adopt(self, session):
         self._live.add(session)
         if self._refusal is not None:
             self._loop.call_soon(self.refuse, session)
+        if self._session_handlers:
+            session._moqt_session_setup.add_done_callback(
+                lambda fut: self._setup_done(session, fut))
         return session
+
+    def _setup_done(self, session, fut) -> None:
+        if (fut.cancelled() or fut.exception() is not None
+                or fut.result() is not True):
+            return
+        for handler in self._session_handlers:
+            try:
+                handler(session)
+            except Exception:
+                logger.exception("session handler failed")
 
     def refuse_sessions(self, reason: str = "server shutting down") -> None:
         """Close every session that arrives from now on (NO_ERROR) before

@@ -304,7 +304,7 @@ async def test_loc_largest_moves_while_paused():
     await feed([(b"p", False, None), (b"k", True, 2), (b"p", False, None)])
     await track.finish()
     await produce
-    assert out.written[2:] == [(5, 0, b"\x0a\x00k"), (5, 1, b"\x0a\x00p")]
+    assert out.written[2:] == [(5, 0, b"k"), (5, 1, b"p")]
     assert track._largest == (5, 1)
 
 

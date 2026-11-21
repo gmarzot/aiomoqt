@@ -1,15 +1,23 @@
 """Status for aiomoqt-relay's dashboard: host metrics from /proc,
-event-loop lag, a rolling history, MSF catalog classification and an
-atomic JSON writer. Host metrics are Linux only; elsewhere they are empty.
+event-loop lag, GC pass timing, a stall sampler, a rolling history, MSF
+catalog classification and an atomic JSON writer. Host metrics are Linux
+only; elsewhere they are empty.
 """
 
 import asyncio
+import datetime
+import gc
 import ipaddress
 import json
+import logging
 import os
 import platform
 import re
-from collections import deque
+import sys
+import threading
+import time
+import traceback
+from collections import Counter, deque
 from typing import Any, Iterable, Optional
 
 # Interfaces whose traffic is not the host's own.
@@ -449,6 +457,178 @@ class LoopLag:
         ms = [round(s * 1000, 2) for s in self.samples]
         return {"p50": percentile(ms, 50), "p99": percentile(ms, 99),
                 "max": max(ms) if ms else None}
+
+
+class GcTimer:
+    """Garbage-collection passes since the last take(): count per
+    generation, total and longest time, and the passes of `warn_ms` or
+    more. One per process: shared()."""
+
+    _shared: Optional["GcTimer"] = None
+    KEEP_LONG = 16
+
+    def __init__(self, warn_ms: float = 50.0) -> None:
+        self.warn_ms = warn_ms
+        self._t0 = 0.0
+        # monotonic end, generation and ms of the latest pass.
+        self.last = (0.0, 0, 0.0)
+        self._clear()
+        gc.callbacks.append(self._callback)
+
+    @classmethod
+    def shared(cls) -> "GcTimer":
+        if cls._shared is None:
+            cls._shared = cls()
+        return cls._shared
+
+    def _clear(self) -> None:
+        self.passes = [0, 0, 0]
+        self.total_ms = 0.0
+        self.max_ms = 0.0
+        self.max_gen: Optional[int] = None
+        # (wall time, generation, ms, objects collected)
+        self.long: list[tuple[float, int, float, int]] = []
+
+    def _callback(self, phase: str, info: dict) -> None:
+        now = time.monotonic()
+        if phase == "start":
+            self._t0 = now
+            return
+        ms = (now - self._t0) * 1000
+        gen = info["generation"]
+        self.passes[gen] += 1
+        self.total_ms += ms
+        self.last = (now, gen, ms)
+        if ms > self.max_ms:
+            self.max_ms, self.max_gen = ms, gen
+        if ms >= self.warn_ms and len(self.long) < self.KEEP_LONG:
+            self.long.append((time.time(), gen, ms, info["collected"]))
+
+    def take(self) -> tuple[dict, list]:
+        """The summary since the last take and its long passes."""
+        out = {"passes": self.passes, "total_ms": round(self.total_ms, 2),
+               "max_ms": (round(self.max_ms, 2)
+                          if self.max_gen is not None else None),
+               "max_gen": self.max_gen}
+        long = self.long
+        self._clear()
+        return out, long
+
+    def close(self) -> None:
+        if self._callback in gc.callbacks:
+            gc.callbacks.remove(self._callback)
+        if GcTimer._shared is self:
+            GcTimer._shared = None
+
+
+class GcTotals:
+    """The collector's counts since start: passes, objects collected and
+    uncollectable per generation, objects pending per generation, and the
+    frozen count, read at most once a minute since it walks the frozen
+    objects."""
+
+    FROZEN_EVERY_S = 60.0
+
+    def __init__(self) -> None:
+        self._frozen = 0
+        self._frozen_at: Optional[float] = None
+
+    def take(self, now: float) -> dict:
+        if self._frozen_at is None or now - self._frozen_at >= self.FROZEN_EVERY_S:
+            self._frozen, self._frozen_at = gc.get_freeze_count(), now
+        stats = gc.get_stats()
+        return {"collections": [s["collections"] for s in stats],
+                "collected": [s["collected"] for s in stats],
+                "uncollectable": [s["uncollectable"] for s in stats],
+                "pending": list(gc.get_count()),
+                "frozen": self._frozen}
+
+
+def gc_census(top: int = 40) -> dict:
+    """Objects the collector tracks, by type, most first, with its counts.
+    Walks every tracked object, so the caller's thread holds the GIL for
+    roughly 0.2 ms per 1,000 of them."""
+    count = Counter(f"{type(o).__module__}.{type(o).__qualname__}"
+                    for o in gc.get_objects())
+    return {"time": time.time(),
+            "tracked": sum(count.values()),
+            "generations": [len(gc.get_objects(g)) for g in range(3)],
+            "frozen": gc.get_freeze_count(),
+            "thresholds": list(gc.get_threshold()),
+            **{k: v for k, v in GcTotals().take(0.0).items() if k != "frozen"},
+            "top": count.most_common(max(0, top))}
+
+
+def format_gc_pass(wall: float, gen: int, ms: float, collected: int) -> str:
+    at = datetime.datetime.fromtimestamp(wall, datetime.timezone.utc)
+    return (f"GC gen{gen} pass {ms:.1f} ms at "
+            f"{at:%H:%M:%S}.{at.microsecond // 1000:03d}, "
+            f"{collected} collected")
+
+
+class StallSampler:
+    """Logs where the event loop's thread is once the loop has not run
+    for `stall_ms`, and the stall's length when it ends. A daemon thread
+    polls a heartbeat the loop refreshes; a stall inside native code that
+    holds the GIL is sampled when the GIL is released."""
+
+    def __init__(self, stall_ms: float, log: logging.Logger,
+                 gc_timer: Optional[GcTimer] = None, depth: int = 10,
+                 prefix: str = "") -> None:
+        self.stall_s = stall_ms / 1000
+        self.tick = max(0.005, min(0.05, self.stall_s / 4))
+        self.log = log
+        self.gc = gc_timer
+        self.depth = depth
+        self.prefix = prefix
+        self.beat = time.monotonic()
+        self._ident: Optional[int] = None
+        self._stop = threading.Event()
+
+    async def run(self) -> None:
+        """Refresh the heartbeat; the sampling thread runs alongside."""
+        self._ident = threading.get_ident()
+        self._stop.clear()
+        threading.Thread(target=self._watch, name="stall-trace",
+                         daemon=True).start()
+        try:
+            while True:
+                self.beat = time.monotonic()
+                await asyncio.sleep(self.tick)
+        finally:
+            self._stop.set()
+
+    def _where(self) -> str:
+        frame = (None if self._ident is None
+                 else sys._current_frames().get(self._ident))
+        if frame is None:
+            return "?"
+        stack = traceback.extract_stack(frame, limit=self.depth)
+        return " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno} "
+                           f"{f.name}" for f in reversed(stack))
+
+    def _watch(self) -> None:
+        stalled = None
+        while not self._stop.wait(self.tick):
+            beat = self.beat
+            if stalled is not None:
+                if beat != stalled:
+                    ms = (beat - stalled - self.tick) * 1000
+                    self.log.warning(f"{self.prefix}loop stall ended after "
+                                     f"{ms:.0f} ms")
+                    stalled = None
+                continue
+            late = time.monotonic() - beat - self.tick
+            if late < self.stall_s:
+                continue
+            note = ""
+            if self.gc is not None:
+                end, gen, ms = self.gc.last
+                if end > beat:
+                    note = f", a gen{gen} GC pass of {ms:.0f} ms in it"
+            self.log.warning(f"{self.prefix}loop stalled {late * 1000:.0f} "
+                             f"ms{note}; at {self._where()}")
+            stalled = beat
 
 
 class History:

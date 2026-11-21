@@ -30,6 +30,7 @@ cache-bytes = 1048576
 catalog-probe = true
 cc-algo = "bbr"
 cc-options = "Q0.02"
+pacing-trains = true
 watchdog = 30
 draft = "22,18"
 upstream = ["moqt://origin.example:4433/", "https://origin.example/moq"]
@@ -41,6 +42,7 @@ stream-scheduling = "round_robin"
     assert args.catalog_probe is True
     assert args.cc_algo == "bbr"
     assert args.cc_options == "Q0.02"
+    assert args.pacing_trains is True
     assert args.watchdog == 30.0 and isinstance(args.watchdog, float)
     assert args.draft == [22, 18]
     assert args.upstream == ["moqt://origin.example:4433/",
@@ -99,7 +101,7 @@ def test_a_missing_or_malformed_file_is_an_error(tmp_path, capsys):
 @pytest.mark.skipif(not _DEPLOY_TOML.exists(), reason="no deploy tree")
 def test_the_deploy_config_loads():
     args = relay.parse_args(["--config", str(_DEPLOY_TOML)])
-    assert args.draft == [22, 20, 18, 16, 14]
+    assert args.draft == [22, 20, 18, 16]
     assert args.watchdog == 30.0
     assert args.status_dir == "/status" and args.log_dir == "/logs"
     assert args.control == "/status/control.sock"

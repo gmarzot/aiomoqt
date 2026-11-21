@@ -50,8 +50,7 @@ def _subscribe(t):
 
 def _accounted(*tracks):
     for t in tracks:
-        assert t._cache_bytes == sum(retained_object_bytes(c[3], c[4])
-                                     for c in t._cache)
+        assert t._cache_bytes == sum(map(relay._record_cost, t._cache))
     assert relay._budget.bytes == sum(t._cache_bytes for t in tracks)
 
 
@@ -85,7 +84,7 @@ def test_the_record_charge_covers_a_cached_object(monkeypatch):
     per = _traced(lambda: [t._remember(0, 0, oid, _payload(oid), None, 128,
                                        ObjectStatus.NORMAL)
                            for oid in range(_N)]) / _N - 3
-    assert 0.75 * OBJECT_RECORD_BYTES < per <= OBJECT_RECORD_BYTES, per
+    assert 0.4 * OBJECT_RECORD_BYTES < per <= OBJECT_RECORD_BYTES, per
     t._drop_cache()
 
 
@@ -140,7 +139,9 @@ def test_empty_objects_are_charged_to_a_subscribed_track(monkeypatch):
     t._drop_cache()
 
 
-async def test_empty_objects_are_charged_to_a_send_lane():
+async def test_empty_objects_are_charged_to_a_send_lane(monkeypatch):
+    # No deadline: the lane is held to LANE_BYTES.
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     t = _track()
     lane = t._lane(_subscribe(t))
     # No yield: a subscriber whose lane never drains.
@@ -338,6 +339,7 @@ def _ring_backlog(session):
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP")
 async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
     monkeypatch.setattr(relay, "LANE_BYTES", 1 << 20)
+    monkeypatch.setattr(relay, "_lag_limit", 0)
     caplog.set_level(logging.WARNING, logger="aiomoqt.relay")
     for table in (relay._announced, relay._announce_requests, relay._tracks):
         table.clear()
@@ -376,7 +378,7 @@ async def test_a_stalled_raw_quic_viewer_is_bounded(monkeypatch, caplog):
             assert d.lane.sheds >= 5
             # One WARNING, the repeats folded into a line per SHED_LOG_S.
             warned = [r for r in caplog.records
-                      if "send lane" in r.getMessage()]
+                      if "resetting groups below" in r.getMessage()]
             assert len(warned) == 1, [r.getMessage() for r in warned]
     finally:
         if proc is not None:

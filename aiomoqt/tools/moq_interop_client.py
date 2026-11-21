@@ -15,6 +15,7 @@ intentional deviations, not silent passes.
 
 import argparse
 import asyncio
+import contextlib
 import datetime
 import json
 import logging
@@ -26,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.context import is_draft16_or_later, profile_for
+from aiomoqt.context import canonical_request_error, profile_for
 from aiomoqt.messages import SubgroupHeader
 from aiomoqt.messages.base import MOQTMessage
 from aiomoqt.protocol import _MOQTSessionMixin
@@ -37,34 +38,27 @@ from aiomoqt.tools.moqtest_origin import (
 )
 from aiomoqt.types import (
     ParamType, FetchType, MOQTRequestError, MOQTMessageType, MOQTStreamStopped,
-    SubscribeErrorCode, RequestErrorCode, SubscribeDoneCode,
-    FilterType, GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
+    RequestErrorCode, SubscribeDoneCode,
+    GroupOrder, MOQTDraft, ObjectStatus, parse_draft_spec,
     MOQT_DEFAULT_DRAFTS, D16MessageType,
 )
-from aiomoqt.utils.cli import add_help, add_logging, apply_logging
+from aiomoqt.utils.cli import add_help, add_logging, apply_logging, run
 
 try:
     from aiomoqt import __version__ as AIOMOQT_VERSION
 except Exception:
     AIOMOQT_VERSION = "unknown"
 
-# Spec-compliant "track not found" codes across drafts:
-# d14 SubscribeErrorCode.TRACK_DOES_NOT_EXIST = 0x04
-# d16 RequestErrorCode.DOES_NOT_EXIST         = 0x10
+# "track not found" codes: RequestErrorCode.DOES_NOT_EXIST, and the 0x04
+# peers still send for it.
 TRACK_NOT_FOUND_CODES = frozenset({
-    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
+    0x04,
     int(RequestErrorCode.DOES_NOT_EXIST),
 })
 
 # INTERNAL_ERROR (0x0) is not an acceptable answer to a well-formed
 # request that names a non-existent track — the relay must be specific.
 SUBSCRIBE_BENIGN_ERROR_CODES = frozenset({
-    int(SubscribeErrorCode.UNAUTHORIZED),
-    int(SubscribeErrorCode.TIMEOUT),
-    int(SubscribeErrorCode.NOT_SUPPORTED),
-    int(SubscribeErrorCode.TRACK_DOES_NOT_EXIST),
-    int(SubscribeErrorCode.MALFORMED_AUTH_TOKEN),
-    int(SubscribeErrorCode.EXPIRED_AUTH_TOKEN),
     int(RequestErrorCode.MALFORMED_AUTH_TOKEN),
     int(RequestErrorCode.EXPIRED_AUTH_TOKEN),
     int(RequestErrorCode.DOES_NOT_EXIST),
@@ -103,11 +97,11 @@ def _is_refusal(code: int, compat: frozenset) -> bool:
 # refused, decode error, transport reset) are never compat-passed.
 KNOWN_COMPAT_IMPLS = frozenset({
     "moq-dev",            # cdn.moq.dev /anon — returns 404 for not-found
-    "moq-rs",             # cloudflare moq-rs d14 — returns code=0 for not-found
+    "moq-rs",             # cloudflare moq-rs — returns code=0 for not-found
     "moq-rs-d16",         # itzmanish/moq-rs draft-16 fork (CF endpoint)
     "libquicr",           # Cisco libquicr — accepts SUBSCRIBE to unknown tracks
     "lenient-extensions",  # tolerate truncated trailing extensions block
-    "missing-request-credit",  # d14/d16 peer SETUP without MAX_REQUEST_ID
+    "missing-request-credit",  # d16 peer SETUP without MAX_REQUEST_ID
     "all",                # enable every known compat tolerance
 })
 
@@ -149,6 +143,28 @@ def _format_exc(e: BaseException) -> str:
     if not msg:
         return cls
     return f"{cls}: {msg}" if cls not in msg else msg
+
+
+class _NoReply(Exception):
+    """A request ended by our session closing, not by the peer's answer."""
+
+
+def _check_reply(e: MOQTRequestError) -> MOQTRequestError:
+    """`e` if the peer sent it; _NoReply if the request failed because the
+    session closed (INTERNAL_ERROR with a "session closed" reason)."""
+    if (int(e.error_code) == int(RequestErrorCode.INTERNAL_ERROR)
+            and str(e.reason or "").startswith("session closed")):
+        raise _NoReply(f"no reply before the {e.reason}") from e
+    return e
+
+
+def _refused(step: str, e: MOQTRequestError) -> str:
+    """A failed request for a report: the peer's refusal, or our close."""
+    try:
+        _check_reply(e)
+    except _NoReply as closed:
+        return f"{step}: {closed}"
+    return f"{step} refused: code={e.error_code} {e.reason}"
 
 
 async def _probe_setup_ok(host, port, path, use_quic, tls_disable_verify,
@@ -217,12 +233,29 @@ STANDARD_TESTS = [
     "namespace-discovery",
     "publish-track-only",
     "publish-track-subscribe",
+    "publish-namespace-done-track",
+    "subscribe-cancel-live",
+    "publish-namespace-multi-publisher-retention",
+    "fetch",
+    "fetch-descending",
+    "fetch-error-recovery",
+    "join",
     "moq-test-subgroup-per-group-eog",
+    "moq-test-subgroup-per-group-no-eog",
+    "moq-test-subgroup-per-group-nonzero-start",
     "moq-test-subgroup-per-object",
+    "moq-test-subgroup-per-object-sparse-ids",
     "moq-test-two-subgroups-eog",
+    "moq-test-two-subgroups-no-eog",
     "moq-test-datagram",
+    "moq-test-datagram-nonzero-start",
+    "moq-test-datagram-sparse-ids",
     "moq-test-datagram-eog",
     "moq-test-extensions",
+    "moq-test-extensions-integer-only",
+    "moq-test-extensions-variable-only",
+    "moq-test-object-fragmentation",
+    "moq-test-object-large-id",
     "moq-test-increments",
     "moq-test-forward-zero",
 ]
@@ -401,10 +434,12 @@ def _make_client(host: str, port: int, path: str, use_quic: bool,
     )
 
 
-def _publish_reply(session, request_id: int, track=None) -> asyncio.Future:
+def _publish_reply(session, request_id: Optional[int],
+                   track=None) -> asyncio.Future:
     """The future the relay's reply to our PUBLISH resolves. Take it before
-    the next await. A d14/d16 PUBLISH_OK goes to the track, not the
+    the next await. A d16 PUBLISH_OK goes to the track, not the
     session, so it resolves the future only through `track`."""
+    assert request_id is not None, "PUBLISH not sent"
     fut = session._pending_requests.get(request_id)
     if fut is None:
         fut = session._loop.create_future()
@@ -528,12 +563,11 @@ async def test_publish_namespace_done(host, port, path, use_quic,
                     parameters=_PUB_NS_PARAMS,
                     wait_response=True,
                 )
-                ns_tuple = session._make_namespace_tuple(INTEROP_NAMESPACE)
-                # d14/d16 send PUBLISH_NAMESPACE_DONE; d18 has no such
+                # d16 sends PUBLISH_NAMESPACE_DONE; d18 has no such
                 # message and withdraws by resetting the announce's
                 # request stream (§3.3.2).
                 withdrew = session.publish_namespace_done(
-                    namespace=ns_tuple,
+                    namespace=INTEROP_NAMESPACE,
                     request_id=response.request_id,
                 )
                 how = ("PUBLISH_NAMESPACE_DONE sent" if withdrew is not None
@@ -568,7 +602,7 @@ async def test_subscribe_error(host, port, path, use_quic,
     REQUEST_ERROR, any code) is accepted as a valid "track not found"
     rejection — the assertion is that the relay refused; the exact code
     is noted, not required (relays use non-spec codes, e.g. 404 for
-    moq-dev, 0 for moq-rs d14). A timeout or transport error still fails.
+    moq-dev, 0 for moq-rs). A timeout or transport error still fails.
     """
     moq_dev_compat = _compat_active(compat, "moq-dev")
     moq_rs_compat = _compat_active(compat, "moq-rs")
@@ -622,7 +656,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                     )
                 except MOQTRequestError as e:
                     session.close()
-                    code = int(e.error_code)
+                    code = int(_check_reply(e).error_code)
                     spec_ok = code in TRACK_NOT_FOUND_CODES
                     if spec_ok:
                         return TestResult(
@@ -642,13 +676,13 @@ async def test_subscribe_error(host, port, path, use_quic,
                                 f"Non-spec error code={e.error_code} accepted "
                                 f"as 'track not found'"
                             ),
-                            expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST (0x04/0x10)",
+                            expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST (0x10)",
                             received=f"SUBSCRIBE_ERROR code={e.error_code}",
                             compat=True,
                             compat_note=(
                                 f"{impl} returns non-spec error code "
                                 f"{e.error_code} for not-found; spec expects "
-                                f"0x04 (d14) or 0x10 (d16)"
+                                f"0x10"
                             ),
                         )
                     return TestResult(
@@ -657,7 +691,7 @@ async def test_subscribe_error(host, port, path, use_quic,
                         sessions=sessions,
                         message=(
                             f"Non-conformant: expected TRACK_DOES_NOT_EXIST "
-                            f"(d14=0x04 / d16=0x10), got code={e.error_code}"
+                            f"(0x10), got code={e.error_code}"
                         ),
                         expected="SUBSCRIBE_ERROR code=TRACK_DOES_NOT_EXIST",
                         received=f"SUBSCRIBE_ERROR code={e.error_code}",
@@ -711,7 +745,7 @@ async def test_rendezvous_timeout(host, port, path, use_quic,
                             wait_response=True)
                     code = None
                 except MOQTRequestError as e:
-                    code = int(e.error_code)
+                    code = int(_check_reply(e).error_code)
                 session.close()
     except Exception as e:
         return TestResult(
@@ -812,7 +846,11 @@ async def test_announce_subscribe(host, port, path, use_quic,
                         passed = True
                         pending_hold = True
                     except MOQTRequestError as e:
-                        msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        try:
+                            _check_reply(e)
+                            msg = f"SUBSCRIBE_ERROR: upstream subscribe failed: {e.reason}"
+                        except _NoReply as closed:
+                            msg = f"upstream subscribe: {closed}"
                         passed = False
 
                     sub_session.close()
@@ -846,7 +884,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
                                    timeout=15.0) -> TestResult:
     """Test 7: A subscriber knowing only the namespace learns the trackname.
 
-    d14/d16 answer SUBSCRIBE_NAMESPACE with a PUBLISH per track. d18
+    d16 answers SUBSCRIBE_NAMESPACE with a PUBLISH per track. d18
     reports namespaces first (NAMESPACE) and answers a second request,
     SUBSCRIBE_TRACKS, with the PUBLISH — and moved SUBSCRIBE_NAMESPACE
     from 0x11 to 0x50. SubscribedTrack walks whichever shape the
@@ -881,7 +919,7 @@ async def test_namespace_discovery(host, port, path, use_quic,
                 # Announce the namespace as well as the track: d18
                 # enumerates namespaces, and a relay learns a namespace
                 # exists from PUBLISH_NAMESPACE, not from PUBLISH.
-                # d14/d16 need the PUBLISH for the fused response.
+                # d16 needs the PUBLISH for the fused response.
                 await track.publish(announce_namespace=True,
                                     publish_track=True)
                 reply = _publish_reply(pub_session, track.request_id)
@@ -978,7 +1016,7 @@ async def test_subscribe_before_announce(host, port, path, use_quic,
                         async with asyncio.timeout(2.0):
                             sub_response = await sub_task
                     except MOQTRequestError as e:
-                        sub_response = e  # error is a valid outcome
+                        sub_response = _check_reply(e)  # a valid outcome
                     except asyncio.TimeoutError:
                         sub_response = None
 
@@ -1300,17 +1338,16 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
                     sessions["subscriber"] = _session_meta(sub_session)
 
                     # FORWARD, SUBSCRIBER_PRIORITY and SUBSCRIPTION_FILTER
-                    # are omitted; d14 carries them as fixed fields.
+                    # are omitted.
                     step = "SUBSCRIBE"
                     phase.reschedule(loop.time() + _DATA_PHASE_S)
-                    d16 = is_draft16_or_later(sub_session.negotiated_draft)
                     track = SubscribedTrack(
                         sub_session,
                         "/".join((namespace, *DATA_SUBGROUP_BASIC_CASE)),
                         "track", on_object=sub.on_object, on_done=sub.on_done)
                     await track.subscribe(
                         forward=None, group_order=GroupOrder.ASCENDING,
-                        filter_type=None if d16 else FilterType.LATEST_OBJECT)
+                        filter_type=None)
                     sub_session.register_stream_end_handler(
                         track.track_alias, sub.on_stream_end)
 
@@ -1330,7 +1367,7 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
     except TimeoutError:
         return result(False, f"timed out waiting for {step}")
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except MOQTStreamStopped:
         return result(False, f"relay stopped the subgroup stream for group "
                              f"{pub.group}")
@@ -1368,14 +1405,16 @@ async def test_data_subgroup_basic(host, port, path, use_quic,
 
 
 _HISTORY_GROUP = 5          # objects per group on the relayed track
-_HISTORY_WAIT_S = 5.0       # until the relay has forwarded two groups
+_HISTORY_WAIT_S = 5.0       # until the relay has forwarded the groups
 
 
 async def _relay_history(host, port, path, use_quic, tls_disable_verify,
-                         debug, supported_drafts, name, sessions, body):
+                         debug, supported_drafts, name, sessions, body,
+                         whole=1):
     """Run `body(sub_client, namespace, first_group)` once the relay has
-    forwarded two whole groups of a live publisher's track to a
-    subscriber, so they are history the relay can serve."""
+    forwarded `whole` complete groups, from `first_group` on, of a live
+    publisher's track to a subscriber, so they are history the relay
+    can serve."""
     loop = asyncio.get_running_loop()
     prefix = (*_NS_PREFIX, "moq-test", name, _run_id())
     namespace = "/".join(prefix)
@@ -1399,7 +1438,7 @@ async def _relay_history(host, port, path, use_quic, tls_disable_verify,
             g = getattr(msg, "group_id", group_id)
             if g not in groups:
                 groups.append(g)
-            if len(groups) >= 3 and not two_groups.done():
+            if len(groups) >= whole + 2 and not two_groups.done():
                 two_groups.set_result(None)
 
         async with sub_client.connect() as sub_session:
@@ -1424,25 +1463,84 @@ def _history_result(name, t0, sessions, fetched, what):
         received="" if n else "0 objects")
 
 
+def _fetch_problems(objects, groups, descending=False) -> list:
+    """Deviations of FETCH `objects` [(group, object, status)] from the
+    complete `groups`: duplicate, unexpected and missing objects and,
+    descending, any object not after its predecessor in that order.
+    Status objects count only for the order."""
+    problems, seen, prev = [], set(), None
+    for gid, oid, status in objects:
+        if descending and prev is not None and (
+                gid > prev[0] or (gid == prev[0] and oid <= prev[1])):
+            problems.append(f"object {gid}.{oid} after {prev[0]}.{prev[1]} "
+                            f"in descending order")
+        prev = (gid, oid)
+        if not _is_normal(status):
+            continue
+        if (gid, oid) in seen:
+            problems.append(f"duplicate object {gid}.{oid}")
+            continue
+        seen.add((gid, oid))
+        if gid not in groups or oid not in range(_HISTORY_GROUP):
+            problems.append(f"unexpected object {gid}.{oid}")
+    want = {(g, o) for g in groups for o in range(_HISTORY_GROUP)}
+    missing = sorted(want - seen)
+    if missing:
+        first = ", ".join(f"{g}.{o}" for g, o in missing[:5])
+        problems.append(f"missing {len(missing)} object(s): {first}")
+    return problems
+
+
+def _fetch_result(name, t0, sessions, objects, groups, what,
+                  descending=False):
+    """Pass when `what` returned exactly the complete `groups`."""
+    problems = _fetch_problems(objects, groups, descending)
+    n = sum(1 for o in objects if _is_normal(o[2]))
+    span = (f"group {groups[0]}" if len(groups) == 1
+            else f"groups {groups[0]}-{groups[-1]}")
+    summary = f"{n} objects of {span} received by {what}"
+    if descending:
+        summary += " in descending order"
+    duration_ms = (time.monotonic() - t0) * 1000
+    if not problems:
+        return TestResult(name=name, passed=True, duration_ms=duration_ms,
+                          sessions=sessions, message=summary)
+    return TestResult(
+        name=name, passed=False, duration_ms=duration_ms, sessions=sessions,
+        message=f"{problems[0]} ({len(problems)} problem(s)); {summary}",
+        expected=f"{len(groups) * _HISTORY_GROUP} objects of {span}",
+        received=f"{n} objects")
+
+
+async def _fetch_groups(session, namespace, first, last, objects,
+                        group_order=None):
+    """FETCH groups `first`..`last` whole, appending each object as
+    (group, object, status), until the FETCH stream ends."""
+    session.on_fetch_object = lambda msg, *_: objects.append(
+        (msg.group_id, msg.object_id, getattr(msg, "status", None)))
+    ok = await session.fetch(
+        namespace=namespace, track_name="track", group_order=group_order,
+        start_group=first, start_object=0, end_group=last, end_object=0,
+        wait_response=True)
+    await session.await_fetch_done(ok.request_id, timeout=5)
+
+
 async def test_fetch(host, port, path, use_quic, tls_disable_verify,
                      debug, supported_drafts=None, compat=frozenset(),
                      timeout=15.0) -> TestResult:
     """FETCH: a standalone FETCH of a group the relay has already
-    forwarded returns that group's objects."""
+    forwarded returns that group's objects, all of them and no others."""
     t0 = time.monotonic()
     sessions = {}
     fetched = []
+    groups = []
 
     async def body(sub_client, namespace, group):
+        groups.append(group)
         async with sub_client.connect() as session:
             await session.client_session_init()
             sessions["fetcher"] = _session_meta(session)
-            session.on_fetch_object = lambda msg, *_: fetched.append(msg)
-            ok = await session.fetch(
-                namespace=namespace, track_name="track",
-                start_group=group, start_object=0,
-                end_group=group, end_object=0, wait_response=True)
-            await session.await_fetch_done(ok.request_id, timeout=5)
+            await _fetch_groups(session, namespace, group, group, fetched)
 
     try:
         async with asyncio.timeout(timeout):
@@ -1456,7 +1554,106 @@ async def test_fetch(host, port, path, use_quic, tls_disable_verify,
             message=f"Failed: {_format_exc(e)}",
             expected="FETCH_OK and the group's objects",
             received=_format_exc(e))
-    return _history_result("fetch", t0, sessions, fetched, "the FETCH")
+    return _fetch_result("fetch", t0, sessions, fetched, groups, "the FETCH")
+
+
+async def test_fetch_descending(host, port, path, use_quic,
+                                tls_disable_verify, debug,
+                                supported_drafts=None, compat=frozenset(),
+                                timeout=15.0) -> TestResult:
+    """fetch-descending: a FETCH of two complete groups in Descending
+    group order returns both, the later group first, objects ascending
+    within each."""
+    name = "fetch-descending"
+    t0 = time.monotonic()
+    sessions = {}
+    fetched = []
+    groups = []
+
+    async def body(sub_client, namespace, group):
+        groups.extend((group, group + 1))
+        async with sub_client.connect() as session:
+            await session.client_session_init()
+            sessions["fetcher"] = _session_meta(session)
+            await _fetch_groups(session, namespace, group, group + 1,
+                                fetched, group_order=GroupOrder.DESCENDING)
+
+    try:
+        async with asyncio.timeout(timeout):
+            await _relay_history(host, port, path, use_quic,
+                                 tls_disable_verify, debug, supported_drafts,
+                                 name, sessions, body, whole=2)
+    except Exception as e:
+        return TestResult(
+            name=name, passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
+            message=f"Failed: {_format_exc(e)}",
+            expected="FETCH_OK and two groups in descending order",
+            received=_format_exc(e))
+    return _fetch_result(name, t0, sessions, fetched, groups, "the FETCH",
+                         descending=True)
+
+
+# Groups past the Largest Object that fetch-error-recovery asks for.
+_FETCH_BEYOND = 1000
+
+
+async def test_fetch_error_recovery(host, port, path, use_quic,
+                                    tls_disable_verify, debug,
+                                    supported_drafts=None,
+                                    compat=frozenset(),
+                                    timeout=15.0) -> TestResult:
+    """fetch-error-recovery: a FETCH starting past the Largest Object is
+    refused with INVALID_RANGE; a valid FETCH on the same session then
+    returns its whole group."""
+    name = "fetch-error-recovery"
+    t0 = time.monotonic()
+    sessions = {}
+    fetched = []
+    groups = []
+    refusal = []
+
+    async def body(sub_client, namespace, group):
+        groups.append(group)
+        async with sub_client.connect() as session:
+            await session.client_session_init()
+            sessions["fetcher"] = _session_meta(session)
+            beyond = group + _FETCH_BEYOND
+            try:
+                await session.fetch(
+                    namespace=namespace, track_name="track",
+                    start_group=beyond, start_object=0,
+                    end_group=beyond + 1, end_object=0, wait_response=True)
+                refusal.append(None)
+            except MOQTRequestError as e:
+                refusal.append(canonical_request_error(
+                    int(_check_reply(e).error_code), session._profile))
+            if refusal[0] == RequestErrorCode.INVALID_RANGE:
+                await _fetch_groups(session, namespace, group, group, fetched)
+
+    try:
+        async with asyncio.timeout(timeout):
+            await _relay_history(host, port, path, use_quic,
+                                 tls_disable_verify, debug, supported_drafts,
+                                 name, sessions, body)
+    except Exception as e:
+        return TestResult(
+            name=name, passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
+            message=f"Failed: {_format_exc(e)}",
+            expected="INVALID_RANGE, then FETCH_OK and the group's objects",
+            received=_format_exc(e))
+    code = refusal[0] if refusal else None
+    if code != RequestErrorCode.INVALID_RANGE:
+        got = ("FETCH_OK" if code is None else
+               f"REQUEST_ERROR code={code:#x}")
+        return TestResult(
+            name=name, passed=False,
+            duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
+            message=f"FETCH past the Largest Object answered {got}",
+            expected="REQUEST_ERROR INVALID_RANGE", received=got)
+    return _fetch_result(name, t0, sessions, fetched, groups,
+                         "the FETCH after INVALID_RANGE")
 
 
 async def test_join(host, port, path, use_quic, tls_disable_verify,
@@ -1514,7 +1711,7 @@ async def test_subscribe_namespace_lifecycle(host, port, path, use_quic,
     """subscribe-namespace-lifecycle: a namespace subscriber hears
     NAMESPACE when a separate publisher publishes that namespace, then
     NAMESPACE_DONE when it is withdrawn. Draft-16 asks for NAMESPACE with
-    Subscribe Options; draft-14 has no NAMESPACE message."""
+    Subscribe Options."""
     name = "subscribe-namespace-lifecycle"
     t0 = time.monotonic()
     sessions = {}
@@ -1560,12 +1757,6 @@ async def test_subscribe_namespace_lifecycle(host, port, path, use_quic,
                 await sub_session.client_session_init()
                 sessions["subscriber"] = _session_meta(sub_session)
                 draft = sub_session.negotiated_draft
-                if draft < 16:
-                    sub_session.close()
-                    return _result(
-                        True, "", skipped=True,
-                        skip_reason=f"NAMESPACE is draft-16; "
-                                    f"negotiated draft-{draft}")
                 sub_session.register_handler(
                     D16MessageType.NAMESPACE, _record("NAMESPACE"))
                 sub_session.register_handler(
@@ -1737,34 +1928,67 @@ async def test_publish_track_subscribe(host, port, path, use_quic,
 # moq-test-* cases
 # ---------------------------------------------------------------------------
 
-# moq-rs-draft-18's moq-test-client scenarios: MoQT Test tuple fields 1-15
-# (after "moq-test-00") by case name.
+# moq-rs-draft-18's and xquic's moq-test-client scenarios: MoQT Test tuple
+# fields 1-15 (after "moq-test-00") by case name.
+_LARGE_ID = 1 << 40
 MOQ_TEST_CASES = {
     "moq-test-subgroup-per-group-eog":
         ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "-1", "-1", "0"),
+    "moq-test-subgroup-per-group-no-eog":
+        ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-subgroup-per-group-nonzero-start":
+        ("0", "6", "3", "8", "5", "5", "64", "32", "2", "1", "1", "1", "-1", "-1", "0"),
     "moq-test-subgroup-per-object":
         ("1", "0", "0", "1", "3", "4", "64", "32", "2", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-subgroup-per-object-sparse-ids":
+        ("1", "4", "2", "4", "8", "5", "64", "32", "2", "1", "3", "0", "-1", "-1", "0"),
     "moq-test-two-subgroups-eog":
         ("2", "0", "0", "2", "6", "6", "64", "32", "2", "1", "1", "1", "-1", "-1", "0"),
+    "moq-test-two-subgroups-no-eog":
+        ("2", "0", "0", "2", "6", "6", "64", "32", "2", "1", "1", "0", "-1", "-1", "0"),
     "moq-test-datagram":
         ("3", "0", "0", "2", "4", "5", "64", "32", "20", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-datagram-nonzero-start":
+        ("3", "6", "3", "8", "5", "5", "64", "32", "20", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-datagram-sparse-ids":
+        ("3", "10", "3", "24", "7", "5", "64", "32", "20", "7", "2", "0", "-1", "-1", "0"),
     "moq-test-datagram-eog":
         ("3", "0", "0", "2", "5", "5", "64", "32", "20", "1", "1", "1", "-1", "-1", "0"),
     "moq-test-extensions":
         ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "1", "2", "0"),
+    "moq-test-extensions-integer-only":
+        ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "1", "-1", "0"),
+    "moq-test-extensions-variable-only":
+        ("0", "0", "0", "2", "5", "5", "64", "32", "2", "1", "1", "1", "-1", "2", "0"),
+    # One subgroup stream; the publisher writes the object in fragments.
+    "moq-test-object-fragmentation":
+        ("0", "0", "0", "0", "0", "5", "96", "96", "2", "1", "1", "0", "-1", "-1", "0"),
+    "moq-test-object-large-id":
+        ("0", str(_LARGE_ID), str(_LARGE_ID + 5), str(_LARGE_ID + 1),
+         str(_LARGE_ID + 9), "5", "64", "32", "2", "1", "2", "0", "-1", "-1", "0"),
     "moq-test-increments":
         ("0", "10", "3", "24", "7", "3", "40", "24", "2", "7", "2", "0", "-1", "-1", "0"),
     "moq-test-forward-zero":
         ("0", "0", "0", "1", "2", "3", "64", "32", "2", "1", "1", "0", "-1", "-1", "0"),
 }
+# moq-test-object-fragmentation: payload bytes per stream write.
+_FRAGMENT_BYTES = 24
 _MOQ_TEST_FORWARD_ZERO = "moq-test-forward-zero"
 _MOQ_TEST_RENDEZVOUS_MS = 5000
 # The subscriber's SUBSCRIBE reaches the relay this long before the PUBLISH.
 _MOQ_TEST_HEAD_START_S = 0.2
 _MOQ_TEST_PHASE_S = 8.0
+# Phase time kept after delivery for the grace period and the closes.
+_MOQ_TEST_CLOSE_S = 1.0
+# A relay can answer the PUBLISH at Forward State 0 and raise it with
+# REQUEST_UPDATE once the subscription links.
+_MOQ_TEST_FORWARD_WAIT_S = 1.0
 # After PUBLISH_DONE: datagrams can still trail it, and with Forward State 0
 # an object arriving here still fails the case.
 _MOQ_TEST_GRACE_S = 0.25
+# Datagrams are never retransmitted: a datagram case that lost some but not
+# all of them runs again, up to this many attempts in all.
+_MOQ_TEST_DATAGRAM_ATTEMPTS = 3
 
 
 def _moq_test_expected(p):
@@ -1803,7 +2027,16 @@ def _moq_test_extension_ids(p) -> frozenset:
 
 class _MoqTestSubscriber(_DataSubscriber):
     """Also records each object's extension IDs and, on a datagram, the End
-    of Group type bit."""
+    of Group type bit. With Forward State 0, PUBLISH_DONE ends delivery."""
+
+    def __init__(self, forward_zero: bool = False):
+        super().__init__()
+        self.forward_zero = forward_zero
+
+    def _drained(self) -> bool:
+        if self.forward_zero:
+            return self.done is not None
+        return super()._drained()
 
     def on_object(self, msg, size, ts, group_id, subgroup_id):
         gid = getattr(msg, "group_id", None)
@@ -1888,15 +2121,47 @@ def _moq_test_problems(p, objects, done, streams_ended, streams_reset,
     return problems
 
 
+async def _send_fragmented(session, alias, p) -> int:
+    """One subgroup stream per group; each object goes out in stream
+    writes of _FRAGMENT_BYTES payload bytes, the first also carrying the
+    object header, `freq_ms` apart. Returns the stream count."""
+    streams = 0
+    for g in range(p.start_group, p.last_group + 1, p.g_inc):
+        sid = await session.open_uni_stream()
+        streams += 1
+        hdr = session.subgroup_header(
+            track_alias=alias, group_id=g, subgroup_id=0,
+            publisher_priority=priority_for(g), extensions_present=True)
+        await session.stream_write_drain(sid, hdr.serialize().data)
+        for oid in range(p.start_object, p.last_object + 1, p.o_inc):
+            size = p.size0 if oid == p.start_object else p.size_gt0
+            data = hdr.next_object_bytes(payload=_DATA_FILL * size,
+                                         object_id=oid)
+            cut = len(data) - size + _FRAGMENT_BYTES
+            pieces = [data[:cut]] + [data[i:i + _FRAGMENT_BYTES] for i in
+                                     range(cut, len(data), _FRAGMENT_BYTES)]
+            for piece in pieces:
+                await session.stream_write_drain(sid, piece)
+                await asyncio.sleep(p.freq_ms / 1000)
+        session.stream_fin(sid)
+    return streams
+
+
+# Cases whose publisher writes differently from the tuple's generator.
+_MOQ_TEST_SENDER_FOR = {"moq-test-object-fragmentation": _send_fragmented}
+
+
 class _MoqTestTrack(PublishedTrack):
     """PUBLISHes one MoQT Test track. The tuple's objects go out once
-    `ready` is set, unless the Forward State is then 0."""
+    `ready` is set, unless the Forward State stays 0."""
 
-    def __init__(self, session, namespace: str, track_name: str, params):
+    def __init__(self, session, namespace: str, track_name: str, params,
+                 sender=None):
         super().__init__(session, namespace=namespace, trackname=track_name)
         self._quiet = True
         self._stats_header_printed = True
         self.params = params
+        self.sender = sender or _MOQ_TEST_SENDERS[params.fp]
         self.ready = asyncio.Event()
         self.sent = asyncio.Event()
         self.forwarded = None
@@ -1907,10 +2172,14 @@ class _MoqTestTrack(PublishedTrack):
         # The PUBLISH reply's Forward State applies first.
         await asyncio.sleep(0)
         sub = self._sub_for(session)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _MOQ_TEST_FORWARD_WAIT_S
+        while not sub.forward and loop.time() < deadline:
+            await asyncio.sleep(0.01)
         self.forwarded = bool(sub.forward)
         try:
             if self.forwarded:
-                sub.stream_count = await _MOQ_TEST_SENDERS[self.params.fp](
+                sub.stream_count = await self.sender(
                     session, track_alias, self.params)
         except (Exception, MOQTStreamStopped) as e:
             self.error = e
@@ -1918,13 +2187,59 @@ class _MoqTestTrack(PublishedTrack):
             self.sent.set()
 
 
+def _retrieved(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _subscribe_refusal(task) -> Optional[str]:
+    """The relay's refusal of the SUBSCRIBE `task` sent, if it ended so;
+    not a failure from our own session close."""
+    if task is None or not task.done() or task.cancelled():
+        return None
+    e = task.exception()
+    if not isinstance(e, MOQTRequestError) or e.response is None:
+        return None
+    return f"SUBSCRIBE refused: code={e.error_code} {e.reason}"
+
+
 async def _run_moq_test(name: str, host: str, port: int, path: str,
                         use_quic: bool, tls_disable_verify: bool, debug: bool,
                         supported_drafts=None) -> TestResult:
+    """One attempt, or up to _MOQ_TEST_DATAGRAM_ATTEMPTS while a datagram
+    case only loses datagrams; the message names each earlier loss."""
+    t0 = time.monotonic()
+    losses: list[str] = []
+    for attempt in range(1, _MOQ_TEST_DATAGRAM_ATTEMPTS + 1):
+        r, lost = await _moq_test_attempt(name, host, port, path, use_quic,
+                                          tls_disable_verify, debug,
+                                          supported_drafts)
+        if not lost or attempt == _MOQ_TEST_DATAGRAM_ATTEMPTS:
+            break
+        losses.append(f"attempt {attempt}: {', '.join(lost)}")
+    if not losses:
+        return r
+    earlier = "; ".join(losses)
+    if lost:
+        message = (f"{r.message}; datagrams lost on all {attempt} attempts "
+                   f"({earlier})")
+    else:
+        message = (f"{r.message} (attempt {attempt} of "
+                   f"{_MOQ_TEST_DATAGRAM_ATTEMPTS}; datagrams lost on "
+                   f"{earlier})")
+    return replace(r, message=message,
+                   duration_ms=(time.monotonic() - t0) * 1000)
+
+
+async def _moq_test_attempt(name: str, host: str, port: int, path: str,
+                            use_quic: bool, tls_disable_verify: bool,
+                            debug: bool, supported_drafts
+                            ) -> tuple[TestResult, list]:
     """Subscriber first: SUBSCRIBE with RENDEZVOUS_TIMEOUT to the bare
     tuple namespace, then a second session PUBLISHes the same track and
     sends the tuple's objects; the subscriber checks what the relay
-    delivers."""
+    delivers. Also returns the problems when they are only some lost
+    datagrams, else []."""
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     sessions = {}
@@ -1933,22 +2248,24 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
     forward_zero = name == _MOQ_TEST_FORWARD_ZERO
     namespace = "/".join((*_NS_PREFIX, *fields))
     track_name = f"moq-test-{secrets.token_hex(8)}"
-    sub = _MoqTestSubscriber()
-    pub_track = reply = None
+    sub = _MoqTestSubscriber(forward_zero)
+    pub_track = reply = subscribing = None
     sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=supported_drafts)
     pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
                               debug, supported_drafts=supported_drafts)
 
-    def result(passed: bool, message: str, **kw) -> TestResult:
+    def result(passed: bool, message: str, lost=(),
+               **kw) -> tuple[TestResult, list]:
         return _skip_unsupported_publish(TestResult(
             name=name, passed=passed,
             duration_ms=(time.monotonic() - t0) * 1000,
-            sessions=sessions, message=message, **kw), reply)
+            sessions=sessions, message=message, **kw), reply), list(lost)
 
     step = "subscriber SETUP"
+    phase_end = loop.time() + _MOQ_TEST_PHASE_S
     try:
-        async with asyncio.timeout(_MOQ_TEST_PHASE_S):
+        async with asyncio.timeout_at(phase_end):
             async with sub_client.connect() as sub_session:
                 await sub_session.client_session_init()
                 sessions["subscriber"] = _session_meta(sub_session)
@@ -1971,6 +2288,7 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
                 subscribing = asyncio.ensure_future(track.subscribe(
                     parameters={_RENDEZVOUS_TIMEOUT: _MOQ_TEST_RENDEZVOUS_MS},
                     **omit))
+                subscribing.add_done_callback(_retrieved)
                 await asyncio.wait({subscribing},
                                    timeout=_MOQ_TEST_HEAD_START_S)
                 if subscribing.done():
@@ -1981,8 +2299,9 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
                     await pub_session.client_session_init()
                     sessions["publisher"] = _session_meta(pub_session)
                     step = "PUBLISH"
-                    pub_track = _MoqTestTrack(pub_session, namespace,
-                                              track_name, params)
+                    pub_track = _MoqTestTrack(
+                        pub_session, namespace, track_name, params,
+                        sender=_MOQ_TEST_SENDER_FOR.get(name))
                     await pub_track.publish(publish_track=True, forward=1)
                     request_id = pub_track.request_id
                     if request_id is None:
@@ -2002,15 +2321,18 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
                     pub_track.ready.set()
                     await pub_track.sent.wait()
                     pub_track._send_publish_done(pub_session)
-                    await sub.drain(loop.time() + _DATA_DELIVERY_S)
+                    await sub.drain(phase_end - _MOQ_TEST_CLOSE_S)
                     if forward_zero or params.fp == 3:
                         await asyncio.sleep(_MOQ_TEST_GRACE_S)
                     sub_session.close()
                 pub_session.close()
     except TimeoutError:
-        return result(False, f"timed out waiting for {step}")
+        timed_out = f"timed out waiting for {step}"
+        refusal = _subscribe_refusal(subscribing)
+        return result(False, f"{refusal}; {timed_out}" if refusal
+                      else timed_out)
     except MOQTRequestError as e:
-        return result(False, f"{step} refused: code={e.error_code} {e.reason}")
+        return result(False, _refused(step, e))
     except Exception as e:
         return result(False, f"{step} failed: {_format_exc(e)}")
     finally:
@@ -2037,8 +2359,10 @@ async def _run_moq_test(name: str, host: str, port: int, path: str,
         summary = (f"objects {received}/{len(data)}, End of Group "
                    f"{eogs}/{len(markers)}, Stream Count {count}/{streams}")
     if problems:
+        lost = problems if params.fp == 3 and sub.objects and all(
+            x.startswith("missing ") for x in problems) else ()
         return result(False, f"{problems[0]} ({len(problems)} problem(s)); "
-                             f"{summary}")
+                             f"{summary}", lost=lost)
     return result(True, summary)
 
 
@@ -2051,6 +2375,469 @@ def _moq_test_case(name: str):
     case.__name__ = "test_" + name.replace("-", "_")
     case.__doc__ = f"{name}: MoQT Test tuple {'/'.join(MOQ_TEST_CASES[name])}"
     return case
+
+
+# ---------------------------------------------------------------------------
+# Track and namespace lifecycle
+# ---------------------------------------------------------------------------
+
+# publish-namespace-done-track: one 1-byte object on one subgroup stream.
+_DONE_TRACK_CASE = ("moq-test-00", "0", "0", "0", "0", "0", "1", "1", "1",
+                    "0", "1", "1", "0", "-1", "-1", "0")
+# How long the observer waits, once the publisher has closed, for a
+# PUBLISH_DONE not yet seen.
+_DONE_TRAIL_S = 1.0
+
+
+def _namespace_options(draft: int) -> int:
+    """Subscribe Options asking for NAMESPACE messages: d16 needs them;
+    later drafts send NAMESPACE only."""
+    return _SUBSCRIBE_OPTIONS_NAMESPACE if draft == 16 else 0
+
+
+async def test_publish_namespace_done_track(host, port, path, use_quic,
+                                            tls_disable_verify, debug,
+                                            supported_drafts=None,
+                                            compat=frozenset(),
+                                            timeout=15.0) -> TestResult:
+    """publish-namespace-done-track: a publisher PUBLISHes a track in its
+    announced namespace, delivers one object, ends the track with
+    PUBLISH_DONE and its Stream Count, then withdraws the namespace. An
+    independent observer subscribed to the namespace and the track sees
+    NAMESPACE, the object and PUBLISH_DONE, then NAMESPACE_DONE."""
+    name = "publish-namespace-done-track"
+    t0 = time.monotonic()
+    loop = asyncio.get_running_loop()
+    sessions = {}
+    namespace = "/".join((*_NS_PREFIX, "moq-test", name, _run_id()))
+    params = parse_moq_test(_DONE_TRACK_CASE)
+    sub = _MoqTestSubscriber()
+    events = []
+    changed = asyncio.Event()
+    pub_track = reply = None
+
+    def _event(kind):
+        events.append(kind)
+        changed.set()
+
+    def _record(kind):
+        async def handler(session, msg):
+            suffix = tuple(_as_bytes(f) for f in msg.namespace_suffix)
+            _event(kind if not suffix else f"{kind} {suffix}")
+        return handler
+
+    def _on_done(msg):
+        sub.on_done(msg)
+        _event("PUBLISH_DONE")
+
+    async def _until(kind, wait=_LIFECYCLE_STEP_S) -> bool:
+        try:
+            async with asyncio.timeout(wait):
+                while kind not in events:
+                    changed.clear()
+                    await changed.wait()
+            return True
+        except TimeoutError:
+            return False
+
+    def result(passed, message, **kw):
+        return _skip_unsupported_publish(TestResult(
+            name=name, passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000,
+            sessions=sessions, message=message, **kw), reply)
+
+    obs_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    step = "observer SETUP"
+    try:
+        async with asyncio.timeout(timeout):
+            async with obs_client.connect() as obs:
+                await obs.client_session_init()
+                sessions["observer"] = _session_meta(obs)
+                draft = obs.negotiated_draft
+                obs.register_handler(D16MessageType.NAMESPACE,
+                                     _record("NAMESPACE"))
+                obs.register_handler(D16MessageType.NAMESPACE_DONE,
+                                     _record("NAMESPACE_DONE"))
+                step = "publisher SETUP"
+                async with pub_client.connect() as pub:
+                    await pub.client_session_init()
+                    sessions["publisher"] = _session_meta(pub)
+                    step = "PUBLISH_NAMESPACE"
+                    announced = await pub.publish_namespace(
+                        namespace=namespace, parameters=_PUB_NS_PARAMS,
+                        wait_response=True)
+                    step = "SUBSCRIBE_NAMESPACE"
+                    await obs.subscribe_namespace(
+                        namespace, subscribe_options=_namespace_options(draft),
+                        wait_response=True)
+                    if not await _until("NAMESPACE"):
+                        return result(False, f"no NAMESPACE within "
+                                             f"{_LIFECYCLE_STEP_S:g}s")
+                    step = "PUBLISH"
+                    pub_track = _MoqTestTrack(pub, namespace, "test-track",
+                                              params)
+                    await pub_track.publish(publish_track=True, forward=1)
+                    reply = _publish_reply(pub, pub_track.request_id,
+                                           pub_track)
+                    msg = await reply
+                    if _MOQTSessionMixin._is_error_response(msg):
+                        return result(False, f"PUBLISH refused: code="
+                                             f"{msg.error_code:#x} "
+                                             f"{getattr(msg, 'reason', '')}")
+                    step = "SUBSCRIBE"
+                    track = SubscribedTrack(obs, namespace, "test-track",
+                                            on_object=sub.on_object,
+                                            on_done=_on_done)
+                    track._quiet = True
+                    await track.subscribe(timeout=_SUBSCRIBE_WAIT)
+                    obs.register_stream_end_handler(track.track_alias,
+                                                    sub.on_stream_end)
+                    step = "object delivery"
+                    pub_track.ready.set()
+                    await pub_track.sent.wait()
+                    pub_track._send_publish_done(pub)
+                    await sub.drain(loop.time() + _DATA_DELIVERY_S)
+                    step = "NAMESPACE_DONE"
+                    pub.publish_namespace_done(
+                        namespace=namespace, request_id=announced.request_id)
+                    await _until("NAMESPACE_DONE")
+                    pub.close()
+                # A relay may send it when the publisher's session ends:
+                # reported out of order, not missing.
+                await _until("PUBLISH_DONE", _DONE_TRAIL_S)
+                obs.close()
+    except TimeoutError:
+        return result(False, f"timed out waiting for {step}")
+    except MOQTRequestError as e:
+        return result(False, _refused(step, e))
+    except Exception as e:
+        return result(False, f"{step} failed: {_format_exc(e)}")
+    finally:
+        if pub_track is not None:
+            pub_track.ready.set()
+
+    problems = _moq_test_problems(params, sub.objects, sub.done,
+                                  sub.streams_ended, sub.streams_reset, False)
+    if pub_track.error is not None:
+        problems.insert(0, f"publisher: {_format_exc(pub_track.error)}")
+    elif pub_track.forwarded is False:
+        problems.insert(0, "relay left the PUBLISH at Forward State 0")
+    want = ["NAMESPACE", "PUBLISH_DONE", "NAMESPACE_DONE"]
+    firsts = [events.index(k) if k in events else -1 for k in want]
+    extra = [e for e in events if e not in want]
+    if extra:
+        problems.append(f"observer saw {extra[0]}")
+    elif -1 in firsts or firsts != sorted(firsts):
+        problems.append(f"observer saw {', '.join(events) or 'nothing'}, "
+                        f"expected {', '.join(want)} in that order")
+    received = sum(1 for o in sub.objects if _is_normal(o[4]))
+    count = "none" if sub.done is None else sub.done.stream_count
+    summary = (f"objects {received}/1, Stream Count {count}/1; observer saw "
+               f"{', '.join(events) or 'nothing'}")
+    if problems:
+        return result(False, f"{problems[0]} ({len(problems)} problem(s)); "
+                             f"{summary}",
+                      expected=", ".join(want),
+                      received=", ".join(events) or "nothing")
+    return result(True, summary)
+
+
+_CANCEL_AFTER = 2
+# How long the cancelled subscriber keeps listening.
+_CANCEL_SETTLE_S = 1.0
+# Allowance beyond one RTT for objects the relay sent before the cancel
+# reached it.
+_CANCEL_INFLIGHT_S = 0.1
+
+
+async def test_subscribe_cancel_live(host, port, path, use_quic,
+                                     tls_disable_verify, debug,
+                                     supported_drafts=None,
+                                     compat=frozenset(),
+                                     timeout=15.0) -> TestResult:
+    """subscribe-cancel-live: a subscriber to a live track (an object
+    every 20 ms) cancels after two objects; no object the relay sends
+    after the cancel reaches it."""
+    name = "subscribe-cancel-live"
+    t0 = time.monotonic()
+    loop = asyncio.get_running_loop()
+    sessions = {}
+    namespace = "/".join((*_NS_PREFIX, "moq-test", name, _run_id()))
+    before, after = [], []
+    cancelled = asyncio.Event()
+    cancel_at = None
+    live = None
+    window = _CANCEL_INFLIGHT_S
+
+    def on_object(msg, _size, _recv, group_id=None, *_):
+        nonlocal cancel_at
+        loc = (getattr(msg, "group_id", group_id), msg.object_id)
+        if cancel_at is not None:
+            after.append((*loc, loop.time() - cancel_at))
+            return
+        before.append(loc)
+        if len(before) == _CANCEL_AFTER:
+            cancel_at = loop.time()
+            if live is not None:
+                live.unsubscribe()
+            cancelled.set()
+
+    def result(passed, message, **kw):
+        return TestResult(name=name, passed=passed,
+                          duration_ms=(time.monotonic() - t0) * 1000,
+                          sessions=sessions, message=message, **kw)
+
+    pub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    sub_client = _make_client(host, port, path, use_quic, tls_disable_verify,
+                              debug, supported_drafts=supported_drafts)
+    step = "publisher SETUP"
+    try:
+        async with asyncio.timeout(timeout):
+            async with pub_client.connect() as pub:
+                await pub.client_session_init()
+                sessions["publisher"] = _session_meta(pub)
+                step = "PUBLISH_NAMESPACE"
+                track = PublishedTrack(pub, namespace=namespace,
+                                       trackname="track", object_size=64,
+                                       group_size=6, rate=50)
+                track._quiet = True
+                track._stats_header_printed = True
+                await track.publish(announce_namespace=True,
+                                    publish_track=False)
+                step = "subscriber SETUP"
+                async with sub_client.connect() as sub:
+                    await sub.client_session_init()
+                    sessions["subscriber"] = _session_meta(sub)
+                    step = "SUBSCRIBE"
+                    live = SubscribedTrack(sub, namespace, "track",
+                                           on_object=on_object)
+                    live._quiet = True
+                    await live.subscribe(timeout=_SUBSCRIBE_WAIT)
+                    step = f"{_CANCEL_AFTER} objects"
+                    async with asyncio.timeout(_DATA_DELIVERY_S):
+                        await cancelled.wait()
+                    rtt_us = sub.handshake_info.get("rtt_us") or 0
+                    window += rtt_us / 1e6
+                    await asyncio.sleep(_CANCEL_SETTLE_S)
+                    sub.close()
+                pub.close()
+    except TimeoutError:
+        return result(False, f"timed out waiting for {step}",
+                      expected=f"{_CANCEL_AFTER} objects, then none",
+                      received=f"{len(before)} objects")
+    except MOQTRequestError as e:
+        return result(False, _refused(step, e))
+    except Exception as e:
+        return result(False, f"{step} failed: {_format_exc(e)}")
+
+    late = [a for a in after if a[2] > window]
+    flight = len(after) - len(late)
+    summary = (f"{len(before)} objects before the cancel, {len(late)} after "
+               f"it, {flight} in flight within {window * 1000:.0f} ms")
+    if late:
+        g, o, at = late[0]
+        return result(False, f"object {g}.{o} arrived {at * 1000:.0f} ms "
+                             f"after the cancel; {summary}",
+                      expected="no object after the cancel",
+                      received=f"{len(late)} objects")
+    return result(True, summary)
+
+
+PUBLISH_NAMESPACE_RETENTION_REVISION = 1
+_RETENTION_S = 8.0
+_RETENTION_NAMES = (b"shared", b"sync")
+
+
+class _NamespaceLog:
+    """One namespace subscriber's NAMESPACE / NAMESPACE_DONE, checked as
+    they arrive: each suffix one of _RETENTION_NAMES, each a change of
+    state, a removal only once `removable` holds the name, no offer of a
+    name in `withdrawn`."""
+
+    def __init__(self, role: str, withdrawn=()):
+        self.role = role
+        self.present: set = set()
+        self.seen: list = []
+        self.removable: set = set()
+        self.withdrawn = frozenset(withdrawn)
+        self.problems: list = []
+        self._changed = asyncio.Event()
+
+    def handler(self, available: bool):
+        async def on_message(session, msg):
+            suffix = tuple(_as_bytes(f) for f in msg.namespace_suffix)
+            self.record(suffix, available)
+        return on_message
+
+    def record(self, suffix: tuple, available: bool) -> None:
+        kind = "NAMESPACE" if available else "NAMESPACE_DONE"
+        label = "/".join(f.decode(errors="replace") for f in suffix)
+        self.seen.append(f"{kind} {label}")
+        self._changed.set()
+        if len(suffix) != 1 or suffix[0] not in _RETENTION_NAMES:
+            self.problems.append(f"{self.role}: {kind} for unexpected "
+                                 f"suffix {suffix}")
+            return
+        name = suffix[0]
+        if available and name in self.withdrawn:
+            self.problems.append(f"{self.role}: {kind} {label} after its "
+                                 f"withdrawal")
+        if available == (name in self.present):
+            self.problems.append(f"{self.role}: {kind} {label} while "
+                                 f"{'present' if available else 'absent'}")
+        elif not available and name not in self.removable:
+            self.problems.append(f"{self.role}: premature {kind} {label}")
+        if available:
+            self.present.add(name)
+        else:
+            self.present.discard(name)
+
+    async def until(self, kind: str, name: bytes) -> bool:
+        want = f"{kind} {name.decode()}"
+        try:
+            async with asyncio.timeout(_LIFECYCLE_STEP_S):
+                while want not in self.seen:
+                    self._changed.clear()
+                    await self._changed.wait()
+            return True
+        except TimeoutError:
+            return False
+
+
+async def test_publish_namespace_multi_publisher_retention(
+        host, port, path, use_quic, tls_disable_verify, debug,
+        supported_drafts=None, compat=frozenset()) -> TestResult:
+    """publish-namespace-multi-publisher-retention: two publishers
+    announce one namespace; once the second withdraws, the relay still
+    offers it to new namespace subscribers, and withdraws it from all of
+    them only when the first leaves."""
+    name = "publish-namespace-multi-publisher-retention"
+    t0 = time.monotonic()
+    sessions = {}
+    prefix = "/".join((*_NS_PREFIX, "moq-test", name, _run_id()))
+    shared, sync = (f"{prefix}/{n.decode()}" for n in _RETENTION_NAMES)
+    logs = {}
+    opened = {}
+
+    def result(passed, message, **kw):
+        return TestResult(
+            name=name, passed=passed,
+            duration_ms=(time.monotonic() - t0) * 1000, sessions=sessions,
+            spec_revision=PUBLISH_NAMESPACE_RETENTION_REVISION,
+            message=message, **kw)
+
+    def failed(message):
+        problems = [p for log in logs.values() for p in log.problems]
+        seen = "; ".join(f"{r}: {', '.join(log.seen) or 'nothing'}"
+                         for r, log in logs.items())
+        return result(False, f"{problems[0]}; {message}" if problems
+                      else message,
+                      expected="shared retained until publisher_1 withdraws",
+                      received=seen)
+
+    step = "observer SETUP"
+    try:
+        async with asyncio.timeout(_RETENTION_S), \
+                contextlib.AsyncExitStack() as stack:
+
+            async def connect(role):
+                client = _make_client(host, port, path, use_quic,
+                                      tls_disable_verify, debug,
+                                      supported_drafts=supported_drafts)
+                session = await stack.enter_async_context(client.connect())
+                await session.client_session_init()
+                sessions[role] = _session_meta(session)
+                opened[role] = session
+                return session
+
+            async def watch(role, withdrawn=()):
+                """A SUBSCRIBE_NAMESPACE for the run prefix."""
+                session = await connect(role)
+                draft = session.negotiated_draft
+                log = logs[role] = _NamespaceLog(role, withdrawn)
+                session.register_handler(D16MessageType.NAMESPACE,
+                                         log.handler(True))
+                session.register_handler(D16MessageType.NAMESPACE_DONE,
+                                         log.handler(False))
+                await session.subscribe_namespace(
+                    prefix, subscribe_options=_namespace_options(draft),
+                    wait_response=True)
+                return log
+
+            watched = await watch("observer")
+
+            step = "publisher_1 PUBLISH_NAMESPACE"
+            first = await connect("publisher_1")
+            first_ok = await first.publish_namespace(
+                namespace=shared, parameters=_PUB_NS_PARAMS,
+                wait_response=True)
+            if not await watched.until("NAMESPACE", b"shared"):
+                return failed("observer: no NAMESPACE shared from "
+                              "publisher_1")
+
+            step = "publisher_2 PUBLISH_NAMESPACE"
+            second = await connect("publisher_2")
+            second_ok = [await second.publish_namespace(
+                namespace=ns, parameters=_PUB_NS_PARAMS, wait_response=True)
+                for ns in (shared, sync)]
+            if not await watched.until("NAMESPACE", b"sync"):
+                return failed("observer: no NAMESPACE sync from "
+                              "publisher_2")
+
+            step = "publisher_2 withdrawal"
+            watched.removable.add(b"sync")
+            for ns, ok in zip((shared, sync), second_ok):
+                second.publish_namespace_done(
+                    namespace=second._make_namespace_tuple(ns),
+                    request_id=ok.request_id)
+            if not await watched.until("NAMESPACE_DONE", b"sync"):
+                return failed("observer: no NAMESPACE_DONE sync after "
+                              "publisher_2 withdrew")
+
+            step = "late SUBSCRIBE_NAMESPACE"
+            late = [await watch(role, withdrawn=(b"sync",))
+                    for role in ("subscriber_1", "subscriber_2")]
+            for log in late:
+                if not await log.until("NAMESPACE", b"shared"):
+                    return failed(f"{log.role}: no NAMESPACE shared "
+                                  f"retained from publisher_1")
+            if b"shared" not in watched.present:
+                return failed("observer: shared gone before publisher_1 "
+                              "withdrew")
+
+            step = "publisher_1 withdrawal"
+            for log in logs.values():
+                log.removable.add(b"shared")
+            first.publish_namespace_done(
+                namespace=first._make_namespace_tuple(shared),
+                request_id=first_ok.request_id)
+            for log in logs.values():
+                if not await log.until("NAMESPACE_DONE", b"shared"):
+                    return failed(f"{log.role}: no NAMESPACE_DONE shared "
+                                  f"after publisher_1 withdrew")
+            ended = [r for r, s in opened.items()
+                     if s._moqt_session_closed.done()]
+            for session in opened.values():
+                session.close()
+    except TimeoutError:
+        return failed(f"timed out at {step} (limit {_RETENTION_S:g}s)")
+    except MOQTRequestError as e:
+        return failed(_refused(step, e))
+    except Exception as e:
+        return failed(f"{step} failed: {_format_exc(e)}")
+
+    if ended:
+        return failed(f"session(s) ended early: {', '.join(ended)}")
+    problems = [p for log in logs.values() for p in log.problems]
+    if problems:
+        return failed(f"{len(problems)} problem(s)")
+    return result(True, "shared retained after publisher_2 withdrew; both "
+                        "late subscribers saw it, and all three saw its "
+                        "NAMESPACE_DONE when publisher_1 withdrew")
 
 
 # ---------------------------------------------------------------------------
@@ -2069,9 +2856,15 @@ TEST_FUNCTIONS = {
     "namespace-discovery": test_namespace_discovery,
     "fetch": test_fetch,
     "join": test_join,
+    "fetch-descending": test_fetch_descending,
+    "fetch-error-recovery": test_fetch_error_recovery,
     "subscribe-namespace-lifecycle": test_subscribe_namespace_lifecycle,
     "publish-track-only": test_publish_track_only,
     "publish-track-subscribe": test_publish_track_subscribe,
+    "publish-namespace-done-track": test_publish_namespace_done_track,
+    "subscribe-cancel-live": test_subscribe_cancel_live,
+    "publish-namespace-multi-publisher-retention":
+        test_publish_namespace_multi_publisher_retention,
     **{name: _moq_test_case(name) for name in MOQ_TEST_CASES},
 }
 
@@ -2136,7 +2929,7 @@ def parse_args():
         "--draft", type=parse_draft_spec,
         default=parse_draft_spec(draft_env) if draft_env else None,
         help="MoQT draft, e.g. 18 or draft-18 (single = strict pin) or a "
-             "comma list 18,16,14 (preference-ordered probe: pin the first "
+             "comma list 20,18,16 (preference-ordered probe: pin the first "
              "whose SETUP completes) (env: DRAFT, MOQT_DRAFT). Default: "
              f"probe {','.join(map(str, MOQT_DEFAULT_DRAFTS))}")
     parser.add_argument(
@@ -2191,7 +2984,7 @@ async def run_tests(tests: list[str], host: str, port: int, path: str,
     # single-ALPN SETUP completes. An int pins strictly.
     effective_draft = supported_drafts
     if isinstance(supported_drafts, (list, tuple)):
-        # Preference-ordered probe (e.g. --draft 18,16,14 / DRAFT=18,16,14):
+        # Preference-ordered probe (e.g. --draft 20,18,16 / DRAFT=20,18,16):
         # pin the FIRST draft whose single-ALPN SETUP completes. Each attempt
         # is a deterministic single-ALPN offer, with no multi-offer
         # server-choice vagary.
@@ -2332,7 +3125,7 @@ def main():
             ParamType.AUTH_TOKEN: args.auth_token.encode(),
         }
 
-    # Public API takes the draft NUMBER (14, 16, ...). MOQTClient
+    # Public API takes the draft NUMBER (16, 18, ...). MOQTClient
     # normalizes to the wire form internally; pass args.draft through.
     # No explicit draft (the moq-interop-runner invokes us with RELAY_URL
     # but no DRAFT): probe newest first and pin the first draft whose SETUP
@@ -2370,7 +3163,7 @@ def main():
         tests = STANDARD_TESTS
 
     try:
-        asyncio.run(
+        run(
             run_tests(tests, host, port, path, use_quic,
                       args.tls_disable_verify, args.debug,
                       supported_drafts=supported_drafts,

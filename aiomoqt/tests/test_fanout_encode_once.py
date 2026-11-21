@@ -34,10 +34,13 @@ class _Session:
         self.fins = set()
         self.dgrams = []
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
         self.streams[sid] = bytearray()
+        if initial or end_stream:
+            await self.stream_write_drain(sid, initial, end_stream)
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
@@ -45,9 +48,11 @@ class _Session:
         if end_stream:
             self.fins.add(sid)
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         await asyncio.sleep(0)
         self.streams[sid] += data
+        if end_stream:
+            self.fins.add(sid)
 
     def datagram_max_payload(self):
         return 1 << 16
@@ -165,9 +170,9 @@ def _streams(session):
 
 @pytest.mark.asyncio
 async def test_per_group_peers_share_one_encode_per_state(monkeypatch):
-    # d18 and d22 share a state; d16 and d14 each have their own.
+    # d18 and d22 share a state; d16 has its own.
     peers = [_Session("a", 18), _Session("b", 18), _Session("c", 22),
-             _Session("d", 16), _Session("e", 14)]
+             _Session("d", 16)]
     fan = FanoutDelivery()
     for alias, s in enumerate(peers, 1):
         fan.add(SubgroupDelivery(s, alias), joining=False)
@@ -181,8 +186,8 @@ async def test_per_group_peers_share_one_encode_per_state(monkeypatch):
                                              in _OBJECTS if gg == g])
                   for g in (0, 1)]
         assert _streams(s) == expect, s.name
-    # Three states per object; _by_peer splits the shared one by peer.
-    assert spy.objects == 3 * len(_OBJECTS) + 2
+    # Two states per object; _by_peer splits the shared one by peer.
+    assert spy.objects == 2 * len(_OBJECTS) + 2
 
 
 @pytest.mark.asyncio
@@ -288,7 +293,7 @@ async def test_datagram_encodings_kept_are_bounded(monkeypatch, aliases,
 
     monkeypatch.setattr(delivery_mod.SendLane, "offer", spy)
     await _run(fan, _OBJECTS[:3])
-    held = [len(item[-1]) for item in items if isinstance(item, tuple)]
+    held = [len(item[8]) for item in items if isinstance(item, tuple)]
     assert held and max(held) == kept
     for alias, s in zip(aliases, peers):
         assert s.dgrams == [ObjectDatagram(

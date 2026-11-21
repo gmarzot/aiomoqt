@@ -58,9 +58,9 @@ def test_annexb_key_frame_carries_parameter_sets():
     pub = LocTrackPublisher(None, 'ns', 'video', config=_AVCC,
                             annexb='h264')
     key = pub._package(_lp(_IDR), 0, 0)
-    assert key == b'\x0a\x00' + avcc_param_sets(_AVCC) + _SC + _IDR
-    assert _h264_types(key[2:]) == [7, 8, 5]
-    assert pub._package(_lp(_P), 0, 1) == b'\x0a\x00' + _SC + _P
+    assert key == avcc_param_sets(_AVCC) + _SC + _IDR
+    assert _h264_types(key) == [7, 8, 5]
+    assert pub._package(_lp(_P), 0, 1) == _SC + _P
     exts = pub._object_extensions(LocFrame(_lp(_IDR), True, 1), True,
                                   NS(negotiated_draft=18))
     assert LOC_PROP_VIDEO_CONFIG not in exts
@@ -72,12 +72,12 @@ def test_annexb_keeps_in_band_parameter_sets_single():
                             annexb='h264')
     sps, pps = b'\x67\x64\x00', b'\x68\xee'
     out = pub._package(_lp(sps, pps, _IDR), 0, 0)
-    assert _h264_types(out[2:]) == [7, 8, 5]
+    assert _h264_types(out) == [7, 8, 5]
 
 
 def test_default_is_length_prefixed_with_video_config():
     pub = LocTrackPublisher(None, 'ns', 'video', config=_AVCC)
-    assert pub._package(_lp(_IDR), 0, 0) == b'\x0a\x00' + _lp(_IDR)
+    assert pub._package(_lp(_IDR), 0, 0) == _lp(_IDR)
     exts = pub._object_extensions(LocFrame(_lp(_IDR), True, 1), True,
                                   NS(negotiated_draft=18))
     assert exts[LOC_PROP_VIDEO_CONFIG] == _AVCC
@@ -96,7 +96,7 @@ def test_hevc_parameter_sets_from_hvcc(tmp_path):
     pub = LocTrackPublisher(None, 'ns', 'video', config=video.config,
                             annexb='h265')
     first = next(iter(video.samples()))
-    out = pub._package(first.payload, 0, 0)[2:]
+    out = pub._package(first.payload, 0, 0)
     types = _h265_types(out)
     assert types[:3] == [32, 33, 34] and types.count(33) == 1
     assert 16 <= types[-1] <= 21

@@ -96,7 +96,8 @@ class _Rec:
         self.sent = []
 
     async def send_frame(self, payload, *, key_frame, timestamp,
-                         group_id=None, capture_us=None):
+                         group_id=None, capture_us=None,
+                         end_of_group=False):
         self.sent.append(NS(payload=payload, key=key_frame, ts=timestamp,
                             hint=group_id, capture=capture_us))
 

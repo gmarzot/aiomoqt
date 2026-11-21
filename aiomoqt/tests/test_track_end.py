@@ -60,8 +60,8 @@ async def test_a_subscription_sent_nothing_ends_with_no_streams(use_quic):
 
 
 @requires_certs
-async def test_a_d14_teardown_withdraws_nothing_onto_the_wire():
-    """A d14 PUBLISH_NAMESPACE_DONE ends the whole session at an aiomoqt
+async def test_a_d16_teardown_withdraws_nothing_onto_the_wire():
+    """A d16 PUBLISH_NAMESPACE_DONE ends the whole session at an aiomoqt
     peer. A track withdraws its namespace only once its session has
     closed, when the control stream takes no more messages."""
     port = _port(2, True)
@@ -78,7 +78,7 @@ async def test_a_d14_teardown_withdraws_nothing_onto_the_wire():
 
     server = MOQTServer(host="localhost", port=port, certificate=CERT,
                         private_key=KEY, path="/", use_quic=True,
-                        supported_drafts=14)
+                        supported_drafts=16)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE,
                             _on_publish_namespace)
     server.register_handler(MOQTMessageType.PUBLISH_NAMESPACE_DONE,
@@ -86,16 +86,16 @@ async def test_a_d14_teardown_withdraws_nothing_onto_the_wire():
     quic_server = await server.serve()
     try:
         client = MOQTClient("localhost", port, path="/", use_quic=True,
-                            verify_tls=False, supported_drafts=14)
+                            verify_tls=False, supported_drafts=16)
         async with client.connect() as pub:
             await pub.client_session_init()
-            track = PublishedTrack(pub, namespace="teardown/d14",
+            track = PublishedTrack(pub, namespace="teardown/d16",
                                    trackname="t", object_size=100,
                                    group_size=5, rate=200)
             await track.publish(announce_namespace=True, publish_track=False)
             rx = await asyncio.wait_for(peer, 5.0)
             got = asyncio.Event()
-            await rx.subscribe("teardown/d14", "t", forward=1,
+            await rx.subscribe("teardown/d16", "t", forward=1,
                                on_object=lambda *_: got.set(),
                                wait_response=True)
             await asyncio.wait_for(got.wait(), 5.0)
@@ -103,6 +103,6 @@ async def test_a_d14_teardown_withdraws_nothing_onto_the_wire():
             await asyncio.wait_for(rx.async_closed(), 5.0)
             await asyncio.sleep(0.1)
         assert withdrawn == []
-        assert not pub.is_announced("teardown/d14")
+        assert not pub.is_announced("teardown/d16")
     finally:
         quic_server.close()

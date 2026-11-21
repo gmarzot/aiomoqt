@@ -58,7 +58,7 @@ async def _stalled_fetch(tracks, rx):
     pub = tracks["video"].session
     stalled = asyncio.Event()
 
-    async def _stall(stream_id, data, end_stream=False):
+    async def _stall(stream_id, data, end_stream=False, **kw):
         stalled.set()
         await asyncio.Event().wait()
     pub.stream_write_drain = _stall

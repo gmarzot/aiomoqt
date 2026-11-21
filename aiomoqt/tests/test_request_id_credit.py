@@ -1,4 +1,4 @@
-"""d14/d16 MAX_REQUEST_ID (§9.5): a peer request at or beyond our
+"""d16 MAX_REQUEST_ID (§9.5): a peer request at or beyond our
 advertised ceiling closes the session with TOO_MANY_REQUESTS; we raise
 the ceiling before a well-behaved peer reaches it; we never allocate
 past the peer's ceiling (REQUESTS_BLOCKED once, then refuse) until a
@@ -147,7 +147,7 @@ async def test_d18_has_no_ceiling():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("params", [None, {}, {SetupParamType.IMPLEMENTATION: b"x"}],
                          ids=["none", "empty", "other"])
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 async def test_no_max_request_id_means_no_requests(draft, params):
     # §9.3.1.3: the default is 0; until MAX_REQUEST_ID nothing may be sent.
     s = _stub(draft)
@@ -167,7 +167,7 @@ def missing_credit(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 async def test_compat_lets_requests_out_without_max_request_id(
         draft, missing_credit, caplog):
     # --compat missing-request-credit: an absent MAX_REQUEST_ID leaves our
@@ -187,7 +187,7 @@ async def test_compat_lets_requests_out_without_max_request_id(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 async def test_compat_still_honours_a_max_request_id(draft, missing_credit):
     s = _stub(draft)
     s._ingest_request_limit({SetupParamType.MAX_REQUEST_ID: 2})
@@ -221,7 +221,7 @@ def test_apply_compat_sets_missing_request_credit(monkeypatch):
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
-@pytest.mark.parametrize("draft", [14, 16])
+@pytest.mark.parametrize("draft", [16])
 async def test_credit_waits_while_the_peer_holds_too_many_requests_open(
         draft, use_quic, monkeypatch, caplog):
     # Window 20: ids 0..18, a raise due from id 10 on. With 4 SUBSCRIBEs

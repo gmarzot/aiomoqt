@@ -21,7 +21,7 @@ D18 = profile_for(18)
 def _kvps(props) -> bytes:
     """Key-Value-Pairs as an Immutable Properties value carries them."""
     buf = Buffer(capacity=256, vi64=True)
-    MOQTMessage._extensions_encode(buf, props, with_length=False, delta=True)
+    MOQTMessage._extensions_encode(buf, props, with_length=False)
     return bytes(buf.data_slice(0, buf.tell()))
 
 

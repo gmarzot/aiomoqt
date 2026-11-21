@@ -80,13 +80,19 @@ def test_relay_operator_flags(tmp_path, short_dir):
         assert objects_received(out) > 0, out
         assert rc == 0, out
 
+        census = _control(ctl, "GET", "/gc?top=5")
+        assert len(census["top"]) == 5 and census["tracked"] > 0, census
+        assert len(census["collections"]) == 3, census
+
         sessions = _control(ctl, "GET", "/sessions")
         assert sessions["trace_subscribers"] is False
         assert sessions["sessions"], sessions  # pub_bench is still connected
         assert all({"rtt", "cwin", "lost", "timer_losses"} <= set(row)
                    for row in sessions["sessions"]), sessions
 
-        relay_info = _status(status_dir / "status.json")["relay"]
+        snap = _status(status_dir / "status.json")
+        assert len(snap["totals"]["gc_totals"]["collections"]) == 3
+        relay_info = snap["relay"]
         assert relay_info["port"] == port
         assert sorted(relay_info["transports"]) == ["quic", "wt"]
         assert (log_dir / "relay.log").stat().st_size > 0

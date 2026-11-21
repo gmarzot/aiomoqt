@@ -19,16 +19,22 @@ class _Downstream:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         sid = self._next
         self._next += 4
+        if initial or end_stream:
+            await self.stream_write_drain(sid, initial, end_stream)
         return sid
 
     def stream_write(self, sid, data, end_stream=False):
         self.writes.append((sid, len(data), end_stream))
 
-    async def stream_write_drain(self, sid, data):
-        self.writes.append((sid, len(data), False))
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
+        self.writes.append((sid, len(data), end_stream))
 
     def stream_reset(self, sid, code):
         self.writes.append((sid, "reset", int(code)))
@@ -118,7 +124,7 @@ async def test_malformed_upstream_ends_downstream_and_drops_the_fanout():
         _tracks.pop(key, None)
 
 
-@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+@pytest.mark.parametrize("draft", [16, 18, 22])
 @pytest.mark.parametrize("exts", [None, {0x10: 7}, {0x10: 7, 0x0B: b"ab"}])
 def test_fast_object_encoding_matches_next_object(draft, exts):
     # The relay forwards with next_object_bytes; it must equal next_object.
@@ -147,9 +153,12 @@ class _Capturing(_Downstream):
         self.data.setdefault(sid, bytearray()).extend(data)
         super().stream_write(sid, data, end_stream)
 
-    async def stream_write_drain(self, sid, data):
+    def stream_write_nowait(self, *_a, **_kw):
+        return False
+
+    async def stream_write_drain(self, sid, data, end_stream=False):
         self.data.setdefault(sid, bytearray()).extend(data)
-        await super().stream_write_drain(sid, data)
+        await super().stream_write_drain(sid, data, end_stream)
 
 
 @pytest.mark.asyncio

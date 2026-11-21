@@ -289,7 +289,7 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 12 python -m aiomoqt.tools.sub_bench \
-            -N clock -T now --draft 18,16,14 -k -t 8 \
+            -N clock -T now --draft 18,16 -k -t 8 \
             https://localhost:4443 \
             > /tmp/sub.log 2>&1 || true
           echo === sub.log ===
@@ -372,24 +372,24 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-aiomoqt
-      - name: Run codec microbenches (d14/d16/d18)
+      - name: Run codec microbenches (d16/d18)
         timeout-minutes: 10
         run: |
           # Codec-only, no transport — the subset that is reliable on
-          # hosted runners. Each sweeps all three drafts. Floor
+          # hosted runners. Each sweeps both drafts. Floor
           # enforcement deferred until enough runs to calibrate noise.
           # A draft list is the cross-draft sweep; a single value would
           # report that draft alone.
           {
             python -m aiomoqt.tests.microbench.b1_parser \
-              --draft 14,16,18 --duration 3 || true
+              --draft 16,18 --duration 3 || true
             python -m aiomoqt.tests.microbench.b7_framer \
-              --draft 14,16,18 --duration 3 || true
+              --draft 16,18 --duration 3 || true
             python -m aiomoqt.tests.microbench.b8_control_roundtrip \
               --duration 2 || true
           } | tee /tmp/microbench.txt
           {
-            echo "### Codec microbenches — d14/d16/d18"
+            echo "### Codec microbenches — d16/d18"
             echo "\`${GITHUB_SHA:0:8}\` on \`${RUNNER_OS}\`. Hosted-runner"
             echo "numbers are noisy; read the ratio columns, not absolutes."
             echo '```'

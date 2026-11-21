@@ -34,6 +34,12 @@ def test_video_defaults_to_30_fps_and_one_second_gops():
     assert a.object_size == VideoTrack.mean_object_size("1080p", 30)
 
 
+def test_4kuhd_is_16_mbps_at_two_second_gops():
+    a = _media(["--video", "4kuhd", "-g", "60"])
+    assert a.video == "4kuhd"
+    assert a.object_size * 8 * a.video_fps / 1e6 == pytest.approx(16.0, abs=0.01)
+
+
 def test_rate_and_group_size_keep_their_meaning_with_video():
     a = _media(["--video", "720p", "-r", "60", "-g", "120"])
     assert (a.rate, a.group_size) == (60, 120)

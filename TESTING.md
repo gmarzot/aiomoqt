@@ -27,9 +27,9 @@ python tests/release_regression_test.py --test-tier bench
 # 4. Docker image smoke — build, list cases, run live
 docker build --build-arg VERSION=0.0.0 -t aiomoqt-test .
 docker run --rm aiomoqt-test -l
-docker run --rm --network host -e RELAY_URL=$RELAY aiomoqt-test --draft 14
+docker run --rm --network host -e RELAY_URL=$RELAY aiomoqt-test --draft 16
 
-# 5. Throughput pub/sub (d14/d16 QUIC/WebTransport)
+# 5. Throughput pub/sub (d16 QUIC/WebTransport)
 #    Shell A (publisher):
 python -m aiomoqt.tools.pub_bench $RELAY -s 500000 -t 60 -r 30 -g 30 -k --draft 16
 #    Shell B (subscriber):
@@ -73,8 +73,8 @@ or `--test-suite <suite>` (runs a single suite, ignoring tier).
 ### `integration` tier
 Covers what pytest cannot reach: the tools, the multi-process paths, and the draft × transport matrix.
 - **`loopback-pub-sub`** — `loopback_bench` at fixed rate; asserts throughput > 0 and zero loss. Variants: `-tiny`, `-streams`, `-paced`.
-- **`loopback-bench-d{14,16,18,20,22}-{wt,quic}`** — session-setup / framing smoke for every draft × transport.
-- **`loopback-adaptive-mp-d{14,16,18,20,22}`** — adaptive BW over the multi-process loopback path.
+- **`loopback-bench-d{16,18,20,22}-{wt,quic}`** — session-setup / framing smoke for every draft × transport.
+- **`loopback-adaptive-mp-d{16,18,20,22}`** — adaptive BW over the multi-process loopback path.
 - **`loopback-adaptive-relay-quic-d22`** — adaptive BW in relay mode through a local aiomoqt-relay over raw QUIC.
 - **`loopback-fetch`** — standalone `FETCH` variants: joining-relative, explicit range, invalid-range rejection, unknown request-id rejection.
 
@@ -83,7 +83,7 @@ Covers what pytest cannot reach: the tools, the multi-process paths, and the dra
 - **`relay-pub-sub`** — 3-subscriber multi-sub bench against the relay; asserts N/N subscribers receive the published objects.
 - **`relay-join`** — `SUBSCRIBE + JOINING_FETCH` probe (most relays do not implement this yet; disabled by default in the catalog).
 - **`relay-fetch`** — standalone `FETCH` probe (same).
-- **`relay-discovery`** — a subscriber knowing only the namespace learns the trackname. d14/d16 answer `SUBSCRIBE_NAMESPACE` with a `PUBLISH` per track; d18 reports namespaces first (`NAMESPACE`) and answers a second request, `SUBSCRIBE_TRACKS`. The publisher announces with both `PUBLISH_NAMESPACE` and `PUBLISH`, since a relay learns a namespace exists from the former.
+- **`relay-discovery`** — a subscriber knowing only the namespace learns the trackname. d16 answers `SUBSCRIBE_NAMESPACE` with a `PUBLISH` per track; d18 reports namespaces first (`NAMESPACE`) and answers a second request, `SUBSCRIBE_TRACKS`. The publisher announces with both `PUBLISH_NAMESPACE` and `PUBLISH`, since a relay learns a namespace exists from the former.
 - **`relay-data`** — moq-interop-runner `data-subgroup-basic`: 3 groups × 5 objects through the relay on one subgroup stream per group; every object is checked for presence, subgroup, priority and payload bytes, and the downstream `PUBLISH_DONE` for `TRACK_ENDED` and its Stream Count.
 
 ### `bench` tier (manual dispatch only; not PR-gated)
@@ -142,7 +142,7 @@ Entries live in `tests/relays.json`. Full schema:
     "raw-quic": "moqt://host:port",
     "h3-wt":    "https://host:port/endpoint"
   },
-  "drafts": [14, 16],
+  "drafts": [16, 18],
   "pub_mode": "publish",
   "insecure": false,
   "disabled": false,
@@ -156,7 +156,7 @@ Entries live in `tests/relays.json`. Full schema:
 | `name` | yes | id used in output and `--only` |
 | `urls` | yes | map of `raw-quic` and/or `h3-wt` to full URL |
 | `drafts` | yes | supported MoQT draft numbers |
-| `pub_mode` | no (default `publish`) | `publish` sends only PUBLISH; `publish-ns` sends only PUBLISH_NAMESPACE; `publish-both` sends both (required by Cloudflare d14 moq-rs) |
+| `pub_mode` | no (default `publish`) | `publish` sends only PUBLISH; `publish-ns` sends only PUBLISH_NAMESPACE; `publish-both` sends both |
 | `insecure` | no (default `false`) | if `true`, pass `--tls-disable-verify` / `-k` to subprocess tools |
 | `disabled` | no (default `false`) | if `true`, skip this relay entirely unless `--only` names it |
 | `disabled_suites` | no | list of suite names to skip for this relay (e.g. `["relay-join", "relay-fetch"]`) |
@@ -238,9 +238,9 @@ aiomoqt ships a TAP v14-emitting client at
 `aiomoqt.tools.moq_interop_client` (the same module used internally
 by `relay-ctrl-msg`). The Dockerfile at the repo root builds an image
 consumable by [englishm/moq-interop-runner](https://github.com/englishm/moq-interop-runner).
-The published image is `ghcr.io/gmarzot/aiomoqt:<version>` and
-`:latest`; our `implementations.json` entry is wired up in an upstream
-PR. No local action is required to keep this path green — the release
+The published image is `ghcr.io/gmarzot/aiomoqt:<version>`, plus
+`:latest` (the highest stable release) and `:interop` (the highest
+release, pre-releases included; the runner's aiomoqt entries track it). No local action is required to keep this path green — the release
 workflow pushes a fresh image on every tag.
 
 ## Contribution conformance (publisher)

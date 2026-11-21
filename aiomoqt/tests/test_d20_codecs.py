@@ -451,7 +451,7 @@ def test_range_filter_encoder_refuses_unsendable_ranges():
     ((4, 6), LocationFilter.absolute(1, 2, 4, 5)),
 ], ids=["to-largest", "whole-end-group", "end-object"])
 def test_fetch_d18_range_fields_convert(draft, end, want):
-    # d14-d18 End: last Object + 1, Object 0 the whole group. d20: an
+    # d16-d18 End: last Object + 1, Object 0 the whole group. d20: an
     # inclusive LOCATION_FILTER.
     m = Fetch(fetch_type=1, request_id=0, namespace=_NS, track_name=b"t",
               start_group=1, start_object=2, end_group=end[0],

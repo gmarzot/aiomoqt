@@ -1,0 +1,15 @@
+{
+  "_comment": "Audio/video 180 hold: each viewer subscribes catalog, video and audio on one session. Publisher is external: pub_bench --video 720p -r 30 -g 60 --audio --catalog -t 480 (namespace aiomoqt; tracks video ~2.19 Mbps in 2 s GOPs, audio 341 B at 46.875/s, catalog 512 B at 1/s, one object per group for both). Run load_sim --role sub -f av-viewers.json; duration must equal pub_bench -t. Join shape matches the video-only 180 hold.",
+  "publishers": [
+    {"namespace": "aiomoqt", "track": "video", "bitrate_kbps": 2190, "rate": 30,
+     "gop_s": 2.0, "start_delay": 0, "duration": 480},
+    {"namespace": "aiomoqt", "track": "audio", "bitrate_kbps": 128, "rate": 46.875,
+     "object_size": 341, "gop_s": 0.02, "start_delay": 0, "duration": 480},
+    {"namespace": "aiomoqt", "track": "catalog", "bitrate_kbps": 4, "rate": 1,
+     "object_size": 512, "gop_s": 1.0, "start_delay": 0, "duration": 480}
+  ],
+  "subscribers": [
+    {"namespace": "aiomoqt", "tracks": ["catalog", "video", "audio"], "subs": 180,
+     "join_rate": 2, "join_delay": 2, "churn_rate": 0.0, "leave_early": 0, "leave_rate": 1}
+  ]
+}

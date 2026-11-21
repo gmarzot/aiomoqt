@@ -2,9 +2,12 @@
 classification, and the relay's status snapshot end to end."""
 import asyncio
 import contextlib
+import gc
 import json
+import logging
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -393,6 +396,8 @@ async def test_snapshot_reports_namespaces_tracks_and_sessions(
     assert totals["publishers"] == 1
     assert totals["ingress_bps"] > 0 and totals["egress_bps"] > 0
     assert totals["rtt_p50_ms"] is not None
+    assert totals["admission"] == {"open": True, "refused": 0}
+    assert totals["queue_ms"]["p50"] is not None
     assert sorted(s["role"] for s in snap["sessions"]) == [
         "pub", "sub", "sub"]
     # What each session holds against its per-session caps.
@@ -593,6 +598,36 @@ async def test_viewer_loss_excludes_spurious(relay_tables, tmp_path, monkeypatch
 
 
 @requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+@pytest.mark.parametrize("report", [{"cc_state": 0x10003, "cc_param": 2_240_000}, {}],
+                         ids=["reported", "absent"])
+async def test_sessions_carry_the_congestion_controllers_report(
+        relay_tables, tmp_path, monkeypatch, use_quic, report):
+    # aiopquic's path_quality() cc_state and cc_param, null on a build without them.
+    real = relay._path_quality
+
+    def observed(session):
+        pq = {k: v for k, v in real(session).items() if k not in ("cc_state", "cc_param")}
+        return {**pq, **report}
+    monkeypatch.setattr(relay, "_path_quality", observed)
+    async with _relay(free_udp_port(), use_quic, 22) as connect:
+        pub = await connect()
+        PublishedTrack(pub, namespace=_NS, trackname="video",
+                       object_size=200, group_size=10, rate=200).attach()
+        await pub.publish_namespace(namespace=_NS, wait_response=True)
+        sub = await connect()
+        await SubscribedTrack(sub, _NS, "video").subscribe(timeout=5)
+        status = relay._Status(str(tmp_path / "status.json"),
+                               {"started": time.time()}, [connect.handle])
+        snap = await _delivery_window(status)
+        rows = relay._sessions_report()["sessions"]
+    want = (report.get("cc_state"), report.get("cc_param"))
+    assert len(snap["sessions"]) == 2 and len(rows) == 2, (snap["sessions"], rows)
+    for row in (*snap["sessions"], *rows):
+        assert (row["cc_state"], row["cc_param"]) == want, row
+
+
+@requires_certs
 async def test_publishing_subscriber_reports_no_loss(relay_tables, tmp_path,
                                                      monkeypatch):
     # One loss count per connection: a session that publishes and subscribes
@@ -748,6 +783,36 @@ async def test_platform_written_less_often_than_status(
     assert written.count("status.json") >= 6
 
 
+async def test_a_slow_status_write_does_not_pause_the_loop(
+        relay_tables, monkeypatch, tmp_path):
+    monkeypatch.setattr(relay, "STATUS_INTERVAL_S", 0.05)
+    main = threading.get_ident()
+    writers = []
+
+    def slow_write(path, obj):
+        writers.append(threading.get_ident())
+        time.sleep(0.3)
+    monkeypatch.setattr(relay_status, "write_json_atomic", slow_write)
+    background = set(relay._background)
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    runner = asyncio.create_task(status.run())
+    loop = asyncio.get_running_loop()
+    late = 0.0
+    try:
+        for _ in range(40):
+            t = loop.time()
+            await asyncio.sleep(0.02)
+            late = max(late, loop.time() - t - 0.02)
+    finally:
+        runner.cancel()
+        for task in set(relay._background) - background:
+            task.cancel()
+            relay._background.discard(task)
+    assert len(writers) >= 2 and main not in writers, writers
+    assert late < 0.1, late
+
+
 def _tick(status, rows):
     """One status tick carrying these track rows."""
     status.history.add({"t": time.time()})
@@ -784,6 +849,21 @@ def test_live_tracks_keep_their_slots(tmp_path):
     _tick(status, live + [_row("late")])
     assert len(status.track_history) == cap
     assert "late" not in status.track_history
+
+
+def test_subscribed_tracks_take_slots_from_idle_ones(tmp_path):
+    # Present tracks without subscribers hold every slot: a subscribed
+    # newcomer takes the slot of the one idle longest, an idle one waits.
+    status = relay._Status(str(tmp_path / "status.json"), {"started": time.time()})
+    cap = relay.TRACK_HISTORY_MAX
+    _tick(status, [_row(f"idle\x1f{i}", subs=int(i > 0)) for i in range(cap)])
+    idle = [_row(f"idle\x1f{i}", subs=0) for i in range(cap)]
+    _tick(status, idle)
+    _tick(status, idle + [_row("quiet", subs=0), _row("bench", subs=70)])
+    hist = status.track_history
+    assert len(hist) == cap
+    assert "idle\x1f0" not in hist and "quiet" not in hist
+    assert list(hist["bench"]["subscribers"])[-1] == 70
 
 
 # -- --trace-subscribers and GET /sessions ---------------------------------
@@ -882,3 +962,122 @@ async def test_untraced_relay_counts_nothing_per_object(relay_tables):
                          for lane in lanes), lanes
     assert report["trace_subscribers"] is False
     assert all("subscriptions" not in row for row in report["sessions"])
+
+
+def test_send_lateness_is_the_mean_since_the_last_read(tmp_path, monkeypatch):
+    status = relay._Status(str(tmp_path / "status.json"), {"started": 0}, [])
+    rows = [{"loop_late_checks": 100, "loop_late_us": 200_000}]
+    monkeypatch.setattr(relay, "transport_counters", lambda handles: rows)
+    assert status._send_late_ms() == 2.0   # 2 ms a pass since the start
+    rows[0] = {"loop_late_checks": 300, "loop_late_us": 1_400_000}
+    assert status._send_late_ms() == 6.0   # the last interval only
+    assert status._send_late_ms() is None  # no pass since
+
+
+def test_send_lateness_is_null_on_an_aiopquic_without_it(tmp_path, monkeypatch):
+    status = relay._Status(str(tmp_path / "status.json"), {"started": 0}, [])
+    monkeypatch.setattr(relay, "transport_counters", lambda handles: [
+        {"loop_late_checks": None, "loop_late_us": None}])
+    assert status._send_late_ms() is None
+
+
+# -- GC timing and --stall-trace -------------------------------------------
+
+def test_gc_timer_counts_a_forced_collection():
+    timer = relay_status.GcTimer(warn_ms=0)
+    try:
+        timer.take()
+        gc.collect()
+        line, long = timer.take()
+    finally:
+        timer.close()
+    assert timer._callback not in gc.callbacks
+    assert line["passes"][2] >= 1 and line["max_gen"] is not None
+    assert 0 <= line["max_ms"] <= line["total_ms"]
+    gen2 = [p for p in long if p[1] == 2]
+    assert gen2, long
+    assert relay_status.format_gc_pass(*gen2[-1]).startswith("GC gen2 pass ")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="the host sampler's fields come from /proc")
+def test_status_carries_the_gc_passes_since_the_last_snapshot(
+        relay_tables, tmp_path):
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    status.snapshot(time.monotonic(), time.time())
+    gc.collect()
+    snap = status.snapshot(time.monotonic(), time.time())
+    line = snap["totals"]["gc"]
+    assert line["passes"][2] >= 1 and line["max_ms"] is not None, line
+    assert snap["history"]["gc_max_ms"][-1] == line["max_ms"]
+
+
+def test_status_carries_the_gc_totals(relay_tables, tmp_path):
+    status = relay._Status(str(tmp_path / "status.json"),
+                           {"started": time.time()})
+    gc.collect()
+    totals = status.snapshot(time.monotonic(), time.time())["totals"]
+    t = totals["gc_totals"]
+    assert t["collections"][2] >= 1, t
+    assert all(len(t[k]) == 3 for k in ("collections", "collected",
+                                         "uncollectable", "pending")), t
+    assert t["frozen"] == gc.get_freeze_count()
+
+
+def test_gc_totals_reads_the_frozen_count_once_a_minute():
+    totals = relay_status.GcTotals()
+    assert totals.take(100.0)["frozen"] == gc.get_freeze_count()
+    keep = [{} for _ in range(1000)]
+    gc.freeze()
+    try:
+        assert totals.take(130.0)["frozen"] < gc.get_freeze_count()
+        assert totals.take(160.0)["frozen"] == gc.get_freeze_count()
+    finally:
+        gc.unfreeze()
+    del keep
+
+
+class _CensusMarker:
+    pass
+
+
+def test_gc_census_counts_tracked_objects_by_type():
+    keep = [_CensusMarker() for _ in range(3000)]
+    census = relay_status.gc_census(top=60)
+    names = dict(census["top"])
+    assert names[f"{__name__}._CensusMarker"] >= 3000, census["top"][:5]
+    assert len(census["top"]) <= 60
+    assert census["tracked"] >= sum(names.values())
+    assert len(census["generations"]) == 3
+    assert census["frozen"] == gc.get_freeze_count()
+    del keep
+
+
+def _block_the_loop(seconds):
+    time.sleep(seconds)
+
+
+async def test_stall_trace_logs_the_stalled_stack(caplog):
+    log = logging.getLogger("stall_trace_test")
+    caplog.set_level(logging.WARNING, logger=log.name)
+    sampler = relay_status.StallSampler(100, log)
+    task = asyncio.create_task(sampler.run())
+    try:
+        await asyncio.sleep(0.1)
+        _block_the_loop(0.4)
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    lines = [r.getMessage() for r in caplog.records if r.name == log.name]
+    at = [i for i, m in enumerate(lines) if "_block_the_loop" in m]
+    assert len(at) == 1 and lines[at[0]].startswith("loop stalled "), lines
+    assert any(m.startswith("loop stall ended after ")
+               for m in lines[at[0] + 1:]), lines
+
+
+def test_stall_trace_is_off_by_default():
+    assert relay.parse_args([]).stall_trace == 0
+    assert relay.parse_args(["--stall-trace", "150"]).stall_trace == 150

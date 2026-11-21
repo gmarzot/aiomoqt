@@ -188,14 +188,12 @@ async def test_a_refused_registration_stays_registered():
         == SessionCloseCode.DUPLICATE_AUTH_TOKEN_ALIAS
 
 
-async def test_setup_delete_and_d14_tokens_are_not_validated():
+async def test_setup_and_delete_tokens_are_not_validated():
     s = _validating(cache=64)
     assert s._resolve_auth_token(Setup(options={TOKEN: AuthToken(b"x")})) is None
     s._resolve_auth_token(_sub(1, AuthTokenRef(Alias.REGISTER, 1, 0, b"x")))
     assert s._resolve_auth_token(_sub(3, AuthTokenRef(Alias.DELETE, 1))) is None
-    d14 = _validating(draft=14)
-    assert d14._resolve_auth_token(_sub(1, AuthToken(b"x"))) is None
-    assert s.validated == [(b"x", 0)] and d14.validated == []
+    assert s.validated == [(b"x", 0)]
 
 
 # -- over a real session: the server closes with the right code ----------

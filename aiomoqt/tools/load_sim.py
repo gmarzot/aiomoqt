@@ -37,9 +37,17 @@ Scenario file (JSON):
     "subscribers": [                           // >1 group per track is fine
       {"namespace": "conf-main", "track": "keynote", "subs": 50,
        "join_rate": 10, "join_delay": 0, "churn_rate": 0.02,
-       "leave_early": 60, "leave_rate": 5}
+       "leave_early": 60, "leave_rate": 5},
+      {"namespace": "conf-main",               // "tracks" instead of "track":
+       "tracks": ["catalog", "video", "audio"],  // all on one session
+       "subs": 20, "join_rate": 2}
     ]
   }
+
+A "tracks" group's subscriber is live once every track has subscribed and
+leaves when any of them closes; its timeline follows the first track. It
+expects the sum of its tracks' rates, and fails if any track falls below
+the delivery floor or receives nothing.
 
 Split roles across hosts by running the same scenario with --role pub on
 the publisher box and --role sub elsewhere (start within a few seconds
@@ -65,7 +73,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.track import SubscribedTrack, TrackState
+from aiomoqt.track import SubscribedTrack
 from aiomoqt.types import FilterType
 from aiomoqt.utils import cli as _cli
 from aiomoqt.utils.cli import endpoint_url
@@ -83,9 +91,10 @@ from aiomoqt.utils.workers import (
     pub_worker_entry,
     MP_CTX,
     SUBSCRIBE_RETRY_WINDOW_S,
+    retry_wait,
     SUBSCRIBE_EACH_TIMEOUT_S,
     STATS_INTERVAL_S,
-    STOP_POLL_S,
+    wait_tracks_end,
 )
 
 TICK_S = 1.0
@@ -94,6 +103,10 @@ TICK_S = 1.0
 SUBS_DRAIN_GRACE_S = 5.0
 # A group fails below this fraction of rate x live-subscriber-seconds.
 EXPECTED_FLOOR = 0.5
+# Each track must also reach EXPECTED_FLOOR over every RECENT_S window
+# that owed at least RECENT_MIN_OBJS objects, so one that stops mid-run fails.
+RECENT_S = 10.0
+RECENT_MIN_OBJS = 5
 CMD_POLL_S = 0.1
 # Join commands in flight count against the group target until the host
 # reports an outcome; expire unanswered ones so a wedged shard can't
@@ -162,7 +175,8 @@ EXAMPLE_SCENARIO = {
 # Events on events_queue (all tagged group/shard):
 #   {'kind':'evt','ev': 'joined'|'join_failed'|'left'|'ended'|'died', ...}
 #   {'kind':'group_stats', 'live', 'dt', 'rx_bytes', 'rx_objs' (over dt),
-#    'lat_p90_ms', 'total_bytes', 'total_objs', ...}   every STATS_INTERVAL_S
+#    'lat_p90_ms', 'lat_p99_ms', 'total_bytes', 'total_objs', ...}
+#   every STATS_INTERVAL_S
 # ---------------------------------------------------------------------------
 
 async def _slot_task(cfg, relay, slot, events_q, group, shard,
@@ -173,7 +187,6 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
     the refill path, so every death is visible as a leave+join on the
     relay, which is the point of a dashboard load test."""
     stop_ev: asyncio.Event = slot["stop"]
-    stats: TrackStats = slot["stats"]
     if start_delay > 0:
         try:
             await asyncio.wait_for(stop_ev.wait(), timeout=start_delay)
@@ -184,10 +197,12 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
         except asyncio.TimeoutError:
             pass
 
-    def _on_object(msg, size_bytes, recv_time_us, group_id=None,
-                   subgroup_id=None, *_args, **_kw):
-        stats.on_object(msg, size_bytes, recv_time_us, group_id,
-                        subgroup_id)
+    def _receiver(stats: TrackStats):
+        def _on_object(msg, size_bytes, recv_time_us, group_id=None,
+                       subgroup_id=None, *_args, **_kw):
+            stats.on_object(msg, size_bytes, recv_time_us, group_id,
+                            subgroup_id)
+        return _on_object
 
     outcome = "died"
     detail = None
@@ -205,36 +220,43 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
         async with client.connect() as session:
             await session.client_session_init()
             deadline = time.monotonic() + SUBSCRIBE_RETRY_WINDOW_S
-            subscribed = False
-            track = None
+            tracks = []
             last_err = None
-            while time.monotonic() < deadline and not stop_ev.is_set():
-                track = SubscribedTrack(
-                    session, cfg["namespace"], trackname=cfg["trackname"],
-                    on_object=_on_object,
-                )
-                stats.timing = track.timing
-                try:
-                    await track.subscribe(
-                        timeout=SUBSCRIBE_EACH_TIMEOUT_S,
-                        filter_type=FilterType(
-                            cfg.get("sub_filter", FilterType.LATEST_OBJECT)),
+            for name in cfg["tracknames"]:
+                stats: TrackStats = slot["stats"][name]
+                subscribed = False
+                while time.monotonic() < deadline and not stop_ev.is_set():
+                    track = SubscribedTrack(
+                        session, cfg["namespace"], trackname=name,
+                        on_object=_receiver(stats),
                     )
-                    subscribed = True
+                    stats.timing = track.timing
+                    try:
+                        await track.subscribe(
+                            timeout=SUBSCRIBE_EACH_TIMEOUT_S,
+                            filter_type=FilterType(cfg.get(
+                                "sub_filter", FilterType.LATEST_OBJECT)),
+                        )
+                        subscribed = True
+                        break
+                    except Exception as e:
+                        if await retry_wait(e, stop_ev):
+                            continue
+                        m = str(e)
+                        last_err = m
+                        # Transient: the track is not up yet, or two joins
+                        # raced the relay's forwarder setup. Both clear on
+                        # a retry inside the window.
+                        if ("code=4" in m or "does not exist" in m
+                                or "no such namespace" in m
+                                or "forwarder" in m):
+                            await asyncio.sleep(0.3)
+                            continue
+                        break
+                if not subscribed:
                     break
-                except Exception as e:
-                    m = str(e)
-                    last_err = m
-                    # Transient: the track is not up yet, or two joins
-                    # raced the relay's forwarder setup. Both clear on a
-                    # retry inside the window.
-                    if ("code=4" in m or "does not exist" in m
-                            or "no such namespace" in m
-                            or "forwarder" in m):
-                        await asyncio.sleep(0.3)
-                        continue
-                    break
-            if not subscribed:
+                tracks.append(track)
+            if len(tracks) < len(cfg["tracknames"]):
                 # Stopped mid-join is a cancellation, not a failure.
                 ev = "join_cancelled" if stop_ev.is_set() else "join_failed"
                 _post(events_q, {"kind": "evt", "ev": ev,
@@ -246,14 +268,7 @@ async def _slot_task(cfg, relay, slot, events_q, group, shard,
             slot["live"] = True
             _post(events_q, {"kind": "evt", "ev": "joined",
                              "group": group, "shard": shard})
-            while not stop_ev.is_set():
-                if getattr(track, "state", None) == TrackState.CLOSED:
-                    outcome = ("ended" if getattr(track, "completed", False)
-                               else "died")
-                    break
-                await asyncio.sleep(STOP_POLL_S)
-            else:
-                outcome = "left"
+            outcome = await wait_tracks_end(tracks, stop_ev) or "left"
             session.close()
     except Exception as e:
         if not slot["live"]:
@@ -287,7 +302,8 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
         nonlocal next_sid
         sid = next_sid
         next_sid += 1
-        slot = {"stop": asyncio.Event(), "stats": TrackStats(),
+        slot = {"stop": asyncio.Event(),
+                "stats": {n: TrackStats() for n in cfg["tracknames"]},
                 "live": False, "done": False, "task": None}
         slot["task"] = asyncio.create_task(
             _slot_task(cfg, relay, slot, events_q, group, shard, delay))
@@ -319,6 +335,7 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
 
     reaped_bytes = 0
     reaped_objs = 0
+    reaped_track_objs = {n: 0 for n in cfg["tracknames"]}
 
     async def _stats_loop():
         nonlocal reaped_bytes, reaped_objs
@@ -331,29 +348,37 @@ async def _group_host_task(cfg, mp_stop_event, cmd_q, events_q):
             # the group's running counters so departed subscribers keep
             # counting toward total_bytes.
             for sid in [k for k, s in slots.items() if s["done"]]:
-                snap = slots[sid]["stats"].snapshot()
-                reaped_bytes += snap["total_bytes"]
-                reaped_objs += snap["total_objs"]
+                for name, st in slots[sid]["stats"].items():
+                    snap = st.snapshot()
+                    reaped_bytes += snap["total_bytes"]
+                    reaped_objs += snap["total_objs"]
+                    reaped_track_objs[name] += snap["total_objs"]
                 del slots[sid]
             rx_bytes = rx_objs = live = 0
             total_bytes = reaped_bytes
             total_objs = reaped_objs
-            worst_p90 = 0.0
+            track_objs = dict(reaped_track_objs)
+            worst_p90 = worst_p99 = 0.0
             for s in slots.values():
-                snap = s["stats"].snapshot()
-                rx_bytes += snap["rx_bytes"]
-                rx_objs += snap["rx_objs"]
-                total_bytes += snap["total_bytes"]
-                total_objs += snap["total_objs"]
-                worst_p90 = max(worst_p90, snap["lat_p90_ms"])
+                for name, st in s["stats"].items():
+                    snap = st.snapshot()
+                    rx_bytes += snap["rx_bytes"]
+                    rx_objs += snap["rx_objs"]
+                    total_bytes += snap["total_bytes"]
+                    total_objs += snap["total_objs"]
+                    track_objs[name] += snap["total_objs"]
+                    worst_p90 = max(worst_p90, snap["lat_p90_ms"])
+                    worst_p99 = max(worst_p99, snap["lat_p99_ms"])
                 if s["live"]:
                     live += 1
             _post(events_q, {
                 "kind": "group_stats", "group": group, "shard": shard,
                 "live": live, "dt": dt,
                 "rx_bytes": rx_bytes, "rx_objs": rx_objs,
-                "lat_p90_ms": worst_p90, "total_bytes": total_bytes,
-                "total_objs": total_objs, "t": time.monotonic(),
+                "lat_p90_ms": worst_p90, "lat_p99_ms": worst_p99,
+                "total_bytes": total_bytes,
+                "total_objs": total_objs, "track_objs": track_objs,
+                "t": time.monotonic(),
             })
 
     cmd_task = asyncio.create_task(_cmd_loop())
@@ -426,10 +451,17 @@ class PubSpec:
 
 
 class GroupSpec:
-    def __init__(self, gid: int, cfg: dict, pub: PubSpec, dscale: float = 1.0):
+    """A subscriber group on one or more tracks of a namespace; the first
+    track's timeline drives it."""
+
+    def __init__(self, gid: int, cfg: dict, *pubs: PubSpec,
+                 dscale: float = 1.0):
         self.gid = gid
-        self.pub = pub
-        self.key = pub.key
+        self.pubs = list(pubs)
+        self.pub = pub = pubs[0]
+        self.multi = len(pubs) > 1
+        self.key = (f"{pub.namespace}/{'+'.join(p.track for p in pubs)}"
+                    if self.multi else pub.key)
         self.max_subs = int(cfg["subs"])
         self.join_rate = max(1, int(cfg.get("join_rate", 10)))
         self.churn_rate = float(cfg.get("churn_rate", 0.02))
@@ -488,6 +520,11 @@ class GroupRT:
         self.iv = {"join": 0, "leave": 0, "fail": 0}
         self.max_live = 0
         self.expected_objs = 0.0
+        self.expected_track = {p.track: 0.0 for p in spec.pubs}
+        # Per track: (now, delivered, owed) samples over RECENT_S, and the
+        # worst window below the floor as (delivered, owed, scenario t).
+        self.track_hist: Dict[str, deque] = {}
+        self.track_short: Dict[str, tuple] = {}
 
     def live(self) -> int:
         return sum(s.live for s in self.shards)
@@ -647,23 +684,59 @@ def _rx_Bps(group_stats: dict) -> float:
 
 def _accrue_expected(groups: Dict[int, GroupRT], pubs: Dict[str, PubRT],
                      t: float, dt: float):
-    """Add dt seconds of objects owed to each group's live subscribers: the
-    track's rate while it is on its timeline and, when published locally,
-    confirmed and not yet ended."""
+    """Add dt seconds of objects owed to each group's live subscribers: per
+    track, its rate while it is on its timeline and, when published
+    locally, confirmed and not yet ended."""
     for g in groups.values():
-        pub = g.spec.pub
-        prt = pubs.get(pub.key)
-        if not pub.active_at(t):
-            continue
-        if prt is not None and (not prt.published or prt.ended):
-            continue
-        g.expected_objs += g.live() * pub.fps * dt
+        live = g.live()
+        for pub in g.spec.pubs:
+            prt = pubs.get(pub.key)
+            if not pub.active_at(t):
+                continue
+            if prt is not None and (not prt.published or prt.ended):
+                continue
+            owed = live * pub.fps * dt
+            g.expected_objs += owed
+            g.expected_track[pub.track] += owed
+
+
+def _note_recent(groups: Dict[int, GroupRT], t: float, now: float):
+    """Sample each track's delivered and owed objects; keep its worst full
+    RECENT_S window below EXPECTED_FLOOR in track_short."""
+    for g in groups.values():
+        for pub in g.spec.pubs:
+            name = pub.track
+            n = sum(s.stats.get("track_objs", {}).get(name, 0)
+                    for s in g.shards)
+            hist = g.track_hist.setdefault(name, deque())
+            hist.append((now, n, g.expected_track[name]))
+            while len(hist) > 1 and hist[1][0] <= now - RECENT_S:
+                hist.popleft()
+            t0, n0, e0 = hist[0]
+            if now - t0 < RECENT_S:
+                continue
+            got, owed = n - n0, g.expected_track[name] - e0
+            if owed < RECENT_MIN_OBJS or got >= owed * EXPECTED_FLOOR:
+                continue
+            worst = g.track_short.get(name)
+            if worst is None or got / owed < worst[0] / worst[1]:
+                g.track_short[name] = (got, owed, t)
+
+
+def _short_note(grt: "GroupRT", track: str) -> str:
+    short = grt.track_short.get(track)
+    if short is None:
+        return ""
+    got, owed, t = short
+    return (f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED over "
+            f"{RECENT_S:.0f}s at T+{t:.0f}s ({got}/{owed:.0f})")
 
 
 def _predict_egress(pubs: List[PubSpec], groups: List[GroupSpec]):
     per_track: Dict[str, int] = {}
     for gs in groups:
-        per_track[gs.key] = per_track.get(gs.key, 0) + gs.max_subs
+        for ps in gs.pubs:
+            per_track[ps.key] = per_track.get(ps.key, 0) + gs.max_subs
     total = sum(per_track.get(p.key, 0) * p.bps for p in pubs)
     return total, per_track
 
@@ -682,8 +755,8 @@ def parse_args(argv=None):
     p.add_argument("-f", "--scenario-file", dest="scenario",
                    default="default", metavar="NAME|PATH",
                    help="Scenario: a packaged name (default, rich-matrix, "
-                        "churn-storm, datagram-mix, viewers) or a path to "
-                        "JSON (default: default)")
+                        "churn-storm, datagram-mix, viewers, av-viewers) "
+                        "or a path to JSON (default: default)")
     p.add_argument("--example", action="store_true",
                    help="Print a demo scenario JSON and exit")
 
@@ -700,8 +773,9 @@ def parse_args(argv=None):
                             "'viewers') at a live broadcast.")
     quick.add_argument("-T", "--trackname", type=str, default="track",
                        help="quick mode: track name (default: track)")
-    quick.add_argument("-t", "--duration", type=int, default=30,
-                       help="quick mode: seconds (default: 30)")
+    quick.add_argument("-t", "--duration", type=int, default=0,
+                       help="quick mode: run time in seconds; 0 (default): "
+                            "no limit")
     quick.add_argument("--subs", type=int, default=None,
                        help="Subscriber count (enables quick mode)")
     quick.add_argument("-s", "--object-size", type=int, default=1024,
@@ -744,6 +818,17 @@ def parse_args(argv=None):
     return p, args
 
 
+def _no_data_forever(groups, horizon, t) -> bool:
+    """With no time limit, nothing else ends a run against a dead relay."""
+    return (math.isinf(horizon) and t >= _cli.SETUP_TIMEOUT
+            and not any(s.stats.get("total_objs", 0)
+                        for g in groups.values() for s in g.shards))
+
+
+def _secs(t):
+    return "no limit" if math.isinf(t) else f"{t:.0f}s"
+
+
 def main():
     p, args = parse_args()
     _cli.apply_logging(args, default=logging.INFO)
@@ -755,13 +840,13 @@ def main():
     if args.subs is not None:
         fps = args.rate or 30
         ns = args.namespace or "aiomoqt"
-        scenario = {
+        scenario: Dict[str, Any] = {
             "publishers": [{
                 "namespace": ns, "track": args.trackname,
                 "bitrate_kbps": int(args.object_size * fps * 8 / 1000),
                 "fps": fps, "object_size": args.object_size,
                 "gop_s": (args.group_size / fps) if args.group_size else 1.0,
-                "start_delay": 0, "duration": args.duration,
+                "start_delay": 0, "duration": args.duration or math.inf,
             }],
             "subscribers": [{
                 "namespace": ns, "track": args.trackname,
@@ -788,11 +873,19 @@ def main():
     by_key = {ps.key: ps for ps in pub_specs}
     group_specs = []
     for i, c in enumerate(scenario.get("subscribers", [])):
-        key = f"{c['namespace']}/{c['track']}"
-        if key not in by_key:
-            p.error(f"subscriber group {i} references unknown track {key}")
-        group_specs.append(
-            GroupSpec(i, c, by_key[key], args.duration_scale))
+        if ("track" in c) == ("tracks" in c):
+            p.error(f"subscriber group {i}: give one of 'track' or "
+                    f"'tracks'")
+        names = [c["track"]] if "track" in c else list(c["tracks"])
+        if not names:
+            p.error(f"subscriber group {i}: 'tracks' is empty")
+        keys = [f"{c['namespace']}/{n}" for n in names]
+        for key in keys:
+            if key not in by_key:
+                p.error(f"subscriber group {i} references unknown "
+                        f"track {key}")
+        group_specs.append(GroupSpec(i, c, *(by_key[k] for k in keys),
+                                     dscale=args.duration_scale))
 
     total_bps, per_track_subs = _predict_egress(pub_specs, group_specs)
     horizon = max((ps.start_delay + ps.duration for ps in pub_specs),
@@ -808,7 +901,7 @@ def main():
           f"{len({ps.namespace for ps in pub_specs})} namespaces")
     print(f"  subscribers: {peak_subs} peak target across "
           f"{len(group_specs)} groups")
-    print(f"  timeline:    {horizon:.0f}s "
+    print(f"  timeline:    {_secs(horizon)} "
           f"(duration-scale {args.duration_scale:g})")
     print(f"  worst-case egress if all peaks align: "
           f"{fmt_bps(total_bps)}")
@@ -817,7 +910,7 @@ def main():
     for ps in pub_specs:
         subs = per_track_subs.get(ps.key, 0)
         print(f"    {ps.key:<28} {fmt_bps(ps.bps):>10} x {subs:>4} subs"
-              f"  T+{ps.start_delay:.0f}s..{ps.start_delay + ps.duration:.0f}s"
+              f"  T+{ps.start_delay:.0f}s..{_secs(ps.start_delay + ps.duration)}"
               f"  obj={ps.object_size}B @ {ps.fps:g}/s"
               + ("  [datagram]" if ps.delivery == "datagram" else ""))
     print("─" * 72)
@@ -829,7 +922,7 @@ def main():
         **_cli.transport_kwargs(args),
     )
 
-    stopping = False
+    stopping = no_data = False
 
     def _on_sigint(_sig, _frm):
         nonlocal stopping
@@ -854,7 +947,7 @@ def main():
                 cmd_q = MP_CTX.Queue(maxsize=10000)
                 cfg = dict(common, group=gs.gid, shard=si,
                            namespace=gs.pub.namespace,
-                           trackname=gs.pub.track,
+                           tracknames=[ps.track for ps in gs.pubs],
                            stagger=args.stagger)
                 proc = MP_CTX.Process(
                     target=group_host_entry,
@@ -868,7 +961,7 @@ def main():
     if args.report:
         csv_f = open(args.report, "w")
         csv_f.write("t,namespace,track,live,target,rx_mbps,p90_ms,"
-                    f"joins,leaves,fails,{','.join(CPU_FIELDS)}\n")
+                    f"joins,leaves,fails,{','.join(CPU_FIELDS)},p99_ms\n")
         cpu_csv = _csv_line(cpu_fields())
 
     start = time.monotonic()
@@ -931,6 +1024,7 @@ def main():
             _accrue_expected(groups, pubs, t, now - last_tick)
             last_tick = now
             if not stopping:
+                _note_recent(groups, t, now)
                 for grt in groups.values():
                     _tick_group(grt, t, rng)
 
@@ -943,6 +1037,9 @@ def main():
                 p90 = max((s.stats.get("lat_p90_ms", 0.0)
                            for g in groups.values() for s in g.shards),
                           default=0.0)
+                p99 = max((s.stats.get("lat_p99_ms", 0.0)
+                           for g in groups.values() for s in g.shards),
+                          default=0.0)
                 pubs_up = sum(1 for prt in pubs.values()
                               if prt.proc is not None and not prt.ended)
                 iv = {"join": 0, "leave": 0, "fail": 0}
@@ -953,7 +1050,7 @@ def main():
                 line = (f"  T+{t:>5.0f}s  subs={live_total:<5} "
                         f"(+{iv['join']}/-{iv['leave']}"
                         f"/x{iv['fail']})  rx={fmt_bps(rx_bps):<10} "
-                        f"p90={p90:.0f}ms")
+                        f"p90={p90:.0f}ms p99={p99:.0f}ms")
                 if pubs:
                     line += f"  pubs={pubs_up}/{len(pubs)}"
                 print(line)
@@ -961,7 +1058,7 @@ def main():
                     per_track: Dict[str, list] = {}
                     for g in groups.values():
                         row = per_track.setdefault(
-                            g.spec.key, [0, 0, 0, 0.0])
+                            g.spec.key, [0, 0, 0, 0.0, 0.0])
                         row[0] += g.live()
                         row[1] += g.spec.max_subs
                         row[2] += sum(_rx_Bps(s.stats)
@@ -969,14 +1066,21 @@ def main():
                         row[3] = max(row[3],
                                      max((s.stats.get("lat_p90_ms", 0.0)
                                           for s in g.shards), default=0.0))
+                        row[4] = max(row[4],
+                                     max((s.stats.get("lat_p99_ms", 0.0)
+                                          for s in g.shards), default=0.0))
                     for key, row in per_track.items():
                         ns, tr = key.split("/", 1)
                         csv_f.write(f"{t:.0f},{ns},{tr},{row[0]},{row[1]},"
                                     f"{row[2] * 8 / 1e6:.2f},"
-                                    f"{row[3]:.1f},,,,{cpu_csv}\n")
+                                    f"{row[3]:.1f},,,,{cpu_csv},"
+                                    f"{row[4]:.1f}\n")
                     csv_f.flush()
 
             # --- end conditions ---
+            if _no_data_forever(groups, horizon, t):
+                print(f"  no objects within {_cli.SETUP_TIMEOUT}s; stopping.")
+                no_data = stopping = True
             pubs_done = all(prt.ended for prt in pubs.values()) if pubs \
                 else t >= horizon
             # Subscribers do NOT self-terminate when a publisher stops:
@@ -1031,7 +1135,7 @@ def main():
     print("─" * 72)
     for line in lines:
         print(line)
-    if stopping:
+    if stopping and not no_data:
         return 130     # interrupted: the verdict covers a partial run
     return 1 if failed else 0
 
@@ -1064,6 +1168,27 @@ def _verdict(groups: Dict[int, "GroupRT"],
         elif total_objs < expected * EXPECTED_FLOOR:
             note = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
             failed = True
+        elif not gs.multi and _short_note(grt, gs.pubs[0].track):
+            note = _short_note(grt, gs.pubs[0].track)
+            failed = True
+        track_lines = []
+        if gs.multi:
+            for ps in gs.pubs:
+                n = sum(s.stats.get("track_objs", {}).get(ps.track, 0)
+                        for s in grt.shards)
+                exp = round(grt.expected_track[ps.track])
+                tnote = ""
+                if grt.max_live and n == 0:
+                    tnote = "  << NO OBJECTS"
+                elif grt.max_live and n < exp * EXPECTED_FLOOR:
+                    tnote = f"  << BELOW {EXPECTED_FLOOR:.0%} OF EXPECTED"
+                elif grt.max_live:
+                    tnote = _short_note(grt, ps.track)
+                if tnote:
+                    failed = True
+                    note = note or f"  << {ps.track}: {tnote[5:]}"
+                track_lines.append(
+                    f"    {ps.track:<26} objs={n} expected={exp}{tnote}")
         lines.append(
             f"  {gs.key:<28} peak {grt.max_live:>4}/{gs.max_subs:<4} "
             f"joins={grt.joins:<5} churn={grt.churns:<5} "
@@ -1071,6 +1196,7 @@ def _verdict(groups: Dict[int, "GroupRT"],
             f"died={grt.deaths:<4} objs={total_objs} expected={expected} "
             f"bytes={total_rx} "
             f"rx={total_rx / 1e6:.0f}MB{note}")
+        lines.extend(track_lines)
     for prt in pubs.values():
         if not prt.published:
             lines.append(f"  {prt.spec.key:<28} << PUBLISHER NEVER CONFIRMED")

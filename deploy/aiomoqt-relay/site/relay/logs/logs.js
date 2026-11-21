@@ -51,6 +51,7 @@
       r.lines[0] = line.text.slice(m[0].length);
       if (START.test(r.lines[0])) r.kind = 'start';
       else if (r.level >= 40) r.kind = 'error';
+      else if (r.level === 30) r.kind = 'warning';
       return r;
     }
     if (START.test(line.text)) return Object.assign(r, {level: 20, kind: 'start'});
@@ -298,7 +299,7 @@
         + (state.polled ? `, read ${new Date(state.polled).toISOString().slice(11, 19)} UTC` : '');
     $('status').textContent = s;
     $('status').classList.toggle('bad', !!state.error);
-    for (const kind of ['start', 'error', 'crash']) {
+    for (const kind of ['start', 'error', 'warning', 'crash']) {
       const n = shown.filter((r) => r.kind === kind).length;
       const b = $(`jump-${kind === 'start' ? 'restart' : kind}`);
       b.querySelector('b').textContent = fmt.num(n);
@@ -391,6 +392,7 @@
     $('earlier').addEventListener('click', loadEarlier);
     $('jump-restart').addEventListener('click', () => jump('start'));
     $('jump-error').addEventListener('click', () => jump('error'));
+    $('jump-warning').addEventListener('click', () => jump('warning'));
     $('jump-crash').addEventListener('click', () => jump('crash'));
     loadList();
     setInterval(loadList, LIST_MS);

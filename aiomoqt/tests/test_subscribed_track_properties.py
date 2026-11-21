@@ -67,7 +67,7 @@ async def test_subscribed_tracks_keep_their_own_properties(draft, use_quic):
 
 def _kvps(props, vi64):
     buf = Buffer(capacity=256, vi64=vi64)
-    MOQTMessage._extensions_encode(buf, props, with_length=False, delta=True)
+    MOQTMessage._extensions_encode(buf, props, with_length=False)
     return bytes(buf.data_slice(0, buf.tell()))
 
 
