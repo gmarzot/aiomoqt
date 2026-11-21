@@ -15,11 +15,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable, Dict, Optional
 
-from ..messages import SubgroupHeader
 from ..track import PublishedTrack, TrackState
 from ..types import (
     MOQTMessageType, MOQTRequestError, ObjectStatus, RequestErrorCode,
-    StreamResetCode,
 )
 from ..utils.logger import get_logger
 from .catalog import (
@@ -48,32 +46,31 @@ CATALOG_FETCH_HISTORY = 64 << 10
 
 
 class CatalogTrackPublisher(PublishedTrack):
-    """Publishes the "catalog" track: the current independent catalog
-    opens each group; queued deltas follow as Objects >= 1.
+    """Publishes the "catalog" track: each independent catalog opens a
+    group as Object 0; deltas follow as Objects >= 1.
 
-    One emitter serves the current subscription. It sends nothing at
-    Forward State 0 (§5.1), opens a new group with the current catalog
-    when forwarding resumes, and is cancelled with its open stream reset
-    when the subscription ends (§5.1.1); the next SUBSCRIBE starts a new
-    one. Group IDs continue across subscriptions.
+    Objects are numbered once, kept in the FETCH history and fanned out
+    to every subscription's lane. A subscription that joins, or whose
+    Forward State returns to 1, opens a new group with the current
+    catalog, so it starts at a complete one (§11.2); every subscription
+    takes that group. At Forward State 0 it gets nothing (§5.1). Group
+    IDs continue across subscriptions.
     """
-
-    # Queued when forwarding resumes: send the current catalog.
-    _RESUME = object()
 
     def __init__(self, session, namespace: str, catalog: Optional[Catalog]):
         super().__init__(session, namespace, CATALOG_TRACK_NAME,
                          priority=CATALOG_PUBLISHER_PRIORITY,
                          fetch_history_bytes=CATALOG_FETCH_HISTORY)
         self.catalog = catalog
-        # The catalog track has content by construction: the current
-        # independent catalog is emitted as (0, 0) on first demand, so
-        # SUBSCRIBE_OK must say ContentExists even before generation.
+        # The current catalog is numbered on first demand, so
+        # SUBSCRIBE_OK says ContentExists even before that.
         self._largest = (0, 0)
-        self._updates: asyncio.Queue = asyncio.Queue()
         # A relay holding later groups would read a restarted 0 as stale.
         self._next_group = 0
-        self._emitter: Optional[asyncio.Task] = None
+        # Open group and its next Object ID; None until first demand.
+        self._group: Optional[int] = None
+        self._next_object = 0
+        self._finished = asyncio.Event()
 
     @property
     def next_group(self) -> int:
@@ -84,159 +81,108 @@ class CatalogTrackPublisher(PublishedTrack):
     def next_group(self, group_id: int) -> None:
         self._next_group = group_id
 
-    def _serving(self) -> bool:
-        return self._emitter is not None and not self._emitter.done()
+    def _number(self, group_start: bool) -> tuple:
+        """The next object's Location."""
+        if group_start:
+            self._group, self._next_object = self._next_group, 0
+            self._next_group += 1
+        loc = (self._group, self._next_object)
+        self._next_object += 1
+        return loc
 
-    def _fold(self, update: Catalog) -> None:
-        """Make `update` part of the current catalog without sending it."""
-        if update.is_delta:
-            self.catalog.apply(update)
+    def _open(self) -> None:
+        """Number the current catalog on first demand. No peer has a lane
+        yet, so it goes to the history; joiners take it from there."""
+        if self._group is None and self.catalog is not None:
+            group_id, object_id = self._number(group_start=True)
+            self._remember(group_id, object_id, self.catalog.to_json().encode())
+
+    async def _write(self, payload: bytes, group_start: bool) -> None:
+        group_id, object_id = self._number(group_start)
+        if self._out is None:
+            self._remember(group_id, object_id, payload)
         else:
-            self.catalog = update
+            await self._out.write(group_id, object_id, payload,
+                                  group_start=group_start)
 
     async def publish_catalog(self, catalog: Catalog) -> None:
-        """Queue a new independent catalog (starts a new group). While no
-        subscription is served it supersedes everything queued, so a
-        periodic refresh cannot grow the queue."""
-        if self._serving():
-            await self._updates.put(catalog)
+        """Publish a new independent catalog: it opens a new group. Before
+        first demand it only replaces the catalog to be numbered."""
+        if self._finished.is_set():
             return
-        finished = False
-        while not self._updates.empty():
-            finished |= self._updates.get_nowait() is None
         self.catalog = catalog
-        if finished:
-            self._updates.put_nowait(None)
+        if self._group is not None:
+            await self._write(catalog.to_json().encode(), group_start=True)
 
     async def publish_delta(self, delta: Catalog) -> None:
-        """Queue a delta update (next object in the current group)."""
-        await self._updates.put(delta)
+        """Publish a delta update: the next object in the open group."""
+        if not delta.is_delta:
+            await self.publish_catalog(delta)
+            return
+        if self._finished.is_set():
+            return
+        self._open()
+        self.catalog.apply(delta)
+        await self._write(delta.to_json().encode(), group_start=False)
 
     async def finish(self) -> None:
-        await self._updates.put(None)
+        """End the track: End of Track, then PUBLISH_DONE, on each
+        subscription served."""
+        self._finished.set()
+
+    async def produce(self, out) -> None:
+        # publish_*() write the objects; this holds the track open.
+        await self._finished.wait()
+
+    async def _new_group(self) -> None:
+        """Open a group with the current catalog for a joining or
+        resuming subscription."""
+        if not self._finished.is_set():
+            await self._write(self.catalog.to_json().encode(),
+                              group_start=True)
+
+    async def _start_generating(self, session, trigger: str):
+        self._open()
+        sub = self._sub_for(session)
+        delivery = sub.delivery
+        await super()._start_generating(session, trigger)
+        if sub.delivery is not delivery and sub.forward:
+            # The new lane joins at the next group boundary.
+            await self._new_group()
 
     def _set_forward(self, sub, forward: Optional[int]) -> None:
-        resumed = forward is not None and bool(forward) and not sub.forward
+        resumed = bool(forward) and not sub.forward and sub.generating
         super()._set_forward(sub, forward)
-        if resumed and self._serving():
-            self._updates.put_nowait(self._RESUME)
+        lane = getattr(sub.delivery, "lane", None)
+        if resumed and lane is not None and self._group is not None:
+            # Drop the rest of the open group; resume at the next one.
+            lane.resume(self._group)
+            asyncio.ensure_future(self._new_group())
 
-    async def generate(self, session, track_alias: int):
-        """Serve the catalog to the subscription under `track_alias`,
-        replacing any earlier emitter."""
-        if self._emitter is not None:
-            self._emitter.cancel()
-        task = asyncio.ensure_future(self._emit_loop(session, track_alias))
-        self._emitter = task
-        # Owned like a producer: the last subscriber leaving cancels it.
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    def _resume_lane(self, sub) -> None:
+        """_set_forward resumed the lane."""
+
+    def _on_sent(self, group_id: int, object_id: int) -> None:
+        self._total_sent += 1
+
+    def _stop_producing(self, sub=None) -> None:
+        """Idle one peer and reset its open stream (§5.1.1). Production
+        ends once every peer's session has closed."""
+        sub = self._subs[0] if sub is None else sub
+        super()._stop_producing(sub)
+        if sub.delivery is not None and not sub.generating:
+            sub.delivery.cancel()
+        prod = self._production
+        if prod is not None and not prod.done() and all(
+                getattr(s.session, '_close_err', None) is not None
+                for s in self._subs):
+            prod.cancel()
 
     async def _on_fetch(self, session, msg) -> None:
         """FETCH from the catalog objects published; before any was, the
-        current catalog stands at (0, 0)."""
-        if self._history is not None and not len(self._history):
-            self._history.add(0, 0, self.catalog.to_json().encode(),
-                              priority=self.priority)
+        current catalog is numbered first."""
+        self._open()
         await super()._on_fetch(session, msg)
-
-    async def _end_track(self, session, track_alias: int, header,
-                         stream_id) -> None:
-        """End of Track one past the last object on the open stream, else
-        at the start of the next group on a new stream."""
-        data = b""
-        if stream_id is None:
-            stream_id = await session.open_uni_stream()
-            session.set_stream_priority(stream_id, self._stream_band(session))
-            self._stream_count += 1
-            header = SubgroupHeader(
-                track_alias=track_alias, group_id=self._next_group,
-                subgroup_id=0, publisher_priority=self.priority,
-                prof=session._profile)
-            self._next_group += 1
-            data = header.serialize().data
-        data += header.next_object(payload=b"", object_id=header.next_object_id,
-                                   status=ObjectStatus.END_OF_TRACK).data
-        session.stream_write(stream_id, data, end_stream=True)
-
-    async def _emit_loop(self, session, track_alias: int):
-        sub = self._sub_for(session)
-        prof = session._profile
-        header = None
-        stream_id = None
-        # Deltas may follow only in a group that has seen every update.
-        can_append = False
-
-        async def _emit(payload: bytes, new_group: bool):
-            nonlocal header, stream_id
-            if new_group:
-                if stream_id is not None:
-                    buf = header.end_group(object_id=header.next_object_id)
-                    session.stream_write(stream_id, buf.data,
-                                         end_stream=True)
-                    stream_id = None
-                stream_id = await session.open_uni_stream()
-                session.set_stream_priority(stream_id,
-                                            self._stream_band(session))
-                self._stream_count += 1
-                header = SubgroupHeader(
-                    track_alias=track_alias, group_id=self._next_group,
-                    subgroup_id=0, publisher_priority=self.priority,
-                    prof=prof)
-                self._next_group += 1
-                await session.stream_write_drain(stream_id,
-                                                 header.serialize().data)
-            buf = header.next_object(payload=payload)
-            await session.stream_write_drain(stream_id, buf.data)
-            self._remember(header.group_id, header._last_object_id, payload)
-            self._total_sent += 1
-
-        async def _emit_catalog():
-            nonlocal can_append
-            # A joining subscriber needs a complete catalog first (§11.2).
-            await _emit(self.catalog.to_json().encode(), new_group=True)
-            can_append = True
-
-        try:
-            if sub.forward:
-                await _emit_catalog()
-            while True:
-                update = await self._updates.get()
-                if update is None:
-                    break
-                if update is self._RESUME:
-                    if sub.forward:
-                        await _emit_catalog()
-                    continue
-                if not sub.forward:
-                    # §5.1: no Objects at Forward State 0.
-                    self._fold(update)
-                    can_append = False
-                    continue
-                if update.is_delta and can_append:
-                    await _emit(update.to_json().encode(), new_group=False)
-                    self._fold(update)
-                else:
-                    self._fold(update)
-                    await _emit_catalog()
-        except asyncio.CancelledError:
-            # §5.1.1: the subscription ended; reset its open stream.
-            if stream_id is not None and session._close_err is None:
-                session.stream_reset(stream_id, StreamResetCode.CANCELLED)
-            raise
-        except Exception as e:
-            if session._close_err is None:
-                logger.warning(f"Catalog: emitter stopped: {e}")
-            return
-        if sub.forward:
-            try:
-                await self._end_track(session, track_alias, header, stream_id)
-            except Exception as e:
-                logger.debug(f"Catalog: End of Track not sent: {e!r}")
-        elif stream_id is not None:
-            buf = header.end_group(object_id=header.next_object_id)
-            session.stream_write(stream_id, buf.data, end_stream=True)
-        self._send_publish_done(session)
 
 
 class MediaPublisher:

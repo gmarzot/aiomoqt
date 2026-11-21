@@ -70,16 +70,18 @@ async def _until(pred, timeout=3.0):
 
 
 async def _three_groups(session, pubs):
-    """Subscribe to the catalog and publish two more: groups 0..2. Returns
-    the subscription's Request ID."""
+    """Subscribe to the catalog and publish two more: groups 1..3, the
+    current catalog at (0, 0) before them. Returns the subscription's
+    Request ID."""
     live = []
     session.on_object_received = (
         lambda obj, size, ts, gid, sgid: live.append(gid))
     ok = await session.subscribe(_NS, "catalog", wait_response=True)
     pub, = pubs.values()
+    await _until(lambda: 1 in live)
     for n in (1, 2):
         await pub.catalog_track.publish_catalog(_catalog(n))
-    await _until(lambda: 2 in live)
+    await _until(lambda: 3 in live)
     return ok.request_id
 
 
@@ -95,15 +97,15 @@ async def test_absolute_catalog_fetch_after_group_0(draft, use_quic):
                                 location_filter=LocationFilter.absolute(1, 0))
         else:
             msg = session.fetch(_NS, "catalog", start_group=1,
-                                start_object=0, end_group=2, end_object=0)
+                                start_object=0, end_group=3, end_object=0)
         session.register_fetch_object_handler(
             msg.request_id, lambda obj, *_: got.append(
                 (obj.group_id, obj.object_id, bytes(obj.payload))))
         ok = await session._await_response(msg.request_id)
         assert await session.await_fetch_done(msg.request_id, timeout=3.0)
-        assert (ok.largest_group_id, ok.largest_object_id) == (2, 1)
-        assert [(g, o) for g, o, _ in got] == [(1, 0), (2, 0)]
-        assert [Catalog.from_json(p).generatedAt for *_, p in got] == [1, 2]
+        assert (ok.largest_group_id, ok.largest_object_id) == (3, 1)
+        assert [(g, o) for g, o, _ in got] == [(1, 0), (2, 0), (3, 0)]
+        assert [Catalog.from_json(p).generatedAt for *_, p in got] == [0, 1, 2]
         assert session._close_err is None
 
 
@@ -117,10 +119,10 @@ async def test_relative_joining_catalog_fetch(draft, use_quic):
         await asyncio.sleep(0.1)
         session.on_fetch_object = lambda obj, *_: got.append(
             (obj.group_id, obj.object_id))
-        # Joining Location (2, 0): one group back is groups 1 and 2.
+        # Joining Location (3, 0): one group back is groups 2 and 3.
         _, fetch = await session.join(_NS, "catalog", joining_start=1,
                                       fetch_type=FetchType.RELATIVE_JOINING,
                                       wait_response=True)
         assert await session.await_fetch_done(fetch.request_id, timeout=3.0)
-        assert got == [(1, 0), (2, 0)]
+        assert got == [(2, 0), (3, 0)]
         assert session._close_err is None
