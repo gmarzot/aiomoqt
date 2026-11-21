@@ -395,7 +395,8 @@ class MediaSubscriber:
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
     delta. `timestamp_errors` is each media track's
-    SubscribedTrack policy. A media track's Track Properties are its
+    SubscribedTrack policy; `repair_s` each mpeg2ts track's FETCH repair
+    budget (see MsftsTrackSubscriber). A media track's Track Properties are its
     subscriber's (`tracks[name]`); `properties(name)` is the merged view.
     """
 
@@ -405,10 +406,12 @@ class MediaSubscriber:
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
                  on_arrival: Optional[Callable] = None,
-                 timestamp_errors: str = 'cancel'):
+                 timestamp_errors: str = 'cancel',
+                 repair_s: float = 0.0):
         self.session = session
         self.namespace = namespace
         self.timestamp_errors = timestamp_errors
+        self.repair_s = repair_s
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
         # find a broadcast whose name it was never told.
@@ -584,7 +587,8 @@ class MediaSubscriber:
             sub = MsftsTrackSubscriber(
                 self.session, namespace, name, packet_size=ts.packet_size,
                 on_frame=on_frame, on_arrival=on_arrival,
-                timestamp_errors=self.timestamp_errors)
+                timestamp_errors=self.timestamp_errors,
+                repair_s=self.repair_s)
         elif init is not None:
             sub = LocmafTrackSubscriber(self.session, namespace, name,
                                         init=init, **callbacks)
