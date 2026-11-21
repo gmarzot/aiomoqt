@@ -234,7 +234,9 @@ def parse_args():
                         metavar='MS',
                         help='OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT of every '
                              'media track, as Track Properties (MOQT §8); '
-                             '0 sets none. Default: 0')
+                             '0 sets none. With a *-floor --cc-algo it is '
+                             'also the floor\'s latency budget (L<MS> in '
+                             '--cc-options) unless one is given. Default: 0')
     parser.add_argument('--loc01-compat', action='store_true',
                         help='Also emit timestamps under loc-01\'s '
                              'property id 0x02 for players not yet on '
@@ -388,6 +390,11 @@ def parse_args():
         args.duration = math.inf
     if args.delivery_timeout < 0:
         parser.error('--delivery-timeout: milliseconds, or 0 for none')
+    cc_opts = args.cc_options or ''
+    if (args.delivery_timeout and (args.cc_algo or '').endswith('-floor')
+            and 'L' not in cc_opts):
+        # The floor's latency budget: queueing delay within it still arrives in time.
+        args.cc_options = f'{cc_opts}L{args.delivery_timeout}'
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
     if is_udp_url(args.ts):

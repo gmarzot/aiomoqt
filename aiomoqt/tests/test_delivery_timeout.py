@@ -180,6 +180,23 @@ def test_pub_media_delivery_timeout(monkeypatch, argv, want):
             track.subgroup_delivery_timeout) == (want, want)
 
 
+@pytest.mark.parametrize("argv, want", [
+    (["--cc-algo", "bbr1-floor", "--delivery-timeout", "320"], "L320"),
+    (["--cc-algo", "bbr-floor", "--cc-options", "K1.3",
+      "--delivery-timeout", "600"], "K1.3L600"),
+    (["--cc-algo", "bbr1-floor", "--cc-options", "L200",
+      "--delivery-timeout", "600"], "L200"),
+    (["--cc-algo", "bbr1-floor"], None),
+    (["--cc-algo", "bbr1", "--delivery-timeout", "320"], None),
+])
+def test_delivery_timeout_is_the_floors_latency_budget(monkeypatch, argv,
+                                                       want):
+    from aiomoqt.tools import pub_media
+    monkeypatch.setattr(sys, "argv",
+                        ["pub_media", "moqt://localhost:4433", *argv])
+    assert pub_media.parse_args().cc_options == want
+
+
 # -- SUBGROUP_DELIVERY_TIMEOUT sweep -----------------------------------
 
 _DT = StreamResetCode.DELIVERY_TIMEOUT
