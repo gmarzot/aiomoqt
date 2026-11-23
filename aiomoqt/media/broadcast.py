@@ -165,8 +165,8 @@ class CatalogTrackPublisher(PublishedTrack):
         self._total_sent += 1
 
     def _stop_producing(self, sub=None) -> None:
-        """Idle one peer and reset its open stream (§5.1.1). Production
-        ends once every peer's session has closed."""
+        """Idle one subscription and reset its open stream (§5.1.1).
+        Production ends once every peer's session has closed."""
         sub = self._subs[0] if sub is None else sub
         super()._stop_producing(sub)
         if sub.delivery is not None and not sub.generating:
