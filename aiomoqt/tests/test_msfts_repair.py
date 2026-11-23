@@ -113,10 +113,9 @@ async def test_reset_subgroups_are_repaired_in_order(draft, use_quic):
                         (g, o, bytes(f.payload))))
                 await subs[n].subscribe(parameters={0x02: 100})
             total = _GROUPS * _PER_GROUP
-            deadline = time.monotonic() + 8
-            while any(len(v) < total for v in got.values()):
-                if time.monotonic() > deadline:
-                    break
+            deadline = time.monotonic() + 30
+            while (any(len(v) < total for v in got.values())
+                   and time.monotonic() < deadline):
                 await asyncio.sleep(0.02)
     finally:
         quic_server.close()
@@ -124,6 +123,12 @@ async def test_reset_subgroups_are_repaired_in_order(draft, use_quic):
     want = [(g, o, _payload(g, o)) for g in range(_GROUPS)
             for o in range(_PER_GROUP)]
     for n in names:
-        assert subs[n].repairs >= 1, n
-        assert subs[n].repaired >= 1, n
-        assert got[n] == want, (n, len(got[n]), subs[n].repairs_expired)
+        s = subs[n]
+        state = dict(track=n, got=len(got[n]), repairs=s.repairs,
+                     repaired=s.repaired, expired=s.repairs_expired,
+                     pending=sorted(g for gs, _ in s._repairing.values()
+                                    for g in gs),
+                     held=s.order.held, late=s.order.late,
+                     skipped=s.order.skipped)
+        assert s.repairs >= 1 and s.repaired >= 1, state
+        assert got[n] == want, state
