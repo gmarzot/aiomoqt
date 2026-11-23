@@ -467,7 +467,7 @@ async def test_reconnect_resumes_the_timeline_after_a_relay_restart(
 
 @requires_certs
 @pytest.mark.parametrize('use_quic', [True, False], ids=['quic', 'wt'])
-async def test_reconnect_cancels_the_lost_sessions_catalog_emitter(
+async def test_reconnect_ends_the_lost_sessions_catalog(
         monkeypatch, h264_aac, arrivals, use_quic):  # noqa: F811
     port = _BASE_PORT + 22 + (not use_quic)
     url = _url(port, use_quic)
@@ -477,13 +477,14 @@ async def test_reconnect_cancels_the_lost_sessions_catalog_emitter(
                      '--mp4', h264_aac, '--loop', '--reconnect')
     sub_args = _argv(monkeypatch, 'sub_media', url, '-k', '--draft', '18',
                      '-N', ns, '--analyze', '-t', '2', '-i', '1')
-    emitters = []   # (catalog track, its session, emitter task)
-    generate = CatalogTrackPublisher.generate
+    emitters = []   # (catalog track, its session)
+    start = CatalogTrackPublisher._start_generating
 
-    async def recording(self, session, track_alias):
-        await generate(self, session, track_alias)
-        emitters.append((self, session, self._emitter))
-    monkeypatch.setattr(CatalogTrackPublisher, 'generate', recording)
+    async def recording(self, session, trigger, sub=None):
+        await start(self, session, trigger, sub=sub)
+        emitters.append((self, session))
+    monkeypatch.setattr(CatalogTrackPublisher, '_start_generating',
+                        recording)
     srv, handle = await _serve(port, use_quic, 18)
     pub = None
     try:
@@ -500,11 +501,11 @@ async def test_reconnect_cancels_the_lost_sessions_catalog_emitter(
         seen = len(arrivals)
         assert await sub_media.run(sub_args) == 0
         assert len(arrivals) > seen
-        for _, _, task in old:
-            assert task.done(), task
-        new = [(c, t) for c, s, t in emitters[len(old):]
-               if s not in {s for _, s, _ in old}]
-        assert new and any(c._total_sent for c, _ in new), emitters
+        for track, _ in old:
+            assert track._production.done(), track
+        new = [c for c, s in emitters[len(old):]
+               if s not in {s for _, s in old}]
+        assert new and any(c._total_sent for c in new), emitters
         await asyncio.wait_for(pub, 15)
     finally:
         if pub is not None and not pub.done():

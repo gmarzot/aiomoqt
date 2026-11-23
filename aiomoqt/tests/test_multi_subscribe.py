@@ -409,10 +409,10 @@ def _catalog():
 @pytest.mark.asyncio
 @_TRANSPORTS
 @_D20
-async def test_catalog_refuses_a_second_subscribe(draft, use_quic):
-    """The catalog's one emitter serves one subscription per session: a
-    second is NOT_SUPPORTED and the first keeps receiving, while a data
-    track on the session takes two."""
+async def test_catalog_serves_a_second_subscribe(draft, use_quic):
+    """Two catalog subscriptions on one session each take the group the
+    second's join opens and every later object, as a data track on the
+    session takes two."""
     from aiomoqt.media import CatalogTrackPublisher
     peer = _Peer()
     async with _loopback(_port(7, draft, "generate", use_quic), draft,
@@ -422,14 +422,14 @@ async def test_catalog_refuses_a_second_subscribe(draft, use_quic):
         _track(session, "video", "generate").attach()
         _, first = await peer.subscribe("catalog")
         assert await _until(lambda: len(first.objects) >= 1)
-        with pytest.raises(MOQTRequestError) as err:
-            await peer.subscribe("catalog")
-        assert err.value.response is not None, "timed out, no reply"
-        assert err.value.error_code == RequestErrorCode.NOT_SUPPORTED
+        _, second = await peer.subscribe("catalog")
+        assert await _until(lambda: len(second.objects) >= 1
+                            and len(first.objects) >= 2)
         await catalog.publish_catalog(_catalog())
-        assert await _until(lambda: len(first.objects) >= 2), (
-            "first catalog subscription stopped")
-        assert len(set(first.objects)) == len(first.objects)
+        for rx in (first, second):
+            assert await _until(lambda: len(rx.objects) >= 2), (
+                "a catalog subscription stopped")
+            assert len(set(rx.objects)) == len(rx.objects)
         _, a = await peer.subscribe("video")
         _, b = await peer.subscribe("video")
         for rx in (a, b):
