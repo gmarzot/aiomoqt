@@ -50,6 +50,30 @@ def test_datagram_with_video_applies_to_audio(monkeypatch):
     assert args.audio_datagram and not args.datagram
 
 
+def test_audio_frames_per_group_sets_the_audio_group_size(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["pub_bench", "moqt://x:1", "--video",
+                                      "720p", "--audio", "--catalog",
+                                      "--audio-frames-per-group", "25"])
+    args = pub_bench.parse_args()
+    tracks = {t.trackname: t for t in pub_bench._side_tracks(None, args)}
+    assert tracks["audio"].group_size == 25
+    assert tracks["catalog"].group_size == 1
+
+
+@pytest.mark.parametrize("extra, err", [
+    ([], "--audio-frames-per-group needs --audio"),
+    (["--audio", "--audio-frames-per-group", "0"], "must be 1-100"),
+])
+def test_audio_frames_per_group_usage(monkeypatch, capsys, extra, err):
+    argv = ["pub_bench", "moqt://x:1", "--video", "720p", *extra]
+    if "--audio-frames-per-group" not in argv:
+        argv += ["--audio-frames-per-group", "5"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit):
+        pub_bench.parse_args()
+    assert err in capsys.readouterr().err
+
+
 def test_datagram_with_video_needs_audio(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["pub_bench", "moqt://x:1", "--video",
                                       "720p", "-D"])
@@ -124,3 +148,37 @@ async def test_audio_and_catalog_beside_video(tmp_path, use_quic,
     assert _rate(audio) == pytest.approx(_cli.AUDIO_RATE, rel=0.1)
     assert _rate(video) == pytest.approx(30, rel=0.1)
     assert 2 <= len(catalog) <= WINDOW_S + 2
+
+
+@requires_certs
+@pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
+async def test_audio_frames_per_group_on_the_wire(tmp_path, use_quic):
+    port = free_udp_port()
+    rlog = tmp_path / "relay.log"
+    relay = spawn("moq_interop_relay", "--bind", "127.0.0.1", "--port", port,
+                  "--dual", "--cert", CERT, "--key", KEY, log=rlog)
+    pub = None
+    try:
+        wait_for(rlog, "Listening on", relay)
+        url = (f"moqt://127.0.0.1:{port}" if use_quic
+               else f"https://127.0.0.1:{port}/")
+        plog = tmp_path / "pub.log"
+        pub = spawn("pub_bench", url, "-k", "--video", "240p", "-r", 30,
+                    "-g", 30, "--audio", "--audio-frames-per-group", 5,
+                    "-t", 30, log=plog)
+        wait_for(plog, "Published 'aiomoqt/audio'", pub)
+        got = await _receive(port, use_quic, ["video", "audio"])
+    finally:
+        if pub is not None:
+            stop(pub)
+        stop(relay)
+
+    audio = got["audio"]
+    assert len(audio) >= 20, len(audio)
+    by_group = {}
+    for _, gid, oid, _, _ in audio:
+        by_group.setdefault(gid, []).append(oid)
+    full = [oids for oids in by_group.values() if len(oids) == 5]
+    assert full and all(oids == [0, 1, 2, 3, 4] for oids in full), by_group
+    assert _rate(audio) == pytest.approx(_cli.AUDIO_RATE, rel=0.1)
+

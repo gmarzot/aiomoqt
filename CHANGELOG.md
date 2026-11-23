@@ -2,6 +2,7 @@
 
 ## v0.15.0 (unreleased)
 
+- `pub_bench --audio-frames-per-group N` puts N audio objects in each group, one subgroup stream per group, as `pub_media` does.
 - A subgroup object whose length field no stream can carry, such as a second subgroup header read as an object, closes the session with PROTOCOL_VIOLATION naming the field, value and offset (a properties length makes the track malformed), instead of a raw `OverflowError` message; needs aiopquic with `LengthFieldError`.
 - `sub_media --repair MS` FETCHes the mpeg2ts Objects a subscription will not deliver (the rest of a group whose stream was reset, groups skipped over) from the publisher and holds the in-order output up to MS for them; `MsftsTrackSubscriber(repair_s=)`, `MediaSubscriber(repair_s=)`.
 - Publishers and aiomoqt-relay order a session's data streams by SUBSCRIBER_PRIORITY, then publisher priority (§5.1.2), from SUBSCRIBE, PUBLISH_OK, FETCH and REQUEST_UPDATE; streams already open move on an update. Each distinct subscriber priority on a session takes a slice of the data bands; a session whose requests share one, or send none, keeps its bands.

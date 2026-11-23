@@ -142,6 +142,10 @@ The URL scheme selects the transport:
                         help='Also PUBLISH <trackname>-2, whose objects '
                              'differ, with the --forward state')
     _cli.add_side_tracks(parser)
+    parser.add_argument('--audio-frames-per-group', type=int, default=None,
+                        metavar='N',
+                        help='With --audio: N audio objects per group, one '
+                             'subgroup stream per group (default: 1)')
     parser.add_argument('--goaway-after', type=float, default=None,
                         metavar='SECONDS',
                         help='Send GOAWAY this long after publishing; '
@@ -171,6 +175,12 @@ The URL scheme selects the transport:
     _cli.add_help(parser)
     args = parser.parse_args()
     _cli.check_side_tracks(parser, args)
+    n = args.audio_frames_per_group
+    if n is not None:
+        if not args.audio:
+            parser.error('--audio-frames-per-group needs --audio')
+        if not 1 <= n <= 100:
+            parser.error('--audio-frames-per-group must be 1-100')
     _cli.check_video(parser, args)
     _cli.check_datagram(parser, args)
     if args.prefill and not args.fetch_history:
@@ -193,7 +203,7 @@ class _SideTrack(PublishedTrack):
 
 def _side_tracks(session, args):
     """The --catalog and --audio tracks: one object per group, so each
-    object opens a subgroup stream."""
+    object opens a subgroup stream; audio takes --audio-frames-per-group."""
     tracks = []
     for name, size, rate, datagram in args.side_tracks:
         t = _SideTrack(
@@ -201,7 +211,8 @@ def _side_tracks(session, args):
             namespace=args.namespace,
             trackname=name,
             object_size=size,
-            group_size=1,
+            group_size=(args.audio_frames_per_group or 1
+                        if name == 'audio' else 1),
             rate=rate,
             forwarding=(ForwardingPreference.DATAGRAM if datagram
                         else ForwardingPreference.SUBGROUP),
