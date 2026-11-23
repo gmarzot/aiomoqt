@@ -97,8 +97,9 @@ class _Sub:
 
 
 def _slow_down(session, delay=_SLOW_S):
-    """Every awaited write to `session` takes `delay`: a subscriber whose
-    streams drain slowly."""
+    """Every awaited write to `session` takes `delay`, and its transport
+    reports all it was written as still held: a subscriber whose streams
+    drain slowly, whether its lane or a fanout() writes them."""
     real = session.stream_write_drain
 
     async def slow(stream_id, data, end_stream=False, **kw):
@@ -106,6 +107,20 @@ def _slow_down(session, delay=_SLOW_S):
         await real(stream_id, data, end_stream, **kw)
     session.stream_write_drain = slow
     session.stream_write_nowait = lambda *_a, **_kw: False
+    _hold(session)
+
+
+def _hold(session):
+    """`session`'s transport reports every byte written to a stream as
+    still held, even once the stream has retired."""
+    quic = session._quic
+    used, sent = quic.tx_data_ring_used, quic.tx_sent_bytes
+    held: dict = {}
+
+    def holding(sid):
+        n = held[sid] = max(held.get(sid, 0), used(sid) + sent(sid))
+        return n
+    quic.tx_data_ring_used = holding
 
 
 async def _until(pred, timeout=5.0):

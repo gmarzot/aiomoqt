@@ -25,6 +25,7 @@ from aiomoqt.types import ObjectStatus, StreamResetCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.tests._relay_wait import until_published
+from aiomoqt.tests.test_relay_send_lanes import _hold
 
 pytestmark = requires_certs
 
@@ -840,3 +841,44 @@ async def test_a_subgroup_delivery_timeout_still_resets(fake_relay):
         int(StreamResetCode.DELIVERY_TIMEOUT)] * 3
     assert [end for _b, end in on[0]] == ["fin"] * 3
 
+
+@needs_fanout
+@pytest.mark.asyncio
+@_TRANSPORTS
+@pytest.mark.parametrize("fanout", [True, False], ids=["on", "off"])
+async def test_a_member_whose_transport_holds_its_bytes_sheds(
+        fanout, use_quic, monkeypatch):
+    """Past --lag-limit by what its transport holds, a viewer sheds whole
+    groups with DELIVERY_TIMEOUT, fanout member or not."""
+    monkeypatch.setattr(relay, "_lag_limit", 0.5)
+    if not fanout:
+        monkeypatch.setattr(relay, "_DestSet", None)
+    # Groups shorter than the lag limit: only what the transport holds of
+    # earlier streams puts the viewer behind.
+    shape = _shape(groups=12, objects=10, gap=0.03, reset=None)
+    st = SimpleNamespace(member=False)
+    watch = asyncio.ensure_future(relay._watch_lanes())
+
+    async def hold(run):
+        video = run.tracks["video"]
+        d = video.downstream[2]
+        _hold(d.session)
+        for _ in range(150):
+            st.member = st.member or any(
+                k[0] == id(d.session) for k in video._fanout_members)
+            if d.lane is not None and d.lane.sheds:
+                break
+            await asyncio.sleep(0.02)
+        st.lane = d.lane
+        st.others = [x.lane.sheds for x in video.downstream[:2]]
+    try:
+        run, stats = await _relay_run(
+            _port(14 + (not fanout), use_quic), use_quic, [18], shape=shape,
+            during=hold, complete=[0, 1])
+    finally:
+        watch.cancel()
+    assert st.member is fanout, st.member
+    assert st.lane.sheds >= 1, st.lane.sheds
+    assert st.lane.cut_code == StreamResetCode.DELIVERY_TIMEOUT
+    assert st.others == [0, 0], st.others
+    assert run.views[0] == run.views[1]

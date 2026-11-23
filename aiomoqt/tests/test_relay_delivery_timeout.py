@@ -16,6 +16,7 @@ from aiomoqt.types import ParamType, StreamResetCode
 from aiomoqt.tests._certs import requires_certs
 from aiomoqt.tests.test_relay_send_lanes import (_Fake, _obj, _relay,
                                                  _settle, relay_tables)
+from aiomoqt.tests.test_relay_send_lanes import _slow_down as _slow_lane
 
 assert relay_tables  # fixture, used by name
 
@@ -235,13 +236,7 @@ class _Sub:
 
 
 def _slow_down(session):
-    real = session.stream_write_drain
-
-    async def slow(stream_id, data, end_stream=False, **kw):
-        await asyncio.sleep(_SLOW_S)
-        await real(stream_id, data, end_stream, **kw)
-    session.stream_write_drain = slow
-    session.stream_write_nowait = lambda *_a, **_kw: False
+    _slow_lane(session, _SLOW_S)
 
 
 def _publish(pub):
