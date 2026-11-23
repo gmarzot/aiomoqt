@@ -34,7 +34,8 @@ moq-fabric mesh), `moq-fabric-bench` (sends and measures a track through one),
 `moq-interop-client`, `moq-interop-relay`, `aiomoqt-versions`. Others run as
 modules: `python -m aiomoqt.tools.pub_media` / `sub_media` (MSF media; `sub_media -Q/-W` listens
 for a publisher that dials it with `--pub-ns`; `--ts --msfts` and
-`--ts-out` carry MPEG-TS as MSFTS, `--ts-playout` plays it out on its PCR; `--input` ingest needs
+`--ts-out` carry MPEG-TS as MSFTS, `--ts-playout` plays it out on its PCR, `--repair` FETCHes what
+the subscription missed; `--input` ingest needs
 the `media` extra),
 `aiomoqt.tools.abr_ingest` (ABR ladder; needs the `abr` extra), `aiomoqt.tools.moqtest_origin`.
 
@@ -84,6 +85,9 @@ SIGUSR1.
   `--stream-scheduling`) defaults to `chain`: tracks of one priority share a session's bandwidth
   and each sends its groups in order. It needs aiopquic with stream chains and runs as `fifo`
   (the oldest stream takes the band) without them. A track given `stream_priority` is not chained.
+- Priorities: a request's SUBSCRIBER_PRIORITY orders its streams before publisher priority. With k
+  distinct subscriber priorities on one session the data bands split k ways, so publisher priorities
+  resolve more coarsely; a track given `stream_priority` keeps that band whatever either says.
 - Many sessions in one process: `MOQTClient(shared_transport=SharedTransport(sockets=N))` puts them on
   one picoquic worker, far cheaper than one each. Give it one socket per session on Linux: sessions sharing
   a source port all land on one worker thread of a relay that hashes ports to threads (mvfst).

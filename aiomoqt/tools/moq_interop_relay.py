@@ -124,7 +124,7 @@ import copy
 import datetime
 import faulthandler
 import gc
-from functools import lru_cache
+from functools import lru_cache, partial
 import heapq
 import itertools
 import json
@@ -518,13 +518,17 @@ def _band_of(priority, discipline) -> int:
     return to_stream_priority(priority, discipline=discipline)
 
 
-def _stream_band(session, priority) -> int:
+def _stream_band(session, priority, subscriber_priority=None) -> int:
     """Transport band for a downstream data stream of this publisher
-    priority."""
+    priority under a request of this subscriber priority."""
     if priority is None or not 0 <= priority <= 255:
         priority = 128
-    return _band_of(priority, getattr(
-        session, 'stream_scheduling', STREAM_SCHEDULING))
+    sched = getattr(session, 'stream_scheduling', None) or STREAM_SCHEDULING
+    table = getattr(session, 'band_table', None)
+    if table is None:
+        return _band_of(priority, sched)
+    return table(128 if subscriber_priority is None else subscriber_priority,
+                 sched)[priority]
 
 
 def _no_tx(_stream_id) -> int:
@@ -673,13 +677,15 @@ class _Downstream:
                  "joined_at", "replaying", "location_filter", "group_order",
                  "fills", "range_params", "filters", "lane", "lost",
                  "fence", "timeout", "subgroup_timeout", "objects_sent",
-                 "bytes_sent", "largest_sent")
+                 "bytes_sent", "largest_sent", "priority")
 
     def __init__(self, session, alias, request_id, forward=True,
-                 window=_UNFILTERED):
+                 window=_UNFILTERED, priority=None):
         self.session = session
         self.alias = alias
         self.request_id = request_id
+        # SUBSCRIBER_PRIORITY (§5.1.1); 128 when omitted (§9.20.7).
+        self.priority = 128 if priority is None else priority
         # Forward State (§5.1): objects flow only while True.
         self.forward = forward
         # Filter window (§5.1.2): (start Location, End Group or None[,
@@ -2129,6 +2135,8 @@ class _RelayedTrack:
         self.attaching = False
         # (id(session), group, subgroup) -> (stream_id, SubgroupHeader)
         self._streams = {}
+        # id(session) -> its downstream's bands by publisher priority.
+        self._bands: dict = {}
         # id(session) -> {(group, subgroup): stream_id} of the streams
         # opened, kept past FIN until the transport has drained them.
         self._tx_streams: dict = {}
@@ -2403,6 +2411,7 @@ class _RelayedTrack:
         for d in self.downstream:
             if id(d.session) not in draining and _session_live(d.session):
                 self._close_streams(d.session, StreamResetCode.CANCELLED)
+            self._hold_priority(d, release=True)
         self.downstream.clear()
         self._ds_ver += 1
         self._fanout_hist.clear()
@@ -2557,6 +2566,7 @@ class _RelayedTrack:
         if d in self.downstream:
             self.downstream.remove(d)
             self._ds_ver += 1
+            self._hold_priority(d, release=True)
             if self._queued(d):
                 d.lane.finish(SubscribeDoneCode.SUBSCRIPTION_ENDED,
                               "subscription ended")
@@ -2891,11 +2901,13 @@ class _RelayedTrack:
 
     def add_downstream(self, session, track_alias, request_id=None,
                        forward=True, window=_UNFILTERED,
-                       replay=False) -> _Downstream:
+                       replay=False, priority=None) -> _Downstream:
         """Join the fan-out. With `replay`, cached objects inside the
         window go to the subscriber first, then live ones."""
         self.attaching = False
-        d = _Downstream(session, track_alias, request_id, forward, window)
+        d = _Downstream(session, track_alias, request_id, forward, window,
+                        priority)
+        self._hold_priority(d)
         d.fence = self.fence
         if forward:
             # A joining FETCH from this subscriber backfills to here.
@@ -2914,6 +2926,42 @@ class _RelayedTrack:
         return next((d for d in self.downstream if d.session is session
                      and d.request_id == request_id), None)
 
+    def set_priority(self, d, priority) -> None:
+        """A REQUEST_UPDATE's SUBSCRIBER_PRIORITY for `d`."""
+        if priority is not None and priority != d.priority:
+            d.priority = priority
+            self._hold_priority(d)
+
+    def _hold_priority(self, d, release=False) -> None:
+        """Tell d's session the subscriber priority it is sent under, or
+        that it is gone (`release`)."""
+        hold = getattr(d.session, 'hold_subscriber_priority', None)
+        if hold is None:
+            return
+        hold(d, None if release else d.priority, partial(self._reband, d))
+        if release:
+            self._bands.pop(id(d.session), None)
+        else:
+            self._reband(d)
+
+    def _reband(self, d) -> None:
+        """d's bands from its subscriber priority; open streams move to
+        them (§5.1.1)."""
+        session = d.session
+        sched = (getattr(session, 'stream_scheduling', None)
+                 or STREAM_SCHEDULING)
+        table = session.band_table(d.priority, sched)
+        sk = id(session)
+        if self._bands.get(sk) == table:
+            return
+        self._bands[sk] = table
+        for k, (stream_id, header) in self._streams.items():
+            if k[0] == sk:
+                p = header.publisher_priority
+                session.set_stream_priority(
+                    stream_id, table[p if p is not None and 0 <= p <= 255
+                                     else 128])
+
     def drop_session(self, session):
         self._fanout_leave_session(id(session))
         for lane in [lane for lane in self._lanes
@@ -2924,6 +2972,7 @@ class _RelayedTrack:
                 # d22 §3.4.1: a cancelled subscription resets its fills.
                 for task in list(d.fills):
                     task.cancel()
+                self._hold_priority(d, release=True)
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
         self._ds_ver += 1
@@ -3728,8 +3777,11 @@ class _RelayedTrack:
                     initial += first
         self._count_tx(session, len(initial))
         sched = getattr(session, 'stream_scheduling', None)
-        band = _band_of(prio if prio is not None and 0 <= prio <= 255 else 128,
-                        sched or STREAM_SCHEDULING)
+        bands = self._bands.get(skey[0])
+        p = 128 if prio is None else prio
+        band = (bands[p] if bands is not None
+                else _band_of(p if 0 <= p <= 255 else 128,
+                              sched or STREAM_SCHEDULING))
         try:
             if sched == "chain":
                 stream_id = await session.open_uni_stream(
@@ -3792,9 +3844,13 @@ class _RelayedTrack:
                 encoded[key] = parts
         initial = b"".join(parts)
         sched = getattr(session, 'stream_scheduling', None)
-        band = _band_of(prio if prio is not None and 0 <= prio <= 255 else 128,
-                        sched or STREAM_SCHEDULING)
-        tx = self._tx_streams.setdefault(id(session), {})
+        sk = id(session)
+        bands = self._bands.get(sk)
+        p = 128 if prio is None else prio
+        band = (bands[p] if bands is not None
+                else _band_of(p if 0 <= p <= 255 else 128,
+                              sched or STREAM_SCHEDULING))
+        tx = self._tx_streams.setdefault(sk, {})
         k = (gid, sgid)
 
         def created(stream_id):
@@ -5293,7 +5349,8 @@ def _attach_subscriber(session, msg, track, largest) -> bool:
     # unfiltered starts at {0, 0}.
     replay = track.largest is not None and window[0] <= track.largest
     d = track.add_downstream(session, ok.track_alias, msg.request_id,
-                             forward=forward, window=window, replay=replay)
+                             forward=forward, window=window, replay=replay,
+                             priority=getattr(msg, "priority", None))
     d.location_filter = getattr(msg, "location_filter", None)
     d.group_order = getattr(msg, "group_order", None)
     d.set_filters(merge_range_filters({}, msg.parameters or {}),
@@ -5411,7 +5468,8 @@ async def _serve_fill(track, d, request_id, fill, rng,
         serving = True
         await session.serve_fetch(
             request_id, served, group_order=order,
-            stream_priority=_stream_band(session, objs[0][5] if objs else None))
+            stream_priority=_stream_band(session, objs[0][5] if objs else None,
+                                         d.priority))
         logger.info(f"relay: fill {track.key} request {request_id} served "
                     f"{len(objs)} object(s) {start}..{end} from {source}")
     except asyncio.CancelledError:
@@ -5520,6 +5578,8 @@ def _apply_update(session, msg, found) -> None:
         d.location_filter = lf
     if d.take_timeout(msg.parameters):
         track.time_lane(d)
+    track.set_priority(d, (msg.parameters or {}).get(
+        ParamType.SUBSCRIBER_PRIORITY))
     if forward is not None:
         if forward and not d.forward:
             d.joined_at = track.largest
@@ -5558,6 +5618,7 @@ def _update_filters(session, msg, track, d) -> bool:
         if d in track.downstream:
             track.downstream.remove(d)
             track._ds_ver += 1
+            track._hold_priority(d, release=True)
         track._end(d, SubscribeDoneCode.UPDATE_FAILED, None, why)
         return False
     d.set_filters(merged, track.properties)
@@ -6082,10 +6143,15 @@ async def _offer_track(session, track, key, request_id=None):
                 ParamType.FORWARD, 1)
         window = _reply_window(session, reply, seen) or _UNFILTERED
         # Cached objects inside the subscriber's window go first.
+        prio = getattr(reply, 'priority', None)
+        if prio is None:
+            prio = (getattr(reply, 'parameters', None) or {}).get(
+                ParamType.SUBSCRIBER_PRIORITY)
         d = track.add_downstream(session, pub_msg.track_alias,
                                  pub_msg.request_id, forward=bool(forward),
                                  window=window,
-                                 replay=track.largest is not None)
+                                 replay=track.largest is not None,
+                                 priority=prio)
         d.set_filters(_track_sub_filters.get((id(session), request_id), {}),
                       track.properties)
         session.register_request_cancel_handler(
@@ -6409,10 +6475,20 @@ async def _on_fetch(session, msg):
     objs = _filtered(objs, RangeFilters.from_params(msg.parameters))
     if int(order) == int(GroupOrder.DESCENDING):
         objs = sorted(objs, key=lambda o: (-o[0], o[2]))
-    await session.serve_fetch(
-        msg.request_id, _counted_fetch(objs, track, source),
-        group_order=int(order),
-        stream_priority=_stream_band(session, objs[0][5] if objs else None))
+    prio = getattr(msg, 'subscriber_priority', None)
+    holder = ('fetch', msg.request_id)
+    hold = getattr(session, 'hold_subscriber_priority', None)
+    if hold is not None:
+        hold(holder, 128 if prio is None else prio)
+    try:
+        await session.serve_fetch(
+            msg.request_id, _counted_fetch(objs, track, source),
+            group_order=int(order),
+            stream_priority=_stream_band(
+                session, objs[0][5] if objs else None, prio))
+    finally:
+        if hold is not None:
+            hold(holder, None)
     n_up = sum((o[0], o[2]) in up_keys for o in objs) if up_keys else 0
     size = sum(len(o[3] or b"") for o in objs)
     logger.info(f"relay: FETCH ns={ns} track={track_name} served "

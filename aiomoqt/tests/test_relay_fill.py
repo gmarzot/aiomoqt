@@ -264,7 +264,7 @@ async def test_an_empty_cache_and_a_failed_upstream_fail_the_fill(
     monkeypatch.setattr(relay, "_fetch_upstream", no_upstream)
     monkeypatch.setattr(relay, "_fail_fill", fail_fill)
     d = SimpleNamespace(session=SimpleNamespace(serve_fetch=serve_fetch),
-                        group_order=None)
+                        group_order=None, priority=128)
     fill = ({} if timeout_ms is None
             else {D20ParamType.FILL_TIMEOUT: timeout_ms})
     for rid, name in enumerate(_SIZES):
