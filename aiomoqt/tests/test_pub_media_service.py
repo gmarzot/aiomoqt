@@ -182,10 +182,11 @@ async def test_signal_withdraws_refuses_and_closes(
     done_orig = PublishedTrack._send_publish_done
 
     def publish_done(self, session, status_code=0x2, final=True,
-                     reason=None):
+                     reason=None, sub=None):
         log.append(('publish_done', time.monotonic(), self.trackname,
                     int(status_code)))
-        return done_orig(self, session, status_code, final, reason=reason)
+        return done_orig(self, session, status_code, final, reason=reason,
+                         sub=sub)
     monkeypatch.setattr(PublishedTrack, '_send_publish_done', publish_done)
     withdraw_orig = relay._withdraw_namespace
 
@@ -479,8 +480,8 @@ async def test_reconnect_ends_the_lost_sessions_catalog(
     emitters = []   # (catalog track, its session)
     start = CatalogTrackPublisher._start_generating
 
-    async def recording(self, session, trigger):
-        await start(self, session, trigger)
+    async def recording(self, session, trigger, sub=None):
+        await start(self, session, trigger, sub=sub)
         emitters.append((self, session))
     monkeypatch.setattr(CatalogTrackPublisher, '_start_generating',
                         recording)

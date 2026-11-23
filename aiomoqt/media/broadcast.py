@@ -140,11 +140,11 @@ class CatalogTrackPublisher(PublishedTrack):
         Track."""
         await self._write(self.catalog.to_json().encode(), group_start=True)
 
-    async def _start_generating(self, session, trigger: str):
+    async def _start_generating(self, session, trigger: str, sub=None):
         self._open()
-        sub = self._sub_for(session)
+        sub = self._sub_for(session) if sub is None else sub
         delivery = sub.delivery
-        await super()._start_generating(session, trigger)
+        await super()._start_generating(session, trigger, sub=sub)
         if sub.delivery is not delivery and sub.forward:
             # The new lane joins at the next group boundary.
             await self._new_group()

@@ -2,7 +2,9 @@
 
 ## v0.15.0 (unreleased)
 
-- The MSF catalog track is served through the shared fan-out path: each catalog and delta is numbered once and reaches every subscription, on any session; a subscription that joins, or resumes at Forward State 1, opens a new group with the current catalog as Object 0, which every subscription takes.
+- The MSF catalog track is served through the shared fan-out path: each catalog and delta is numbered once and reaches every subscription, on any session or several on one (d20); a subscription that joins, or resumes at Forward State 1, opens a new group with the current catalog as Object 0, which every subscription takes.
+- A generate() subgroup stream whose open was still in flight when its subscription ended is now counted in PUBLISH_DONE's Stream Count (§9.9) and reset; over WebTransport it went uncounted and was left open.
+- From d20 a `PublishedTrack` serves several concurrent SUBSCRIBEs to it on one session (§3.1), each with its own alias, filter, Forward State, producers and PUBLISH_DONE stream count, including a SUBSCRIBE beside our own PUBLISH; they were refused with NOT_SUPPORTED. d16 and d18 still refuse a second one with DUPLICATE_SUBSCRIPTION, and aiomoqt-relay still refuses it with NOT_SUPPORTED.
 - `pub_bench --audio-frames-per-group N` puts N audio objects in each group, one subgroup stream per group, as `pub_media` does.
 - A subgroup object whose length field no stream can carry, such as a second subgroup header read as an object, closes the session with PROTOCOL_VIOLATION naming the field, value and offset (a properties length makes the track malformed), instead of a raw `OverflowError` message; needs aiopquic with `LengthFieldError`.
 - `sub_media --repair MS` FETCHes the mpeg2ts Objects a subscription will not deliver (the rest of a group whose stream was reset, groups skipped over) from the publisher and holds the in-order output up to MS for them; `MsftsTrackSubscriber(repair_s=)`, `MediaSubscriber(repair_s=)`.

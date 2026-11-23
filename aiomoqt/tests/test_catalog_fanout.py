@@ -69,13 +69,10 @@ class _Sub:
             self.objects.append((group_id, obj.object_id, bytes(obj.payload)))
 
     async def subscribe(self, forward=1):
-        # Session-wide: objects can overtake SUBSCRIBE_OK.
-        self.session.on_object_received = self._on_object
-        msg = self.session.subscribe(_NS, "catalog", forward=forward)
-        self.session.register_publish_done_handler(
-            msg.request_id,
-            lambda m: self.done.done() or self.done.set_result(m))
-        self.ok = await self.session._await_response(msg.request_id)
+        self.ok = await self.session.subscribe(
+            _NS, "catalog", forward=forward, wait_response=True,
+            on_object=self._on_object,
+            on_done=lambda m: self.done.done() or self.done.set_result(m))
         return self
 
     @property
@@ -180,8 +177,35 @@ async def test_two_sessions_take_every_object_once(draft, use_quic):
 @_TRANSPORTS
 @pytest.mark.parametrize("draft", [20, 22])
 async def test_two_subscriptions_on_one_session(draft, use_quic):
-    pytest.skip("a second catalog SUBSCRIBE on a session needs the "
-                "multi-subscribe change (#444)")
+    # From d20 one session may hold several subscriptions (§3.1).
+    async with _loopback(_port(6, draft, use_quic), draft, use_quic
+                         ) as (track, sessions):
+        a = await _Sub(sessions[0]).subscribe()
+        await _until(lambda: a.locations() == [(1, 0)])
+        b = await _Sub(sessions[0]).subscribe()
+        assert a.ok.track_alias != b.ok.track_alias
+        await _until(lambda: b.locations() == [(2, 0)]
+                     and len(a.objects) == 2)
+        await _publish_run(track)
+        await _until(lambda: len(b.objects) == 4 and len(a.objects) == 5)
+        run = [(2, 0), (2, 1), (3, 0), (3, 1)]
+        assert a.locations() == [(1, 0), *run]
+        assert b.locations() == run
+        sessions[0].unsubscribe(a.request_id)
+        await _until(lambda: len(track._out.lanes) == 2
+                     and sum(s.generating for s in track.subscriptions) == 1)
+        await track.publish_delta(_clone("video-4"))
+        await _until(lambda: len(b.objects) == 5)
+        await track.finish()
+        done = await asyncio.wait_for(b.done, 5.0)
+        await asyncio.sleep(0.1)
+        assert len(a.objects) == 5 and a.ended is None
+        assert b.locations() == [*run, (3, 2)]
+        assert b.ended == (3, 3)
+        assert done.stream_count == 2
+        for sub in (a, b):
+            assert sub.applied().find("video-3") is not None
+        assert b.applied().to_json() == track.catalog.to_json()
 
 
 @_TRANSPORTS

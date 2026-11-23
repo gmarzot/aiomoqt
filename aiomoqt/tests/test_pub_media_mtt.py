@@ -439,9 +439,11 @@ def publish_dones(monkeypatch):
     seen = []
     orig = PublishedTrack._send_publish_done
 
-    def record(self, session, status_code=0x2, final=True, reason=None):
+    def record(self, session, status_code=0x2, final=True, reason=None,
+               sub=None):
         seen.append((self.trackname, int(status_code), reason))
-        return orig(self, session, status_code, final, reason=reason)
+        return orig(self, session, status_code, final, reason=reason,
+                    sub=sub)
     monkeypatch.setattr(PublishedTrack, '_send_publish_done', record)
     return seen
 
