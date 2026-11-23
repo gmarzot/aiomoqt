@@ -190,13 +190,14 @@ async def test_broadcast_delta_update():
                 track_filter=lambda t: t.name == "audio")
             await sub.start()
             for _ in range(200):
-                if len(seen) >= 2:
+                if seen and seen[-1] == 3:
                     break
                 await asyncio.sleep(0.02)
     finally:
         server.close()
-    # Independent catalog (2 tracks) then the applied clone delta (3).
-    assert seen[:2] == [2, 3]
+    # The clone delta reached the subscriber: by the joining FETCH, or in
+    # the independent catalog the subscription's new group carries.
+    assert seen and seen[-1] == 3
     assert sub.catalog.find("video-2").codec == "avc1.640028"
     assert sub.catalog.find("video-2").bitrate == 500_000
     # track_filter honored: only audio was subscribed.

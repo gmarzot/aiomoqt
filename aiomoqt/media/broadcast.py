@@ -136,10 +136,9 @@ class CatalogTrackPublisher(PublishedTrack):
 
     async def _new_group(self) -> None:
         """Open a group with the current catalog for a joining or
-        resuming subscription."""
-        if not self._finished.is_set():
-            await self._write(self.catalog.to_json().encode(),
-                              group_start=True)
+        resuming subscription; after finish() too, ahead of End of
+        Track."""
+        await self._write(self.catalog.to_json().encode(), group_start=True)
 
     async def _start_generating(self, session, trigger: str):
         self._open()
