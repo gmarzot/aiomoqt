@@ -91,8 +91,8 @@ class CatalogTrackPublisher(PublishedTrack):
         return loc
 
     def _open(self) -> None:
-        """Number the current catalog on first demand. No peer has a lane
-        yet, so it goes to the history; joiners take it from there."""
+        """Number the current catalog on first demand, into the history
+        for FETCH; no peer has a lane yet."""
         if self._group is None and self.catalog is not None:
             group_id, object_id = self._number(group_start=True)
             self._remember(group_id, object_id, self.catalog.to_json().encode())
