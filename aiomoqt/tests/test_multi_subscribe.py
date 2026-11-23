@@ -17,7 +17,7 @@ from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import (FilterType, MOQTMessageType, MOQTRequestError,
-                           RequestErrorCode)
+                           ParamType, RequestErrorCode)
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -435,3 +435,52 @@ async def test_catalog_refuses_a_second_subscribe(draft, use_quic):
         for rx in (a, b):
             assert await _until(lambda: len(rx.objects) >= _MIN_OBJECTS)
             rx.check()
+
+
+def _bands(sub) -> set:
+    """Bands the subscription's streams go out on now."""
+    if sub.delivery is not None:
+        return {sub.delivery.stream_priority}
+    return {s.band for s in sub.senders}
+
+
+@pytest.mark.asyncio
+@_TRANSPORTS
+@_KINDS
+@_D20
+async def test_subscriber_priority_is_per_subscription(draft, kind,
+                                                       use_quic):
+    """Each subscription sends under its own SUBSCRIBER_PRIORITY (§5.1.2);
+    a REQUEST_UPDATE re-bands only the one it updates."""
+    peer = _Peer()
+    async with _loopback(_port(8, draft, kind, use_quic), draft, use_quic,
+                         peer) as session:
+        video = _track(session, "video", kind)
+        for track in (_track(session, "audio", kind), video):
+            track.attach()
+        _, audio = await peer.subscribe("audio")
+        ok_a, a = await peer.subscribe("video", priority=10)
+        ok_b, b = await peer.subscribe("video", priority=200)
+        for rx in (a, b, audio):
+            assert await _until(lambda: len(rx.objects) >= _MIN_OBJECTS)
+        sub_a = _sub_at(video, ok_a.track_alias)
+        sub_b = _sub_at(video, ok_b.track_alias)
+        assert (sub_a.priority, sub_b.priority) == (10, 200)
+
+        def banded(sub) -> bool:
+            want = video._stream_band(session, video.priority, sub=sub)
+            return _bands(sub) == {want}
+        assert await _until(lambda: banded(sub_a) and banded(sub_b))
+        band_a = video._stream_band(session, video.priority, sub=sub_a)
+        band_b = video._stream_band(session, video.priority, sub=sub_b)
+        assert band_a < band_b, (band_a, band_b)
+        await peer.session.request_update(
+            ok_a.request_id, wait_response=True,
+            parameters={ParamType.SUBSCRIBER_PRIORITY: 250})
+        assert (sub_a.priority, sub_b.priority) == (250, 200)
+        assert await _until(lambda: banded(sub_a) and banded(sub_b))
+        assert (video._stream_band(session, video.priority, sub=sub_a)
+                > video._stream_band(session, video.priority, sub=sub_b))
+        for rx in (a, b, audio):
+            assert await _grows(rx)
+        b.check()
