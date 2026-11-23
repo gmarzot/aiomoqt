@@ -547,17 +547,21 @@ _BUDGET = 512 << 10
 
 
 class _FakeDestSet:
-    """aiopquic DestSet over _FakeTransport."""
+    """aiopquic DestSet over _FakeTransport: generation-checked indexes."""
 
     def __init__(self, transport, datagram=False):
         self.transport = transport
         self.ents: dict = {}
         self._next = 0
 
-    def add(self, dest):
-        if dest is None or dest[0] is not self.transport:
-            raise ValueError("no destination")
-        i, self._next = self._next, self._next + 1
+    def add(self, conn, stream_id):
+        dest = conn._fanout_dest(stream_id)
+        if dest is None:
+            return None
+        if dest[0] is not self.transport:
+            raise ValueError("destination belongs to another transport")
+        self._next += 1
+        i = 1 << 32 | self._next
         self.ents[i] = dest
         return i
 
@@ -608,7 +612,7 @@ class _FakeViewer:
         self._quic = SimpleNamespace(
             tx_data_ring_used=lambda sid: self.ring.get(sid, 0),
             stream_released=lambda sid: not self.ring.get(sid, 0),
-            fanout_dest=self.fanout_dest)
+            transport=transport, _fanout_dest=self.fanout_dest)
 
     def fanout_dest(self, sid):
         if sid not in self.data or sid in self.fins or sid in self.resets:
@@ -835,3 +839,4 @@ async def test_a_subgroup_delivery_timeout_still_resets(fake_relay):
     assert [end for _b, end in on[2]] == [
         int(StreamResetCode.DELIVERY_TIMEOUT)] * 3
     assert [end for _b, end in on[0]] == ["fin"] * 3
+

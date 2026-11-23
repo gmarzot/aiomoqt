@@ -1725,20 +1725,20 @@ class _SubgroupFanout:
 
 def _add_dest(dests, session, stream_id):
     """Add `session`'s stream `stream_id` to its shard's DestSet in `dests`
-    (transport -> (DestSet, {index: member})), looked up and added in one
-    step; (transport, (DestSet, members), index), or None."""
-    dest_of = getattr(getattr(session, "_quic", None), "fanout_dest", None)
-    dest = None if dest_of is None else dest_of(stream_id)
-    if dest is None:
+    (transport -> (DestSet, {index: member})); (transport, (DestSet,
+    members), index), or None when the stream cannot be added."""
+    conn = getattr(session, "_quic", None)
+    transport = getattr(conn, "transport", None)
+    if transport is None:
         return None
-    transport = dest[0]
     pair = dests.get(transport)
     try:
         if pair is None:
             pair = dests[transport] = (_DestSet(transport), {})
-        return transport, pair, pair[0].add(dest)
+        index = pair[0].add(conn, stream_id)
     except (TypeError, ValueError):
         return None
+    return None if index is None else (transport, pair, index)
 
 
 def _in_step(lane, gid) -> bool:
