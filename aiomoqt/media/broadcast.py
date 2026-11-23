@@ -121,6 +121,18 @@ class CatalogTrackPublisher(PublishedTrack):
         if resumed and self._serving():
             self._updates.put_nowait(self._RESUME)
 
+    async def _on_subscribe(self, session, msg):
+        # One emitter serves the catalog: a second concurrent SUBSCRIBE on
+        # the session is refused (d20 allows it, §3.1).
+        if session._profile.param_table >= 20 and any(
+                s.session is session and s.subscribers
+                for s in self.subscriptions):
+            session.subscribe_error(
+                msg.request_id, error_code=RequestErrorCode.NOT_SUPPORTED,
+                reason="catalog already subscribed in this session")
+            return
+        await super()._on_subscribe(session, msg)
+
     async def generate(self, session, track_alias: int):
         """Serve the catalog to the subscription under `track_alias`,
         replacing any earlier emitter."""

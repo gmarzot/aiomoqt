@@ -25,7 +25,7 @@ _GROUP = 3
 class _FetchOnly(PublishedTrack):
     """History and a Largest Location, nothing sent on a subscription."""
 
-    async def _start_generating(self, session, trigger):
+    async def _start_generating(self, session, trigger, sub=None):
         return None
 
 
