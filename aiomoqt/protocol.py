@@ -1828,8 +1828,8 @@ class _MOQTSessionMixin:
                     and getattr(state.parser, 'end_of_group', False)):
                 self._set_group_bound(
                     alias, group_id, state.object_id + 1,
-                    f"END_OF_GROUP bit of stream {stream_id}'s header "
-                    f"0x{state.parser._compute_type():x}")
+                    f"stream {stream_id} ended with the END_OF_GROUP bit "
+                    f"after object {group_id}.{state.object_id}")
             cb = self._stream_end_handlers.get(alias)
             clean = error_code == QuicErrorCode.NO_ERROR
             if cb:
@@ -2220,17 +2220,28 @@ class _MOQTSessionMixin:
         stream of the track) with MALFORMED_TRACK, cancel the
         subscription, refuse the track's later streams; the session
         stays up. Stream-end handlers see reset_code MALFORMED_TRACK."""
-        logger.error(f"MOQT: malformed track alias={alias}: {reason}")
+        first = alias is not None and alias not in self._malformed_aliases
+        sids = [] if stream_id is None else [stream_id]
+        if first:
+            self._malformed_aliases.add(alias)
+            sids += [sid for key, sid in self._subgroup_stream_by_key.items()
+                     if key[0] == alias and sid != stream_id]
+        self._note_peer_address()
+        addr = self._peer_addr
+        where = ""
+        if addr:
+            host = f"[{addr[0]}]" if ":" in addr[0] else addr[0]
+            where = f" from {host}:{addr[1]}"
         if stream_id is not None:
-            self._reject_stream(stream_id, StreamResetCode.MALFORMED_TRACK,
-                                reason)
-        if alias is None or alias in self._malformed_aliases:
+            where += f", stream {stream_id}"
+        resets = f"; {len(sids)} stream(s) reset" if sids else ""
+        (logger.warning if first or alias is None else data_log.debug)(
+            f"MOQT: malformed track alias={alias}{where}: {reason}{resets}")
+        for sid in sids:
+            self._reject_stream(sid, StreamResetCode.MALFORMED_TRACK, reason,
+                                quiet=True)
+        if not first:
             return
-        self._malformed_aliases.add(alias)
-        for key, sid in list(self._subgroup_stream_by_key.items()):
-            if key[0] == alias:
-                self._reject_stream(sid, StreamResetCode.MALFORMED_TRACK,
-                                    reason)
         request_id = self._track_aliases.get(alias)
         if request_id is not None:
             try:
@@ -2249,14 +2260,14 @@ class _MOQTSessionMixin:
             if (entry is not None and object_id >= entry[0]
                     and not (object_id == entry[0]
                              and status == ObjectStatus.END_OF_GROUP)):
-                return (f"object {group_id}.{object_id} at or past end "
-                        f"of group ({entry[0]}, from the {entry[1]})")
+                return (f"object {group_id}.{object_id} is past the end "
+                        f"of group {group_id} ({entry[1]})")
         end = self._track_bound.get(alias)
         if (end is not None and (group_id, object_id) >= end
                 and not ((group_id, object_id) == end
                          and status == ObjectStatus.END_OF_TRACK)):
-            return (f"object {group_id}.{object_id} at or past end "
-                    f"of track {end[0]}.{end[1]}")
+            return (f"object {group_id}.{object_id} is past the end "
+                    f"of track (END_OF_TRACK object {end[0]}.{end[1]})")
         return None
 
     def _note_object_bound(self, alias: int, group_id: int, object_id: int,
@@ -2271,7 +2282,7 @@ class _MOQTSessionMixin:
         elif end_of_group_bit:
             self._set_group_bound(
                 alias, group_id, object_id + 1,
-                f"END_OF_GROUP bit of datagram {group_id}.{object_id}")
+                f"datagram {group_id}.{object_id} has the END_OF_GROUP bit")
 
     GROUP_BOUNDS_PER_TRACK = 256
 
