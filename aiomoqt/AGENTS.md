@@ -105,7 +105,7 @@ SIGUSR1.
   recent-object cache (8 groups / 32 MiB per track, all tracks under one `--cache-bytes` budget,
   least recently used evicted first; objects charged payload, properties and record overhead) for FETCH and JOIN; authorization only with `--auth-key` (SETUP and, from d16, each request), no rate limiting; a per-stream TX budget
   and a bounded send lane per subscriber, shedding whole groups (streams reset) from one that falls
-  behind, and logging a `lane stalled` WARNING for one that makes no progress for 10 s;
+  behind (subscribers in step share one aiopquic `fanout()` per subgroup object, where aiopquic has it), and logging a `lane stalled` WARNING for one that makes no progress for 10 s;
   per-session caps on namespace requests and SUBSCRIBEs (`--max-namespaces-per-session`,
   `--max-subscriptions-per-session`), refused past them with EXCESSIVE_LOAD; tracks no subscriber
   has forwarded for `--pause-after` (60 s) paused upstream until the next one; objects past the

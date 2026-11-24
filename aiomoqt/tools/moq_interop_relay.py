@@ -57,6 +57,12 @@ Limits:
     the publisher's and its own) resets with DELIVERY_TIMEOUT a subgroup
     stream the transport has not released that long after its FIN. A
     subscriber's delivery timeouts are not sent upstream (§10.2.3-10.2.4).
+  * With aiopquic's fanout() (DestSet), the subscribers in step at a
+    subgroup's first object (lane idle, Forward State 1, no Range Filters,
+    inside their window) are written its later objects by one fanout() per
+    draft profile per worker. One refused, late or updated finishes the
+    subgroup on its lane and rejoins at a later one. Off with
+    --trace-subscribers.
   * Namespace tables are in memory and global to the process.
 
 Routing model (cross-session, single relay instance):
@@ -114,6 +120,7 @@ import atexit
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict, deque
 import contextlib
+import copy
 import datetime
 import faulthandler
 import gc
@@ -188,6 +195,11 @@ from aiomoqt.utils.cli import (AUTH_KEY_ENV, AUTH_TYPE_ENV, add_auth,
                                add_fabric_node, add_help, add_logging,
                                apply_logging, auth_from_args)
 from aiomoqt.utils.url import parse_relay_url
+
+try:
+    from aiopquic._binding._transport import DestSet as _DestSet
+except ImportError:  # aiopquic without fanout(): every subscriber takes its lane
+    _DestSet = None
 
 # Version confinement. The interop runner injects DRAFT (moq-interop-runner
 # PR #95) — or older MOQT_DRAFT — to pin the relay to one draft; the client
@@ -312,6 +324,8 @@ LANE_MARK_S = 0.05
 LANE_MARKS = 100
 # --trace-subscribers: count what each subscription is sent.
 _trace_subscribers = False
+# In-step subscribers a subgroup needs for its fanout.
+FANOUT_MIN = 2
 _pause_sweep = None
 
 
@@ -1652,6 +1666,93 @@ class _TracedRelayDelivery(_RelayDelivery):
         return rest
 
 
+class _FanoutMember:
+    """A subscriber's subgroup stream written by its variant's fanout()."""
+
+    __slots__ = ("d", "lane", "skey", "header", "fanout", "variant",
+                 "transport", "index", "base", "join_n", "leave_n")
+
+    def __init__(self, d, lane, skey, header, fanout, variant, transport,
+                 index, base, join_n):
+        self.d = d
+        self.lane = lane
+        self.skey = skey
+        # The stream's own header, brought up to date when it leaves.
+        self.header = header
+        self.fanout = fanout
+        self.variant = variant
+        self.transport = transport
+        self.index = index
+        # variant.bytes at the join; track mark numbers at join and leave.
+        self.base = base
+        self.join_n = join_n
+        self.leave_n = None
+
+
+class _FanoutVariant:
+    """Members whose object bytes are the same: one draft profile and
+    encoding state. One DestSet per shard transport."""
+
+    __slots__ = ("header", "dests", "n", "bytes", "born")
+
+    def __init__(self, header):
+        self.header = copy.copy(header)
+        # transport -> (DestSet, {index: _FanoutMember})
+        self.dests = {}
+        self.n = 0
+        # Bytes written to each member, cumulative; newest object's arrival.
+        self.bytes = 0
+        self.born = None
+
+
+class _SubgroupFanout:
+    """One live subgroup's fanout: its variants, the candidates still to
+    join, and the subscribers it leaves to their lanes."""
+
+    __slots__ = ("key", "pending", "outsiders", "variants", "ver")
+
+    def __init__(self, key, pending, downstream, ver):
+        self.key = key
+        # In step at the subgroup's first object; each joins once its lane
+        # has opened the stream and is idle.
+        self.pending = pending
+        # id(d) -> d: the subscribers its objects are offered to.
+        self.outsiders = {id(d): d for d in downstream}
+        self.variants: dict = {}
+        # The track's _ds_ver that `outsiders` follows.
+        self.ver = ver
+
+
+def _add_dest(dests, session, stream_id):
+    """Add `session`'s stream `stream_id` to its shard's DestSet in `dests`
+    (transport -> (DestSet, {index: member})); (transport, (DestSet,
+    members), index), or None when the stream cannot be added."""
+    if isinstance(session, FabricHop):
+        # Its writes count the fabric session's bytes.
+        return None
+    conn = getattr(session, "_quic", None)
+    transport = getattr(conn, "transport", None)
+    if transport is None:
+        return None
+    pair = dests.get(transport)
+    try:
+        if pair is None:
+            pair = dests[transport] = (_DestSet(transport), {})
+        index = pair[0].add(conn, stream_id)
+    except (TypeError, ValueError):
+        return None
+    return None if index is None else (transport, pair, index)
+
+
+def _in_step(lane, gid) -> bool:
+    """`lane` holds and writes nothing, keeps no byte bound, is not late,
+    and sends group `gid`."""
+    return not (lane.items or lane.busy or lane._held is not None
+                or lane.late or lane.bound or lane.stopped or lane.final
+                or not lane.gate
+                or (lane.floor is not None and lane.floor > gid))
+
+
 class _RelayLane(SendLane):
     """One subscriber's SendLane, registered for the lane checks and the
     status page. It sheds once the oldest live object its subscriber has
@@ -1692,6 +1793,10 @@ class _RelayLane(SendLane):
         # 0: no byte bound.
         self.bound = (LANE_BYTES if _lanes_over_budget
                       or self._deadline is None else 0)
+        # A fanout member has no byte bound.
+        track = getattr(self, "track", None)
+        if self.bound and track is not None and track._fanout_members:
+            track._fanout_leave_lane(self)
 
     @SendLane.deadline.setter
     def deadline(self, value) -> None:
@@ -1715,14 +1820,18 @@ class _RelayLane(SendLane):
         most one mark late. Else the oldest queued, None for none."""
         if self.tx_bytes:
             track, sid = self.track, self._sid
-            unsent = track._tx_written.get(sid, 0) - self.tx_bytes
             marks = track._marks
             # Older marks may hold another session's count under a reused id.
             lo = max(0, self._mark0 - track._marks_n + len(marks))
-            i = bisect_right(marks, unsent, lo,
-                             key=lambda m: m[0].get(sid, 0))
-            born = (marks[i][1] if i < len(marks)
-                    else track._tx_born).get(sid)
+            hist = track._fanout_hist.get(sid)
+            if hist:
+                born = track._fanout_oldest(sid, hist, self.tx_bytes, lo)
+            else:
+                unsent = track._tx_written.get(sid, 0) - self.tx_bytes
+                i = bisect_right(marks, unsent, lo,
+                                 key=lambda m: m[0].get(sid, 0))
+                born = (marks[i][1] if i < len(marks)
+                        else track._tx_born).get(sid)
             if born is not None:
                 return born
         for it in self.items:
@@ -1752,8 +1861,11 @@ class _RelayLane(SendLane):
             return now + deadline
         at = oldest + deadline
         if now > at:
-            # The next object offered reschedules.
+            # The next object offered reschedules. A fanout member leaves
+            # now, so that object reaches its lane.
             self.late = True
+            if self.track._fanout_members:
+                self.track._fanout_leave_lane(self)
             return now + deadline
         return at if at > now else math.nextafter(now, math.inf)
 
@@ -1807,6 +1919,8 @@ class _RelayLane(SendLane):
     def _exit(self) -> None:
         _lanes.discard(self)
         self._time_due = None
+        if self.track._fanout_members:
+            self.track._fanout_leave_lane(self)
         # stop() and the task's exit both land here: transfer once.
         if self in self.track._lanes:
             self.track._lanes.discard(self)
@@ -2042,6 +2156,17 @@ class _RelayedTrack:
         self._marks_n = 0
         # id(session) -> subgroup streams opened (PUBLISH_DONE count)
         self._sent_streams = {}
+        # (group, subgroup) -> its _SubgroupFanout; -> candidates taken at
+        # its first object; subgroups past their first object.
+        self._fanouts: dict = {}
+        self._fanout_first: dict = {}
+        self._fanout_seen: set = set()
+        # (id(session), group, subgroup) -> _FanoutMember, while a member.
+        self._fanout_members: dict = {}
+        # id(session) -> its _FanoutMembers the marks still span.
+        self._fanout_hist: dict = {}
+        # Bumped when `downstream` changes.
+        self._ds_ver = 0
         # (id(session), group, subgroup) whose stream the subscriber
         # stopped: its later objects are skipped, never reopened (§11.3.2).
         self._stopped = set()
@@ -2279,6 +2404,9 @@ class _RelayedTrack:
     def _release_downstream(self) -> None:
         """Forget the subscribers; lanes draining to their PUBLISH_DONE
         keep their streams, the rest stop and their open streams reset."""
+        for key in list(self._fanouts):
+            self._fanout_close(key)
+        self._fanout_first.clear()
         for lane in list(self._lanes):
             if not lane.final:
                 lane.stop()
@@ -2288,6 +2416,8 @@ class _RelayedTrack:
                 self._close_streams(d.session, StreamResetCode.CANCELLED)
             self._hold_priority(d, release=True)
         self.downstream.clear()
+        self._ds_ver += 1
+        self._fanout_hist.clear()
         for k in [k for k in self._streams if k[0] not in draining]:
             self._streams.pop(k, None)
         for k in [k for k in self._tx_streams if k not in draining]:
@@ -2370,6 +2500,7 @@ class _RelayedTrack:
         DELIVERY_TIMEOUT. True, skipping the rest of the group, unless the
         track sends datagrams: those are only dropped."""
         sk = id(session)
+        self._fanout_leave_session(sk)
         streamed = False
         for k, (sid, _hdr) in list(self._streams.items()):
             if k[0] == sk and k[1] == group_id:
@@ -2437,6 +2568,7 @@ class _RelayedTrack:
             return
         if d in self.downstream:
             self.downstream.remove(d)
+            self._ds_ver += 1
             self._hold_priority(d, release=True)
             if self._queued(d):
                 d.lane.finish(SubscribeDoneCode.SUBSCRIPTION_ENDED,
@@ -2448,6 +2580,7 @@ class _RelayedTrack:
     def _close_streams(self, session, reset_code=None) -> None:
         """FIN the session's open streams, or reset them with
         `reset_code`."""
+        self._fanout_leave_session(id(session))
         if reset_code is not None:
             self._tx_streams.pop(id(session), None)
         for k, (sid, _hdr) in list(self._streams.items()):
@@ -2464,6 +2597,7 @@ class _RelayedTrack:
         """Reset the session's streams of groups below `below` with `code`:
         open ones, and FINed ones the transport has not yet sent out."""
         sk = id(session)
+        self._fanout_leave_session(sk)
         tx = self._tx_streams.get(sk) or {}
         used = _tx_used(session)
         for k, sid in list(tx.items()):
@@ -2782,6 +2916,7 @@ class _RelayedTrack:
             # A joining FETCH from this subscriber backfills to here.
             d.joined_at = self.largest
         self.downstream.append(d)
+        self._ds_ver += 1
         self._peak_subs = max(self._peak_subs, len(self.downstream))
         if replay:
             d.replaying = True
@@ -2831,6 +2966,7 @@ class _RelayedTrack:
                                      else 128])
 
     def drop_session(self, session):
+        self._fanout_leave_session(id(session))
         for lane in [lane for lane in self._lanes
                      if lane.d.session is session]:
             lane.stop()
@@ -2842,6 +2978,7 @@ class _RelayedTrack:
                 self._hold_priority(d, release=True)
         self.downstream = [d for d in self.downstream
                            if d.session is not session]
+        self._ds_ver += 1
         # A cancelled subscription's open streams must be reset.
         if _session_live(session):
             self._reset_streams(session, float("inf"))
@@ -2855,6 +2992,7 @@ class _RelayedTrack:
             t.cancel()
         self._tx_written.pop(id(session), None)
         self._tx_born.pop(id(session), None)
+        self._fanout_hist.pop(id(session), None)
 
     def _end_due(self, k, n) -> None:
         n += self._ends_due.get(k, 0)
@@ -2905,7 +3043,44 @@ class _RelayedTrack:
                 born = None
             item = _item(gid, True, sgid, oid, payload, exts, prio, status,
                          shape, {}, cost, born)
-            for d in list(self.downstream):
+            targets = self.downstream
+            first = None
+            dgram = (shape.__class__ is tuple and shape
+                     and shape[0] == "DGRAM")
+            if (self._fanouts or self._fanout_first) and not dgram:
+                key = (gid, sgid)
+                if oid is None or status in _STREAM_ENDS:
+                    # Each subscriber's stream ends on its own lane.
+                    self._fanout_first.pop(key, None)
+                    if key in self._fanouts:
+                        self._fanout_close(key)
+                else:
+                    fo = self._fanouts.get(key)
+                    if fo is None and key in self._fanout_first:
+                        fo = self._fanout_open(key)
+                    if fo is not None:
+                        if fo.ver != self._ds_ver:
+                            self._fanout_rebuild(fo)
+                        if fo.pending:
+                            self._fanout_join(fo)
+                        if fo.variants:
+                            self._fanout_write(fo, payload, exts, oid, born,
+                                               item[11])
+                            targets = fo.outsiders.values()
+                        elif fo.pending:
+                            targets = fo.outsiders.values()
+                        else:
+                            del self._fanouts[key]
+            if (oid is not None and _DestSet is not None
+                    and not _trace_subscribers
+                    and len(self.downstream) >= FANOUT_MIN
+                    and status not in _STREAM_ENDS and not dgram
+                    and (gid, sgid) not in self._fanout_seen):
+                self._fanout_seen.add((gid, sgid))
+                # A stream whose end is already queued is written whole.
+                if (gid, sgid) not in self._ends_due:
+                    first = []
+            for d in list(targets):
                 if d.replaying:
                     continue
                 if not _session_live(d.session):
@@ -2925,10 +3100,15 @@ class _RelayedTrack:
                         # A filtered-out end marker still ends its stream.
                         out = _item(gid, True, sgid, None, None, None, prio,
                                     "END", None)
+                    elif first is not None and self._fanout_ready(d, gid,
+                                                                  sgid):
+                        first.append(d)
                 self._lane(d).offer(out)
                 if (oid is not None and d.window[1] == gid and status in (
                         ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK)):
                     self.end_downstream(d)
+            if first is not None and len(first) >= FANOUT_MIN:
+                self._fanout_first[(gid, sgid)] = first
             if born is not None and born >= self._mark_at:
                 self.mark_lanes(born)
 
@@ -2939,11 +3119,260 @@ class _RelayedTrack:
         if not self._lanes:
             return
         marks = self._marks
-        marks.append((self._tx_written.copy(), self._tx_born.copy()))
+        # Fanout members' bytes are their variant's, copied here.
+        snap = None
+        if self._fanouts:
+            snap = {v: (v.bytes, v.born) for fo in self._fanouts.values()
+                    for v in fo.variants.values() if v.n}
+        marks.append((self._tx_written.copy(), self._tx_born.copy(), snap))
         self._marks_n += 1
         # LANE_MARKS span the longest deadline.
         if len(marks) > LANE_MARKS + 2:
             del marks[0]
+
+    # Fanout: the subgroup streams of subscribers in step are written by one
+    # aiopquic fanout() per variant per shard; the rest take their lanes.
+
+    def _fanout_ready(self, d, gid, sgid) -> bool:
+        """At the subgroup's first object, before it is offered: `d` takes
+        every object of it, unchanged, and its lane is in step."""
+        lane = d.lane
+        skey = (id(d.session), gid, sgid)
+        end_group = d.window[1]
+        return (d.filters is None
+                and (end_group is None or gid < end_group)
+                and (lane is None or _in_step(lane, gid))
+                and skey not in self._streams and skey not in self._stopped
+                and gid not in d.lost and not self._short(gid, d.start))
+
+    def _fanout_open(self, key):
+        """The subgroup's fanout, at its second object."""
+        cands = self._fanout_first.pop(key)
+        fo = self._fanouts[key] = _SubgroupFanout(key, cands, self.downstream,
+                                                  self._ds_ver)
+        logger.debug(f"relay: fanout {self.key} {key[0]}.{key[1]}: "
+                     f"{len(cands)} candidate(s)")
+        return fo
+
+    def _fanout_rebuild(self, fo) -> None:
+        """`downstream` has changed: the outsiders again, and no member
+        that has left it."""
+        gid, sgid = fo.key
+        members = self._fanout_members
+        out = {}
+        kept = set()
+        for d in self.downstream:
+            m = members.get((id(d.session), gid, sgid))
+            if m is None or m.d is not d:
+                out[id(d)] = d
+            else:
+                kept.add(id(d))
+        for v in fo.variants.values():
+            for _ds, mine in list(v.dests.values()):
+                for m in list(mine.values()):
+                    if id(m.d) not in kept:
+                        self._fanout_leave(m, v.header._last_object_id,
+                                           v.bytes)
+        fo.outsiders = out
+        fo.pending = [d for d in fo.pending if id(d) in out]
+        fo.ver = self._ds_ver
+
+    def _fanout_join(self, fo) -> None:
+        """Add the candidates whose lane has written the subgroup so far
+        and is idle; drop those that can no longer join."""
+        gid, sgid = fo.key
+        waiting = []
+        for d in fo.pending:
+            lane = d.lane
+            if (lane is None or lane.stopped or lane.final
+                    or d.filters is not None or not d.forward):
+                continue
+            if lane.busy or lane.items or lane._held is not None:
+                waiting.append(d)
+                continue
+            skey = (id(d.session), gid, sgid)
+            entry = self._streams.get(skey)
+            # No entry: written whole, or not opened.
+            if (entry is not None and entry[1] is not None
+                    and _in_step(lane, gid) and skey not in self._stopped
+                    and skey not in self._fanout_members):
+                self._fanout_add(fo, d, lane, skey, entry)
+        fo.pending = waiting
+
+    def _fanout_add(self, fo, d, lane, skey, entry) -> bool:
+        """`d`'s open stream into the variant its header's encoding state
+        selects; False when that state or the stream does not fit."""
+        stream_id, header = entry
+        state = header.encoding_state()
+        vkey = (id(header.prof), state[:-1])
+        v = fo.variants.get(vkey)
+        if v is None:
+            v = fo.variants[vkey] = _FanoutVariant(header)
+        elif not v.n:
+            v.header = copy.copy(header)
+        elif v.header.encoding_state() != state:
+            return False
+        added = _add_dest(v.dests, d.session, stream_id)
+        if added is None:
+            return False
+        transport, pair, index = added
+        m = _FanoutMember(d, lane, skey, header, fo, v, transport, index,
+                          v.bytes, self._marks_n)
+        pair[1][index] = m
+        v.n += 1
+        self._fanout_members[skey] = m
+        fo.outsiders.pop(id(d), None)
+        hist = self._fanout_hist.get(skey[0])
+        if hist is None:
+            hist = self._fanout_hist[skey[0]] = []
+        else:
+            n0 = self._marks_n - len(self._marks)
+            hist[:] = [h for h in hist if h.leave_n is None or h.leave_n > n0]
+        hist.append(m)
+        return True
+
+    def _fanout_write(self, fo, payload, exts, oid, born, encoded) -> None:
+        """One fanout() of the object per variant per shard. A refused
+        member leaves before the object, which its lane then takes."""
+        n = 0
+        for v in fo.variants.values():
+            if not v.n:
+                continue
+            header = v.header
+            last = header._last_object_id
+            try:
+                data = _object_data(header, payload, exts, oid, encoded)
+            except Exception:
+                # Each lane then fails it for its own subscriber.
+                for _ds, members in list(v.dests.values()):
+                    for m in list(members.values()):
+                        self._fanout_leave(m, last, v.bytes)
+                continue
+            for transport, (ds, members) in v.dests.items():
+                live = len(ds)
+                if not live:
+                    continue
+                try:
+                    refused = transport.fanout(ds, data)
+                except Exception:
+                    # Raised before any write: all of this set take lanes.
+                    logger.warning(f"relay: fanout {self.key} failed",
+                                   exc_info=True)
+                    refused = [(i, 0) for i in members]
+                if refused:
+                    live -= len(refused)
+                    for index, code in refused:
+                        m = members[index]
+                        logger.debug(f"relay: fanout {self.key} "
+                                     f"{fo.key[0]}.{fo.key[1]}: stream "
+                                     f"{ds.stream_id(index)} "
+                                     f"refused ({code}), on its lane")
+                        self._fanout_leave(m, last, v.bytes)
+                n += live
+            v.bytes += len(data)
+            v.born = born
+        if n:
+            self._objects_out += n
+            self._bytes_out += n * len(payload or b"")
+
+    def _fanout_leave(self, m, last, total) -> None:
+        """`m` back on its lane, with its stream's header state after
+        Object `last` and the `total` bytes its variant had written."""
+        v = m.variant
+        ds, members = v.dests[m.transport]
+        if members.pop(m.index, None) is None:
+            return
+        ds.remove(m.index)
+        v.n -= 1
+        if self._fanout_members.get(m.skey) is m:
+            del self._fanout_members[m.skey]
+        m.leave_n = self._marks_n
+        if last is not None:
+            m.header.advance(last)
+        m.fanout.outsiders[id(m.d)] = m.d
+        # Kept only for the marks: no links back to the track.
+        m.d = m.lane = m.fanout = None
+        if total > m.base:
+            sk = m.skey[0]
+            tx = self._tx_written
+            tx[sk] = tx.get(sk, 0) + total - m.base
+            born, tb = v.born, self._tx_born
+            if born is not None and (tb.get(sk) is None or born > tb[sk]):
+                tb[sk] = born
+
+    def _fanout_leave_lane(self, lane) -> None:
+        for m in self._fanout_hist.get(lane._sid, ()):
+            if m.leave_n is None and m.lane is lane:
+                v = m.variant
+                self._fanout_leave(m, v.header._last_object_id, v.bytes)
+
+    def _fanout_leave_session(self, sk) -> None:
+        """Every stream of session `sk` back on its lane, and none to join."""
+        if not (self._fanout_members or self._fanouts or self._fanout_first):
+            return
+        for m in self._fanout_hist.get(sk, ()):
+            if m.leave_n is None:
+                v = m.variant
+                self._fanout_leave(m, v.header._last_object_id, v.bytes)
+        for fo in self._fanouts.values():
+            if fo.pending:
+                fo.pending = [d for d in fo.pending if id(d.session) != sk]
+        for key, cands in list(self._fanout_first.items()):
+            self._fanout_first[key] = [d for d in cands
+                                       if id(d.session) != sk]
+
+    def _fanout_close(self, key) -> None:
+        """End subgroup `key`'s fanout: its members back on their lanes."""
+        fo = self._fanouts.pop(key, None)
+        if fo is None:
+            return
+        for v in fo.variants.values():
+            if not v.n:
+                continue
+            last, total = v.header._last_object_id, v.bytes
+            for ds, members in list(v.dests.values()):
+                for m in list(members.values()):
+                    self._fanout_leave(m, last, total)
+
+    def _fanout_oldest(self, sid, hist, tx_bytes, lo):
+        """_RelayLane._oldest_born() for a session with fanout members:
+        while a member, a stream's bytes are its variant's, which each
+        mark took a copy of."""
+        marks = self._marks
+        n0 = self._marks_n - len(marks)
+        hist[:] = [m for m in hist if m.leave_n is None or m.leave_n > n0]
+        written = self._tx_written.get(sid, 0)
+        for m in hist:
+            if m.leave_n is None:
+                written += m.variant.bytes - m.base
+
+        def taken(i):
+            # Members at mark i, and the variant's (bytes, born) then.
+            snap = marks[i][2] if len(marks[i]) > 2 else None
+            if not snap:
+                return ()
+            n = n0 + i
+            return [(m, snap[m.variant]) for m in hist
+                    if m.join_n <= n and (m.leave_n is None or n < m.leave_n)
+                    and m.variant in snap]
+
+        def written_at(i):
+            return marks[i][0].get(sid, 0) + sum(s[0] - m.base
+                                                 for m, s in taken(i))
+
+        i = bisect_right(range(len(marks)), written - tx_bytes, lo,
+                         key=written_at)
+        if i < len(marks):
+            born = marks[i][1].get(sid)
+            got = [s[1] for m, s in taken(i) if s[0] > m.base]
+        else:
+            born = self._tx_born.get(sid)
+            got = [m.variant.born for m in hist
+                   if m.leave_n is None and m.variant.bytes > m.base]
+        for b in got:
+            if b is not None and (born is None or b > born):
+                born = b
+        return born
 
     def _remember(self, gid, sgid, oid, payload, exts, prio, status,
                   shape=None, cost=None, born=None) -> None:
@@ -3072,6 +3501,11 @@ class _RelayedTrack:
             self._opened = {k for k in self._opened if k[0] >= low}
             self._backfilled = {k for k in self._backfilled if k[0] >= low}
             self._stopped = {k for k in self._stopped if k[1] >= low}
+            for k in [k for k in self._fanouts if k[0] < low]:
+                self._fanout_close(k)
+            self._fanout_first = {k: v for k, v in self._fanout_first.items()
+                                  if k[0] >= low}
+            self._fanout_seen = {k for k in self._fanout_seen if k[0] >= low}
         # Copies below the swept state cannot be told apart: dropped.
         self._floor = max(first, self._state_floor)
         if first < self._pruned_to:
@@ -3210,6 +3644,11 @@ class _RelayedTrack:
             _send_datagram(session, dgram.serialize(prof=prof), alias, gid, oid)
             return
         skey = (id(session), gid, sgid)
+        if self._fanout_members:
+            m = self._fanout_members.get(skey)
+            if m is not None:
+                v = m.variant
+                self._fanout_leave(m, v.header._last_object_id, v.bytes)
         if skey in self._stopped:
             return
         entry = self._streams.get(skey)
@@ -5135,6 +5574,8 @@ async def _release_held_updates(session, rid) -> None:
 def _apply_update(session, msg, found) -> None:
     """Apply an update to a joined downstream subscription and answer it."""
     key, track, d = found
+    # Its stream goes on from its lane.
+    track._fanout_leave_session(id(d.session))
     rid = msg.existing_request_id
     if not _update_filters(session, msg, track, d):
         return
@@ -5186,6 +5627,7 @@ def _update_filters(session, msg, track, d) -> bool:
             retry_interval=0, reason=why))
         if d in track.downstream:
             track.downstream.remove(d)
+            track._ds_ver += 1
             track._hold_priority(d, release=True)
         track._end(d, SubscribeDoneCode.UPDATE_FAILED, None, why)
         return False
