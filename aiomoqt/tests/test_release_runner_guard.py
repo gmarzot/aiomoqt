@@ -1,6 +1,8 @@
-"""The runner's verdicts. relay-pub-sub: zero or missing objects, a FAIL or
-missing load_sim RESULT line, or a non-zero exit fail. A single-case TAP run:
-ok passes, ok with a SKIP directive is a SKIP, not ok fails."""
+"""The runner's verdicts. Every suite fails on a non-zero exit. relay-pub-sub:
+zero or missing objects, a FAIL or missing load_sim RESULT line fail.
+Loopback: zero or missing objects, a missing throughput or a bad payload fail.
+A single-case TAP run: ok passes, ok with a SKIP directive is a SKIP, not ok
+fails."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -81,7 +83,7 @@ def test_loopback_variants_run_this_interpreter(runner, monkeypatch, tmp_path):
     def fake_run(cmd, log, timeout):
         seen.append(cmd)
         log.write_text("")
-        return True, ""
+        return 0, ""
 
     monkeypatch.setattr(runner, "_run", fake_run)
     runner._loopback_pub_sub_variant(tmp_path, "v", ["-t", "1"], 5)
@@ -106,3 +108,91 @@ def test_a_tap_case_skip_is_a_skip_not_a_pass(runner):
 def test_a_tap_case_that_fails_reports_its_message(runner):
     text = _tap("not ok 1 - namespace-discovery")
     assert runner._tap_case_verdict(text, "namespace-discovery") == ("FAIL", "m")
+
+
+_LOOPBACK_OK = ("  Objects:     1,200\n  Bytes:       4,915,200\n"
+                "  Throughput:  7.86 Mbps\n  Jitter:      0.10 ms\n"
+                "  Lost:        0 (0.00%)\n  Out-of-order:   0\n")
+
+
+def test_loopback_good_run_passes(runner):
+    assert runner._loopback_verdict(_LOOPBACK_OK, 0) == ("PASS", "7.86 Mbps")
+
+
+@pytest.mark.parametrize("text,rc,why", [
+    ("  Objects:     1\n  Throughput:  1.0 Mbps\n  Lost:        0 (0.00%)\n",
+     7, "exit 7"),
+    ("  Objects:     0\n  Throughput:  0.0 Mbps\n  Lost:        0 (0.00%)\n",
+     0, "0 objects"),
+    ("  Lost:        0 (0.00%)\n", 0, "no summary"),
+    (_LOOPBACK_OK + "  Payload:     1,200 checked, 3 bad\n", 1, "3 bad payloads"),
+    (_LOOPBACK_OK.replace("0 (0.00%)", "4 (0.33%)"), 0, "4 lost"),
+    (_LOOPBACK_OK, None, "timeout"),
+])
+def test_loopback_failures_fail(runner, text, rc, why):
+    status, detail = runner._loopback_verdict(text, rc)
+    assert status == "FAIL"
+    assert why in detail
+
+
+def test_adaptive_exit_fails_after_high_water(runner):
+    status, detail = runner._adaptive_verdict("High-water: 12Mbps\n", 7)
+    assert status == "FAIL"
+    assert "exit 7" in detail
+
+
+def test_adaptive_good_run_passes(runner):
+    assert runner._adaptive_verdict("High-water: 60Mbps\n", 0) == (
+        "PASS", "high-water 60 Mbps")
+
+
+def test_pytest_exit_fails_after_summary(runner):
+    status, detail = runner._pytest_verdict("10 passed in 0.01s\n", 7)
+    assert status == "FAIL"
+    assert "exit 7" in detail
+
+
+def test_pytest_no_tests_fails(runner):
+    status, _ = runner._pytest_verdict("no tests ran in 0.01s\n", 5)
+    assert status == "FAIL"
+
+
+def test_pytest_good_run_passes(runner):
+    assert runner._pytest_verdict("10 passed, 1 skipped in 0.01s\n", 0) == (
+        "PASS", "10 passed, 1 skipped in 0.01s")
+
+
+def test_a_tap_case_ok_with_nonzero_exit_fails(runner):
+    text = _tap("ok 1 - namespace-discovery")
+    assert runner._tap_case_verdict(text, "namespace-discovery", 1) == (
+        "FAIL", "ok, exit 1")
+
+
+@pytest.mark.parametrize("suite", ["adaptive-mp", "adaptive-relay"])
+def test_adaptive_suites_use_the_exit_code(runner, monkeypatch, tmp_path, suite):
+    def fake_run(cmd, log, timeout):
+        log.write_text("High-water: 12Mbps\n")
+        return 1, ""
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+    if suite == "adaptive-mp":
+        status, detail = runner._loopback_adaptive_mp(tmp_path, 22)
+    else:
+        class _Relay:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, stdout, stderr):
+            stderr.write("Listening on 127.0.0.1\n")
+            stderr.flush()
+            return _Relay()
+
+        monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+        status, detail = runner._loopback_adaptive_relay_quic(tmp_path, 22)
+    assert (status, detail) == ("FAIL", "exit 1, high-water 12 Mbps")

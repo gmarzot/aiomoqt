@@ -48,9 +48,9 @@ async def test_failed_join_is_reported_once_and_releases_pending(monkeypatch, st
     monkeypatch.setattr(ls, 'MOQTClient', Client)
     monkeypatch.setattr(ls, 'SubscribedTrack', Track)
     events = queue.Queue()
-    slot = dict(stop=asyncio.Event(), stats=TrackStats(), live=False, done=False)
+    slot = dict(stop=asyncio.Event(), stats={'track': TrackStats()}, live=False, done=False)
     relay = SimpleNamespace(host='127.0.0.1', port=4433, path='', use_quic=True)
-    await ls._slot_task({'namespace': 'ns', 'trackname': 'track'}, relay,
+    await ls._slot_task({'namespace': 'ns', 'tracknames': ['track']}, relay,
                         slot, events, 0, 0, 0)
     assert slot['done'] and not slot['live']
     assert events.qsize() == 1

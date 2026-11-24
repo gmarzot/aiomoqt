@@ -23,7 +23,7 @@ TOOLS = [
     "pub_bench", "sub_bench", "loopback_bench", "adaptive_bench",
     "pub_server", "load_sim", "relay_probe",
     "moq_interop_client", "moq_interop_relay", "moqtest_origin",
-    "pub_media", "sub_media",
+    "pub_media", "sub_media", "abr_ingest", "moq_fabric_probe", "moq_fabric_bench",
 ]
 
 EXAMPLES = ["pub_example", "sub_example", "join_example", "server_example"]
@@ -239,6 +239,19 @@ def test_short_flag_has_one_meaning_across_tools():
     assert not clashes
 
 
+def test_setup_timeout_follows_duration():
+    assert cli.setup_timeout(argparse.Namespace(duration=0)) == cli.SETUP_TIMEOUT
+    assert cli.setup_timeout(argparse.Namespace(duration=300)) == 300
+
+
+@pytest.mark.parametrize("tool", TOOLS + EXAMPLES)
+def test_duration_defaults_to_no_limit(tool):
+    package = "aiomoqt.examples" if tool in EXAMPLES else "aiomoqt.tools"
+    for action in _parser_actions(tool, package):
+        if "--duration" in action.option_strings:
+            assert action.default == 0, tool
+
+
 @pytest.mark.parametrize("tool", sorted(EXTERNAL_CONTRACT))
 def test_external_contract_matches_its_interface(tool):
     contract = EXTERNAL_CONTRACT[tool]
@@ -311,15 +324,6 @@ def test_packaging_flag_agrees_across_media_tools():
         assert tuple(acts[0].choices) == MEDIA_PACKAGINGS, tool
 
 
-def test_loc_bare_flag_agrees_across_media_tools():
-    """--loc-bare is long-only and the same switch on both media tools."""
-    for tool in ("pub_media", "sub_media"):
-        acts = [a for a in _parser_actions(tool) if a.dest == "loc_bare"]
-        assert len(acts) == 1, tool
-        assert acts[0].option_strings == ["--loc-bare"], tool
-        assert isinstance(acts[0], argparse._StoreTrueAction), tool
-
-
 def test_load_sim_draft_takes_a_draft_list():
     acts = [a for a in _parser_actions("load_sim") if a.dest == "draft"]
     assert acts[0].type("22,20") == [22, 20]
@@ -347,10 +351,11 @@ def test_every_tool_takes_the_logging_flags(tool):
 
 @pytest.mark.parametrize("argv, expected", [
     ([], {}),
-    (["--cc-algo", "cubic", "--cc-options", "Q0.02", "--fc-window", "67108864",
+    (["--cc-algo", "cubic", "--cc-options", "Q0.02", "--pacing-trains",
+      "--fc-window", "67108864",
       "--max-queued-bytes", "0", "--max-inflight-bytes", "0", "--keepalive", "2.5"],
      {"congestion_control_algorithm": "cubic",
-      "congestion_control_options": "Q0.02",
+      "congestion_control_options": "Q0.02", "packet_train_mode": True,
       "flow_control_window": 67108864, "tx_max_queued_bytes": 0,
       "tx_max_inflight_bytes": None, "keep_alive_interval": 2.5}),
     (["--max-inflight-bytes", "4096"], {"tx_max_inflight_bytes": 4096}),
@@ -363,3 +368,44 @@ def test_transport_kwargs(argv, expected):
     if cc_default is not None:
         expected.setdefault("congestion_control_algorithm", cc_default)
     assert cli.transport_kwargs(p.parse_args(argv)) == expected
+
+
+FABRIC_NODE_FLAGS = {"--peer", "--node-id", "--node-metric"}
+MOQ_FABRIC_LISTENER_FLAGS = {"--bind", "-p", "--port", "--cert", "--key"}
+
+
+@pytest.mark.parametrize("tool", ["moq_fabric_probe", "moq_fabric_bench",
+                                  "moq_interop_relay"])
+def test_moq_fabric_node_flags_are_the_grid_group(tool):
+    acts = {o: a for a in _parser_actions(tool) for o in a.option_strings}
+    assert FABRIC_NODE_FLAGS <= set(acts)
+    assert acts["--peer"].type is cli.peer_address
+    assert acts["--peer"].default is None
+    from aiomoqt.moq_fabric import LEAF_METRIC
+    from aiomoqt.moq_fabric.wire import DEFAULT_NODE_METRIC
+    want = (DEFAULT_NODE_METRIC if tool == "moq_interop_relay"
+            else LEAF_METRIC)
+    assert acts["--node-metric"].default == want
+    if tool == "moq_interop_relay":
+        # The relay's own --bind/--port/--cert/--key; the fabric listens
+        # on --peer-port, and -p stays unused.
+        assert acts["--peer-port"].default is None
+        assert "-p" not in acts
+        assert acts["--port"].default == 4443
+    else:
+        assert MOQ_FABRIC_LISTENER_FLAGS <= set(acts)
+        assert "--peer-port" not in acts
+
+
+def test_relay_moq_fabric_flags_parse():
+    from aiomoqt.tools import moq_interop_relay as relay
+    a = relay.parse_args([])
+    assert a.peer is None and a.peer_port is None
+    assert a.node_id is None and a.node_metric == 100
+    a = relay.parse_args(["--peer", "10.0.0.1", "--peer", "[::1]:9",
+                          "--peer-port", "0", "--node-id", "9.9:1",
+                          "--node-metric", "200"])
+    assert a.peer == [("10.0.0.1", 33434), ("::1", 9)]
+    assert (a.peer_port, a.node_id, a.node_metric) == (0, "9.9:1", 200)
+    with pytest.raises(SystemExit):
+        relay.parse_args(["--peer", "h:0"])

@@ -217,7 +217,7 @@ class SenderStats:
 
 class TrackStats:
     """Receiver-side accounting: everything SenderStats tracks, plus
-    latency, jitter, loss and out-of-order detection.
+    latency, jitter, loss, out-of-order and duplicate detection.
 
     Loss is stride-aware: objects striped across N parallel subgroups
     arrive with object_id skipping by N, so the stride is learned per
@@ -231,6 +231,12 @@ class TrackStats:
     group lost (until a late arrival reverses it). A group is settled
     once a group two ahead arrives; the first group (joined mid-way) and
     the newest two are never settled.
+
+    A duplicate, an id already received on its subgroup, counts only in
+    dups, not in objects, bytes or its group. It is recognized from the
+    subgroup's first id, stride and recorded gaps; on a subgroup whose ids
+    leave the stride, or whose gaps were too large to record, an older
+    repeat counts as out-of-order.
     """
 
     def __init__(self, window_s: float = 5.0,
@@ -239,7 +245,8 @@ class TrackStats:
                  windowed: bool = True,
                  minimal: bool = False,
                  latency_every: int = 1,
-                 group_loss: bool = False):
+                 group_loss: bool = False,
+                 lat_min_us: int = _LAT_MIN_US):
         # windowed=False skips the rolling-window upkeep that only
         # snapshot() reads — table-printing consumers (interval_row /
         # summary) never touch it, and this runs per object on the
@@ -254,6 +261,9 @@ class TrackStats:
         # 30k obj/s even N=16 leaves ~2k samples/s for a percentile.
         self.latency_every = max(1, int(latency_every))
         self._lat_tick = 0
+        # Most negative latency kept (us); lower one to keep a known clock
+        # offset that a baseline cancels.
+        self.lat_min_us = lat_min_us
         self.window_s = window_s
         self.start_time = 0.0
         self.first_object_time = 0.0
@@ -263,6 +273,7 @@ class TrackStats:
         self.total_bytes = 0
         self.total_lost = 0
         self.total_ooo = 0
+        self.total_dups = 0
         # Group count, and the ids within the key horizon already counted.
         self.total_groups = 0
         self._recent_groups: set = set()
@@ -305,6 +316,10 @@ class TrackStats:
         # loss. Oldest keys are dropped past _MISSING_CAP ids.
         self._missing: dict = {}
         self._missing_n = 0
+        # First id per key, and keys whose received ids are no longer
+        # known exactly from first, stride and _missing.
+        self._first: dict = {}
+        self._untracked: set = set()
         # Consecutive objects almost always continue the same subgroup
         # stream, so the live key's state is held in slots and only
         # written back to the dicts when the key changes. The group and
@@ -335,6 +350,7 @@ class TrackStats:
         self._snap_objects = 0
         self._snap_bytes = 0
         self._snap_lost = 0
+        self._snap_dups = 0
         self._snap_t = time.monotonic()
 
         # Track timing context; a subscriber shares its SubscribedTrack's.
@@ -418,7 +434,7 @@ class TrackStats:
                 send_us = self._send_us(msg, group_id)
         if send_us is not None and recv_time_us is not None:
             raw = recv_time_us - send_us
-            if _LAT_MIN_US <= raw <= _LAT_MAX_US:
+            if self.lat_min_us <= raw <= _LAT_MAX_US:
                 lat = raw / 1000.0
                 self.lat_count += 1
                 self.lat_sum += lat
@@ -470,14 +486,10 @@ class TrackStats:
             self._saw_datagram = True
         sg = (getattr(msg, 'subgroup_id', None)
               if subgroup_id is None else subgroup_id) if has_sg else None
-        grp_rx = self._grp_rx
-        if grp_rx is not None:
-            n = grp_rx.get(gid)
-            if n is not None and oid < self._grp_size:
-                grp_rx[gid] = n + 1
-            else:
-                self._group_object(gid, oid, sg)
-        if gid == self._lk_g and sg == self._lk_s:
+        pruned = gid < self._key_floor     # counted, no loss keys
+        if pruned:
+            prev = None
+        elif gid == self._lk_g and sg == self._lk_s:
             prev = self._lk_prev
         else:
             self._flush_key()
@@ -485,26 +497,79 @@ class TrackStats:
             key = (gid, sg if sg is not None else 0)
             prev = self._expected.get(key)
             self._lk_stride = self._stride.get(key)
+            if prev is None:
+                self._first[key] = oid
+        # Anything but the next id on the stride (None until learned).
+        irregular = prev is not None and oid - prev != self._lk_stride
+        # A duplicate is caught before the group tally it would inflate.
+        if irregular and oid <= prev and self._repeat(oid, prev):
+            self._count_repeat(size_bytes)
+            return
+        grp_rx = self._grp_rx
+        if grp_rx is not None:
+            n = grp_rx.get(gid)
+            if n is not None and oid < self._grp_size:
+                grp_rx[gid] = n + 1
+            else:
+                self._group_object(gid, oid, sg)
+        if pruned:
+            return
         if prev is None:
             self._lk_prev = oid
-            return
-        stride = self._lk_stride
-        if stride is None and oid > prev:
-            stride = self._lk_stride = oid - prev
-        if stride and stride > 0:
-            if oid > prev + stride:
-                lost = (oid - prev - stride) // stride
-                self.total_lost += lost
-                if grp_rx is not None:
-                    self._grp_gap[gid] = self._grp_gap.get(gid, 0) + lost
-                self._note_missing(prev + stride, oid, stride)
-            elif oid < prev:
-                self.total_ooo += 1
-                self._recover(oid)
-        self._lk_prev = oid if oid > prev else prev
+        elif irregular:
+            self._irregular(gid, oid, prev)
+        else:
+            self._lk_prev = oid
 
     _MISSING_CAP = 65536
     _SETTLED_CAP = 1024
+
+    def _irregular(self, gid: int, oid: int, prev: int) -> None:
+        """Stride learning, loss and reorder for an id other than the
+        live key's next."""
+        stride = self._lk_stride
+        if stride is None:
+            if oid > prev:
+                self._lk_stride = oid - prev
+                self._lk_prev = oid
+            return
+        if oid < prev:
+            self.total_ooo += 1
+            self._recover(oid)
+            return
+        gap = oid - prev
+        if gap % stride:
+            self._untracked.add(self._live_key())
+        if gap > stride:
+            lost = (gap - stride) // stride
+            self.total_lost += lost
+            if self._grp_rx is not None:
+                self._grp_gap[gid] = self._grp_gap.get(gid, 0) + lost
+            self._note_missing(prev + stride, oid, stride)
+        self._lk_prev = oid
+
+    def _repeat(self, oid: int, prev: int) -> bool:
+        """Whether oid, at or behind the live key's newest id, was
+        already received."""
+        if oid == prev:
+            return True
+        stride = self._lk_stride
+        key = self._live_key()
+        first = self._first.get(key)
+        if (not stride or first is None or oid < first
+                or (oid - first) % stride or key in self._untracked):
+            return False
+        ms = self._missing.get(key)
+        return ms is None or oid not in ms
+
+    def _count_repeat(self, size_bytes: int) -> None:
+        """Move a duplicate out of the counters on_object already
+        added it to."""
+        self.total_dups += 1
+        self.total_objects -= 1
+        self.total_bytes -= size_bytes
+        self._iv_objects -= 1
+        self._iv_bytes -= size_bytes
 
     def _group_object(self, gid: int, oid: int, sg) -> None:
         """Whole-group accounting off the fast path: a new group, a
@@ -570,9 +635,10 @@ class TrackStats:
             return
         self._key_floor = floor
         self._flush_key()
-        for d in (self._expected, self._stride):
+        for d in (self._expected, self._stride, self._first):
             for k in [k for k in d if k[0] < floor]:
                 del d[k]
+        self._untracked = {k for k in self._untracked if k[0] >= floor}
         for k in [k for k in self._missing if k[0] < floor]:
             self._missing_n -= len(self._missing.pop(k))
         self._recent_groups = {g for g in self._recent_groups if g >= floor}
@@ -583,14 +649,16 @@ class TrackStats:
     def _note_missing(self, lo: int, hi: int, stride: int) -> None:
         ids = range(lo, hi, stride)
         if len(ids) > self._MISSING_CAP:
+            self._untracked.add(self._live_key())
             return                  # too large to track: stays lost
         ms = self._missing.setdefault(self._live_key(), set())
         before = len(ms)
         ms.update(ids)
         self._missing_n += len(ms) - before
         while self._missing_n > self._MISSING_CAP:
-            self._missing_n -= len(self._missing.pop(next(iter(
-                self._missing))))
+            oldest = next(iter(self._missing))
+            self._missing_n -= len(self._missing.pop(oldest))
+            self._untracked.add(oldest)
 
     def _recover(self, oid: int) -> None:
         """A late object that fills a counted gap is a reorder, not a
@@ -644,6 +712,8 @@ class TrackStats:
         self._snap_objects = self.total_objects
         self._snap_bytes = self.total_bytes
         self._snap_lost = self.total_lost
+        iv_dups = self.total_dups - self._snap_dups
+        self._snap_dups = self.total_dups
         dt = now - self._snap_t
         self._snap_t = now
         return dict(
@@ -651,6 +721,7 @@ class TrackStats:
             lat_n=len(lats), lat_mean_ms=(sum(lats) / len(lats)) if lats else 0.0,
             lat_p90_ms=_pct(lats, 90), lat_p99_ms=_pct(lats, 99),
             jitter_ms=self.jitter, loss=self.total_lost,
+            iv_dups=iv_dups, dups=self.total_dups,
             groups=self.total_groups,
             total_objs=self.total_objects, total_bytes=self.total_bytes,
             ts_source=self.ts_source,
@@ -734,7 +805,46 @@ class TrackStats:
             lat_p50=p50, lat_p95=p95, lat_p99=p99,
             clock_offset=off is not None,
             jitter_ms=self.jitter,
-            lost=self.total_lost, ooo=self.total_ooo,
+            lost=self.total_lost, ooo=self.total_ooo, dups=self.total_dups,
             ts_source=self.ts_source, ts_malformed=self.ts_malformed,
             loss_pct=(self.total_lost / expected * 100) if expected else 0.0,
         )
+
+
+class ViewerStats:
+    """One viewer's TrackStats per track, merged for the slot checks:
+    bytes, objects and loss sum; latency is the worst track's. 'tracks'
+    holds each track's cumulative (objects, bytes)."""
+
+    _SUMMED = ('rx_objs', 'rx_bytes', 'iv_lost', 'lat_n', 'loss', 'groups',
+               'total_objs', 'total_bytes', 'iv_dups', 'dups')
+
+    def __init__(self, names, **kwargs):
+        self.tracks = {name: TrackStats(**kwargs) for name in names}
+
+    @property
+    def total_lost(self) -> int:
+        return sum(t.total_lost for t in self.tracks.values())
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(t.total_bytes for t in self.tracks.values())
+
+    @property
+    def total_objects(self) -> int:
+        return sum(t.total_objects for t in self.tracks.values())
+
+    def snapshot(self) -> dict:
+        snaps = [t.snapshot() for t in self.tracks.values()]
+        merged = dict(snaps[0])
+        for key in self._SUMMED:
+            merged[key] = sum(s[key] for s in snaps)
+        timed = [s for s in snaps if s['lat_n']]
+        merged['lat_p90_ms'] = max((s['lat_p90_ms'] for s in timed), default=0.0)
+        merged['lat_p99_ms'] = max((s['lat_p99_ms'] for s in timed), default=0.0)
+        merged['lat_mean_ms'] = (sum(s['lat_mean_ms'] * s['lat_n'] for s in timed)
+                                 / merged['lat_n']) if merged['lat_n'] else 0.0
+        merged['jitter_ms'] = max(s['jitter_ms'] for s in snaps)
+        merged['tracks'] = {name: (s['total_objs'], s['total_bytes'])
+                            for name, s in zip(self.tracks, snaps)}
+        return merged

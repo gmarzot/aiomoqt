@@ -1,5 +1,5 @@
 """PublishedTrack(immutable_properties=) rides each track's own PUBLISH and
-SUBSCRIBE_OK as Immutable Properties (0x0B); d14 carries none."""
+SUBSCRIBE_OK as Immutable Properties (0x0B)."""
 import asyncio
 import contextlib
 
@@ -18,7 +18,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 17500
-_DRAFTS = [14, 16, 18, 20]
+_DRAFTS = [16, 18, 20]
 _NS = "immutable"
 _PROPS = {
     "video": {0x04: 2000, 0x3B: b"video-meta"},
@@ -37,7 +37,7 @@ def _immutable(msg, draft):
         return None
     return MOQTMessage._extensions_decode(
         Buffer(data=bytes(raw), vi64=profile_for(draft).vi64),
-        with_length=False, buf_end=len(raw), delta=True)
+        with_length=False, buf_end=len(raw))
 
 
 @contextlib.asynccontextmanager
@@ -73,7 +73,7 @@ def _tracks(session):
 
 
 def _expected(name, draft):
-    return _PROPS[name] if draft >= 16 else None
+    return _PROPS[name]
 
 
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])

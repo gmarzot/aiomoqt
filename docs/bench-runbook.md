@@ -247,6 +247,10 @@ one-second GOP is 1 I-frame, 20 B and 9 P under the `ibp` pattern:
 | 1080p | 200,000 | 25,000 | 10,000 | 20,833 | 5.00 |
 | 1440p | 350,000 | 40,000 | 18,000 | 35,666 | 8.56 |
 | 4k | 600,000 | 60,000 | 30,000 | 58,000 | 13.92 |
+| 4kuhd | 744,000 | 93,000 | 37,200 | 77,500 | 18.60 |
+
+`4kuhd` is the 1080p shape scaled to 16.0 Mbps at a two-second GOP (`-g 60`), as 1080p
+is 4.30 Mbps there.
 
 **Rate does not scale with frame rate.** `-r` sets fps; at 60 fps the
 same single I-frame amortises over twice as many frames, so the average
@@ -274,7 +278,7 @@ nothing external to blame; this is the number that says the machine and
 the build are healthy before anything else means much.
 
 ```
-python -m aiomoqt.tools.adaptive_bench
+python -m aiomoqt.tools.adaptive_bench -t 60
 ```
 
 No URL selects the loopback self-test. `-P 4 --step-mbps 20` for
@@ -298,8 +302,8 @@ python -m aiomoqt.tools.loopback_bench -Q --draft 18 --rtt-ms 50 -r 200 -t 10
 - `-Q` raw QUIC, else H3/WebTransport. `--draft` applies to both ends
   (default 14, deprecated: pass 18, 20 or 22).
 - `-s` object size, `-r` aggregate objects/s (0 = as fast as it goes),
-  `-P` parallel subgroup streams, `-g` objects per group, `-t` seconds,
-  `-i` report interval.
+  `-P` parallel subgroup streams, `-g` objects per group, `-t` seconds
+  (0 or absent: no limit), `-i` report interval.
 - `-D` sends ObjectDatagrams instead of streams (object at most ~1150 B);
   run it at the same `-s` and `-r` as a stream run to compare the two.
 - `--fanout` publishes through `produce()` and the per-subscriber send
@@ -340,7 +344,11 @@ there, and `-T v1080p` on both is what selects the track.
   `-g` stays objects per group, so it is the GOP length in frames (default
   one second of frames): `--video 1080p -r 60 -g 120` is 60 fps with 2 s
   GOPs. pub_bench, pub_server and adaptive_bench subs mode all take it.
-- `--video` refuses `-s`, `-P` and `-D`: the profile sets each frame's
+- `--audio` and `--catalog` add those tracks beside `--video` on `pub_bench` and
+  `adaptive_bench`, one object per group; `-D` then sends the audio as ObjectDatagrams.
+  In `adaptive_bench --mode subs` each viewer takes every track, with loss and worst
+  latency across them counted in its checks.
+- Otherwise `--video` refuses `-s`, `-P` and `-D`: the profile sets each frame's
   size, sends one stream, and its I-frames are far past the 1152-byte
   one-packet datagram ceiling. Flat alternative: `-s 4096 -r 120 -g 240`,
   which is 2 s groups at 120 objects per second. Stream turnover is rate
@@ -368,7 +376,7 @@ The publisher's rate is nudged up every interval until the subscriber's
 samples say stop.
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 --report bw-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --start-mbps 10 --step-mbps 10 --max-mbps 500 --latency-threshold 100 -t 300 --report bw-ramp.csv
 ```
 
 Against a relay the publisher and subscriber always run in separate
@@ -377,10 +385,16 @@ one Python process is GIL-bound and can be what you measure.
 
 Latency is the subscriber's p90 over its last 5 s. The controller backs
 off when it stays over `--latency-threshold` (default 100 ms) for two
-intervals. A shortfall, achieved below `--shortfall-ratio` (0.85) of
+intervals. In subs mode, `--too-far-behind SEC` replaces that with the share
+of viewers more than SEC behind: over 5% for two intervals backs off, and a
+viewer past SEC for 5 s resubscribes on its session. Numbers taken this way
+don't compare with worst-viewer runs; report `Delivered` with them. A
+shortfall, achieved below `--shortfall-ratio` (0.85) of
 commanded, holds the ramp and backs off once it lasts three intervals.
 Back-off multiplies by `--backoff-factor` (0.9; closer to 1.0 for gentler
-steps). Hard caps are `--max-mbps` and `-t` seconds. A run that receives
+steps). At `--max-mbps` the run holds, still backing off, until `-t`
+seconds are up; `-t 0` or no `-t` runs until Ctrl-C. `--exit max` ends the
+run on reaching max instead, and `-t` still applies. A run that receives
 nothing exits nonzero.
 
 **Set the threshold relative to the path RTT.** Absolute latency
@@ -410,7 +424,7 @@ python -m aiomoqt.tools.adaptive_bench moqt://127.0.0.1:4433 -k --draft 18 --mod
 On the **load host**:
 
 ```
-python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -j 10 -S 0.1 --sub-filter next-group-start --report subs-ramp.csv
+python -m aiomoqt.tools.adaptive_bench "$RELAY_QUIC" -k --draft 18 --mode subs --role sub -N perf -T subs-ramp --sub-mbps 10 -s 4096 --start-subs 1 --step-subs 5 --max-subs 200 -R 0.5 --spread 0.05 --sub-filter next-group-start -t 300 --report subs-ramp.csv
 ```
 
 It prints what it is waiting for:
@@ -426,8 +440,8 @@ Ramp knobs:
 | Flag | Meaning |
 |---|---|
 | `--step-subs` | subscribers per group, and the batch size: one worker process hosts a group |
-| `-j` / `--join-rate` | seconds between groups. The ramp cadence, independent of `--interval`, which is only reporting |
-| `-S` / `--stagger` | seconds between individual joins inside a group (default 0.1). Spaces the QUIC Initials so a group does not burst the relay; 0 opens the batch at once |
+| `-R` / `--ramp-rate` | new subscribers per second, added one `--step-subs` group at a time. Default: one group per `--interval` |
+| `--spread` | share of each group's slot, 0 to 1, its joins spread over. 1 (default) spaces joins evenly; 0 opens the group at once |
 | `--sub-filter` | `next-group-start` skips the current-group replay some relays do on `latest-object`, the default |
 
 A subscriber counts toward the high-water mark only while it receives at
@@ -438,8 +452,46 @@ shortfall; a lossy or starved subscriber is not counted as capacity. The
 latency threshold works as in flow C, so set it from the path RTT here
 too.
 
-The ramp ends at `--max-subs`; it cannot hold a fixed count. For a fixed
-audience use `load_sim --subs N` (flow E).
+The ramp holds at `--max-subs`, still backing off, until `-t` seconds are
+up; `-t 0` or no `-t` runs until Ctrl-C. `--exit max` ends the run on
+reaching max instead, and `-t` still applies. For a fixed audience with no
+ramp use `load_sim --subs N` (flow E).
+
+`--hold SEC` measures an equilibrium instead of a ramp. Each step is held
+SEC seconds and passes only if every tick stays under the threshold with no
+shortfall, no lossy, late or refused subscriber and no lost object, and, once
+p90 is over half the threshold, it has stopped rising. Steps add 10% while
+p90 is under a tenth of the threshold, 5% under a quarter, then one group.
+The first failure sheds back to
+the last passing level, stopping the subscriber workers furthest behind (those
+still starting up first); the rest stay on and must run clean for 10 s within
+15 s, plus 1.5 intervals for the overshoot's loss flags to clear, then hold
+for `--confirm` (30 s). A level that does not recover gets one reset: every
+subscriber dropped, `--trial-gap` (5 s), then a rejoin, for a relay that does
+not shed late work. A confirmed level is held, still checked, until `-t`, so
+subscriber hosts running side by side end together; a fault there, a failed
+confirmation or no recovery after the reset sheds one group lower and confirms
+again. `--exit sustained` ends the run at the
+confirmation instead. The summary's `Sustained` line is the level held to
+the end and for how long, or `not demonstrated`.
+
+`--join-burst B0` measures the largest burst of joins a relay serves while
+an audience stays healthy. The first `--watchers` share (0.25) of each
+group's subscribers are watchers, never cycled; the rest are joiners. It
+holds `--max-subs` (`--start-subs` is ignored) for `--base-s` (30 s) under
+the `--hold` checks on everyone. A trial of B then has B joiners close their
+session and redial at once, spread across the workers. It passes when 99% of
+them get a first object within `--join-bound` (1000 ms) of the burst and the
+watchers stay clean until every join is done or timed out. Between trials the
+watchers must run clean for `--trial-gap` (5 s), within 30 s or the search
+ends. B grows by half from B0 (by a fifth once first-object p99 passes half
+the bound), up to `--join-max` and the eligible joiners; the first failure
+starts a bisection, and the result must then pass 3 times in a row, stepping
+down 10% on a failure, 3 times at most. A failing first trial halves B down
+to 1. Keep `--interval` and `-j` near 1 s so trials are watched closely. The
+summary prints a `Join trial` line per trial and `Join burst: N subscribers
+at once (confirmed 3x)`, marked `(at --join-max)` or `(pool-limited)` when a
+cap stopped the search without a failure, or `not demonstrated`.
 
 **Latency comes from the object's LOC timestamp** (property 0x10,
 wall-clock µs): pub_bench and pub_media both stamp it, so an audience run
@@ -469,10 +521,18 @@ python -m aiomoqt.tools.load_sim "$RELAY_WT" -f rich-matrix --draft 18 -k --repo
 
 Packaged scenarios are `default`, `rich-matrix` (namespaces by tracks),
 `churn-storm` (join and leave pressure), `datagram-mix` (mixed delivery
-modes) and `viewers`. `--seed` makes the churn reproducible.
+modes), `viewers` and `av-viewers`. `--seed` makes the churn reproducible.
 `--subs-per-proc` caps subscriber slots per host process, default 100.
 The one-track case needs no scenario file at all:
 `--subs 50 -N load-$(date +%H%M%S) -r 30 -s 4096 -t 120`.
+
+`av-viewers` is the 180-viewer hold with each viewer on catalog, video
+and audio over one session, against pub_bench's standard video track:
+
+```
+python -m aiomoqt.tools.pub_bench "$RELAY_WT" --video 720p -r 30 -g 60 --audio --catalog -k --draft 18 -t 480
+python -m aiomoqt.tools.load_sim "$RELAY_WT" -f av-viewers --role sub --draft 18 -k -i 5
+```
 
 `viewers` is an audience and nothing else: `--role sub` drops the
 scenario's own publishers, so **it needs a broadcast already running or
@@ -507,7 +567,7 @@ namespace at the same time.
 | Surface | What it shows |
 |---|---|
 | relay stats | Whatever the relay under test exposes. For moqx that is a Grafana overview: sessions, ingress and egress bandwidth, fan-out ratio, subscribers, drops, loss, latency, and QUIC connections, streams, goodput and RTT. The relay's own account of the run. |
-| `--report PATH` | Per-sample CSV from adaptive_bench, per-interval per-track CSV from load_sim. The artifact to keep and diff across builds. |
+| `--report PATH` | Per-sample CSV from adaptive_bench (in subs mode, `worst_p90_ms` is the worst sub in the last reports and `tick_p90_ms` the worst across the tick, which the controller acts on), per-interval per-track CSV from load_sim. The artifact to keep and diff across builds. |
 | `AIOPQUIC_QLOG_DIR=<dir>` | Standard qlog traces of the QUIC layer: congestion control, RTT, loss. Free to the run. |
 | `--keylogfile PATH` | TLS secrets for Wireshark. Under `--mp` each worker writes `PATH.pub.<pid>` and `PATH.sub.<pid>`, combined when decrypting. |
 

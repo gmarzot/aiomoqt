@@ -129,9 +129,9 @@ def test_datagram_keys_on_group_without_subgroup():
 def test_out_of_order_counted_not_lost():
     s = TrackStats()
     us = _now_us()
-    for o in (0, 1, 2, 1):
+    for o in (0, 1, 3, 2):
         s.on_object(Obj(0, o), 10, us)
-    assert s.summary()['ooo'] >= 1
+    assert (s.summary()['ooo'], s.summary()['lost']) == (1, 0)
 
 
 def test_reorder_that_fills_a_gap_is_not_lost():
@@ -148,7 +148,8 @@ def test_repeat_of_a_received_object_does_not_reverse_loss():
     us = _now_us()
     for o in (0, 1, 3, 1):
         s.on_object(Obj(0, o), 10, us)
-    assert (s.summary()['lost'], s.summary()['ooo']) == (1, 1)
+    summ = s.summary()
+    assert (summ['lost'], summ['ooo'], summ['dups']) == (1, 0, 1)
 
 
 def test_filled_gap_reverses_loss_in_snapshot_deltas():
@@ -378,3 +379,116 @@ def test_group_loss_is_opt_in():
     s = TrackStats()
     _feed_groups(s, range(6), skip={(2, 1)})
     assert s.summary()['lost'] == 0
+
+
+# -- duplicates ------------------------------------------------------
+
+def test_repeat_of_the_newest_object_is_a_duplicate():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 2, 2):
+        s.on_object(Obj(0, o), 10, us)
+    summ = s.summary()
+    assert (summ['objects'], summ['bytes'], summ['dups']) == (3, 30, 1)
+    assert (summ['lost'], summ['ooo']) == (0, 0)
+
+
+def test_repeat_of_a_first_object_is_a_duplicate():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 0, 1):
+        s.on_object(Obj(0, o), 10, us)
+    summ = s.summary()
+    assert (summ['objects'], summ['dups'], summ['lost']) == (2, 1, 0)
+
+
+def test_older_repeat_is_a_duplicate_not_a_reorder():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 4, 8, 12, 4, 0):
+        s.on_object(Obj(0, o, subgroup_id=0), 10, us)
+    summ = s.summary()
+    assert (summ['objects'], summ['dups'], summ['ooo']) == (4, 2, 0)
+
+
+def test_filled_gap_then_its_repeat():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 3, 2, 2):
+        s.on_object(Obj(0, o), 10, us)
+    summ = s.summary()
+    assert (summ['lost'], summ['ooo'], summ['dups'], summ['objects']) \
+        == (0, 1, 1, 4)
+
+
+def test_object_before_a_mid_group_join_is_a_reorder():
+    s = TrackStats()
+    us = _now_us()
+    for o in (5, 6, 7, 3):
+        s.on_object(Obj(0, o), 10, us)
+    summ = s.summary()
+    assert (summ['ooo'], summ['dups'], summ['objects']) == (1, 0, 4)
+
+
+def test_off_stride_ids_report_repeats_as_reorders():
+    """Once ids leave the learned stride, received ids are not known
+    exactly: an older repeat counts as out-of-order, never as a dup."""
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 2, 3, 5, 2):
+        s.on_object(Obj(0, o), 10, us)
+    summ = s.summary()
+    assert (summ['dups'], summ['ooo']) == (0, 1)
+
+
+def test_datagram_repeat_is_a_duplicate():
+    s = TrackStats()
+    us = _now_us()
+    for o in (0, 1, 2, 1):
+        s.on_object(Dgram(0, o), 10, us)
+    assert (s.summary()['dups'], s.summary()['ooo']) == (1, 0)
+
+
+def test_duplicate_does_not_hide_a_lost_subgroup():
+    s = TrackStats(group_loss=True)
+    _feed_groups(s, range(3), skip={(2, 1)})
+    s.on_object(Obj(2, 0, subgroup_id=0), 10, _now_us())
+    _feed_groups(s, range(3, 6))
+    summ = s.summary()
+    assert (summ['lost'], summ['dups']) == (2, 1)
+
+
+def test_duplicate_does_not_reverse_settled_loss():
+    s = TrackStats(group_loss=True)
+    _feed_groups(s, range(6), skip={(2, 1)})
+    assert s.summary()['lost'] == 2
+    s.on_object(Obj(2, 4, subgroup_id=0), 10, _now_us())
+    summ = s.summary()
+    assert (summ['lost'], summ['dups']) == (2, 1)
+
+
+def test_snapshot_reports_duplicates():
+    s = TrackStats(window_s=1.0, group_loss=True)
+    us = _now_us()
+    for o in (0, 1, 1, 2):
+        s.on_object(Obj(0, o, send_us=us), 10, us)
+    first = s.snapshot()
+    assert (first['rx_objs'], first['rx_bytes']) == (3, 30)
+    assert (first['iv_dups'], first['dups'], first['total_objs']) == (1, 1, 3)
+    s.on_object(Obj(0, 0, send_us=us), 10, us)
+    s.on_object(Obj(0, 3, send_us=us), 10, us)
+    second = s.snapshot()
+    assert (second['rx_objs'], second['iv_dups'], second['dups']) == (1, 1, 2)
+    assert (second['iv_lost'], second['loss']) == (0, 0)
+
+
+def test_duplicate_state_is_bounded():
+    from aiomoqt.utils.stats import KEY_HORIZON
+    s = TrackStats(windowed=False, group_loss=True)
+    us = _now_us()
+    for g in range(10_000):
+        for o in (0, 1, 3, 4, 4):
+            s.on_object(Obj(g, o), 10, us)
+    assert s.total_dups == 10_000
+    assert len(s._first) <= KEY_HORIZON
+    assert len(s._untracked) <= KEY_HORIZON

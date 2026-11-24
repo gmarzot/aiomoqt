@@ -1,7 +1,7 @@
 name: MoQ conformance
 
 # draft-afrind-moq-test conformance, driven by moxygen's moqtest_client
-# against aiomoqt as the relay under test:
+# against aiomoqt as the relay under test, in two arrangements:
 #
 #   moqtest_server (listens)  <--SUBSCRIBE--  aiomoqt relay --upstream
 #                                                   ^
@@ -9,9 +9,12 @@ name: MoQ conformance
 #                                                   |
 #                                             moqtest_client
 #
-# This is the arrangement the suite assumes: an origin attached to the
-# relay, with the relay reaching upstream to it. moqtest_server listens
-# and does not dial, so the relay has to be able to dial out.
+#   moqtest_server x2 --relay_url --PUBLISH_NAMESPACE-->  aiomoqt relay
+#                                                   ^
+#                                             moqtest_client
+#
+# The second is moqx's CI arrangement, with a second origin added so
+# every track has a publisher to fail over to.
 #
 # The client encodes its parameters as 16 Track Namespace tuple fields
 # and verifies the objects that come back: group and object numbering,
@@ -54,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        draft: [16, 18]
+        draft: [16, 18, 22]
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -184,6 +187,33 @@ jobs:
               | tee "origin-conformance-$T.log"
           done
 
+      - name: Score the relay with origins dialing it
+        env:
+          DRAFT: ${{ matrix.draft }}
+        run: |
+          python -m aiomoqt.tools.moq_interop_relay \
+            --bind 127.0.0.1 --port 4443 --dual --draft "$DRAFT" \
+            --cert certs/cert.pem --key certs/key.pem \
+            > relay-dial.log 2>&1 &
+          RELAY_PID=$!
+          trap 'kill $RELAY_PID 2>/dev/null || true' EXIT
+          sleep 3
+          for T in quic h3wt; do
+            ORIGINS=()
+            for n in 1 2; do
+              ./harness/bin/moqtest_server \
+                --relay_url=https://127.0.0.1:4443/ --versions="$DRAFT" \
+                --transport=$T > "origin-dial-$T-$n.log" 2>&1 &
+              ORIGINS+=($!)
+            done
+            sleep 3
+            SUITE=$PWD/harness/conformance_test.sh MOXDIR=$PWD/harness \
+            DRAFT="$DRAFT" TRANSPORT=$T LABEL=dial \
+              bash .github/scripts/conformance-score.sh || true
+            kill "${ORIGINS[@]}" 2>/dev/null || true
+            wait "${ORIGINS[@]}" 2>/dev/null || true
+          done
+
       - name: Report the score
         if: always()
         run: |
@@ -198,6 +228,8 @@ jobs:
           name: moq-conformance-logs-d${{ matrix.draft }}
           path: |
             relay.log
+            relay-dial.log
+            origin-dial-*.log
             upstream.log
             conformance-*.log
             origin.log

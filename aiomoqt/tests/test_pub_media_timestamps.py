@@ -23,7 +23,7 @@ class _Track:
         self.payloads = []
 
     async def send_frame(self, payload, *, key_frame, timestamp,
-                         group_id=None):
+                         group_id=None, end_of_group=False):
         self.stamps.append(timestamp)
         self.payloads.append(payload)
 

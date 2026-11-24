@@ -92,14 +92,17 @@ class _StubSession:
     def set_stream_priority(self, _sid, _band):
         return True
 
-    async def open_uni_stream(self):
+    async def open_uni_stream(self, initial=b"", priority=None,
+                              end_stream=False):
         self._sid += 4
+        if initial:
+            await self.stream_write_drain(self._sid, initial)
         return self._sid
 
     def stream_write(self, sid, data, end_stream=False):
         pass
 
-    async def stream_write_drain(self, sid, data):
+    async def stream_write_drain(self, sid, data, end_stream=False):
         pass
 
     def stream_reset(self, sid, code):
@@ -586,7 +589,7 @@ async def test_a_writer_without_a_session_announces_with_no_token():
 
 
 async def test_close_withdraws_after_publish_done():
-    """At d14/d16 an aiomoqt peer ends the session on
+    """At d16 an aiomoqt peer ends the session on
     PUBLISH_NAMESPACE_DONE, so the subscriptions end first."""
     stub = _StubSession()
     agent = AgentSession(stub)

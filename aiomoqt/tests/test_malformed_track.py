@@ -4,6 +4,7 @@ MALFORMED_TRACK, cancel its subscription, refuse the track's later
 streams, and keep the session up. Stream-end handlers see the reset
 code (a relay terminates downstream from it)."""
 import asyncio
+import logging
 import time
 from collections import OrderedDict
 
@@ -12,7 +13,8 @@ import pytest
 from aiomoqt.client import MOQTClient
 from aiomoqt.server import MOQTServer
 from aiomoqt.messages.data import SubgroupHeader
-from aiomoqt.protocol import _MOQTSessionMixin, _DataStreamState, QuicErrorCode
+from aiomoqt.protocol import (MOQTStreamReject, _MOQTSessionMixin,
+                              _DataStreamState, QuicErrorCode)
 from aiomoqt.types import MOQTMessageType, ObjectStatus, StreamResetCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
@@ -47,7 +49,8 @@ def test_end_of_group_and_end_of_track_bound_later_objects():
     s._note_object_bound(7, 3, 10, EOG)
     assert s._object_out_of_bounds(7, 3, 9, NORMAL) is None
     assert s._object_out_of_bounds(7, 3, 10, EOG) is None       # same terminal again
-    assert s._object_out_of_bounds(7, 3, 10, NORMAL)
+    assert s._object_out_of_bounds(7, 3, 10, NORMAL) == (
+        "object 3.10 is past the end of group 3 (END_OF_GROUP object 3.10)")
     assert s._object_out_of_bounds(7, 3, 11, NORMAL)
     assert s._object_out_of_bounds(7, 4, 11, NORMAL) is None    # other group
     s._note_object_bound(7, 5, 0, EOT)
@@ -72,7 +75,20 @@ def test_fin_on_end_of_group_bit_stream_bounds_the_group():
     s._data_streams[11] = state
     s._cleanup_stream(11)
     assert s._object_out_of_bounds(7, 3, 4, NORMAL) is None
-    assert s._object_out_of_bounds(7, 3, 5, NORMAL)
+    # The reason names what ended the group: here the header's bit.
+    assert s._object_out_of_bounds(7, 3, 5, NORMAL) == (
+        "object 3.5 is past the end of group 3 (stream 11 ended with the "
+        "END_OF_GROUP bit after object 3.4)")
+
+
+def test_later_streams_of_a_malformed_track_are_refused_quietly():
+    s = _stub()
+    s._malformed_aliases.add(7)
+    header = SubgroupHeader(track_alias=7, group_id=4, subgroup_id=0)
+    with pytest.raises(MOQTStreamReject) as e:
+        s._admit_subgroup_stream(15, header)
+    assert e.value.error_code == StreamResetCode.MALFORMED_TRACK
+    assert e.value.quiet
 
 
 async def test_cancelling_a_request_stream_frees_the_track_bounds():
@@ -140,6 +156,12 @@ async def test_object_past_end_of_group_resets_the_stream_and_cancels_the_track(
     cancelled = []
     server = await _make_server(_PORT, cancelled).serve()
     ended = []
+    records = []
+    handler = logging.Handler(logging.DEBUG)
+    handler.emit = records.append
+    watched = [logging.getLogger(n) for n in ("aiomoqt.protocol", "aiomoqt.data")]
+    for lg in watched:
+        lg.addHandler(handler)
     try:
         client = MOQTClient("localhost", _PORT, path="/", use_quic=True,
                             verify_tls=False, supported_drafts=18)
@@ -168,7 +190,17 @@ async def test_object_past_end_of_group_resets_the_stream_and_cancels_the_track(
             assert session._close_err is None         # session survives
     finally:
         server.close()
+        for lg in watched:
+            lg.removeHandler(handler)
     assert cancelled                                  # our subscription was cancelled
+    # One WARNING tells it: peer, stream, reason, resets; no ERROR.
+    loud = [r for r in records if r.levelno >= logging.WARNING]
+    assert [r.levelno for r in loud] == [logging.WARNING], [r.getMessage() for r in loud]
+    msg = loud[0].getMessage()
+    assert msg.startswith(f"MOQT: malformed track alias={ok.track_alias} from "), msg
+    assert msg.endswith(": object 0.5 is past the end of group 0 (END_OF_GROUP "
+                        "object 0.2); 1 stream(s) reset"), msg
+    assert ", stream " in msg
 
 
 # -- an Object whose Properties cannot be parsed ------------------------

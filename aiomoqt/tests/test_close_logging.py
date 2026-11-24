@@ -98,14 +98,28 @@ async def test_peer_close_on_webtransport(records, code, level, head):
     assert s._close_err == (code, "WebTransport session closed")
 
 
-async def test_local_error_close_logs_error(records):
-    s = _stub(is_wt=False, setup_done=True)
+@pytest.mark.parametrize("is_wt", [False, True], ids=["quic", "wt"])
+async def test_our_close_for_a_peer_error_logs_warning(records, is_wt):
+    s = _stub(is_wt=is_wt, setup_done=True)
     s._close_session(SessionCloseCode.PROTOCOL_VIOLATION, "bad message")
     rec = _close_line(records)
-    assert rec.levelno == logging.ERROR
+    assert rec.levelno == logging.WARNING
     assert rec.getMessage() == ("MOQT: closing: PROTOCOL_VIOLATION (0x3) "
                                 "to 158.23.190.70:6983; reason: bad message")
     assert s.sent == [()]
+
+
+@pytest.mark.parametrize("code, head", [
+    pytest.param(SessionCloseCode.INTERNAL_ERROR, "INTERNAL_ERROR (0x1)", id="internal"),
+    pytest.param(0x7777, "0x7777", id="unknown-code"),
+])
+async def test_our_close_for_our_own_failure_logs_error(records, code, head):
+    s = _stub(is_wt=False, setup_done=True)
+    s._close_session(code, "broke")
+    rec = _close_line(records)
+    assert rec.levelno == logging.ERROR
+    assert rec.getMessage() == (f"MOQT: closing: {head} "
+                                "to 158.23.190.70:6983; reason: broke")
 
 
 @pytest.mark.parametrize("is_wt", [False, True], ids=["quic", "wt"])
@@ -382,19 +396,22 @@ async def test_local_close_is_one_line(records, use_quic, how):
 
 @requires_certs
 @pytest.mark.parametrize("use_quic", _REAL)
-async def test_a_peer_violation_logs_one_error(records, use_quic):
+async def test_a_peer_violation_logs_one_warning(records, use_quic):
     async with _pair(use_quic, draft=16) as (client, peer, port):
         rid = peer._local_request_max
         client.send_control_message(TrackStatus(
             request_id=rid, track_namespace=(b"n",), track_name=b"t"))
         await _closed(client, peer)
-    errors = [r.getMessage() for r in records.records
-              if r.levelno >= logging.ERROR]
-    assert len(errors) == 1, errors
+    assert not [r.getMessage() for r in records.records
+                if r.levelno >= logging.ERROR]
+    ours = [r.getMessage() for r in records.records
+            if r.levelno == logging.WARNING
+            and r.getMessage().startswith("MOQT: closing:")]
+    assert len(ours) == 1, ours
     assert re.fullmatch(
         rf"MOQT: closing: TOO_MANY_REQUESTS \(0x7\) to 127\.0\.0\.1:\d+; "
         rf"reason: peer request_id {rid} at or beyond our MAX_REQUEST_ID {rid}",
-        errors[0]), errors
+        ours[0]), ours
 
 
 @requires_certs

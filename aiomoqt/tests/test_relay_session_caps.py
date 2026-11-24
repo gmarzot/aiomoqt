@@ -1,7 +1,7 @@
 """aiomoqt-relay caps what one session holds open: namespaces and
 subscriptions past --max-namespaces-per-session and
 --max-subscriptions-per-session are refused with EXCESSIVE_LOAD
-(INTERNAL_ERROR at d14/d16, which lack it), one WARNING per session per
+(INTERNAL_ERROR at d16, which lack it), one WARNING per session per
 cap, while other sessions are unaffected. Refused SUBSCRIBEs leave no
 state in the relay's session."""
 import asyncio
@@ -40,7 +40,6 @@ def _clear_relay():
     relay._cap_warned.clear()
     relay._ns_subs.clear()
     relay._track_subs.clear()
-    relay._announce_subs.clear()
 
 
 @pytest.fixture(autouse=True)

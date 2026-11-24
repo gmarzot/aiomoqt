@@ -14,6 +14,10 @@ audio, plus video from an mp4) to a relay.
   # the same broadcast to two relays: one process, one set of timestamps
   %(prog)s moqt://relay-a:4433/ moqt://relay-b:4433/ -N demo/live --mp4 clip.mp4
 
+  # an ABR ladder: video (with audio), video_1 and video_2, one altGroup
+  %(prog)s https://relay.example/ -N demo/abr --mp4 1080.mp4 --mp4 720.mp4 \\
+    --mp4 360.mp4 --loop --timestamp-mapping
+
 The video track sends the mp4's samples byte-for-byte as LOC canonical
 payloads (loc-02 §2.1.3); the avcC extradata rides the catalog
 initDataList and VIDEO_CONFIG group-start properties. Frames pace to
@@ -30,6 +34,10 @@ frame (loc-04 §2.1.1, §2.1.4) and codec avc3/hev1.
   ffmpeg -fflags nobuffer -i srt://0.0.0.0:9000?mode=listener -map 0:v -map 0:a \\
     -c copy -f mpegts -pes_payload_size 0 -omit_video_pes_length 0 -muxdelay 0 \\
     -flush_packets 1 - | %(prog)s https://relay.example/moq-relay -N obs --ts -
+
+  # MPEG-TS contribution as MSFTS: the TS packets themselves, unmodified,
+  # seven to an object as they arrive on UDP port 5000
+  %(prog)s moqt://relay.example:4433/ -N contrib/feed --ts udp://@:5000 --msfts
 
   # HLS/DASH (anything FFmpeg opens) as CMAF tracks; needs the media
   # extra: pip install 'aiomoqt[media]'. --rendition all is experimental.
@@ -65,7 +73,7 @@ import time
 import traceback
 import uuid
 from fractions import Fraction
-from typing import NamedTuple, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 from aiomoqt.client import MOQTClient
 from aiomoqt.delivery import DatagramTooLarge
@@ -81,8 +89,13 @@ from aiomoqt.media.catalog import (
 from aiomoqt.media.cmaf import CmafChunker, chunk_decode_time, prft_box
 from aiomoqt.media.ingest import INSTALL_HINT, RENDITIONS, Ingest
 from aiomoqt.media.loc import LOC_PROP_AUDIO_CONFIG, LOC_PROP_VIDEO_CONFIG
+from aiomoqt.media import msfts
 from aiomoqt.media.locmaf import LOCMAF_VERSION
 from aiomoqt.media.mpegts import TsCadence, TsDemuxer, TsRates
+from aiomoqt.media.timeline import (
+    MediaTimeline, MediaTimelinePublisher, timeline_name, timeline_track,
+)
+from aiomoqt.media.udp import UdpInput, is_udp_url, parse_udp_url
 from aiomoqt.media.sources import (
     AnnexBAssembler, HevcAnnexBAssembler, Mp4Reader, avcc_codec_string,
     hevc_sps_info, hvcc_codec_string, pcm_tone_frames, sps_dimensions,
@@ -131,9 +144,13 @@ def parse_args():
         parser, namespace=f'aiomoqt/demo-{uuid.uuid4().hex[:4]}',
         namespace_help='MoQT namespace (default: aiomoqt/demo-<rand4>, '
                        'fresh per run; pass one explicitly to pin it)')
-    parser.add_argument('--mp4', type=str, default=None, metavar='FILE',
+    parser.add_argument('--mp4', action='append', default=None,
+                        metavar='FILE',
                         help='Publish this mp4\'s H.264, H.265 or AV1 track '
-                             'as video (samples pass through, no decode)')
+                             'as video (samples pass through, no decode). '
+                             'Repeatable: the first file gives the audio and '
+                             'track video, each further one a video-only '
+                             'track video_1, video_2, ...')
     parser.add_argument('--loop', action='store_true',
                         help='Loop the mp4 for the full duration')
     parser.add_argument('--h264', type=str, default=None, metavar='FILE',
@@ -141,9 +158,34 @@ def parse_args():
                              'stream ("-" = stdin, e.g. an ffmpeg/OBS '
                              'pipe); frames are stamped on arrival')
     parser.add_argument('--ts', type=str, default=None, metavar='FILE',
-                        help='Publish a live MPEG-TS stream ("-" = stdin): '
+                        help='Publish a live MPEG-TS stream ("-" = stdin, '
+                             'or udp://[@][HOST]:PORT to receive datagrams, '
+                             'joining HOST when it is a multicast group): '
                              'H.264 or H.265 video and AAC or Opus audio, '
-                             'stamped from the PES timestamps')
+                             'stamped from the PES timestamps. Each video '
+                             'stream is a track: video, video_1, ... in PMT '
+                             'order; audio is the first audio stream. With '
+                             '--msfts, the TS packets themselves.')
+    parser.add_argument('--msfts', action='store_true',
+                        help='With --ts: publish the TS packets unmodified '
+                             'as one mpeg2ts track (draft-gregoire-moq-'
+                             'msfts-02, as moq2ts --unmodified), named '
+                             'program-<PAT program number>, or mux for a '
+                             'multi-program stream (-T NAME prefixes it), '
+                             'and its MSF media timeline <name>.timeline. '
+                             'Groups start at the first program\'s random '
+                             'access points; the PAT and PMT ride the '
+                             'catalog initDataList. Packets go out as they '
+                             'arrive, no pacing. A PSI change to the program '
+                             'number, or from one program to several or '
+                             'back, ends the track and publishes the next.')
+    parser.add_argument('--msfts-packets', type=int,
+                        default=msfts.DEFAULT_PACKETS, metavar='N',
+                        help='With --msfts: TS packets per object, sent '
+                             'as soon as N have arrived, or a partial '
+                             f'object {msfts.FLUSH_S * 1000:g} ms after '
+                             'its first packet (default: '
+                             f'{msfts.DEFAULT_PACKETS}, 1316 bytes)')
     parser.add_argument('--input', type=str, default=None, metavar='URL',
                         help='Publish anything FFmpeg opens (HLS or DASH '
                              'playlist, file, ...) as CMAF tracks, paced '
@@ -188,6 +230,11 @@ def parse_args():
                         metavar='MS',
                         help='Catalog targetLatency (msf-01 §5.2.8) — '
                              'players size their playout buffer from it')
+    parser.add_argument('--delivery-timeout', type=int, default=0,
+                        metavar='MS',
+                        help='OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT of every '
+                             'media track, as Track Properties (MOQT §8); '
+                             '0 sets none. Default: 0')
     parser.add_argument('--loc01-compat', action='store_true',
                         help='Also emit timestamps under loc-01\'s '
                              'property id 0x02 for players not yet on '
@@ -206,10 +253,6 @@ def parse_args():
                              'of each group, and on every object with '
                              '--loc-codecstring. Default: wall-clock µs, '
                              'no TIMESCALE. 1000000 keeps µs values.')
-    parser.add_argument('--loc-bare', action='store_true',
-                        help='LOC payloads without the (empty) Private '
-                             'Properties block 0x0A 0x00, for receivers '
-                             'predating loc-04 §2.2')
     pub_mode = parser.add_mutually_exclusive_group()
     pub_mode.add_argument('--pub-ns', action='store_true',
                           help='PUBLISH_NAMESPACE only; the relay forwards '
@@ -234,10 +277,11 @@ def parse_args():
                              'sets in every key frame instead of '
                              'VIDEO_CONFIG or catalog initData; catalog '
                              'codec avc3/hev1')
-    parser.add_argument('--catalog-bitrate', type=int, default=None,
-                        metavar='BPS',
+    parser.add_argument('--catalog-bitrate', type=int, action='append',
+                        default=None, metavar='BPS',
                         help='Catalog bitrate of the video track (of audio '
-                             'when there is no video). Default: the '
+                             'when there is no video); repeat for each video '
+                             'track in order. Default: the '
                              'mp4\'s mean; --ts measures it, and the '
                              'catalog omits it until measured.')
     parser.add_argument('--catalog-audio-bitrate', type=int, default=None,
@@ -245,6 +289,15 @@ def parse_args():
                         help='Catalog bitrate of the audio track, with or '
                              'without video. Default: as for '
                              '--catalog-bitrate.')
+    parser.add_argument('--video-alt', choices=('one', 'each'), default=None,
+                        help='With several video tracks (--mp4, --ts): one '
+                             '= one catalog altGroup for all, a ladder '
+                             '(default); each = an altGroup per track, '
+                             'views')
+    parser.add_argument('--video-label', action='append', default=None,
+                        metavar='TEXT',
+                        help='Catalog label of a video track; repeat for '
+                             'each video track in order (--mp4, --ts)')
     parser.add_argument('--init-data', choices=('catalog', 'track', 'object'),
                         default=None,
                         help='LOC decoder config placement: catalog = '
@@ -296,7 +349,10 @@ def parse_args():
              'object of each group. Sources without a fixed GOP (live '
              'inputs, irregular keyframes; see --ts-cadence) send '
              'OBJECT_TIMESTAMP on every object instead. LOC timestamps '
-             'are unchanged.')
+             'are unchanged. With --msfts: TIMESCALE 90 kHz and '
+             'TIMESTAMP_MAPPING anchored at the track\'s start, and on '
+             'every object an OBJECT_TIMESTAMP, its first packet\'s PCR '
+             'time on the ingest wall clock.')
     ts_group.add_argument(
         '--ts-cadence', type=_cadence, default=None,
         metavar='fps=N[/D],gop=M',
@@ -318,7 +374,7 @@ def parse_args():
              'is up, anchor with --timestamp-mapping, stats every '
              '--stats interval, endpoint_lost, '
              'endpoint_up, done); human output goes to stderr')
-    _cli.add_run(parser, duration=30)
+    _cli.add_run(parser)
     _cli.add_session(parser)
     _cli.add_keepalive(parser, default=10)
     _cli.add_fetch_history(parser)
@@ -330,8 +386,19 @@ def parse_args():
         parser.error('-t/--duration: seconds, or 0 for no limit')
     if args.duration == 0:
         args.duration = math.inf
+    if args.delivery_timeout < 0:
+        parser.error('--delivery-timeout: milliseconds, or 0 for none')
     if sum(bool(s) for s in (args.mp4, args.h264, args.ts, args.input)) > 1:
         parser.error('--mp4, --h264, --ts and --input are mutually exclusive')
+    if is_udp_url(args.ts):
+        try:
+            parse_udp_url(args.ts, listen=True)
+        except ValueError as e:
+            parser.error(f'--ts: {e}')
+    if args.msfts:
+        _check_msfts(parser, args)
+    elif args.msfts_packets != msfts.DEFAULT_PACKETS:
+        parser.error('--msfts-packets applies to --msfts only')
     if args.input:
         if args.packaging == PACKAGING_LOC:
             parser.error('--input publishes cmaf or locmaf packaging')
@@ -351,7 +418,6 @@ def parse_args():
         parser.error('--loc-timescale must be positive')
     for flag, on in (('--loc-codecstring', args.loc_codecstring),
                      ('--annexb', args.annexb),
-                     ('--loc-bare', args.loc_bare),
                      ('--loc-timescale', args.loc_timescale)):
         if on and args.packaging != PACKAGING_LOC:
             parser.error(f'{flag} applies to LOC packaging only')
@@ -386,10 +452,20 @@ def parse_args():
             parser.error('--start-at needs --timestamp-mapping')
         if not (args.mp4 or args.ts):
             parser.error('--start-at applies to --mp4 and --ts')
-    for flag, bps in (('--catalog-bitrate', args.catalog_bitrate),
+    for flag, bps in (*(('--catalog-bitrate', b)
+                        for b in args.catalog_bitrate or ()),
                       ('--catalog-audio-bitrate', args.catalog_audio_bitrate)):
         if bps is not None and bps <= 0:
             parser.error(f'{flag} must be positive')
+    if not (args.mp4 or args.ts):
+        for flag, on in (('--video-alt', args.video_alt),
+                         ('--video-label', args.video_label)):
+            if on:
+                parser.error(f'{flag} applies to --mp4 and --ts only')
+        if len(args.catalog_bitrate or ()) > 1:
+            parser.error('--catalog-bitrate: several values need --mp4 or '
+                         '--ts')
+    args.video_alt = args.video_alt or 'one'
     if args.packaging != PACKAGING_LOC:
         for flag, on in (('--no-catalog', args.no_catalog),
                          ('--init-data', args.init_data not in
@@ -399,6 +475,37 @@ def parse_args():
     if args.no_catalog and args.init_data == 'catalog':
         parser.error('--init-data catalog needs a catalog')
     return args
+
+
+# --msfts-packets ceiling: objects under 1 MB.
+_MSFTS_MAX_PACKETS = 5000
+
+
+def _check_msfts(parser, args) -> None:
+    """--msfts takes --ts and no option of the LOC, CMAF or mp4 paths."""
+    if not args.ts:
+        parser.error('--msfts needs --ts')
+    if not 1 <= args.msfts_packets <= _MSFTS_MAX_PACKETS:
+        parser.error(f'--msfts-packets must be 1-{_MSFTS_MAX_PACKETS}')
+    for flag, on in (
+            ('--packaging', args.packaging not in (None, PACKAGING_LOC)),
+            ('--ts-cadence', args.ts_cadence is not None),
+            ('--start-at', args.start_at is not None),
+            ('--datagram', args.datagram), ('--no-catalog', args.no_catalog),
+            ('--annexb', args.annexb), ('--init-data', args.init_data),
+            ('--loc-codecstring', args.loc_codecstring),
+            ('--loc-timescale', args.loc_timescale is not None),
+            ('--loc01-compat', args.loc01_compat),
+            ('--no-audio', args.no_audio), ('--tone', args.tone),
+            ('--catalog-audio-bitrate',
+             args.catalog_audio_bitrate is not None),
+            ('--video-alt', args.video_alt), ('--video-label', args.video_label),
+            ('--video-subgroups', args.video_subgroups != 'group'),
+            ('--audio-subgroups', args.audio_subgroups != 'group'),
+            ('--audio-frames-per-group',
+             args.audio_frames_per_group is not None)):
+        if on:
+            parser.error(f'{flag} does not apply to --msfts')
 
 
 def _cadence(text: str) -> TsCadence:
@@ -480,13 +587,44 @@ def _annexb_codec(codec: str) -> str:
     return {'avc1': 'avc3', 'hvc1': 'hev1'}.get(codec[:4], codec[:4]) + codec[4:]
 
 
+def _video_name(index: int) -> str:
+    """Track name of the index-th video track: video, video_1, ..."""
+    return f'video_{index}' if index else 'video'
+
+
+def _as_list(value) -> list:
+    """None, one value, or a list of them, as a list."""
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _check_video_counts(args, n_video: int) -> None:
+    """At most one --video-label and --catalog-bitrate per video track
+    (one bitrate without video: audio's)."""
+    labels = _as_list(getattr(args, 'video_label', None))
+    if len(labels) > n_video:
+        raise _usage_error(f'{len(labels)} --video-label values for '
+                           f'{n_video} video track(s)')
+    bps = _as_list(getattr(args, 'catalog_bitrate', None))
+    if len(bps) > max(n_video, 1):
+        raise _usage_error(f'{len(bps)} --catalog-bitrate values for '
+                           f'{n_video} video track(s)')
+
+
 def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
+    """`video`: None, one video view or a list, named video, video_1, ...
+    in order; several share one altGroup, or (--video-alt each) take one
+    each."""
     packaging = args.packaging
     chunkers = chunkers or {}
     tracks = []
     init = []
+    videos = _as_list(video)
     live_ts = bool(getattr(args, 'ts', None))
-    explicit = getattr(args, 'catalog_bitrate', None)
+    explicit = _as_list(getattr(args, 'catalog_bitrate', None))
+    labels = _as_list(getattr(args, 'video_label', None))
+    each = getattr(args, 'video_alt', None) == 'each'
     audio_bps = getattr(args, 'catalog_audio_bitrate', None)
     if audio is not None:
         # Opus over LOC needs no decoder description, so no initData.
@@ -497,7 +635,8 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec=audio.codec_string,
             samplerate=audio.samplerate,
             channelConfig=str(audio.channels),
-            bitrate=(audio_bps or (explicit if video is None else None)
+            bitrate=(audio_bps or (explicit[0] if explicit and not videos
+                                   else None)
                      or audio.avg_bitrate or (None if live_ts else 128_000)),
             initRef='a0' if a_init else None))
         if 'audio' in chunkers:
@@ -510,26 +649,30 @@ def _build_catalog(args, video, audio, chunkers=None) -> Catalog:
             renderGroup=1, codec='pcm-s16', samplerate=_SAMPLERATE,
             channelConfig=str(_CHANNELS),
             bitrate=audio_bps or _SAMPLERATE * _CHANNELS * 16))
-    if video is not None:
-        cmaf = 'video' in chunkers
+    for i, video in enumerate(videos):
+        name, ref = _video_name(i), f'v{i}'
+        cmaf = name in chunkers
         # Annex B: a decoder description would contradict the payload.
         annexb = _annexb_family(args, video) is not None
         v_config = None if annexb else video.config
-        tracks.insert(0, CatalogTrack(
-            name='video', packaging=packaging, isLive=True, role='video',
+        tracks.insert(i, CatalogTrack(
+            name=name, packaging=packaging, isLive=True, role='video',
+            label=labels[i] if i < len(labels) else None,
             renderGroup=1,
+            altGroup=None if len(videos) < 2 else i + 1 if each else 1,
             codec=(_annexb_codec(video.codec_string) if annexb
                    else video.codec_string),
             width=video.width, height=video.height,
             framerate=video.fps,
-            bitrate=(explicit or video.avg_bitrate
+            bitrate=((explicit[i] if i < len(explicit) else None)
+                     or video.avg_bitrate
                      or (None if live_ts else 2_000_000)),
-            initRef='v0' if (cmaf or v_config) else None))
+            initRef=ref if (cmaf or v_config) else None))
         if cmaf:
             init.append(InitData.from_bytes(
-                'v0', chunkers['video'].init_segment()))
+                ref, chunkers[name].init_segment()))
         elif v_config:
-            init.append(_init_data(args, 'v0', video.config,
+            init.append(_init_data(args, ref, video.config,
                                    LOC_PROP_VIDEO_CONFIG))
     if getattr(args, 'target_latency', None) is not None:
         for t in tracks:
@@ -685,17 +828,29 @@ class _LiveAudio:
                              else f"mp4a.40.{(self.config[0] >> 3) & 0x1F}")
 
 
+def _ts_input(spec: str):
+    """--ts as a byte stream with read1(): stdin, udp://, or a path."""
+    if spec == '-':
+        return sys.stdin.buffer
+    if is_udp_url(spec):
+        try:
+            return UdpInput(spec)
+        except OSError as e:
+            raise _SourceError(f'  error: --ts {spec}: {e}')
+    return open(spec, 'rb')
+
+
 def _open_live_ts(args):
     """Read the stream until the PMT and the codec configs the catalog
-    needs are in; returns (fh, demuxer, units-so-far, video, audio)."""
-    fh = sys.stdin.buffer if args.ts == '-' else open(args.ts, 'rb')
+    needs are in; returns (fh, demuxer, units-so-far, [video], audio)."""
+    fh = _ts_input(args.ts)
     dmx = TsDemuxer()
     first = []
 
     def ready():
         if not dmx.pmt_seen:
             return False
-        if dmx.video_pid is not None and dmx.video.config is None:
+        if any(asm.config is None for asm in dmx.videos):
             return False
         want_audio = not args.no_audio and dmx.audio_pid is not None
         return not want_audio or dmx.audio_samplerate is not None
@@ -708,13 +863,13 @@ def _open_live_ts(args):
         if units and not first:
             dmx.to_us(units[0].pts)  # anchor at arrival, not at first send
         first += units
-    video = _LiveVideo(dmx.video) if dmx.video_pid is not None else None
+    videos = [_LiveVideo(asm) for asm in dmx.videos]
     audio = (_LiveAudio(dmx)
              if dmx.audio_pid is not None and not args.no_audio else None)
-    if video is None and audio is None:
+    if not videos and audio is None:
         raise _SourceError('  error: ts stream has no H.264/H.265 video or '
                            'AAC/Opus audio')
-    return fh, dmx, first, video, audio
+    return fh, dmx, first, videos, audio
 
 
 async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
@@ -723,20 +878,23 @@ async def _apply_config_change(dmx: TsDemuxer, tracks: dict, pub):
     cat = pub.catalog_track.catalog
     init = {i.id: i for i in (cat.initDataList or [])
             if i.type == INIT_TYPE_INLINE} if cat is not None else {}
-    video = tracks.get('video')
-    if video is not None and dmx.video.config != video.config:
-        video.config = dmx.video.config
-        view = _LiveVideo(dmx.video)
+    for i, asm in enumerate(dmx.videos):
+        name, ref = _video_name(i), f'v{i}'
+        video = tracks.get(name)
+        if video is None or asm.config == video.config:
+            continue
+        video.config = asm.config
+        view = _LiveVideo(asm)
         codec = (_annexb_codec(view.codec_string) if video.annexb
                  else view.codec_string)
         if video.codec_string is not None:
             video.codec_string = codec
         for t in (cat.tracks if cat is not None else ()):
-            if t.name == 'video':
+            if t.name == name:
                 t.codec, t.width, t.height = codec, view.width, view.height
-        if 'v0' in init:
-            init['v0'].data = InitData.from_bytes('v0', view.config).data
-        print(f"  video config changed: {view.width}x{view.height} "
+        if ref in init:
+            init[ref].data = InitData.from_bytes(ref, view.config).data
+        print(f"  {name} config changed: {view.width}x{view.height} "
               f"{codec}")
     audio = tracks.get('audio')
     entry = cat.find('audio') if cat is not None else None
@@ -775,9 +933,9 @@ async def _apply_rates(rates: TsRates, args, pub) -> None:
         return
     for t in cat.tracks:
         if t.role == 'video' and t.framerate is None:
-            t.framerate = rates.fps
+            t.framerate = rates.framerates.get(t.name)
         if t.bitrate is None:
-            t.bitrate = rates.bps.get(t.role)
+            t.bitrate = rates.bps.get(t.name)
     await _republish(pub)
 
 
@@ -809,10 +967,10 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
         if [u for u in units if rates.add(u)]:
             await _apply_rates(rates, args, pub)
         for u in units:
-            track = tracks.get(u.kind)
+            track = tracks.get(u.track)
             if track is None:
                 continue
-            key = u.key
+            key, end = u.key, False
             stamp = dmx.to_us(u.pts)
             if wall0 is not None:
                 if stamp < wall0:
@@ -831,8 +989,9 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
                 else:
                     key = n_audio % audio_per_group == 0
                     n_audio += 1
-            await _send(track, stats[u.kind], u.payload, key,
-                        timestamp=stamp)
+                    end = n_audio % audio_per_group == 0
+            await _send(track, stats[u.track], u.payload, key,
+                        timestamp=stamp, end=end)
         if eof or time.monotonic() >= deadline:
             break
         chunk = await loop.run_in_executor(None, fh.read1, 65536)
@@ -842,6 +1001,265 @@ async def _feed_ts_live(tracks: dict, fh, dmx: TsDemuxer, first, args,
             units, eof = dmx.close(), True
     for track in tracks.values():
         await track.finish()
+
+
+class _Publisher(FanoutPublisher):
+    """FanoutPublisher giving each media track the --delivery-timeout."""
+
+    delivery_timeout = 0
+
+    def add_track(self, track):
+        if self.delivery_timeout:
+            track.object_delivery_timeout = self.delivery_timeout
+            track.subgroup_delivery_timeout = self.delivery_timeout
+        return super().add_track(track)
+
+
+# --msfts: refuse a stream with no PAT and PMT in this many packets.
+_MSFTS_PSI_PACKETS = 100_000
+
+
+def _now_us() -> int:
+    return int(time.time() * 1_000_000)
+
+
+def _open_msfts(args):
+    """Read the stream until the PAT and the first program's PMT are in;
+    returns (fh, packager, objects so far)."""
+    fh = _ts_input(args.ts)
+    packager = msfts.TsPackager(args.msfts_packets)
+    first = []
+    while not packager.ready:
+        if packager.packets_in > _MSFTS_PSI_PACKETS:
+            raise _SourceError(f'  error: no PAT and PMT in '
+                               f'{_MSFTS_PSI_PACKETS} packets of --ts')
+        chunk = fh.read1(65536)
+        if not chunk:
+            raise _SourceError('  error: ts stream ended before PAT and PMT')
+        first += packager.feed(chunk, _now_us())
+    return fh, packager, first
+
+
+def _msfts_name(args, packager) -> str:
+    """The track name the stream's PSI gives: program-<PAT program
+    number>, or mux for a multiplex; -T NAME prefixes it, NAME-program-N
+    or NAME-mux."""
+    if packager.mode == msfts.MODE_UNMODIFIED_MULTIPLEX:
+        name = 'mux'
+    else:
+        programs = packager.programs
+        name = f'program-{programs[0][0] if programs else 1}'
+    return f'{args.trackname}-{name}' if args.trackname else name
+
+
+# A new track's objects wait this long for its first subscriber, so a
+# receiver that follows the catalog to it misses none.
+_SWITCH_HOLD_S = 2.0
+
+
+class _MsftsRun:
+    """--msfts: the mpeg2ts track of the stream's current PSI and its
+    media timeline track; with --timestamp-mapping, frindell timing on
+    the media track. A PSI change to a field the track declares ends
+    both and opens the next pair (msfts-02 §6), listed alone in a new
+    independent catalog, its groups numbered on from the last."""
+
+    def __init__(self, args, packager, session):
+        self.args = args
+        self.packager = packager
+        self.session = session
+        self.pub: Any = None
+        self.stats: dict = {}
+        self.generation = packager.generation
+        self.name = _msfts_name(args, packager)
+        self.track: Any = None
+        self.timeline_track: Any = None
+        self.timeline: Optional[MediaTimeline] = None
+        self._timeline_stats = _TrackStats()
+        self._backlog: Optional[list] = None
+        self._backlog_at = 0.0
+
+    def catalog(self) -> Catalog:
+        """This generation's catalog: its track, its timeline, the PAT
+        and PMT."""
+        explicit = _as_list(getattr(self.args, 'catalog_bitrate', None))
+        entry = self.packager.catalog_track(
+            self.name, bitrate=explicit[0] if explicit else None,
+            target_latency=self.args.target_latency)
+        tracks = [entry, timeline_track(timeline_name(self.name),
+                                        [self.name])]
+        return Catalog(generatedAt=int(time.time() * 1000), tracks=tracks,
+                       initDataList=[InitData.from_bytes(
+                           entry.initRef, self.packager.init_data)])
+
+    def add_tracks(self, pub, first_group: int = 0) -> list:
+        """Build this generation's tracks into `pub`; `first_group` is the
+        group its objects start at."""
+        self.pub = pub
+        history = self.args.fetch_history
+        self.track = pub.add_track(msfts.MsftsTrackPublisher(
+            self.session, self.args.namespace, self.name,
+            fetch_history_bytes=history))
+        if self.args.timestamp_mapping:
+            self.track.frindell = msfts.PcrTimestamps(first_group,
+                                                      _now_us())
+        self.stats[self.name] = _TrackStats()
+        self.timeline = MediaTimeline()
+        self.timeline_track = pub.add_track(MediaTimelinePublisher(
+            self.session, self.args.namespace, timeline_name(self.name),
+            fetch_history_bytes=history))
+        return [self.track, self.timeline_track]
+
+    async def send(self, o) -> None:
+        if o.track != self.generation:
+            await self._next(o.track, o.group)
+        if self._backlog is not None:
+            self._backlog.append(o)
+            await self.drain()
+            return
+        await self._send(o)
+
+    async def drain(self) -> None:
+        """Release a new track's held objects once it has a subscriber;
+        past the hold, drop them as a live start would."""
+        held = self._backlog
+        if held is None:
+            return
+        if self.track.demand[0] > 0:
+            self._backlog = None
+            for o in held:
+                await self._send(o)
+        elif time.monotonic() - self._backlog_at > _SWITCH_HOLD_S:
+            self._backlog = None
+            self.stats[self.name].dropped += len(held)
+
+    @property
+    def holding(self) -> bool:
+        return self._backlog is not None
+
+    async def _send(self, o) -> None:
+        frindell = getattr(self.track, 'frindell', None)
+        at = o.at_us if frindell is None else frindell.wall_us(o.pcr, o.at_us)
+        sent = await _send(self.track, self.stats[self.name], o.payload,
+                           o.key, timestamp=at,
+                           group_id=o.group if o.key else None,
+                           arrival_us=o.at_us)
+        if (sent and o.key and self.timeline is not None
+                and o.pts is not None):
+            await _send(self.timeline_track, self._timeline_stats,
+                        self.timeline.add(o.pts // 90, o.group, 0,
+                                          o.at_us // 1000),
+                        True, group_id=o.group, end=True)
+
+    async def _next(self, generation: int, first_group: int) -> None:
+        """End this generation's tracks and publish the next's."""
+        old = self.name
+        for t in (self.track, self.timeline_track):
+            if t is not None:
+                await t.finish()
+                self.pub.remove_track(t.trackname)
+        self.stats.pop(old, None)
+        self.generation = generation
+        self.name = _msfts_name(self.args, self.packager)
+        self.timeline_track = self.timeline = None
+        for t in self.add_tracks(self.pub, first_group):
+            await self.pub.publish_track(t)
+        cat = self.pub.catalog_track.catalog
+        fresh = self.catalog()
+        if cat is not None:
+            cat.tracks, cat.initDataList = fresh.tracks, fresh.initDataList
+        await _republish(self.pub)
+        self._backlog = []
+        self._backlog_at = time.monotonic()
+        print(f"  {old}: the PSI changed a track field; ended it, "
+              f"publishing {self.name}")
+
+    async def apply_change(self) -> None:
+        """New PSI within the track, or a measured mux rate, into the
+        catalog, republished. Track fields stay as declared (MSF §5.3);
+        the initialization data follows the PSI (§6.12)."""
+        packager = self.packager
+        cat = self.pub.catalog_track.catalog
+        entry = cat.find(self.name) if cat is not None else None
+        if entry is None:
+            return
+        if packager.psi_changed:
+            packager.psi_changed = False
+            for item in cat.initDataList or ():
+                if item.id == entry.initRef:
+                    item.data = InitData.from_bytes(item.id,
+                                                    packager.init_data).data
+            print(f"  {self.name}: PSI changed, catalog initData updated")
+        if packager.bitrate_changed:
+            packager.bitrate_changed = False
+            if entry.bitrate is None:
+                entry.bitrate = packager.bitrate
+        await _republish(self.pub)
+
+    async def finish(self) -> None:
+        for t in (self.track, self.timeline_track):
+            if t is not None:
+                await t.finish()
+
+
+# A new track's backlog checks for its subscriber this often.
+_HOLD_POLL_S = 0.02
+
+
+async def _feed_msfts(run: _MsftsRun, fh, first, args):
+    """Send each object as the packager completes it; a partial one goes
+    once it has waited the packager's flush time."""
+    loop = asyncio.get_running_loop()
+    packager = run.packager
+    deadline = time.monotonic() + args.duration
+    if isinstance(fh, UdpInput):
+        read = fh.read
+    else:
+        pending = None
+
+        async def read(timeout):
+            nonlocal pending
+            if pending is None:
+                pending = loop.run_in_executor(None, fh.read1, 65536)
+            done, _ = await asyncio.wait({pending}, timeout=timeout)
+            if not done:
+                return None
+            fut, pending = pending, None
+            return fut.result()
+    objs = list(first)
+    eof = False
+    while True:
+        if packager.psi_changed or packager.bitrate_changed:
+            await run.apply_change()
+        for o in objs:
+            await run.send(o)
+        await run.drain()
+        left = deadline - time.monotonic()
+        if eof or left <= 0:
+            break
+        due = packager.flush_due()
+        timeout = left if math.isfinite(left) else None
+        if due is not None:
+            wait = max(0.0, (due - _now_us()) / 1e6)
+            timeout = wait if timeout is None else min(timeout, wait)
+        if run.holding:
+            timeout = (_HOLD_POLL_S if timeout is None
+                       else min(timeout, _HOLD_POLL_S))
+        chunk = await read(timeout)
+        now = _now_us()
+        if chunk is None:
+            due = packager.flush_due()
+            objs = packager.flush(now) if due is not None and now >= due else []
+        elif chunk:
+            objs = packager.feed(chunk, now)
+        else:
+            objs, eof = packager.close(), True
+    if isinstance(fh, UdpInput):
+        fh.close()
+    if run.holding:
+        run._backlog_at = 0.0
+        await run.drain()
+    await run.finish()
 
 
 def _cmaf_wrap(chunker: CmafChunker, video: bool):
@@ -1025,20 +1443,32 @@ class _Mp4Pass:
 
 
 def _mp4_passes(reader, audio, loop: bool, align: bool = False):
-    """(video, audio) _Mp4Pass of an mp4, None where absent, looping on
-    one period: the video track's presented duration, else audio's. With
-    `loop` and `align`, see _align_period."""
-    video = reader.video
-    lead = video or reader.audio
-    if lead is None:
-        return None, None
-    period = lead.presented_duration
-    passes = (_Mp4Pass(video, period, loop) if video else None,
-              _Mp4Pass(audio, period, loop, audio.samplerate)
-              if audio else None)
+    """(video, audio) _Mp4Pass of an mp4, None where absent; see
+    _mp4_ladder."""
+    videos, audio_pass = _mp4_ladder(
+        [reader.video] if reader.video else [], audio, loop, align)
+    return (videos[0] if videos else None), audio_pass
+
+
+def _mp4_ladder(videos: list, audio, loop: bool, align: bool = False):
+    """([video _Mp4Pass], audio _Mp4Pass or None) of mp4 tracks, looping
+    on one period: the shortest video track's presented duration, with a
+    WARNING when that trims a longer one, else audio's. With `loop` and
+    `align`, see _align_period."""
+    lead = videos or ([audio] if audio is not None else [])
+    if not lead:
+        return [], None
+    period = min(t.presented_duration for t in lead)
+    if loop and any(t.presented_duration != period for t in videos):
+        log.warning("--loop: video clips of %s s all loop on the shortest, "
+                    "%.3f s", ', '.join(f'{float(t.presented_duration):.3f}'
+                                        for t in videos), period)
+    passes = [_Mp4Pass(t, period, loop) for t in videos]
+    a_pass = (_Mp4Pass(audio, period, loop, audio.samplerate)
+              if audio is not None else None)
     if loop and align:
-        _align_period(*passes)
-    return passes
+        _align_period(passes, a_pass)
+    return passes, a_pass
 
 
 def _lcm(a: Fraction, b: Fraction) -> Fraction:
@@ -1047,18 +1477,19 @@ def _lcm(a: Fraction, b: Fraction) -> Fraction:
                     a.denominator * b.denominator)
 
 
-def _align_period(video: Optional[_Mp4Pass],
+def _align_period(videos: List[_Mp4Pass],
                   audio: Optional[_Mp4Pass]) -> None:
     """Trim the loop period to a whole number of the least common multiple
     of the video group and audio frame durations, so that every pass
     starts on both epoch grids; kept when the clip is shorter."""
     units = []
-    if video is not None and video.cadence:
-        c = video.cadence
-        units.append(Fraction(c.frame * c.per_group, c.timescale))
+    for video in videos:
+        if video.cadence:
+            c = video.cadence
+            units.append(Fraction(c.frame * c.per_group, c.timescale))
     if audio is not None and audio.cadence:
         units.append(Fraction(audio.cadence.frame, audio.cadence.timescale))
-    lead = video if video is not None else audio
+    lead = videos[0] if videos else audio
     if not units or lead is None:
         return
     unit = functools.reduce(_lcm, units)
@@ -1070,15 +1501,36 @@ def _align_period(video: Optional[_Mp4Pass],
                     "frame durations: loop seams carry OBJECT_TIMESTAMP",
                     period, unit)
         return
-    timed = video if video is not None and video.cadence else audio
+    timed = next((p for p in (*videos, audio)
+                  if p is not None and p.cadence), None)
     c = timed.cadence if timed is not None else None
     if c is not None and period - whole > Fraction(c.frame, c.timescale):
         log.warning("--loop: period trimmed from %.3f to %.3f s, a multiple "
                     "of %.3f s, so every pass starts on the group and frame "
                     "grids", period, whole, unit)
-    for p in (video, audio):
+    for p in (*videos, audio):
         if p is not None:
             p.trim(whole)
+
+
+def _check_cadences(passes: Dict[str, _Mp4Pass]) -> None:
+    """--timestamp-mapping: every video track on one frame duration and
+    GOP length in seconds, so their group and object IDs agree."""
+    def shape(p):
+        c = p.cadence
+        return c and (Fraction(c.frame, c.timescale), c.per_group)
+    shapes = {name: shape(p) for name, p in passes.items()}
+    if len(set(shapes.values())) < 2:
+        return
+
+    def fmt(s):
+        if s is None:
+            return 'no fixed cadence'
+        return f'{float(s[0]) * 1000:.3f} ms frames, {s[1]} per GOP'
+    raise _usage_error(
+        '--timestamp-mapping needs one frame duration and GOP length on '
+        'every video track: ' + '; '.join(
+            f'{name} {fmt(s)}' for name, s in shapes.items()))
 
 
 def _sample_us(source) -> int:
@@ -1109,11 +1561,13 @@ def _frindell_for(mp4: _Mp4Pass, per_group=None):
 
 
 def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str,
-                   per_group: int = 1) -> MediaTimestamps:
-    """MediaTimestamps for a --ts track: mapped from --ts-cadence at the
-    Unix epoch (audio on its frame size), else explicit."""
+                   per_group: int = 1, index: int = 0) -> MediaTimestamps:
+    """MediaTimestamps for a --ts track (video: the index-th): mapped from
+    --ts-cadence at the Unix epoch (audio on its frame size), else
+    explicit."""
     cadence = args.ts_cadence
-    if cadence is None or not any(u.kind == kind for u in first):
+    if cadence is None or not any(u.kind == kind and u.index == index
+                                  for u in first):
         return MediaTimestamps(0)
     if kind == 'audio':
         return cadence.audio_timestamps(
@@ -1124,7 +1578,7 @@ def _ts_timestamps(args, dmx: TsDemuxer, first, kind: str,
 def _anchor_ts(dmx: TsDemuxer, first, video: bool, wall0) -> None:
     """Hold the --ts clock with the first video key frame, else the first
     audio frame, at `wall0`."""
-    units = [u for u in first if u.kind == ('video' if video else 'audio')]
+    units = [u for u in first if u.track == ('video' if video else 'audio')]
     if units:
         u = next((u for u in units if u.key), units[0])
         dmx.clock.anchor(u.pts, wall0)
@@ -1139,10 +1593,13 @@ async def _pace(start: float, ts_us: int, pace: bool):
 
 async def _send(track, stats, payload: bytes, key: bool,
                 timestamp: Optional[Union[int, Fraction]] = None,
-                group_id: Optional[int] = None):
+                group_id: Optional[int] = None, end: bool = False,
+                arrival_us: Optional[int] = None):
     """Send one frame, or drop it while no subscriber has started
     generation: a paced feeder stays on the clock instead of queueing a
-    backlog for a late joiner.
+    backlog for a late joiner. `end` makes it its group's last frame.
+    True when it was sent. `arrival_us`, when the timestamp is not the
+    frame's arrival, is what its send lag counts from.
 
     LOC timestamps without a TIMESCALE property are µs since the Unix
     epoch — players schedule against the wall clock. Paced sources pass
@@ -1150,13 +1607,13 @@ async def _send(track, stats, payload: bytes, key: bool,
     stamped at send time."""
     if track.demand[0] == 0:
         stats.dropped += 1
-        return
+        return False
     entry_us = int(time.time() * 1_000_000)
     if timestamp is None:
         timestamp = entry_us
     stamp = (timestamp * track.timescale // 1_000_000 if track.timescale
              else round_us(timestamp))
-    kw = {}
+    kw = {'end_of_group': True} if end else {}
     frindell = getattr(track, 'frindell', None)
     if frindell is not None:
         kw['capture_us'] = timestamp
@@ -1166,10 +1623,12 @@ async def _send(track, stats, payload: bytes, key: bool,
                            group_id=group_id, **kw)
     # lag: how late the frame already was when we got it (source, pipe,
     # demux). tx: what handing it to the track cost us.
-    stats.count(payload, round_us(entry_us - timestamp),
-                int(time.time() * 1_000_000) - entry_us)
+    stats.count(payload, round_us(entry_us - (
+        timestamp if arrival_us is None else arrival_us)),
+        int(time.time() * 1_000_000) - entry_us)
     if key:
         stats.groups += 1
+    return True
 
 
 class _TrackStats:
@@ -1253,20 +1712,23 @@ async def _report_stats(stats: dict, interval: float, pub: FanoutPublisher,
     a stats event per interval; each track's `forwarding` counts its
     peers taking objects (Forward State 1, not idle)."""
     t0 = time.monotonic()
-    prev_obj = {name: 0 for name in stats}
-    prev_bytes = {name: 0 for name in stats}
+    # Per name: the stats last seen and their counts; a name's new
+    # stats (a returning --msfts track) count from 0.
+    prev: dict = {}
     while True:
         await asyncio.sleep(interval)
         parts = []
         tracks = {}
-        for name, st in stats.items():
+        for name, st in list(stats.items()):
             track = pub.tracks.get(name)
             discarded = getattr(track, 'frames_dropped', 0)
             objects = st.objects - discarded
-            ops = (objects - prev_obj[name]) / interval
-            kbps = (st.bytes - prev_bytes[name]) * 8 / interval / 1000
-            prev_obj[name] = objects
-            prev_bytes[name] = st.bytes
+            last = prev.get(name)
+            last_obj, last_bytes = ((0, 0) if last is None or last[0] is not st
+                                    else last[1:])
+            ops = (objects - last_obj) / interval
+            kbps = (st.bytes - last_bytes) * 8 / interval / 1000
+            prev[name] = (st, objects, st.bytes)
             forwarding = sum(1 for sub in getattr(track, 'subscriptions', ())
                              if sub.forward and sub.generating)
             tracks[name] = dict(objects=objects, groups=st.groups,
@@ -1312,11 +1774,13 @@ async def _feed_tone(track, args, stats: _TrackStats, clock=None,
         at = _exact(ts + offset * 1_000_000)
         await _pace(start, round_us(at), not args.no_pace)
         capture = _exact(wall0 + at)
+        end = False
         if m is not None:
             key, group = m.group_of(capture) != group, m.group_of(capture)
         else:
             key = i % per_group == 0
-        await _send(track, stats, payload, key, timestamp=capture)
+            end = (i + 1) % per_group == 0
+        await _send(track, stats, payload, key, timestamp=capture, end=end)
     await track.finish()
 
 
@@ -1359,17 +1823,20 @@ async def _feed_mp4_track(track, mp4: _Mp4Pass, args,
                        else offset + base + mp4.period if loop else None)
                 payload = wrap(s, ts, None if nxt is None
                                else round(nxt * 1_000_000))
+            end = False
             if grid is not None:
                 key = grid.group_of(capture) != group
                 group = grid.group_of(capture)
             elif group_frames is not None:
                 key = n % group_frames == 0
                 n += 1
+                end = n % group_frames == 0
             else:
                 key = s.key_frame
             if prft and key:
                 payload = _with_prft(payload, round_us(capture))
-            await _send(track, stats, payload, key, timestamp=capture)
+            await _send(track, stats, payload, key, timestamp=capture,
+                        end=end)
         k += 1
         if not loop or k * mp4.period > args.duration:
             break
@@ -1558,56 +2025,78 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     libquicr = apply_compat(getattr(args, 'compat', ''))
     urls = args.url if isinstance(args.url, list) else [args.url]
     relays = [parse_relay_url(u) for u in urls]
-    reader = Mp4Reader(args.mp4) if args.mp4 else None
-    video = reader.video if reader else None
+    readers = [Mp4Reader(path) for path in args.mp4 or ()]
+    reader = readers[0] if readers else None
+    if len(readers) > 1:
+        for path, r in zip(args.mp4, readers):
+            if r.video is None:
+                raise _SourceError(f"  error: {path}: no video track")
+    videos = [r.video for r in readers if r.video is not None]
     live = _open_live_h264(args) if args.h264 else None
     if live:
-        video = live[3]
-    ts = _open_live_ts(args) if args.ts else None
+        videos = [live[3]]
+    msfts_in = (_open_msfts(args) if args.ts and getattr(args, 'msfts', False)
+                else None)
+    msfts_run = None
+    if msfts_in:
+        args.no_audio = True
+        msfts_run = _MsftsRun(args, msfts_in[1], None)
+    ts = _open_live_ts(args) if args.ts and not msfts_in else None
     ts_audio = None
     if ts:
-        video, ts_audio = ts[3], ts[4]
+        videos, ts_audio = ts[3], ts[4]
         if args.ts_cadence is not None:
             ts[1].clock.hold()
-            if video is not None:
-                video.fps = args.ts_cadence.framerate
+            for v in videos:
+                v.fps = args.ts_cadence.framerate
         if ts_audio is None:
             args.no_audio = True
+    video = videos[0] if videos else None
+    _check_video_counts(args, len(videos))
     mp4_audio = (reader.audio
                  if reader and not (args.tone or args.no_audio) else None)
     chunkers = {}
     if args.packaging != PACKAGING_LOC and not args.input:
-        chunkers['video'] = CmafChunker(video)
+        for i, v in enumerate(videos):
+            chunkers[_video_name(i)] = CmafChunker(v)
         if mp4_audio is not None:
             chunkers['audio'] = CmafChunker(mp4_audio)
         elif not args.no_audio:
             print(f"  note: {args.packaging} packaging — tone audio skipped "
                   "(no AAC or Opus track in the mp4)")
             args.no_audio = True
-    annexb = _annexb_family(args, video)
-    if args.annexb and annexb is None:
+    annexbs = [_annexb_family(args, v) for v in videos]
+    if args.annexb and (not annexbs or None in annexbs):
         print("  note: --annexb applies to H.264/H.265 video; off")
-    v_codec = (_annexb_codec(video.codec_string) if annexb
-               else video.codec_string if video is not None else None)
+    v_codecs = [_annexb_codec(v.codec_string) if a else v.codec_string
+                for v, a in zip(videos, annexbs)]
     ingest = await _open_ingest(args) if args.input else None
     if ingest is not None:
         catalog = _build_ingest_catalog(args, ingest)
+    elif msfts_run is not None:
+        catalog = msfts_run.catalog()
     else:
-        catalog = _build_catalog(args, video, mp4_audio or ts_audio, chunkers)
-    v_mp4, a_mp4 = (_mp4_passes(reader, mp4_audio, args.loop,
-                                args.timestamp_mapping)
-                    if reader else (None, None))
+        catalog = _build_catalog(args, videos, mp4_audio or ts_audio,
+                                 chunkers)
+    v_mp4s, a_mp4 = (_mp4_ladder(videos, mp4_audio, args.loop,
+                                 args.timestamp_mapping)
+                     if reader else ([], None))
+    if args.timestamp_mapping and len(v_mp4s) > 1:
+        _check_cadences({_video_name(i): p for i, p in enumerate(v_mp4s)})
     spf = _SAMPLERATE * _FRAME_MS // 1000
     a_per = _audio_per_group(
         args, _sample_us(mp4_audio) if mp4_audio is not None
         else _FRAME_MS * 1000)
     if ts is not None:
-        v_time = _ts_timestamps(args, ts[1], ts[2], 'video')
+        v_times = [_ts_timestamps(args, ts[1], ts[2], 'video', index=i)
+                   for i in range(len(videos))]
         a_time = _ts_timestamps(args, ts[1], ts[2], 'audio', a_per)
     else:
-        v_time = _frindell_for(v_mp4) if v_mp4 else MediaTimestamps(0)
+        v_times = [_frindell_for(p) for p in v_mp4s]
         a_time = (_frindell_for(a_mp4, a_per) if a_mp4 is not None
                   else MediaTimestamps(0, _SAMPLERATE, spf * a_per, spf))
+    # The first video track gives the run its grid and --start-at check.
+    v_time = v_times[0] if v_times else MediaTimestamps(0)
     # With --timestamp-mapping the run starts on the epoch grid of video,
     # else of audio.
     grid = (_grid(v_time if video is not None else None,
@@ -1624,6 +2113,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
     async with contextlib.AsyncExitStack() as stack:
         if ingest is not None:
             stack.callback(ingest.close)
+        for opened in (msfts_in, ts):
+            if opened and isinstance(opened[0], UdpInput):
+                stack.callback(opened[0].close)
         stack.push_async_callback(_close_endpoints, endpoints)
         # A relay that cannot be reached is left out; the run fails only
         # when none can.
@@ -1650,8 +2142,6 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                  if args.audio_subgroups == 'object'
                  else StreamMapping.PER_GROUP)
         session = sessions[0]
-        # CMAF objects are not LOC: no Private Properties block.
-        loc_bare = args.loc_bare or args.packaging == PACKAGING_CMAF
         cfg_at = _INIT_DATA[args.init_data][1]
 
         def _track(name, **kwargs):
@@ -1661,7 +2151,6 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                 return LocmafTrackPublisher(session, args.namespace, name,
                                             init=init, **kwargs)
             return LocTrackPublisher(session, args.namespace, name,
-                                     loc_bare=loc_bare,
                                      timescale=args.loc_timescale,
                                      config_property=cfg_at, **kwargs)
         # One start for every paced feeder.
@@ -1676,8 +2165,9 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             if args.timestamp_mapping:
                 track.frindell = frindell
             return track
-        pub = FanoutPublisher(sessions, args.namespace,
-                              None if args.no_catalog else catalog)
+        pub = _Publisher(sessions, args.namespace,
+                         None if args.no_catalog else catalog)
+        pub.delivery_timeout = args.delivery_timeout
         stats = {}
         feeders = []
         if ingest is not None:
@@ -1688,26 +2178,32 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
                     MediaTimestamps(wall0)))
                 stats[t.name] = _TrackStats()
             feeders.append(_feed_ingest(ingest, tracks, args, stats))
+        elif msfts_run is not None and msfts_in is not None:
+            fh, _, first = msfts_in
+            msfts_run.session, msfts_run.stats = session, stats
+            msfts_run.add_tracks(pub)
+            feeders.append(_feed_msfts(msfts_run, fh, first, args))
         elif ts is not None:
             fh, dmx, first, _, _ = ts
             if grid is not None:
                 _anchor_ts(dmx, first, video is not None and v_time.mapped,
                            wall0)
             tracks = {}
-            if video is not None:
-                tracks['video'] = pub.add_track(_timed(LocTrackPublisher(
-                    session, args.namespace, 'video', config=video.config,
-                    mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+            for i, v in enumerate(videos):
+                name = _video_name(i)
+                tracks[name] = pub.add_track(_timed(LocTrackPublisher(
+                    session, args.namespace, name, config=v.config,
+                    mapping=v_map, loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(v_codec), annexb=annexb,
+                    codec_string=_cs(v_codecs[i]), annexb=annexbs[i],
                     fetch_history_bytes=args.fetch_history),
-                    v_time))
-                stats['video'] = _TrackStats()
+                    v_times[i]))
+                stats[name] = _TrackStats()
             if ts_audio is not None:
                 tracks['audio'] = pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'audio', media_kind='audio',
                     config=ts_audio.config, mapping=a_map,
-                    loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
                     codec_string=_cs(ts_audio.codec_string),
                     fetch_history_bytes=args.fetch_history),
@@ -1743,25 +2239,27 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
             feeders.append(_feed_h264_live(
                 pub.add_track(_timed(LocTrackPublisher(
                     session, args.namespace, 'video', config=video.config,
-                    mapping=v_map, loc01_compat=args.loc01_compat, loc_bare=loc_bare,
+                    mapping=v_map, loc01_compat=args.loc01_compat,
                     timescale=args.loc_timescale, config_property=cfg_at,
-                    codec_string=_cs(v_codec), annexb=annexb,
+                    codec_string=_cs(v_codecs[0]), annexb=annexbs[0],
                     fetch_history_bytes=args.fetch_history),
                     MediaTimestamps(wall0))),
                 fh, asm, first, args, stats['video']))
-        elif video is not None and v_mp4 is not None:
-            v_ck = chunkers.get('video')
-            stats['video'] = _TrackStats()
-            feeders.append(_feed_mp4_track(
-                pub.add_track(_timed(_track(
-                    'video', mapping=v_map,
-                    config=None if v_ck else video.config,
-                    loc01_compat=args.loc01_compat,
-                    codec_string=_cs(v_codec), annexb=annexb),
-                    v_time)),
-                v_mp4, args, stats['video'],
-                wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
-                clock=clock))
+        else:
+            for i, (v, v_mp4) in enumerate(zip(videos, v_mp4s)):
+                name = _video_name(i)
+                v_ck = chunkers.get(name)
+                stats[name] = _TrackStats()
+                feeders.append(_feed_mp4_track(
+                    pub.add_track(_timed(_track(
+                        name, mapping=v_map,
+                        config=None if v_ck else v.config,
+                        loc01_compat=args.loc01_compat,
+                        codec_string=_cs(v_codecs[i]), annexb=annexbs[i]),
+                        v_times[i])),
+                    v_mp4, args, stats[name],
+                    wrap=_cmaf_wrap(v_ck, video=True) if v_ck else None,
+                    clock=clock))
         start = dict(announce_namespace=(args.pub_ns or args.pub_both),
                      publish_track=(not args.pub_ns or args.pub_both),
                      forward=args.forward)
@@ -1875,10 +2373,10 @@ async def _run(args, events: Optional[_MttEvents]) -> str:
 
 
 def main():
-    # Until run() takes over the signal, SIGTERM stops a run as SIGINT does.
+    # SIGTERM stops a run as SIGINT does, through the loop once it runs.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
-        asyncio.run(run(parse_args()))
+        _cli.run(run(parse_args()), sigterm=True)
     except KeyboardInterrupt:
         pass
     except _SourceError as e:

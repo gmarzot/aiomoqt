@@ -134,13 +134,13 @@ async def test_standalone_fetch_two_tracks(draft, use_quic):
                 *start, *end), wait_response=True)
             for name, (start, end) in ranges.items()))
         for ok, (name, (start, end)) in zip(oks, ranges.items()):
-            # FetchOk keeps the d14-d18 form: the last Object plus one.
+            # FetchOk keeps the d16-d18 form: the last Object plus one.
             assert (ok.largest_group_id, ok.largest_object_id) == (
                 end[0], end[1] + 1)
             objs = await rx.done(ok.request_id)
             assert _locations(objs) == _range(start, end)
             assert {len(o.payload) for o in objs} == {_SIZES[name]}
-        # The d14-d18 arguments: End Object 0 is the whole End Group.
+        # The d16-d18 arguments: End Object 0 is the whole End Group.
         ok = await rx.session.fetch(_NS, "audio", start_group=1,
                                     start_object=2, end_group=2, end_object=0,
                                     wait_response=True)
@@ -381,7 +381,7 @@ async def test_fetch_priority_update_is_accepted(use_quic):
         pub = tracks["video"].session
         stalled = asyncio.Event()
 
-        async def _stall(stream_id, data, end_stream=False):
+        async def _stall(stream_id, data, end_stream=False, **kw):
             stalled.set()
             await asyncio.Event().wait()
         pub.stream_write_drain = _stall

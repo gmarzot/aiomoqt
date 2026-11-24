@@ -290,7 +290,7 @@ class AgentSession:
     async def close(self) -> None:
         """Close every reader and fetch, end each writer's track (its
         peers get PUBLISH_DONE), then withdraw the namespaces announced
-        for them: at d14/d16 an aiomoqt peer ends the whole session on
+        for them: at d16 an aiomoqt peer ends the whole session on
         PUBLISH_NAMESPACE_DONE."""
         if self._closed:
             return

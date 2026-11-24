@@ -470,6 +470,8 @@
   ".transport[].loop_callbacks": [
    "int"
   ],
+  ".transport[].loop_late_checks": [],
+  ".transport[].loop_late_us": [],
   ".transport[].rx_event_drops": [
    "int"
   ],
@@ -511,6 +513,7 @@
   "": [
    "object"
   ],
+  ".moq_fabric": [],
   ".generated": [
    "float"
   ],
@@ -529,6 +532,10 @@
   ".history.egress_bps[]": [
    "int"
   ],
+  ".history.gc_max_ms": [
+   "array"
+  ],
+  ".history.gc_max_ms[]": [],
   ".history.groups_out_per_s": [
    "array"
   ],
@@ -599,10 +606,20 @@
   ".history.rtt_p50_ms[]": [
    "float"
   ],
+  ".history.send_late_ms": [
+   "array"
+  ],
+  ".history.send_late_ms[]": [],
   ".history.sessions": [
    "array"
   ],
   ".history.sessions[]": [
+   "int"
+  ],
+  ".history.shed_bytes": [
+   "array"
+  ],
+  ".history.shed_bytes[]": [
    "int"
   ],
   ".history.subscribers": [
@@ -726,6 +743,8 @@
   ".sessions[].addr": [
    "string"
   ],
+  ".sessions[].cc_param": [],
+  ".sessions[].cc_state": [],
   ".sessions[].cwin_bytes": [
    "int"
   ],
@@ -792,6 +811,15 @@
   ".totals": [
    "object"
   ],
+  ".totals.admission": [
+   "object"
+  ],
+  ".totals.admission.open": [
+   "bool"
+  ],
+  ".totals.admission.refused": [
+   "int"
+  ],
   ".totals.by_draft": [
    "object"
   ],
@@ -838,6 +866,50 @@
   ".totals.fetches": [
    "int"
   ],
+  ".totals.gc": [
+   "object"
+  ],
+  ".totals.gc.max_gen": [],
+  ".totals.gc.max_ms": [],
+  ".totals.gc.passes": [
+   "array"
+  ],
+  ".totals.gc.passes[]": [
+   "int"
+  ],
+  ".totals.gc.total_ms": [
+   "float"
+  ],
+  ".totals.gc_totals": [
+   "object"
+  ],
+  ".totals.gc_totals.collected": [
+   "array"
+  ],
+  ".totals.gc_totals.collected[]": [
+   "int"
+  ],
+  ".totals.gc_totals.collections": [
+   "array"
+  ],
+  ".totals.gc_totals.collections[]": [
+   "int"
+  ],
+  ".totals.gc_totals.frozen": [
+   "int"
+  ],
+  ".totals.gc_totals.pending": [
+   "array"
+  ],
+  ".totals.gc_totals.pending[]": [
+   "int"
+  ],
+  ".totals.gc_totals.uncollectable": [
+   "array"
+  ],
+  ".totals.gc_totals.uncollectable[]": [
+   "int"
+  ],
   ".totals.groups_out_per_s": [
    "float"
   ],
@@ -845,6 +917,9 @@
    "float"
   ],
   ".totals.ingress_bps": [
+   "int"
+  ],
+  ".totals.lane_bytes": [
    "int"
   ],
   ".totals.loop_lag_ms": [
@@ -874,13 +949,29 @@
   ".totals.publishers": [
    "int"
   ],
+  ".totals.queue_ms": [
+   "object"
+  ],
+  ".totals.queue_ms.max": [
+   "float"
+  ],
+  ".totals.queue_ms.p50": [
+   "float"
+  ],
+  ".totals.queue_ms.p90": [
+   "float"
+  ],
   ".totals.rtt_p50_ms": [
    "float"
   ],
   ".totals.rtt_p99_ms": [
    "float"
   ],
+  ".totals.send_late_ms": [],
   ".totals.sessions": [
+   "int"
+  ],
+  ".totals.shed_bytes": [
    "int"
   ],
   ".totals.spurious_pct": [
@@ -939,6 +1030,9 @@
   ],
   ".tracks[].cache_groups": [
    "int"
+  ],
+  ".tracks[].cache_seconds": [
+   "float"
   ],
   ".tracks[].drops": [
    "int"
@@ -1008,6 +1102,9 @@
   ],
   ".tracks[].rtt_up_ms": [
    "float"
+  ],
+  ".tracks[].shed_bytes": [
+   "int"
   ],
   ".tracks[].since": [
    "float"

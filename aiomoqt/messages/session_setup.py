@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 
 from . import MOQTMessageType, MOQTMessage, BUF_SIZE
 from ..context import DraftProfile
@@ -14,11 +14,9 @@ logger = get_logger(__name__)
 class ServerSetup(MOQTMessage):
     """SERVER_SETUP message for accepting MOQT session.
 
-    Draft-14: Selected Version (i), Num Parameters (i), Parameters (..)
-    Draft-16: Num Parameters (i), Parameters (..)
-              (version negotiated via ALPN, not in-band)
+    Num Parameters (i), Parameters (..); the version is negotiated via
+    ALPN or WT-Protocol.
     """
-    selected_version: int = None
     parameters: Dict[int, Any] = None
 
     def __post_init__(self):
@@ -27,10 +25,6 @@ class ServerSetup(MOQTMessage):
     def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
-
-        # Draft-14: version on wire; Draft-16: version via ALPN
-        if prof.setup_carries_versions:
-            payload.push_uint_var(self.selected_version)
 
         MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
@@ -43,23 +37,18 @@ class ServerSetup(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
                     buf_end: Optional[int] = None) -> 'ServerSetup':
         """Handle SERVER_SETUP message."""
-        version = None
-        if prof.setup_carries_versions:
-            version = buf.pull_uint_var()
         params = MOQTMessage._deserialize_params(buf, prof=prof,
                                                  buf_end=buf_end)
-        return cls(selected_version=version, parameters=params)
+        return cls(parameters=params)
 
 
 @dataclass(slots=True)
 class ClientSetup(MOQTMessage):
     """CLIENT_SETUP message for initializing MOQT session.
 
-    Draft-14: Num Versions (i), Versions (i)..., Num Params (i), Params (..)
-    Draft-16: Num Params (i), Params (..)
-              (version negotiated via ALPN, not in-band)
+    Num Params (i), Params (..); the version is negotiated via ALPN or
+    WT-Protocol.
     """
-    versions: List[int] = None
     parameters: Dict[int, Any] = None
 
     def __post_init__(self):
@@ -68,12 +57,6 @@ class ClientSetup(MOQTMessage):
     def serialize(self, *, prof: DraftProfile) -> Buffer:
         buf = Buffer(capacity=BUF_SIZE)
         payload = Buffer(capacity=BUF_SIZE)
-
-        # Draft-14: versions on wire; Draft-16: version via ALPN
-        if prof.setup_carries_versions:
-            payload.push_uint_var(len(self.versions))
-            for version in self.versions:
-                payload.push_uint_var(version)
 
         MOQTMessage._serialize_params(payload, self.parameters, prof=prof)
 
@@ -86,14 +69,9 @@ class ClientSetup(MOQTMessage):
     def deserialize(cls, buf: Buffer, *, prof: DraftProfile,
                     buf_end: Optional[int] = None) -> 'ClientSetup':
         """Handle CLIENT_SETUP message."""
-        versions = []
-        if prof.setup_carries_versions:
-            version_count = buf.pull_uint_var()
-            for _ in range(version_count):
-                versions.append(buf.pull_uint_var())
         params = MOQTMessage._deserialize_params(buf, prof=prof,
                                                  buf_end=buf_end)
-        return cls(versions=versions, parameters=params)
+        return cls(parameters=params)
 
 
 @dataclass(slots=True)

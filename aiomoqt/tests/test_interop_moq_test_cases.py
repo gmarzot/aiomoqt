@@ -1,13 +1,17 @@
 """moq_interop_client moq-test-* cases: through aiomoqt-relay in one
 process, and the verifier against hand-built deliveries."""
+import asyncio
+import gc
 from types import SimpleNamespace
 
 import pytest
 
+from aiomoqt.context import profile_for
+from aiomoqt.messages import SubgroupHeader
 from aiomoqt.tools import moq_interop_client as client
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.tools.moqtest_origin import priority_for
-from aiomoqt.types import ObjectStatus, SubscribeDoneCode
+from aiomoqt.types import ObjectStatus, RequestErrorCode, SubscribeDoneCode
 
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 
@@ -32,23 +36,41 @@ async def _run_case(name, port, draft, use_quic):
         relay._tracks.clear()
 
 
-def test_cases_run_by_default_under_moq_rs_names():
+def test_cases_run_by_default_under_moq_rs_and_xquic_names():
     assert _NAMES == [
-        "moq-test-subgroup-per-group-eog", "moq-test-subgroup-per-object",
-        "moq-test-two-subgroups-eog", "moq-test-datagram",
-        "moq-test-datagram-eog", "moq-test-extensions",
-        "moq-test-increments", "moq-test-forward-zero"]
+        "moq-test-subgroup-per-group-eog",
+        "moq-test-subgroup-per-group-no-eog",
+        "moq-test-subgroup-per-group-nonzero-start",
+        "moq-test-subgroup-per-object",
+        "moq-test-subgroup-per-object-sparse-ids",
+        "moq-test-two-subgroups-eog", "moq-test-two-subgroups-no-eog",
+        "moq-test-datagram", "moq-test-datagram-nonzero-start",
+        "moq-test-datagram-sparse-ids", "moq-test-datagram-eog",
+        "moq-test-extensions", "moq-test-extensions-integer-only",
+        "moq-test-extensions-variable-only", "moq-test-object-fragmentation",
+        "moq-test-object-large-id", "moq-test-increments",
+        "moq-test-forward-zero"]
     assert client.STANDARD_TESTS[-len(_NAMES):] == _NAMES
     assert all(name in client.TEST_FUNCTIONS for name in _NAMES)
 
 
 @pytest.mark.parametrize("name, counts", [
     ("moq-test-subgroup-per-group-eog", (15, 3, 3)),
+    ("moq-test-subgroup-per-group-no-eog", (18, 0, 3)),
+    ("moq-test-subgroup-per-group-nonzero-start", (6, 3, 3)),
     ("moq-test-subgroup-per-object", (8, 0, 8)),
+    ("moq-test-subgroup-per-object-sparse-ids", (3, 0, 3)),
     ("moq-test-two-subgroups-eog", (18, 3, 6)),
+    ("moq-test-two-subgroups-no-eog", (21, 0, 6)),
     ("moq-test-datagram", (15, 0, 0)),
+    ("moq-test-datagram-nonzero-start", (9, 0, 0)),
+    ("moq-test-datagram-sparse-ids", (9, 0, 0)),
     ("moq-test-datagram-eog", (15, 3, 0)),
     ("moq-test-extensions", (15, 3, 3)),
+    ("moq-test-extensions-integer-only", (15, 3, 3)),
+    ("moq-test-extensions-variable-only", (15, 3, 3)),
+    ("moq-test-object-fragmentation", (1, 0, 1)),
+    ("moq-test-object-large-id", (6, 0, 2)),
     ("moq-test-increments", (9, 0, 3)),
     ("moq-test-forward-zero", (6, 0, 2)),
 ])
@@ -58,6 +80,58 @@ def test_expected_delivery(name, counts):
     assert (len(data), len(markers), streams) == counts
 
 
+@pytest.mark.parametrize("name, ids", [
+    ("moq-test-extensions", {2, 5}),
+    ("moq-test-extensions-integer-only", {2}),
+    ("moq-test-extensions-variable-only", {5}),
+])
+def test_extension_variants_carry_their_property_types(name, ids):
+    assert client._moq_test_extension_ids(_params(name)) == ids
+
+
+def test_large_id_case_crosses_2_to_the_40():
+    data, _, _ = client._moq_test_expected(_params("moq-test-object-large-id"))
+    big = 1 << 40
+    assert sorted(data) == [(g, o) for g in (big, big + 1)
+                            for o in (big + 5, big + 7, big + 9)]
+
+
+class _WriteLog:
+    """Just enough of a session for _send_fragmented."""
+
+    def __init__(self, draft):
+        self._profile = profile_for(draft)
+        self.writes, self.fins = [], []
+
+    async def open_uni_stream(self):
+        return 2
+
+    def subgroup_header(self, **kw):
+        return SubgroupHeader(prof=self._profile, **kw)
+
+    async def stream_write_drain(self, sid, data):
+        self.writes.append(bytes(data))
+
+    def stream_fin(self, sid):
+        self.fins.append(sid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", [18, 22])
+async def test_fragmentation_writes_one_object_in_four_pieces(draft):
+    p = _params("moq-test-object-fragmentation")
+    assert client._MOQ_TEST_SENDER_FOR["moq-test-object-fragmentation"] \
+        is client._send_fragmented
+    s = _WriteLog(draft)
+    assert await client._send_fragmented(s, 0, p) == 1
+    header, *pieces = s.writes
+    assert len(pieces) == 4 and s.fins == [2]
+    assert [len(x) for x in pieces[1:]] == [24, 24, 24]
+    # The first piece also carries the object header.
+    assert pieces[0].endswith(b"t" * 24) and len(pieces[0]) > 24
+    assert b"".join(pieces).endswith(b"t" * 96)
+
+
 @requires_certs
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_quic", [True, False], ids=["quic", "wt"])
@@ -65,7 +139,7 @@ def test_expected_delivery(name, counts):
 @pytest.mark.parametrize("name", _NAMES)
 async def test_case_passes_through_the_relay(name, draft, use_quic):
     port = (_BASE_PORT + 2 * _NAMES.index(name) + (0 if use_quic else 1)
-            + (0 if draft == 18 else 20))
+            + (0 if draft == 18 else 2 * len(_NAMES)))
     r = await _run_case(name, port, draft, use_quic)
     assert r.passed and not r.skipped, r.message
     assert set(r.sessions) == {"subscriber", "publisher"}
@@ -97,6 +171,153 @@ async def test_forward_zero_notes_a_relay_that_takes_the_track(monkeypatch):
     assert r.passed, r.message
     assert r.message == ("0 objects with Forward State 0; Stream Count 0; "
                          "relay took the PUBLISH at Forward State 1")
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_publisher_waits_for_a_late_forward_state_raise(monkeypatch):
+    # PUBLISH_OK at Forward State 0, raised after SUBSCRIBE_OK reaches the
+    # subscriber.
+    answer = relay._answer_publish
+    monkeypatch.setattr(relay, "_answer_publish",
+                        lambda track, forward=None: answer(track, forward=0))
+    set_forward = client._MoqTestTrack._set_forward
+
+    def late(self, sub, forward):
+        if forward:
+            asyncio.get_running_loop().call_later(
+                0.1, set_forward, self, sub, forward)
+        else:
+            set_forward(self, sub, forward)
+
+    monkeypatch.setattr(client._MoqTestTrack, "_set_forward", late)
+    r = await _run_case("moq-test-subgroup-per-group-eog", _BASE_PORT + 52,
+                        18, True)
+    assert r.passed, r.message
+
+
+def _count_streams(monkeypatch, count):
+    """The relay reports count(sent) streams in each downstream
+    PUBLISH_DONE."""
+    end = relay._RelayedTrack._end
+
+    def _end(self, d, *args, **kw):
+        key = id(d.session)
+        self._sent_streams[key] = count(self._sent_streams.get(key, 0))
+        end(self, d, *args, **kw)
+
+    monkeypatch.setattr(relay._RelayedTrack, "_end", _end)
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_forward_zero_fails_at_publish_done_with_streams(monkeypatch):
+    # The relay takes the track and passes the upstream Stream Count down.
+    monkeypatch.setattr(relay, "_forwarding", lambda track: True)
+    _count_streams(monkeypatch, lambda sent: 2)
+    r = await _run_case("moq-test-forward-zero", _BASE_PORT + 53, 18, True)
+    assert not r.passed
+    assert r.message.startswith(
+        "downstream Stream Count 2, expected 0 (1 problem(s))"), r.message
+    assert r.duration_ms < 4000
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_stream_count_never_met_fails_inside_the_phase(monkeypatch):
+    monkeypatch.setattr(client, "_MOQ_TEST_PHASE_S", 3.0)
+    _count_streams(monkeypatch, lambda sent: sent + 1)
+    r = await _run_case("moq-test-subgroup-per-group-eog", _BASE_PORT + 54,
+                        18, True)
+    assert not r.passed
+    assert r.message.startswith(
+        "downstream Stream Count 4, expected 3 (1 problem(s))"), r.message
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_refused_subscribe_leads_a_publish_timeout(monkeypatch,
+                                                           caplog):
+    async def _unanswered(session, msg):
+        pass
+
+    monkeypatch.setattr(relay, "_on_publish", _unanswered)
+    monkeypatch.setattr(client, "_MOQ_TEST_RENDEZVOUS_MS", 300)
+    monkeypatch.setattr(client, "_MOQ_TEST_PHASE_S", 2.0)
+    r = await _run_case("moq-test-datagram", _BASE_PORT + 55, 18, True)
+    gc.collect()
+    assert r.message == (
+        f"SUBSCRIBE refused: code={int(RequestErrorCode.TIMEOUT)} no "
+        f"publisher within the rendezvous timeout; timed out waiting for "
+        f"PUBLISH")
+    assert "never retrieved" not in caplog.text
+
+
+def _lose(monkeypatch, attempts, lost=lambda loc: loc == (1, 5)):
+    """The first `attempts` subscribers never see the objects at the
+    locations `lost` picks. Returns every subscriber, in order."""
+    on_object = client._MoqTestSubscriber.on_object
+    subs = []
+
+    def lossy(self, msg, size, ts, group_id, subgroup_id):
+        if self not in subs:
+            subs.append(self)
+        gid = getattr(msg, "group_id", None)
+        loc = (group_id if gid is None else gid, msg.object_id)
+        if subs.index(self) < attempts and lost(loc):
+            return
+        on_object(self, msg, size, ts, group_id, subgroup_id)
+
+    monkeypatch.setattr(client._MoqTestSubscriber, "on_object", lossy)
+    return subs
+
+
+_EOG_LOST = "missing End of Group at 1.5"
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempts", [1, 2])
+async def test_a_datagram_case_that_lost_some_runs_again(monkeypatch,
+                                                         attempts):
+    subs = _lose(monkeypatch, attempts)
+    r = await _run_case("moq-test-datagram-eog", _BASE_PORT + 55 + attempts,
+                        18, True)
+    assert r.passed, r.message
+    assert len(subs) == attempts + 1
+    earlier = "; ".join(f"attempt {n}: {_EOG_LOST}"
+                        for n in range(1, attempts + 1))
+    assert r.message == (f"objects 15/15, End of Group 3/3, Stream Count "
+                         f"0/0 (attempt {attempts + 1} of 3; datagrams lost "
+                         f"on {earlier})")
+
+
+@requires_certs
+@pytest.mark.asyncio
+async def test_a_datagram_case_that_loses_on_every_attempt_fails(
+        monkeypatch):
+    subs = _lose(monkeypatch, 3)
+    r = await _run_case("moq-test-datagram-eog", _BASE_PORT + 58, 18, True)
+    assert not r.passed
+    assert len(subs) == 3
+    assert r.message == (
+        f"{_EOG_LOST} (1 problem(s)); objects 15/15, End of Group 2/3, "
+        f"Stream Count 0/0; datagrams lost on all 3 attempts (attempt 1: "
+        f"{_EOG_LOST}; attempt 2: {_EOG_LOST})")
+
+
+@requires_certs
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name, lost", [
+    ("moq-test-subgroup-per-group-eog", lambda loc: loc == (1, 5)),
+    ("moq-test-datagram-eog", lambda loc: True),
+], ids=["stream", "every-datagram"])
+async def test_only_some_lost_datagrams_run_again(monkeypatch, name, lost):
+    subs = _lose(monkeypatch, 3, lost)
+    r = await _run_case(name, _BASE_PORT + 59, 18, True)
+    assert not r.passed
+    assert len(subs) == 1
+    assert "attempt" not in r.message, r.message
 
 
 def _params(name):

@@ -68,7 +68,7 @@ def moqt_test_id(case):
     return cls.__name__
 
 def moqt_message_serialization(cls, params, type_id=None, needs_len=False,
-                               draft=14):
+                               draft=16):
     """
     Test MOQT message class serialization/deserialization
 
@@ -77,7 +77,7 @@ def moqt_message_serialization(cls, params, type_id=None, needs_len=False,
         params: Dictionary of parameters to initialize the class
         type_id: Expected type id (if any)
         needs_len: Whether deserialize needs the buffer length
-        draft: Draft number to (de)serialize under (default 14).
+        draft: Draft number to (de)serialize under (default 16).
     """
     obj = cls(**params)
     buf = _serialize(obj, draft)
@@ -141,7 +141,7 @@ def moqt_message_serialization_versioned(cls, params, type_id=None,
         skip_fields: set of field names to skip comparison (e.g. fields
                      that are None on wire in d16 but set in the input)
     """
-    draft = get_major_version(version) if version is not None else 14
+    draft = get_major_version(version) if version is not None else 16
     obj = cls(**params)
     buf = _serialize(obj, draft)
     buf_len = buf.tell()
@@ -151,10 +151,10 @@ def moqt_message_serialization_versioned(cls, params, type_id=None,
         # Message Type uses the negotiated varint flavor (vi64 for d18,
         # RFC9000 otherwise); the Length stays uint16 in all drafts
         # (§10.1). pull_vint == pull_uint_var when vi64 is False, so this
-        # is unchanged for d14/d16.
+        # is unchanged for d16.
         buf.vi64 = profile_for(draft).vi64
         id = buf.pull_vint()
-        # d14/d16 define a distinct PUBLISH_OK (0x1E, d16 §9.14); only
+        # d16 defines a distinct PUBLISH_OK (0x1E, §9.14); only
         # d18 replies to a PUBLISH with the universal REQUEST_OK (0x07),
         # "PUBLISH_OK" being its shorthand name there (§10.5).
         if type_id == MOQTMessageType.PUBLISH_OK and draft >= 18:

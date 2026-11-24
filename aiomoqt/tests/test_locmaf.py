@@ -322,7 +322,7 @@ class _Out:
         self.resets = 0
 
     async def write(self, group_id, object_id, payload, group_start=False,
-                    extensions=None):
+                    extensions=None, end_of_group=False):
         self.written.append((group_id, object_id, payload))
 
     def reset_group(self):

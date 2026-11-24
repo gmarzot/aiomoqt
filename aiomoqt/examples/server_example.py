@@ -1,10 +1,8 @@
 import logging
 import argparse
 
-import asyncio
-
 from aiomoqt.server import MOQTServer
-from aiomoqt.utils.cli import add_help
+from aiomoqt.utils.cli import add_help, run
 from aiomoqt.utils.logger import get_logger, set_log_level
 
 
@@ -68,7 +66,7 @@ async def main(args):
 if __name__ == "__main__":
     try:
         args = parse_args()
-        asyncio.run(main(args), debug=args.debug)
+        run(main(args), debug=args.debug)
 
     except KeyboardInterrupt:
         pass

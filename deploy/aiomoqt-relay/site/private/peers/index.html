@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>aiomoqt-relay peers</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23b23c0e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/relay/dashboard.css">
+<link rel="stylesheet" href="peers.css">
+<script src="/relay/common.js" defer></script>
+<script src="peers.js" defer></script>
+<script src="/version.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="hero-top">
+      <a class="brand" href="/" aria-label="aiomoqt-relay home">
+        <span class="brand-text">
+          <span class="brand-name">aiomoqt-relay</span>
+          <span class="brand-sub"><span class="dot" aria-hidden="true"></span>A Marz Research Project</span>
+        </span>
+      </a>
+      <span class="crumb"><a href="/private/">private</a> / peers</span>
+    </div>
+  </header>
+
+  <p class="unavailable" id="unavailable" hidden>No peer report yet: the collector writes one every minute.</p>
+  <noscript><p class="unavailable">This page needs JavaScript.</p></noscript>
+
+  <section class="tiles" aria-label="Peers today, UTC">
+    <div class="tile" data-key="ips"><h3>IPs today</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="pub_ips"><h3>Publishing</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="sub_ips"><h3>Subscribing</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="sessions"><h3>Sessions today</h3><div class="value">—</div><div class="sub"></div></div>
+    <div class="tile" data-key="namespaces"><h3>Namespaces today</h3><div class="value">—</div><div class="sub">published</div></div>
+    <div class="tile" data-key="all"><h3>IPs, all kept</h3><div class="value">—</div><div class="sub"></div></div>
+  </section>
+
+  <section class="panel">
+    <div class="log-bar">
+      <label class="grow">Filter <input type="search" id="q" placeholder="IP or namespace" autocomplete="off"></label>
+      <span class="log-status" id="generated"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>IPs</h2>
+    <div class="table-wrap">
+      <table id="t-ips" class="compact">
+        <thead><tr><th>IP</th><th>Role</th><th class="n">Sessions</th><th>First seen</th><th>Last seen</th>
+          <th>Transport</th><th>Published</th><th>Subscribed</th></tr></thead>
+        <tbody><tr><td colspan="8" class="empty">No peers.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Namespaces</h2>
+    <div class="table-wrap">
+      <table id="t-namespaces" class="compact">
+        <thead><tr><th>Namespace</th><th>Publisher</th><th class="n">Tracks</th><th class="n">Subscriber IPs</th>
+          <th>First seen</th><th>Last seen</th></tr></thead>
+        <tbody><tr><td colspan="6" class="empty">No namespaces.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Days, UTC</h2>
+    <div class="table-wrap">
+      <table id="t-days" class="compact">
+        <thead><tr><th>Day</th><th class="n">IPs</th><th class="n">Publishing</th><th class="n">Subscribing</th>
+          <th class="n">Sessions</th><th class="n">Namespaces</th></tr></thead>
+        <tbody><tr><td colspan="6" class="empty">No days.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <a href="/">aiomoqt-relay</a> · <a href="/relay/">dashboard</a> · <a href="/private/">private</a> · A Marz Research Project
+    <span data-versions></span>
+  </footer>
+</main>
+</body>
+</html>

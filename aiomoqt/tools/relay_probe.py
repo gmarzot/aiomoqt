@@ -2,9 +2,9 @@
 """
 MOQ relay probe — determines relay liveness and supported draft versions.
 
-Each endpoint URL is probed once per draft (14, 16, 18 by default; use
+Each endpoint URL is probed once per draft (16, 18, 20, 22 by default; use
 --draft to narrow), over the transport its scheme selects:
-  - moqt:// URLs: raw QUIC (moqt-NN / moq-00 ALPN)
+  - moqt:// URLs: raw QUIC (moqt-NN ALPN)
   - https:// URLs: H3/WebTransport (WT-Protocol)
 
 Each probe does a proper CLIENT_SETUP/SERVER_SETUP handshake and clean close.
@@ -46,7 +46,7 @@ from aiomoqt.types import (
     parse_draft_spec,
 )
 from aiomoqt.utils.cli import (add_help, add_logging, apply_logging,
-                               endpoint_url)
+                               endpoint_url, run)
 from aiomoqt.utils.url import parse_relay_url
 
 logging.basicConfig(
@@ -70,14 +70,13 @@ OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/output/relay-status.json")
 # it per relay.
 VERIFY_TLS = True
 
-# Draft versions to probe, oldest first — d14 bare WT CONNECT must
-# run before d16 (which sends wt-available-protocols) to avoid
-# relay state issues on sequential probes to the same endpoint.
+# Draft versions to probe, oldest first.
 DRAFT_PROBES = [
     # Draft numbers (the public MoQTClient supported_drafts form).
-    ("draft-14", 14),
     ("draft-16", 16),
     ("draft-18", 18),
+    ("draft-20", 20),
+    ("draft-22", 22),
 ]
 
 # Set from --draft to probe a single draft instead of the full DRAFT_PROBES
@@ -295,9 +294,6 @@ async def run_loop():
              "endpoints": [
                 {"url": "moqt://fb.mvfst.net:9448"},
             ]},
-            {"id": "cloudflare", "name": "Cloudflare", "endpoints": [
-                {"url": "moqt://draft-14.cloudflare.mediaoverquic.com:443"},
-            ]},
         ]
 
     last_probed = {}  # relay_id -> monotonic time of last probe
@@ -359,8 +355,8 @@ def parse_args(argv=None):
         help="draft(s) to probe: a single draft (--draft 18) or a list "
              "(--draft 18,16). By default each listed draft is probed "
              "INDIVIDUALLY, in order; with --offer the whole list is offered "
-             "in ONE session. Default (no --draft) probes 14, 16, 18 each; "
-             "20 and 22 are probed only when named.")
+             "in ONE session. Default (no --draft) probes 16, 18, 20 "
+             "and 22 each.")
     p.add_argument(
         "--offer", action="store_true", default=False,
         help="with a multi-draft --draft, offer the whole list in ONE "
@@ -471,7 +467,7 @@ def _cli():
         args, default=logging.CRITICAL if args.url else logging.INFO)
     if args.url:
         # Single-URL mode: skip the relays-file / output-file machinery.
-        rc = asyncio.run(_probe_single_url(
+        rc = run(_probe_single_url(
             args.url, args.timeout, debug=level <= logging.DEBUG,
             verify_tls=VERIFY_TLS))
         raise SystemExit(rc)
@@ -482,7 +478,7 @@ def _cli():
     OUTPUT_FILE = args.output_file
     PROBE_TIMEOUT = args.timeout
     PROBE_INTERVAL = args.interval
-    asyncio.run(run_loop())
+    run(run_loop())
 
 
 if __name__ == "__main__":

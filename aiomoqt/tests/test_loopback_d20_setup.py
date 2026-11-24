@@ -18,7 +18,7 @@ from aiomoqt.tests._certs import CERT, KEY, requires_certs
 pytestmark = requires_certs
 
 _BASE_PORT = 16600
-_ALL_DRAFTS = [22, 20, 18, 16, 14]
+_ALL_DRAFTS = [22, 20, 18, 16]
 
 
 async def _start_server(port, use_quic, supported_drafts=_ALL_DRAFTS):
@@ -108,7 +108,7 @@ async def test_d20_offer_falls_back_to_a_d18_server(use_quic):
     18."""
     port = _BASE_PORT + 12 + (0 if use_quic else 1)
     handle, captured = await _start_server(port, use_quic,
-                                           supported_drafts=[18, 16, 14])
+                                           supported_drafts=[18, 16])
     try:
         client = _client(port, use_quic, [22, 20, 18])
         async with client.connect() as session:
@@ -122,7 +122,7 @@ async def test_d20_offer_falls_back_to_a_d18_server(use_quic):
 
 async def test_d20_is_refused_by_a_server_not_configured_for_it():
     port = _BASE_PORT + 14
-    handle, _ = await _start_server(port, True, supported_drafts=[18, 16, 14])
+    handle, _ = await _start_server(port, True, supported_drafts=[18, 16])
     try:
         with pytest.raises(Exception):
             async with asyncio.timeout(8):

@@ -2,12 +2,13 @@ import asyncio
 import contextlib
 import ssl
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from aiopquic.asyncio.client import connect as aiopquic_connect
 from aiopquic._binding._transport import TransportContext
 from aiopquic.quic.configuration import QuicConfiguration
 
+from .cat import CatAuth
 from .protocol import (
     MOQTPeer, MOQTSessionQuic, MOQTSessionWTClient,
     DEFAULT_TX_MAX_INFLIGHT_BYTES, USER_AGENT,
@@ -17,6 +18,39 @@ from .types import moqt_alpn_for_version, normalize_supported_drafts
 from .utils.logger import *
 
 logger = get_logger(__name__)
+
+
+class SharedTransport:
+    """One picoquic worker and RX ring for many MOQTClient connections.
+
+    Pass it as MOQTClient(shared_transport=), from one event loop. The first
+    connection's settings apply to all, so give every client the same ones.
+    close() after the last connection ends. With `sockets` above 1, on Linux,
+    connections take that many source ports in turn; otherwise they share one.
+    """
+
+    def __init__(self, ring_capacity: Optional[int] = None, sockets: int = 0) -> None:
+        self.ring_capacity = ring_capacity
+        self.sockets = sockets
+        self._engine: Any = None
+        self._wt_transport: Optional[TransportContext] = None
+
+    @property
+    def engine(self) -> Any:
+        """The raw QUIC side, created on first use."""
+        if self._engine is None:
+            from aiopquic.asyncio.client import QuicClientEngine
+            self._engine = QuicClientEngine(ring_capacity=self.ring_capacity,
+                                            sockets=self.sockets)
+        return self._engine
+
+    def close(self) -> None:
+        if self._engine is not None:
+            self._engine.close()
+            self._engine = None
+        if self._wt_transport is not None:
+            self._wt_transport.stop()
+            self._wt_transport = None
 
 
 class MOQTClient(MOQTPeer):
@@ -36,6 +70,7 @@ class MOQTClient(MOQTPeer):
         libquicr_compat: Optional[bool] = False,
         congestion_control_algorithm: Optional[str] = None,
         congestion_control_options: Optional[str] = None,
+        packet_train_mode: bool = False,
         flow_control_window: Optional[int] = None,
         tx_max_inflight_bytes: Optional[int] = DEFAULT_TX_MAX_INFLIGHT_BYTES,
         tx_max_queued_bytes: Optional[int] = None,
@@ -44,6 +79,8 @@ class MOQTClient(MOQTPeer):
         qlog_dir: Optional[str] = None,
         implementation: Optional[str] = USER_AGENT,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        shared_transport: Optional[SharedTransport] = None,
+        auth: Optional[CatAuth] = None,
     ):
         super().__init__(libquicr_compat=libquicr_compat,
                          tx_max_inflight_bytes=tx_max_inflight_bytes,
@@ -65,7 +102,7 @@ class MOQTClient(MOQTPeer):
         # for the WT path's underlying QUIC transport).
         self.quic_debug_log = quic_debug_log
         # Public API contract: supported_drafts is the set of IETF draft
-        # numbers (e.g. 16, or [16, 14]) this client offers; None means
+        # numbers (e.g. 16, or [18, 16]) this client offers; None means
         # "offer every supported version" (the auto path). Internal state
         # stores a non-empty list of full IETF version codes (e.g.
         # 0xff000010), newest first — what ALPN encodes and CLIENT_SETUP
@@ -87,6 +124,8 @@ class MOQTClient(MOQTPeer):
         # Algorithm option string, e.g. "Q0.02" for bbr; None keeps the
         # configuration's.
         self.congestion_control_options = congestion_control_options
+        # Paced sends release up to 10 packets at once (picoquic train mode).
+        self.packet_train_mode = packet_train_mode
         # QUIC flow-control window, per stream and per connection; None keeps
         # the configuration's (16 MiB built here).
         self.flow_control_window = flow_control_window
@@ -102,6 +141,9 @@ class MOQTClient(MOQTPeer):
         # UDP SO_RCVBUF/SO_SNDBUF request (bytes). None = aiopquic
         # default (64 MiB, kernel-clamped to rmem_max/wmem_max).
         self.socket_buffer_size = socket_buffer_size
+        self.shared_transport = shared_transport
+        # Presents a token in SETUP.
+        self.auth = auth
 
         logger.debug(
             f"MOQT: client session: {self} use_quic={use_quic} path={path}")
@@ -131,15 +173,11 @@ class MOQTClient(MOQTPeer):
                 if cfg.secrets_log_file is None and self.keylog_filename:
                     cfg.secrets_log_file = self.keylog_filename
             else:
-                # Offer one ALPN per supported draft, newest first, so a
-                # d16-only peer negotiates moqt-16 and a d14 peer falls
-                # back to moq-00. The session sets its version from
-                # whichever ALPN the peer selects (version-from-ALPN). A
-                # single offered draft yields a single ALPN; the auto
-                # offer (supported_drafts=None) yields every version —
-                # without that, auto offered only moq-00 (d14) and
-                # d16-only relays closed the connection (376) before
-                # SERVER_SETUP.
+                # Offer one ALPN per supported draft, newest first. The
+                # session sets its version from whichever ALPN the peer
+                # selects (version-from-ALPN). A single offered draft
+                # yields a single ALPN; the auto offer
+                # (supported_drafts=None) yields every version.
                 alpn = [moqt_alpn_for_version(v)
                         for v in self.supported_drafts]
                 cfg = QuicConfiguration(
@@ -161,6 +199,8 @@ class MOQTClient(MOQTPeer):
                     self.congestion_control_algorithm)
             if self.congestion_control_options is not None:
                 cfg.congestion_control_options = self.congestion_control_options
+            if self.packet_train_mode:
+                cfg.packet_train_mode = True
             if self.flow_control_window is not None:
                 cfg.max_data = cfg.max_stream_data = self.flow_control_window
             if self.tx_max_queued_bytes is not None:
@@ -186,8 +226,11 @@ class MOQTClient(MOQTPeer):
 
     @asynccontextmanager
     async def _connect_quic(self, cfg, protocol):
+        shared = self.shared_transport
+        # Passed only when set: older aiopquic has no such argument.
+        engine = {"engine": shared.engine} if shared is not None else {}
         async with aiopquic_connect(self.host, self.port, configuration=cfg,
-                                    create_protocol=protocol) as session:
+                                    create_protocol=protocol, **engine) as session:
             try:
                 yield session
             finally:
@@ -227,44 +270,51 @@ class MOQTClient(MOQTPeer):
         cc_options = getattr(wt_cfg, "congestion_control_options", None)
         if self.tx_max_queued_bytes is not None:
             wt_cfg.tx_max_queued_bytes = self.tx_max_queued_bytes
-        if wt_cfg.event_ring_capacity is not None:
-            transport = TransportContext(
-                ring_capacity=wt_cfg.event_ring_capacity)
-        else:
-            transport = TransportContext()
-        transport.start(
-            is_client=True, alpn="h3",
-            verify_peer=bool(self.verify_tls) and wt_cfg.verify_peer,
-            ca_file=self.ca_file or wt_cfg.cafile,
-            max_datagram_frame_size=64 * 1024,
-            debug_log=self.quic_debug_log,
-            rx_data_ring_cap=wt_cfg.max_stream_data,
-            initial_max_data=wt_cfg.max_data,
-            initial_max_streams_uni=wt_cfg.max_streams_uni,
-            initial_max_streams_bidi=wt_cfg.max_streams_bidi,
-            idle_timeout_ms=int(wt_cfg.idle_timeout * 1000),
-            congestion_control_algorithm=(
-                wt_cfg.congestion_control_algorithm),
-            **({"congestion_control_options": cc_options}
-               if cc_options is not None else {}),
-            keep_alive_interval_ms=int(
-                (self.keep_alive_interval or 0) * 1000),
-            socket_buffer_size=(self.socket_buffer_size or 0),
-            qlog_dir=wt_cfg.qlog_dir,
-        )
+        shared = self.shared_transport
+        transport = shared._wt_transport if shared is not None else None
+        if transport is None:
+            ring = (shared.ring_capacity if shared is not None else None) \
+                or wt_cfg.event_ring_capacity
+            if ring is not None:
+                transport = TransportContext(ring_capacity=ring)
+            else:
+                transport = TransportContext()
+            transport.start(
+                is_client=True, alpn="h3",
+                verify_peer=bool(self.verify_tls) and wt_cfg.verify_peer,
+                ca_file=self.ca_file or wt_cfg.cafile,
+                max_datagram_frame_size=64 * 1024,
+                debug_log=self.quic_debug_log,
+                rx_data_ring_cap=wt_cfg.max_stream_data,
+                initial_max_data=wt_cfg.max_data,
+                initial_max_streams_uni=wt_cfg.max_streams_uni,
+                initial_max_streams_bidi=wt_cfg.max_streams_bidi,
+                idle_timeout_ms=int(wt_cfg.idle_timeout * 1000),
+                congestion_control_algorithm=(
+                    wt_cfg.congestion_control_algorithm),
+                **({"congestion_control_options": cc_options}
+                   if cc_options is not None else {}),
+                **({"packet_train_mode": True} if self.packet_train_mode else {}),
+                keep_alive_interval_ms=int(
+                    (self.keep_alive_interval or 0) * 1000),
+                socket_buffer_size=(self.socket_buffer_size or 0),
+                qlog_dir=wt_cfg.qlog_dir,
+                **({"client_sockets": shared.sockets}
+                   if shared is not None and shared.sockets else {}),
+            )
+            if shared is not None:
+                shared._wt_transport = transport
         # MoQT draft over WebTransport: the ALPN is "h3", so unlike raw
         # QUIC it carries no MoQT version — it is negotiated in-band via
         # WT-Available-Protocols -> WT-Protocol. Offer every applicable
         # draft as a subprotocol in the caller's preference order; the
         # server selects one and the session locks its draft from that
-        # selection (in client_session_init). Drafts >= 15 advertise via
-        # "moqt-NN" (per moq-transport-16 §3.1); d14 uses the legacy
-        # in-band CLIENT_SETUP path (no subprotocol). wt_draft (the first
+        # selection (in client_session_init). Drafts advertise via
+        # "moqt-NN" (per moq-transport-16 §3.1). wt_draft (the first
         # offered) is the pre-negotiation guess stamped below; for a
         # multi-draft offer the WT-Protocol selection overrides it.
         wt_draft = self.supported_drafts[0]
-        wt_protocols = [f"moqt-{d}" for d in self.supported_drafts
-                        if d >= 15] or None
+        wt_protocols = [f"moqt-{d}" for d in self.supported_drafts]
         session = MOQTSessionWTClient(
             transport,
             self.host, self.port, self.path or "",
@@ -274,8 +324,7 @@ class MOQTClient(MOQTPeer):
         )
         # Stamp the resolved MoQT draft: over WT the ALPN is "h3" so the
         # session never learns it from ProtocolNegotiated (as raw QUIC
-        # does). Without this the d16 ServerSetup handler reads the d14
-        # default from negotiated_draft and reverts the context.
+        # does).
         session.negotiated_draft = wt_draft
         # Stamp the aggregate TX gate budget and per-stream ring cap
         # on the WT session (the client constructs the session
@@ -308,7 +357,8 @@ class MOQTClient(MOQTPeer):
                     except Exception:
                         pass
                 finally:
-                    try:
-                        transport.stop()
-                    except Exception:
-                        pass
+                    if shared is None:
+                        try:
+                            transport.stop()
+                        except Exception:
+                            pass

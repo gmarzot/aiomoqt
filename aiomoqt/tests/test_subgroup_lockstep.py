@@ -42,7 +42,7 @@ class _RecordingSender:
     def encode_open(self, object_id, payload, extensions):
         return None
 
-    async def send(self, object_id, payload, extensions):
+    async def send(self, object_id, payload, extensions, last=False):
         await asyncio.sleep(0.004 if self.subgroup_id == _SLOW else 0)
         return len(payload)
 
@@ -115,10 +115,10 @@ async def test_a_late_subscriber_gets_every_subgroup_of_each_group(
         use_quic, monkeypatch):
     real_send = track_mod._SubgroupSender.send
 
-    async def _send(self, object_id, payload, extensions):
+    async def _send(self, object_id, payload, extensions, last=False):
         if self.subgroup_id == _SLOW:
             await asyncio.sleep(0.008)
-        return await real_send(self, object_id, payload, extensions)
+        return await real_send(self, object_id, payload, extensions, last)
 
     real_encode = track_mod._SubgroupSender.encode_open
 

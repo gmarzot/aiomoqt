@@ -33,12 +33,13 @@ PACKAGING_MEDIA_TIMELINE = "mediatimeline"
 PACKAGING_EVENT_TIMELINE = "eventtimeline"
 PACKAGING_MOQLOG = "moqlog"
 PACKAGING_MOQMETRICS = "moqmetrics"
+PACKAGING_MPEG2TS = "mpeg2ts"  # draft-gregoire-moq-msfts
 # Packagings aiomoqt publishes and subscribes as media tracks.
 MEDIA_PACKAGINGS = (PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_LOCMAF)
 _KNOWN_PACKAGING = frozenset({
     PACKAGING_LOC, PACKAGING_CMAF, PACKAGING_LOCMAF, PACKAGING_CATALOG,
     PACKAGING_MEDIA_TIMELINE, PACKAGING_EVENT_TIMELINE,
-    PACKAGING_MOQLOG, PACKAGING_MOQMETRICS,
+    PACKAGING_MOQLOG, PACKAGING_MOQMETRICS, PACKAGING_MPEG2TS,
 })
 
 # §5.1.7 initialization reference types.
@@ -386,6 +387,13 @@ class Catalog:
             if t.targetLatency is not None and t.buffers is not None:
                 issues.append(
                     f"{tag}: targetLatency and buffers are exclusive")
+            if t.packaging == PACKAGING_MPEG2TS:
+                from .msfts import track_issues
+                issues.extend(f"{tag}: {i}" for i in track_issues(t, self))
+                # An mpeg2ts track is a multiplex: no codec (msfts-02 §7).
+                if t.role in _AV_ROLES and t.bitrate is None:
+                    issues.append(f"{tag}: {t.role} track requires bitrate")
+                continue
             if t.role in _AV_ROLES:
                 if t.codec is None:
                     issues.append(f"{tag}: {t.role} track requires codec")

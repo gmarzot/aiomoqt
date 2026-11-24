@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 import argparse
-import asyncio
 import logging
 import uuid
+from typing import Any
 
 from aiomoqt.types import MOQT_DEFAULT_DRAFTS, ForwardingPreference, parse_draft_spec
 from aiomoqt.client import MOQTClient
 from aiomoqt.track import PublishedTrack, VideoTrack
 from aiomoqt.utils import class_name, get_logger, set_log_level, wait_cond_timeout
-from aiomoqt.utils.cli import add_help
+from aiomoqt.utils.cli import add_help, run
 from aiomoqt.utils.url import parse_relay_url
 
 GROUP_SIZE = 30
@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('-P', '--streams', type=int, default=1, help='Parallel subgroup streams (default: 1)')
     parser.add_argument('-s', '--object-size', type=int, default=1024, help='Object payload size bytes (default: 1024)')
     parser.add_argument('-r', '--rate', type=float, default=30, help='Frames per second (default: 30)')
-    parser.add_argument('-t', '--duration', type=int, default=120, help='Duration in seconds (default: 120)')
+    parser.add_argument('-t', '--duration', type=int, default=0, help='Duration in seconds (default: 120)')
     parser.add_argument('--video', type=str, default=None, metavar='RES',
                         choices=['720p', '1080p', '1440p', '4k'],
                         help='Video simulation mode with I/B/P frames (720p, 1080p, 1440p, 4k)')
@@ -84,13 +84,17 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
                datagram: bool = False,
                insecure: bool = False, auth_token: str = None, draft: int = None,
                streams: int = 1, object_size: int = 1024, rate: float = 30,
-               duration: int = 120, video: str = None, gop_pattern: str = 'ibp',
+               duration: int = 0, video: str = None, gop_pattern: str = 'ibp',
                cc_algo: str = 'bbr', max_queued_bytes: int = None,
                max_inflight_bytes: int = None):
     log_level = logging.DEBUG if debug else logging.INFO
     set_log_level(log_level)
     logger = get_logger(__name__)
 
+    inflight: dict[str, Any] = (
+        {'tx_max_inflight_bytes':
+         (None if max_inflight_bytes == 0 else max_inflight_bytes)}
+        if max_inflight_bytes is not None else {})
     client = MOQTClient(
         host,
         port,
@@ -102,9 +106,7 @@ async def main(host: str, port: int, path: str, namespace: str, trackname: str,
         keylog_filename=args.keylogfile,
         congestion_control_algorithm=cc_algo,
         tx_max_queued_bytes=max_queued_bytes,
-        **({'tx_max_inflight_bytes':
-            (None if max_inflight_bytes == 0 else max_inflight_bytes)}
-           if max_inflight_bytes is not None else {}),
+        **inflight,
     )
 
     auth = auth_token.encode() if auth_token else b""
@@ -151,7 +153,7 @@ if __name__ == "__main__":
 
     try:
         args = parse_args()
-        asyncio.run(main(
+        run(main(
             host=args.host,
             port=args.port,
             path=args.path,

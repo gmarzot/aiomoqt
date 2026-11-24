@@ -53,7 +53,7 @@ async def test_a_probe_passes_through_a_live_relay(use_quic):
 @_TRANSPORTS
 async def test_a_probe_fails_when_the_relay_drops_objects(use_quic,
                                                           monkeypatch):
-    async def _drop(self, *args, **kwargs):
+    def _drop(self, *args, **kwargs):
         return None
     monkeypatch.setattr(relay._RelayedTrack, "_forward_one", _drop)
     port = _BASE_PORT + 2 + (not use_quic)
@@ -133,7 +133,7 @@ async def test_the_watchdog_exits_after_consecutive_misses_only(
     monkeypatch.setattr(relay.os, "_exit", _exit)
     monkeypatch.setattr(relay.logging, "shutdown", lambda: None)
     with pytest.raises(_Exit) as exc:
-        await relay._watchdog(0.01, "127.0.0.1", 1, True, [14, 16, 18])
+        await relay._watchdog(0.01, "127.0.0.1", 1, True, [16, 18])
     assert exc.value.args == (relay.WATCHDOG_EXIT,)
     assert len(probes) == 6
     assert {args[3] for args in probes} == {18}       # newest draft only

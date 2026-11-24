@@ -9,7 +9,7 @@ SETUP_BODY = bytes.fromhex("00020264")
 
 def _session(settled: bool):
     s = object.__new__(_MOQTSessionMixin)
-    s.negotiated_draft = 14                 # unpinned __init__ default
+    s.negotiated_draft = 16                 # unpinned __init__ default
     s._draft_settled = settled
     s._pre_draft_stream_data = {}
     s._uni_peek_stash = {}
@@ -52,6 +52,6 @@ def test_settled_session_routes_immediately():
 def test_webtransport_session_never_holds():
     s = _session(settled=False)
     s._is_wt = True
-    s._ingest_stream_data(3, b"\x10\x00", False)          # d14 subgroup stream
+    s._ingest_stream_data(3, b"\x10\x00", False)          # d16 subgroup stream
     assert s.routed == [("data", 3, b"\x10\x00", False)]
     assert s._pre_draft_stream_data == {}

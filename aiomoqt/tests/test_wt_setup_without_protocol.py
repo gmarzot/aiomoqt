@@ -1,12 +1,15 @@
-"""A WebTransport server with no negotiated WT-Protocol runs the d14 fallback;
-a d18+ SETUP arriving there on a uni stream closes with a reason naming the
-missing WT-Available-Protocols offer, not as an unknown data stream type."""
+"""A WebTransport server with no negotiated WT-Protocol settles no draft: a
+d18+ SETUP arriving there on a uni stream closes with a reason naming the
+missing WT-Available-Protocols offer, not as an unknown data stream type, and
+a d16 CLIENT_SETUP on the control stream is refused the same way."""
 import asyncio
 import logging
 import re
 
 from aiopquic.asyncio.webtransport import connect_webtransport
 
+from aiomoqt.context import profile_for
+from aiomoqt.messages import ClientSetup
 from aiomoqt.server import MOQTServer
 from aiomoqt.tests._certs import CERT, KEY, requires_certs
 from aiomoqt.utils.buffer import Buffer
@@ -26,7 +29,7 @@ def _setup_prefix() -> bytes:
 async def test_d18_setup_without_wt_protocol_names_the_offer(caplog):
     server = MOQTServer(host="localhost", port=_PORT, certificate=CERT,
                         private_key=KEY, path="/", use_quic=False,
-                        supported_drafts=[22, 20, 18, 16, 14])
+                        supported_drafts=[22, 20, 18, 16])
     handle = await server.serve()
     try:
         async with asyncio.timeout(10):
@@ -49,5 +52,28 @@ async def test_d18_setup_without_wt_protocol_names_the_offer(caplog):
                   and "no WT-Protocol" in r.getMessage()]
         assert len(logged) == 1, logged
         assert re.search(r"peer \[?[0-9a-f.:]+\]?:\d+\)$", logged[0]), logged
+    finally:
+        handle.close()
+
+
+async def test_client_setup_without_wt_protocol_is_refused():
+    server = MOQTServer(host="localhost", port=_PORT + 1, certificate=CERT,
+                        private_key=KEY, path="/", use_quic=False,
+                        supported_drafts=[22, 20, 18, 16])
+    handle = await server.serve()
+    try:
+        async with asyncio.timeout(10):
+            async with connect_webtransport(
+                    "localhost", _PORT + 1, "/", verify_peer=False) as wt:
+                assert wt.negotiated_protocol is None
+                sid = await wt.create_stream(bidir=True)
+                setup = ClientSetup(parameters={}).serialize(
+                    prof=profile_for(16))
+                wt.send_stream_data(sid, bytes(setup.data))
+                await wt.wait_closed()
+                closed = wt._session_close_event
+        assert closed is not None
+        reason = bytes(closed.reason).decode(errors="replace")
+        assert "no WT-Protocol" in reason, reason
     finally:
         handle.close()

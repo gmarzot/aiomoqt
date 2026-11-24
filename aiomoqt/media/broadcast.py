@@ -24,13 +24,14 @@ from ..types import (
 from ..utils.logger import get_logger
 from .catalog import (
     Catalog, CatalogError, CATALOG_TRACK_NAME, MEDIA_PACKAGINGS,
-    PACKAGING_LOC, PACKAGING_LOCMAF,
+    PACKAGING_LOC, PACKAGING_LOCMAF, PACKAGING_MPEG2TS,
 )
 from .loc import LocTrackPublisher, LocTrackSubscriber
 from .locmaf import (
     LocmafError, LocmafTrackSubscriber, SUPPORTED_LOCMAF_VERSIONS,
     TrackContext,
 )
+from .msfts import MsftsError, MsftsTrack, MsftsTrackSubscriber
 
 logger = get_logger(__name__)
 
@@ -119,6 +120,18 @@ class CatalogTrackPublisher(PublishedTrack):
         super()._set_forward(sub, forward)
         if resumed and self._serving():
             self._updates.put_nowait(self._RESUME)
+
+    async def _on_subscribe(self, session, msg):
+        # One emitter serves the catalog: a second concurrent SUBSCRIBE on
+        # the session is refused (d20 allows it, §3.1).
+        if session._profile.param_table >= 20 and any(
+                s.session is session and s.subscribers
+                for s in self.subscriptions):
+            session.subscribe_error(
+                msg.request_id, error_code=RequestErrorCode.NOT_SUPPORTED,
+                reason="catalog already subscribed in this session")
+            return
+        await super()._on_subscribe(session, msg)
 
     async def generate(self, session, track_alias: int):
         """Serve the catalog to the subscription under `track_alias`,
@@ -265,8 +278,8 @@ class MediaPublisher:
 
     async def start(self, announce_namespace: bool = False,
                     publish_track: bool = True, forward: int = 0) -> None:
-        """Announce the broadcast, then install the session-level demux
-        over PublishedTrack's per-track handlers.
+        """Install the session-level demux over PublishedTrack's per-track
+        handlers, then announce the broadcast.
 
         announce_namespace: one PUBLISH_NAMESPACE for the broadcast; the
         relay forwards subscriber SUBSCRIBEs per track.
@@ -278,17 +291,8 @@ class MediaPublisher:
         if not (announce_namespace or publish_track):
             raise ValueError("start(): need announce_namespace or "
                              "publish_track")
-        if announce_namespace:
-            await self.session.publish_namespace(
-                namespace=self.namespace, wait_response=True)
-            logger.info(f"MediaPublisher: announced '{self.namespace}'")
-        for track in self._by_name.values():
-            if publish_track:
-                # The track may also serve other sessions; this is ours.
-                await track.publish(publish_track=True, forward=forward,
-                                    session=self.session)
-            else:
-                track._sub_for(self.session).state = TrackState.ANNOUNCED
+        self._started = dict(publish_track=publish_track, forward=forward)
+        # Before any announcement: a SUBSCRIBE may overtake its reply.
         self.session.register_handler(
             MOQTMessageType.SUBSCRIBE, self._demux_subscribe)
         self.session.register_handler(
@@ -297,6 +301,37 @@ class MediaPublisher:
             MOQTMessageType.SUBSCRIBE_UPDATE, self._demux_update)
         self.session.register_handler(
             MOQTMessageType.FETCH, self._demux_fetch)
+        if not publish_track:
+            # Set first: an early SUBSCRIBE moves it on to SUBSCRIBED.
+            for track in self._by_name.values():
+                track._sub_for(self.session).state = TrackState.ANNOUNCED
+        if announce_namespace:
+            await self.session.publish_namespace(
+                namespace=self.namespace, wait_response=True)
+            logger.info(f"MediaPublisher: announced '{self.namespace}'")
+        if publish_track:
+            for track in self._by_name.values():
+                # The track may also serve other sessions; this is ours.
+                await track.publish(publish_track=True, forward=forward,
+                                    session=self.session)
+
+    async def publish_track(self, track: PublishedTrack) -> None:
+        """Offer a track added after start() as start() offered the
+        others: PUBLISH, or held for a SUBSCRIBE under the announced
+        namespace."""
+        started = getattr(self, '_started', None)
+        if started is None:
+            return
+        if started['publish_track']:
+            await track.publish(publish_track=True, forward=started['forward'],
+                                session=self.session)
+        else:
+            track._sub_for(self.session).state = TrackState.ANNOUNCED
+
+    def remove_track(self, name: str) -> None:
+        """Route nothing more to track `name`; a SUBSCRIBE for it is
+        refused (DOES_NOT_EXIST)."""
+        self._by_name.pop(name, None)
 
     def _track_for_request(self, request_id) -> Optional[PublishedTrack]:
         for track in self._by_name.values():
@@ -347,8 +382,7 @@ class MediaPublisher:
         from ..messages import RequestUpdate
         # d16 REQUEST_UPDATE references the original request via
         # existing_request_id (its request_id is the update's own);
-        # d18 dropped that field — its request_id IS the reference —
-        # and d14 SUBSCRIBE_UPDATE keys on request_id directly.
+        # d18 dropped that field — its request_id IS the reference.
         rid = (msg.existing_request_id
                if isinstance(msg, RequestUpdate)
                and msg.existing_request_id is not None
@@ -358,24 +392,23 @@ class MediaPublisher:
             logger.warning(f"MediaPublisher: update for unknown "
                            f"request_id={rid}")
             return
-        if isinstance(msg, RequestUpdate):
-            await track._on_request_update(session, msg)
-        else:
-            await track._on_subscribe_update(session, msg)
+        await track._on_request_update(session, msg)
 
 
 class MediaSubscriber:
     """Consumes an MSF broadcast: reads the catalog track, then
-    subscribes every LOC, CMAF and LOCMAF track it describes (a LOCMAF
-    track only with a supported locmafVersion and an init).
+    subscribes every LOC, CMAF, LOCMAF and mpeg2ts track it describes (a
+    LOCMAF track only with a supported locmafVersion and an init, an
+    mpeg2ts track only with valid MSFTS fields; its frames come in Group
+    and Object order, see MsftsTrackSubscriber).
 
     on_frame(track_name, frame, group_id, object_id) receives media;
     on_arrival(track_name, msg, recv_us, group_id, subgroup_id, frame)
     sees every media-track object first (see LocTrackSubscriber);
     on_catalog(catalog) fires on every independent catalog or applied
-    delta. `loc_bare` expects LOC payloads without the Private
-    Properties block. `timestamp_errors` is each media track's
-    SubscribedTrack policy. A media track's Track Properties are its
+    delta. `timestamp_errors` is each media track's
+    SubscribedTrack policy; `repair_s` each mpeg2ts track's FETCH repair
+    budget (see MsftsTrackSubscriber). A media track's Track Properties are its
     subscriber's (`tracks[name]`); `properties(name)` is the merged view.
     """
 
@@ -385,12 +418,12 @@ class MediaSubscriber:
                  track_filter: Optional[Callable] = None,
                  discover: bool = False,
                  on_arrival: Optional[Callable] = None,
-                 loc_bare: bool = False,
-                 timestamp_errors: str = 'cancel'):
+                 timestamp_errors: str = 'cancel',
+                 repair_s: float = 0.0):
         self.session = session
         self.namespace = namespace
-        self.loc_bare = loc_bare
         self.timestamp_errors = timestamp_errors
+        self.repair_s = repair_s
         # Treat `namespace` as a prefix and resolve it to the namespace
         # actually being published under it (§9.4), so a subscriber can
         # find a broadcast whose name it was never told.
@@ -525,47 +558,67 @@ class MediaSubscriber:
 
     async def _subscribe_media(self) -> None:
         for entry in list(self.catalog.tracks):
-            if entry.packaging not in MEDIA_PACKAGINGS:
-                logger.info(f"MediaSubscriber: skipping {entry.name!r} "
-                            f"(packaging={entry.packaging!r})")
-                continue
-            if entry.name in self.tracks:
-                continue
-            init = None
-            if entry.packaging == PACKAGING_LOCMAF:
-                init = self._locmaf_init(entry)
-                if init is None:
-                    continue
-            if not self.track_filter(entry):
-                continue
-            name = entry.name
-            callbacks = dict(
-                on_frame=(lambda f, gid, oid, _n=name:
-                          self.on_frame and self.on_frame(_n, f, gid, oid)),
-                on_arrival=(lambda m, rx, gid, sg, f, _n=name:
-                            self.on_arrival
-                            and self.on_arrival(_n, m, rx, gid, sg, f)),
-                timestamp_errors=self.timestamp_errors)
-            namespace = entry.namespace or self.namespace
-            if init is not None:
-                sub = LocmafTrackSubscriber(self.session, namespace, name,
-                                            init=init, **callbacks)
-            else:
-                # CMAF objects are not LOC: no Private Properties block.
-                bare = self.loc_bare or entry.packaging != PACKAGING_LOC
-                sub = LocTrackSubscriber(self.session, namespace, name,
-                                         loc_bare=bare, **callbacks)
-            if entry.packaging == PACKAGING_LOC:
-                # cmaf init is a CMAF header consumed by the sink, not
-                # decoder extradata — leave config unset there.
-                init = self.catalog.resolve_init(entry)
-                if init is not None:
-                    sub.set_config(init)
-            # Registered first: its objects can arrive before subscribe()
-            # returns.
-            self.tracks[name] = sub
+            await self.subscribe_track(entry)
+
+    async def subscribe_track(self, entry) -> Optional[LocTrackSubscriber]:
+        """Subscribe one catalog track, as start() does each: None when
+        it is not media this subscriber reads, already subscribed, or
+        refused by `track_filter`."""
+        ts = None
+        if entry.packaging == PACKAGING_MPEG2TS:
             try:
-                await sub.subscribe()
-            except BaseException:
-                self.tracks.pop(name, None)
-                raise
+                ts = MsftsTrack.from_entry(entry)
+            except MsftsError as e:
+                logger.warning(f"MediaSubscriber: skipping {e}")
+                return None
+        elif entry.packaging not in MEDIA_PACKAGINGS:
+            logger.info(f"MediaSubscriber: skipping {entry.name!r} "
+                        f"(packaging={entry.packaging!r})")
+            return None
+        if entry.name in self.tracks:
+            return None
+        init = None
+        if entry.packaging == PACKAGING_LOCMAF:
+            init = self._locmaf_init(entry)
+            if init is None:
+                return None
+        if not self.track_filter(entry):
+            return None
+        name = entry.name
+
+        def on_frame(f, gid, oid, _n=name):
+            return self.on_frame and self.on_frame(_n, f, gid, oid)
+
+        def on_arrival(m, rx, gid, sg, f, _n=name):
+            return self.on_arrival and self.on_arrival(_n, m, rx, gid,
+                                                       sg, f)
+        callbacks = dict(on_frame=on_frame, on_arrival=on_arrival,
+                         timestamp_errors=self.timestamp_errors)
+        namespace = entry.namespace or self.namespace
+        if ts is not None:
+            sub = MsftsTrackSubscriber(
+                self.session, namespace, name, packet_size=ts.packet_size,
+                on_frame=on_frame, on_arrival=on_arrival,
+                timestamp_errors=self.timestamp_errors,
+                repair_s=self.repair_s)
+        elif init is not None:
+            sub = LocmafTrackSubscriber(self.session, namespace, name,
+                                        init=init, **callbacks)
+        else:
+            sub = LocTrackSubscriber(self.session, namespace, name,
+                                     **callbacks)
+        if entry.packaging == PACKAGING_LOC:
+            # cmaf init is a CMAF header consumed by the sink, not
+            # decoder extradata — leave config unset there.
+            init = self.catalog.resolve_init(entry)
+            if init is not None:
+                sub.set_config(init)
+        # Registered first: its objects can arrive before subscribe()
+        # returns.
+        self.tracks[name] = sub
+        try:
+            await sub.subscribe()
+        except BaseException:
+            self.tracks.pop(name, None)
+            raise
+        return sub
