@@ -18,7 +18,8 @@ from aiopquic.asyncio.server import serve as aiopquic_serve
 from aiopquic.quic.events import StreamDataReceived, StreamReset
 
 from aiomoqt.client import MOQTClient
-from aiomoqt.messages.data import SubgroupHeader
+from aiomoqt.messages.data import ObjectDatagram, SubgroupHeader
+from aiomoqt.moq_fabric import FabricHop
 from aiomoqt.tools import moq_interop_relay as relay
 from aiomoqt.track import PublishedTrack
 from aiomoqt.types import ObjectStatus, StreamResetCode
@@ -882,3 +883,108 @@ async def test_a_member_whose_transport_holds_its_bytes_sheds(
     assert st.lane.cut_code == StreamResetCode.DELIVERY_TIMEOUT
     assert st.others == [0, 0], st.others
     assert run.views[0] == run.views[1]
+
+
+class _DgramViewer(_FakeViewer):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.dgrams = []
+
+    def datagram_max_payload(self):
+        return 1 << 16
+
+    def send_dgram_message(self, buf):
+        self.dgrams.append(bytes(buf.data))
+
+
+class _SlowOpenViewer(_FakeViewer):
+    async def open_uni_stream(self, *a, **kw):
+        for _ in range(30):
+            await asyncio.sleep(0)
+        return await super().open_uni_stream(*a, **kw)
+
+
+@needs_fanout
+async def test_a_datagram_in_a_fanout_subgroup_goes_as_a_datagram(fake_relay):
+    """Object 3 of group 0 arrives as a datagram while subgroup 0's
+    stream is in fanout: every viewer gets it as a datagram, and the
+    stream carries only its own objects."""
+    runs = {}
+    for fanout in (True, False):
+        t = _FakeTransport()
+        viewers = [_DgramViewer(t) for _ in range(3)]
+        track = fake_relay(viewers, fanout=fanout)
+        for oid in range(6):
+            payload = _payload("v", 0, oid, 300)
+            if oid == 3:
+                msg = ObjectDatagram(track_alias=0, group_id=0, object_id=oid,
+                                     publisher_priority=100, payload=payload)
+                track.on_object(msg, 300, 0, 0, None)
+            else:
+                track.on_object(_msg(0, oid, payload, first=oid == 0), 300,
+                                0, 0, 0)
+            await _settle()
+            for v in viewers:
+                v.tick()
+        track.on_stream_end(0, 0)
+        await _settle(50)
+        runs[fanout] = [(v.streams(), v.dgrams) for v in viewers]
+        assert bool(t.calls) is fanout
+    assert runs[True] == runs[False]
+    assert all(len(dgrams) == 1 for _s, dgrams in runs[True])
+
+
+@needs_fanout
+async def test_an_object_its_variant_cannot_encode_fails_on_each_lane(
+        fake_relay):
+    """An Object ID repeated within a subgroup: each subscriber is dropped
+    as without fanout, and the track keeps forwarding."""
+    out = {}
+    for fanout in (True, False):
+        t = _FakeTransport()
+        viewers = [_FakeViewer(t) for _ in range(3)]
+        track = fake_relay(viewers, fanout=fanout)
+        for oid in (0, 1, 2, 3, 2, 4):
+            track.on_object(_msg(0, oid, _payload("v", 0, oid, 300),
+                                 first=oid == 0), 300, 0, 0, 0)
+            await _settle()
+        assert bool(t.calls) is fanout
+        for oid in range(3):
+            track.on_object(_msg(1, oid, _payload("v", 1, oid, 300),
+                                 first=oid == 0), 300, 0, 1, 0)
+            await _settle()
+        await _settle(50)
+        out[fanout] = (track.task is None or track.task.done(),
+                       len(track.downstream), track.queue.qsize(),
+                       [v.streams() for v in viewers])
+    assert out[True] == out[False]
+    assert out[True][:3] == (False, 0, 0), out[True][:3]
+
+
+@needs_fanout
+async def test_a_viewer_joining_a_pass_later_shares_the_variant(fake_relay):
+    """A viewer whose stream opens later joins the subgroup's variant once
+    its lane has caught up: one fanout() per object writes all three."""
+    runs = {}
+    for fanout in (True, False):
+        t = _FakeTransport()
+        viewers = [_FakeViewer(t), _FakeViewer(t), _SlowOpenViewer(t)]
+        track = fake_relay(viewers, fanout=fanout)
+        await _feed(track, viewers, groups=1, objects=6)
+        runs[fanout] = [v.streams() for v in viewers]
+        if fanout:
+            wrote = [len(w) for w, _r in t.calls]
+            assert wrote[0] == 2 and set(wrote[1:]) == {3}, wrote
+    assert runs[True] == runs[False]
+
+
+def test_fabric_hops_keep_their_own_write_path(monkeypatch):
+    """A fabric hop's stream never joins: its writes count the fabric
+    session's bytes."""
+    monkeypatch.setattr(relay, "_DestSet", _FakeDestSet)
+    viewer = _FakeViewer(_FakeTransport())
+    viewer.data[3] = b""
+    hop = object.__new__(FabricHop)
+    hop._proto = SimpleNamespace(_quic=viewer._quic)
+    assert relay._add_dest({}, viewer, 3) is not None
+    assert relay._add_dest({}, hop, 3) is None

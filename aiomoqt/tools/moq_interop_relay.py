@@ -1727,6 +1727,9 @@ def _add_dest(dests, session, stream_id):
     """Add `session`'s stream `stream_id` to its shard's DestSet in `dests`
     (transport -> (DestSet, {index: member})); (transport, (DestSet,
     members), index), or None when the stream cannot be added."""
+    if isinstance(session, FabricHop):
+        # Its writes count the fabric session's bytes.
+        return None
     conn = getattr(session, "_quic", None)
     transport = getattr(conn, "transport", None)
     if transport is None:
@@ -3042,7 +3045,9 @@ class _RelayedTrack:
                          shape, {}, cost, born)
             targets = self.downstream
             first = None
-            if self._fanouts or self._fanout_first:
+            dgram = (shape.__class__ is tuple and shape
+                     and shape[0] == "DGRAM")
+            if (self._fanouts or self._fanout_first) and not dgram:
                 key = (gid, sgid)
                 if oid is None or status in _STREAM_ENDS:
                     # Each subscriber's stream ends on its own lane.
@@ -3069,9 +3074,7 @@ class _RelayedTrack:
             if (oid is not None and _DestSet is not None
                     and not _trace_subscribers
                     and len(self.downstream) >= FANOUT_MIN
-                    and status not in _STREAM_ENDS
-                    and not (shape.__class__ is tuple and shape
-                             and shape[0] == "DGRAM")
+                    and status not in _STREAM_ENDS and not dgram
                     and (gid, sgid) not in self._fanout_seen):
                 self._fanout_seen.add((gid, sgid))
                 # A stream whose end is already queued is written whole.
@@ -3201,7 +3204,7 @@ class _RelayedTrack:
         selects; False when that state or the stream does not fit."""
         stream_id, header = entry
         state = header.encoding_state()
-        vkey = (id(header.prof), state[:3])
+        vkey = (id(header.prof), state[:-1])
         v = fo.variants.get(vkey)
         if v is None:
             v = fo.variants[vkey] = _FanoutVariant(header)
@@ -3237,7 +3240,14 @@ class _RelayedTrack:
                 continue
             header = v.header
             last = header._last_object_id
-            data = _object_data(header, payload, exts, oid, encoded)
+            try:
+                data = _object_data(header, payload, exts, oid, encoded)
+            except Exception:
+                # Each lane then fails it for its own subscriber.
+                for _ds, members in list(v.dests.values()):
+                    for m in list(members.values()):
+                        self._fanout_leave(m, last, v.bytes)
+                continue
             for transport, (ds, members) in v.dests.items():
                 live = len(ds)
                 if not live:
