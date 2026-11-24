@@ -2381,10 +2381,10 @@ async def test_a_publisher_closing_on_a_held_publish_done_ends_the_track_once(
             real = PublishedTrack._send_publish_done
 
             def short(self, session, status_code=0x2, final=True,
-                      reason=None):
-                self._sub_for(session).fill_streams += 1
+                      reason=None, sub=None):
+                (sub or self._sub_for(session)).fill_streams += 1
                 return real(self, session, SubscribeDoneCode.GOING_AWAY,
-                            final, "publisher restarting")
+                            final, "publisher restarting", sub=sub)
             monkeypatch.setattr(PublishedTrack, "_send_publish_done", short)
             track.end()
             async with asyncio.timeout(2):

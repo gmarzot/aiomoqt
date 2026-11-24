@@ -1699,10 +1699,20 @@ class FanoutDelivery:
     def drop_session(self, session) -> bool:
         """Detach a session's lanes, resetting any open group. True if it
         had one."""
-        mine = [ln for ln in self.lanes if ln.session is session]
+        return self._detach([ln for ln in self.lanes
+                             if ln.session is session])
+
+    def drop(self, delivery) -> bool:
+        """Detach one delivery's lane, resetting any open group. True if
+        it had one."""
+        return self._detach([ln for ln in self.lanes
+                             if ln.writer is delivery])
+
+    def _detach(self, mine: list) -> bool:
         if not mine:
             return False
-        self.lanes = [ln for ln in self.lanes if ln.session is not session]
+        gone = {id(ln) for ln in mine}
+        self.lanes = [ln for ln in self.lanes if id(ln) not in gone]
         for lane in mine:
             lane.stop()
             lane.writer.reset_group()

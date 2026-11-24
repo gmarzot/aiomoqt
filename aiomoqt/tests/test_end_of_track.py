@@ -97,9 +97,11 @@ def _order(monkeypatch):
     monkeypatch.setattr(SubgroupDelivery, "end_track", spy_end_track)
     done = PublishedTrack._send_publish_done
 
-    def spy_done(self, session, status_code=0x2, final=True, reason=None):
-        log.append(("done", self._sub_for(session).track_alias))
-        return done(self, session, status_code, final, reason=reason)
+    def spy_done(self, session, status_code=0x2, final=True, reason=None,
+                 sub=None):
+        log.append(("done", (sub or self._sub_for(session)).track_alias))
+        return done(self, session, status_code, final, reason=reason,
+                    sub=sub)
     monkeypatch.setattr(PublishedTrack, "_send_publish_done", spy_done)
     return log
 
