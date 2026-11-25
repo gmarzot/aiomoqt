@@ -1,196 +1,56 @@
 # AGENTS.md
 
-Contributor guide for the `aiomoqt` repository. `aiomoqt` is an asyncio implementation of IETF
-MoQT (Media over QUIC Transport), layered on `aiopquic` (picoquic binding). Pure Python; the
-transport is a binary wheel dependency.
+Contributor guide for `aiomoqt`, an asyncio implementation of IETF MoQT on `aiopquic` (picoquic
+binding). `aiomoqt/AGENTS.md` ships in the wheel for agents using the installed package; keep its
+API boundary and traps consistent with this file.
 
-`aiomoqt/AGENTS.md` is a separate, shorter guide that ships in the wheel, for agents using the
-installed package. Keep its API boundary and traps consistent with this file.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `aiomoqt/protocol.py` | session state machine, control + data plane (~300 KB) |
-| `aiomoqt/client.py`, `server.py` | `MOQTClient`; `MOQTServer.serve()` / `serve_dual()` |
-| `aiomoqt/track.py` | `Track`, `PublishedTrack`, `SubscribedTrack`, `VideoTrack` |
-| `aiomoqt/delivery.py` | `StreamMapping`, `ObjectHistory`, `SubgroupDelivery`, `SendLane`, `FanoutDelivery` |
-| `aiomoqt/fanout.py` | `FanoutPublisher`: one MSF broadcast on several relays |
-| `aiomoqt/moq_fabric/` | moq-fabric mesh (moqx, LAPS) as a leaf node: wire codec, track hashes, `FabricNode`, d18 inner framing (`inner.py`), SNS per session (`ib.py`); `moq-fabric-probe` (`tools/moq_fabric_probe.py`) observes and originates; `moq-fabric-bench` (`tools/moq_fabric_bench.py`) sends and measures a track through the fabric |
-| `aiomoqt/messages/` | sans-I/O encode/decode; `messages/d18/`, `messages/d20/` for draft-specific shapes (d22 shares d20's) |
-| `aiomoqt/agent/` | declarative, JSON-round-tripping specs and `AgentSession` / `Reader` / `Writer` |
-| `aiomoqt/cat.py` | CAT credentials in the format moqx verifies: mint, verify, grants |
-| `aiomoqt/types.py`, `context.py` | draft numbers, error codes, `DraftProfile`, `profile_for()` |
-| `aiomoqt/media/` | MSF catalog, `broadcast.py` composer, LOC, CMAF, LOCMAF packaging, MPEG-TS packets as MSFTS (`msfts.py`, PCR playout and TS analysis in `tsplayout.py`); ingest (PyAV, DASH, MPEG-TS, TS over UDP) and synthetic sources; `abr.py` ABR ladder on cymedia |
-| `aiomoqt/tools/` | CLI tools: pub/sub/loopback/adaptive benches, `pub_server`, `load_sim`, `pub_media` / `sub_media`, `abr_ingest`, `relay_probe`, `moq_interop_client`, `moq_interop_relay` (aiomoqt-relay), `moqtest_origin`, `relay_status`; `scenarios/` for `load_sim` |
-| `aiomoqt/utils/` | CLI grid (`cli.py`), stats, URL parsing, logging, bench workers |
-| `aiomoqt/examples/` | minimal pub, sub, join and server examples; ship in the wheel |
-| `aiomoqt/versions.py` | `aiomoqt-versions`: aiomoqt, aiopquic, picoquic and picotls build info |
-| `aiomoqt/tests/` | the pytest tree, **inside** the package dir, left out of the wheel |
-| `tests/` | `release_regression_test.py` (tier runner) + `relays.json`; `contrib/` = contribution-runner sweep; `moqdev-smoke/` = moq-dev's relay smoke in Docker. No pytest files |
-| `deploy/aiomoqt-relay/` | compose, nginx and runbook for the public aiomoqt-relay |
-| `docs/` | bench and demo runbooks; CAT auth flows (`cat-auth.md`) |
+Read when the task touches it:
+- `docs/dev/layout.md`: what lives where
+- `docs/dev/conventions.md`: CLI grid, logging, drafts, routing and layering in full; lint and types
+- `docs/dev/ci-and-release.md`: test tiers, CI workflows, pins, release flow, versions
+- `TESTING.md`: tiers, suites, relay catalog, manual runs
 
 ## Setup
 
-Python >= 3.12 (CI: 3.12 / 3.13 / 3.14 on linux and macos).
-
     uv pip install -e ".[test,media]"      # ".[dev]" adds ruff + ty
 
-`media` (PyAV) is optional; without it the media tests skip. `test` brings `jsonschema` for the
-agent-spec tests.
-Install editable: the loopback suites and bench scripts resolve `certs/` relative to the working
-tree. `pytest` writes `certs/` on first run; for the bench tools see README "Development".
-Version comes from `setuptools_scm` (git tags): a shallow clone without tags builds as
-`0.0.0+unknown`, which is why CI uses `fetch-depth: 0`.
+Python >= 3.12. Install editable: the loopback suites and benches resolve `certs/` from the
+working tree.
 
 ## Tests
 
-`tests/release_regression_test.py` is what CI runs. Tiers group suites; `--test-suite` runs
-one suite directly, `--skip-suite` drops one from a selected tier.
-
     python tests/release_regression_test.py --test-tier unit --test-tier integration
     python tests/release_regression_test.py --test-suite loopback-fetch
-
-`unit` = the whole pytest tree, one run. `integration` = tools, multi-process paths and the
-draft × transport matrix over localhost. `interop` = live relays from `tests/relays.json`.
-`bench` = measurement only. `media-locmaf` is a manual suite (named with `--test-suite` only)
-against Eyevinn's public moqlivemock. `moqdev-smoke`, also manual, runs moq-dev's relay smoke
-(rust, js-web and js-bun clients) in Docker against `--moqdev-relays` (default
-`aiomoqt-relay`); run it on moq-test. A run with no `--test-tier` or `--test-suite` selects
-every tier, **including interop**. Exit is 1 iff some suite FAILed; SKIP and XFAIL (a failure on
-a non-gating relay or draft) do not gate.
-
-Network rule: the interop tier, a bare runner run, `relay_probe`, `moq_interop_client`,
-`media-locmaf` and `moqdev-smoke` reach public infrastructure. Run them from CI or a remote
-host, not a laptop.
-
-Plain pytest works too (`pytest.ini`: `testpaths = aiomoqt/tests`, `asyncio_mode=auto`):
-
     python -m pytest -q aiomoqt/tests
 
-Always `python -m pytest`, never the `pytest` binary: `-m` puts cwd on `sys.path` so an
-installed copy in site-packages cannot shadow the source tree and silently skip tests.
+- `python -m pytest`, never the `pytest` binary: an installed copy can shadow the source tree
+  and silently skip tests.
+- A runner run with no `--test-tier` or `--test-suite` includes interop. The interop tier,
+  `relay_probe`, `moq_interop_client`, `media-locmaf` and `moqdev-smoke` reach public
+  infrastructure: run them from CI or a remote host, not a laptop.
+- Zero objects delivered is a failure, never a pass. An assertion that cannot find its results
+  line fails loudly.
+- Per-track or per-request state gets a test with two tracks on one session, over raw QUIC and
+  WebTransport (`test_multi_track_publish.py`; through the relay, `test_relay_forwarding.py`).
 
-Zero objects delivered is a failure, never a pass; an assertion that cannot find its results
-line fails loudly rather than vacuously. Anything with per-track or per-request state gets a
-test with at least two tracks on one session, over raw QUIC and WebTransport
-(`test_multi_track_publish.py`, and through the relay in `test_relay_forwarding.py`).
+## Rules
 
-## CI
-
-- `ci.yml` (pull requests, push to main): `pin-guard`; `lint` (ruff); `types` (ty, report only);
-  `core` = unit + integration on the full
-  matrix, macOS adding `--skip-suite loopback-fetch` (the native QUIC close stalls ~10 s on an
-  un-drained fetch stream); `multi-proc` = `pub_server` against `sub_bench`; `peer-interop` =
-  cloudflare `moq-rs` plus the `ghcr.io/openmoq/moqx` image; `microbenchmark`
-  (continue-on-error).
-- `moq-conformance.yml` (push to `gmarzot-*` dev branches, dispatch): moxygen's moq-test client
-  against our relay, pinned in `.github/moxygen-pin`. It never runs on main.
-- `contrib-conformance.yml` (push to one dev branch, `ci:run-conformance` label, dispatch): our
-  publisher under mondain's contribution runner (`.github/contrib-runner-pin`) against
-  `tests/contrib/baseline.json`; report-only. Its push branch is hardcoded: bump it every dev
-  cycle.
-- `interop-regression.yml` (weekly, `ci:run-interop` label, dispatch): the interop tier.
-- `release.yml` (dispatch): see below.
-
-`.github/aiopquic-pin` (`owner/repo@ref`) builds aiopquic from source so a PR can pair with an
-unreleased aiopquic change. `pin-guard` hard-fails it on main or a release-labeled PR.
-
-## Release flow
-
-1. Work lands on the dev branch `gmarzot-X.Y.Z`, which has an open tracking PR to main.
-2. Release candidates: dispatch `release.yml` on the dev branch with `N.N.NrcN` (or `a`/`b`).
-3. Final release: squash-merge the tracking PR to main, then dispatch `release.yml` on main with
-   `N.N.N`.
-   `verify` requires a green `ci.yml` run and a green `moq-conformance.yml` run on a commit with
-   the identical tree; it does not re-run them. The wheel is built once and smoke-tested, then
-   tagged and published. `dry_run` stops after the smoke test.
-4. Merge main back into the dev branches. Start the next dev branch from the release tag and open
-   its tracking PR.
-
-Versions: setuptools_scm describes from the last final tag (rc, a and b tags are ignored) with
-`release-branch-semver`, so a dev build reports the next minor, e.g. `0.14.0.devN` after 0.13.3;
-N is not meaningful. Release tags sit on squash commits that are not ancestors of the dev
-branch: check releases with `git diff <commit> <tag>`, not ancestry.
-
-## Lint and types
-
-`[tool.ruff]` in `pyproject.toml`: `line-length = 100`, `select = ["E","F","W"]`,
-`ignore = ["E501"]`, with per-file ignores for the star-import modules. CI's `lint` job runs a
-pinned ruff and must pass. `types` runs a pinned `ty` and reports a count above
-`.github/ty-baseline` without failing the run; lower the baseline as diagnostics are fixed.
-Do not run `ruff format` across existing files: it reflows code the change never touched.
-
-The package ships `py.typed`, so downstream `mypy --strict` follows these annotations. Keep
-externally-callable defs annotated. Checking types from the repo root reports hundreds of
-errors in our own internals; check against an installed wheel in a clean venv instead.
-`aiopquic` ships no `py.typed`, so QUIC-facing signatures degrade to `Any` downstream.
-
-## Conventions
-
-**CLI grid.** `aiomoqt/utils/cli.py` defines the shared flag grid; its module docstring lists
-it. `test_cli_grid.py` checks every tool in `TOOLS` and every example: a grid short flag means
-only its grid meaning, and any short flag means one thing across all of them. There are no
-exceptions; `moq_interop_client`'s `-r/-t/-l/-v` are the interop runner's interface, listed in
-`EXTERNAL_CONTRACT` and tested against it. The `add_*` groups take no toggles: arguments set
-defaults, never which flags exist (also tested). A dialed URL's
-scheme selects the transport (`moqt://` raw QUIC, `https://` or bare `host:port`
-WebTransport); listeners use `-Q`/`-W`, and both together serve one port via ALPN dispatch.
-`-t` defaults to 0, no limit, on every tool and example (also tested); a tool may add an exit condition with `--exit COND`.
-`-h`, `-?` and `--help` print help on every tool and example (`cli.add_help`; the test requires
-all three). Write `-h` in docs: `-?` is a shell glob.
-Entry points run their coroutine with `cli.run`, not `asyncio.run`: Ctrl-C cancels the main
-task from the event loop, between callbacks (`test_cli_run.py`). Tools that install their own
-SIGINT handler are listed there.
-
-**Fan-out layering.** Peer mechanics live in `PublishedTrack` and `aiomoqt/delivery.py`.
-Packagers under `aiomoqt/media/` only package and number objects; `broadcast.py` is the single
-exempt composer. `test_packaging_does_not_know_about_peers` greps the media tree for
-`FanoutDelivery`, `add_session`, `_subs` and friends and fails if one appears.
-
-**Per-track routing.** `register_handler` holds one handler per message type for the whole
-session, so a track that registers one takes it from every other track. Messages addressed to a
-track or a request (SUBSCRIBE, PUBLISH_OK, updates) route through the session's track and
-request tables (`PublishedTrack.attach()`, `_bind_request()`), which take precedence over app
-handlers. `test_published_tracks_take_no_session_handler_slot` enforces this for `track.py`.
-
-**Drafts.** 16, 18, 20 and 22 are all live; odd-numbered drafts are not supported.
-Draft numbers are plain ints everywhere (`MOQTDraft`, the `draft=` kwarg, `supported_drafts`); the
-IETF code `0xff0000NN` and the ALPN (`moqt-NN`) exist only at the
-wire boundary. Default offer is newest-first `MOQT_DEFAULT_DRAFTS = (22, 20, 18, 16)`.
-Route behavior differences through `profile_for(draft)` / `DraftProfile` in `context.py`
-rather than scattering version checks. New wire shapes need a case in
-`test_wire_conformance.py`, including malformed ones: aiopquic's Cython codecs and our Python
-codecs can agree on valid bytes while diverging on invalid ones.
-
-**Logging.** INFO tells a session's story, one line per event: setup (`setup complete:
-draft-N`) and close; each control message where it crosses the wire (`MOQT send:` out,
-`control message parsed:` in); and request or track outcomes no message carries (cancellations,
-refusals, forward-state changes, `Track:` and `relay:` summaries). DEBUG is a second view of a
-message already logged, transport plumbing, per-stream lifecycle (open, close, reset) and request
-or track bookkeeping; its volume does not grow with the object count. TRACE (`TRACE = 5` in
-`aiomoqt.utils.logger`, registered by name only) is per object, per chunk, per datagram and wire
-hex: emit it as `log.log(TRACE, …)`, behind `log.isEnabledFor(TRACE)` on hot paths. WARNING is a
-tolerated peer deviation, a bound hit, or a session we close for the peer's error; ERROR is a
-session we end for our own failure (INTERNAL_ERROR).
-
-Category loggers, stable names: `aiomoqt.control` (control messages, requests), `aiomoqt.data`
-(subgroup streams, datagrams, objects in and out), `aiomoqt.fetch` (FETCH streams and objects),
-`aiomoqt.transport` (QUIC and WebTransport events, stream ops, ALPN), `aiomoqt.relay` (the
-relay), `aiomoqt.moq_fabric` (moq-fabric sessions). A line that belongs to none uses its
-module logger. Tools take `--log-level {error,warning,info,debug,trace}` (`-d`/`--debug` =
-`debug`) and `--log CAT=LEVEL[,…]` from the
-grid (`add_logging`, `apply_logging`); `AIOMOQT_LOG` takes the same spec, where a bare `LEVEL`
-sets every logger, and the flags win. `MOQTServer(quiet_peers=…)` logs a health probe's sessions
-at DEBUG. The relay's SIGUSR1 steps INFO → DEBUG → TRACE → INFO; its `--control` socket's
-`POST /debug` toggles DEBUG.
-
-**CHANGELOG, commits, comments.** One short CHANGELOG line per user-visible change; commits
-`area: short imperative summary`; comments say what or why in few words, never history.
-
-## API boundary and traps
-
-The import boundary, internals not to reach into, and user-facing traps are in
-`aiomoqt/AGENTS.md`. `protocol.py` is where the session state machine belongs: extend it there
-instead of driving it from outside.
+- Work lands on the dev branch `gmarzot-X.Y.Z`, which has a tracking PR to main.
+- `protocol.py` owns the session state machine: extend it there, don't drive it from outside.
+- Drafts 16, 18, 20, 22, as plain ints; wire codes and ALPN only at the wire boundary. Branch on
+  `profile_for(draft)` / `DraftProfile`, not version checks. A new wire shape needs a
+  `test_wire_conformance.py` case, malformed input included.
+- Track and request messages route through the session's track and request tables
+  (`PublishedTrack.attach()`, `_bind_request()`), not `register_handler`, which holds one
+  handler per message type for the whole session.
+- Peer mechanics live in `PublishedTrack` and `delivery.py`. Packagers under `aiomoqt/media/`
+  only package and number objects; `broadcast.py` is the one exempt composer.
+- CLI flags come from the grid in `aiomoqt/utils/cli.py`; a short flag means one thing across all
+  tools and examples (`test_cli_grid.py`). Entry points use `cli.run`, not `asyncio.run`.
+- Logging: INFO is one line per session event; DEBUG's volume does not grow with object count;
+  per-object output is TRACE, behind `isEnabledFor(TRACE)` on hot paths. Use the category
+  loggers (`aiomoqt.control`, `.data`, `.fetch`, `.transport`, `.relay`, `.moq_fabric`).
+- ruff must pass. Never run `ruff format` across existing files.
+- Keep externally-callable defs annotated (`py.typed` ships).
+- One short CHANGELOG line per user-visible change; commits `area: short imperative summary`;
+  comments say what or why in few words, never history.
